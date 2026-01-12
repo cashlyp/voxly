@@ -1,0 +1,30 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment files
+api/.env
+bot/.env
+
+
+# Node dependencies
+**/node_modules
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build artifacts
+**/dist
+**/build
+
+#
+# Local databases or data files
+api/db/data.db
+bot/db/data.db
+
+# Instruction files
+.github/implementation.md
+Implementation.md
+codex.md

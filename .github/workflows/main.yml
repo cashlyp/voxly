@@ -1,0 +1,49 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: Deploy via SSH to EC2
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Deploy using SSH
+        uses: appleboy/ssh-action@v0.1.6
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # Ensure PM2 is in PATH
+            export PATH=$PATH:/home/ubuntu/.npm-global/bin
+
+            # Navigate to project root
+            cd /home/ubuntu/voicednut
+
+            # Pull latest changes
+            git pull origin main
+
+            # Kill PM2 daemon and delete all processes
+            pm2 kill
+            pm2 delete all
+
+            # Deploy API
+            cd api
+            npm install
+            npm run db:migrate
+            pm2 startOrRestart ecosystem.config.js --env production
+
+            # Deploy Bot
+            cd ../bot
+            npm install
+            pm2 startOrRestart ecosystem.config.js --env production
+
+            # Save PM2 process list
+            pm2 save

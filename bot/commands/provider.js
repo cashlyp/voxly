@@ -1,0 +1,154 @@
+const axios = require('axios');
+const config = require('../config');
+const { getUser, isAdmin } = require('../db/db');
+const { buildLine, section, escapeMarkdown } = require('../utils/messageStyle');
+
+const ADMIN_HEADER_NAME = 'x-admin-token';
+const SUPPORTED_PROVIDERS = ['twilio', 'aws', 'vonage'];
+
+function formatProviderStatus(status) {
+    if (!status) {
+        return section('⚙️ Call Provider Settings', ['No status data available.']);
+    }
+
+    const current = typeof status.provider === 'string' ? status.provider : 'unknown';
+    const stored = typeof status.stored_provider === 'string' && status.stored_provider.length > 0
+        ? status.stored_provider
+        : current;
+    const supportedValues = Array.isArray(status.supported_providers) && status.supported_providers.length > 0
+        ? status.supported_providers
+        : SUPPORTED_PROVIDERS;
+    const vonageReady = status.vonage_ready ? '✅ Ready' : '⚠️ Missing keys';
+
+    const details = [
+        buildLine('•', `Current Provider`, `*${current.toUpperCase()}*`),
+        buildLine('•', `Stored Default`, stored.toUpperCase()),
+        buildLine('•', `AWS Ready`, status.aws_ready ? '✅' : '⚠️'),
+        buildLine('•', `Twilio Ready`, status.twilio_ready ? '✅' : '⚠️'),
+        buildLine('•', `Vonage Ready`, vonageReady),
+        buildLine('•', `Supported Backbones`, supportedValues.join(', ').toUpperCase())
+    ];
+
+    return section('⚙️ Call Provider Settings', details);
+}
+
+async function fetchProviderStatus() {
+    const response = await axios.get(`${config.apiUrl}/admin/provider`, {
+        timeout: 10000,
+        headers: {
+            [ADMIN_HEADER_NAME]: config.admin.apiToken,
+            'Content-Type': 'application/json',
+        },
+    });
+    return response.data;
+}
+
+async function updateProvider(provider) {
+    const response = await axios.post(
+        `${config.apiUrl}/admin/provider`,
+        { provider },
+        {
+            timeout: 15000,
+            headers: {
+                [ADMIN_HEADER_NAME]: config.admin.apiToken,
+                'Content-Type': 'application/json',
+            },
+        }
+    );
+    return response.data;
+}
+
+async function ensureAuthorizedAdmin(ctx) {
+    const fromId = ctx.from?.id;
+    if (!fromId) {
+        await ctx.reply('❌ Missing sender information.');
+        return { user: null, isAdminUser: false };
+    }
+
+    const user = await new Promise((resolve) => getUser(fromId, resolve));
+    if (!user) {
+        await ctx.reply('❌ You are not authorized to use this bot.');
+        return { user: null, isAdminUser: false };
+    }
+
+    const admin = await new Promise((resolve) => isAdmin(fromId, resolve));
+    if (!admin) {
+        await ctx.reply('❌ This command is for administrators only.');
+        return { user, isAdminUser: false };
+    }
+
+    return { user, isAdminUser: true };
+}
+
+async function handleProviderSwitch(ctx, requestedProvider) {
+    await ctx.reply(`🛠 Switching call provider to *${requestedProvider.toUpperCase()}*...`, { parse_mode: 'Markdown' });
+
+    const result = await updateProvider(requestedProvider);
+    const status = await fetchProviderStatus();
+
+    const baseLine = result.changed === false
+        ? `ℹ️ Provider already set to *${status.provider?.toUpperCase() || requestedProvider.toUpperCase()}*.`
+        : `✅ Call provider set to *${status.provider?.toUpperCase() || requestedProvider.toUpperCase()}*.`;
+
+    const payload = `${baseLine}\n\n${formatProviderStatus(status)}`;
+
+    await ctx.reply(payload, { parse_mode: 'Markdown' });
+}
+
+function registerProviderCommand(bot) {
+    bot.command('provider', async (ctx) => {
+        const text = ctx.message?.text || '';
+        const args = text.split(/\s+/).slice(1);
+        const requestedAction = (args[0] || '').toLowerCase();
+
+        const { isAdminUser } = await ensureAuthorizedAdmin(ctx);
+        if (!isAdminUser) {
+            return;
+        }
+
+        try {
+            const status = await fetchProviderStatus();
+            const supported = Array.isArray(status?.supported_providers) && status.supported_providers.length > 0
+                ? status.supported_providers.map((item) => item.toLowerCase())
+                : SUPPORTED_PROVIDERS;
+
+            if (!requestedAction || requestedAction === 'status') {
+                await ctx.reply(formatProviderStatus(status), { parse_mode: 'Markdown' });
+                return;
+            }
+
+            if (!supported.includes(requestedAction)) {
+                const options = supported.map((item) => `• /provider ${item}`).join('\n');
+                await ctx.reply(
+                    `❌ Unsupported provider "${requestedAction}".\n\nUsage:\n• /provider status\n${options}`
+                );
+                return;
+            }
+
+            await handleProviderSwitch(ctx, requestedAction);
+        } catch (error) {
+            console.error('Failed to manage provider via Telegram command:', error);
+            if (error.response) {
+                const details = error.response.data?.details || error.response.data?.error || error.response.statusText;
+                await ctx.reply(`❌ Failed to update provider: ${escapeMarkdown(details || 'Unknown error')}`);
+            } else if (error.request) {
+                await ctx.reply('❌ No response from API. Please check the server status.');
+            } else {
+                await ctx.reply(`❌ Error: ${error.message}`);
+            }
+        }
+    });
+}
+
+function initializeProviderCommand(bot) {
+    registerProviderCommand(bot);
+}
+
+module.exports = initializeProviderCommand;
+module.exports.registerProviderCommand = registerProviderCommand;
+module.exports.fetchProviderStatus = fetchProviderStatus;
+module.exports.updateProvider = updateProvider;
+module.exports.formatProviderStatus = formatProviderStatus;
+module.exports.handleProviderSwitch = handleProviderSwitch;
+module.exports.SUPPORTED_PROVIDERS = SUPPORTED_PROVIDERS;
+module.exports.ADMIN_HEADER_NAME = ADMIN_HEADER_NAME;
