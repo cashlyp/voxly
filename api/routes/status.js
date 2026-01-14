@@ -27,17 +27,27 @@ class EnhancedWebhookService {
     this.liveConsoleDebounceMs = 900;
     this.liveConsoleMaxEvents = 5;
     this.liveConsoleMaxPreviewChars = 200;
-    // Smooth “cell signal” style animation for live call console
     this.waveformFrames = [
-      '▁ ▁ ▁ ▁ ▁',
-      '▁ ▂ ▁ ▁ ▁',
-      '▁ ▂ ▃ ▁ ▁',
-      '▁ ▂ ▃ ▄ ▁',
-      '▁ ▂ ▃ ▄ ▅',
-      '▁ ▂ ▃ ▄ ▁',
-      '▁ ▂ ▃ ▁ ▁',
-      '▁ ▂ ▁ ▁ ▁'
+      '▁▂▃▄▅▆▇▆▅',
+      '▂▃▄▅▆▇▆▅▄',
+      '▃▄▅▆▇▆▅▄▃',
+      '▄▅▆▇▆▅▄▃▂',
+      '▅▆▇▆▅▄▃▂▁',
+      '▆▇▆▅▄▃▂▁▂',
+      '▇▆▅▄▃▂▁▂▃',
+      '▆▅▄▃▂▁▂▃▄',
+      '▅▄▃▂▁▂▃▄▅',
+      '▄▃▂▁▂▃▄▅▆',
+      '▃▂▁▂▃▄▅▆▇',
+      '▂▁▂▃▄▅▆▇▆',
+      '▁▂▃▄▅▆▇▆▅',
+      '▂▃▄▅▆▇▆▅▄',
+      '▃▄▅▆▇▆▅▄▃',
+      '▄▅▆▇▆▅▄▃▂'
     ];
+    this.waveformFlat = '▁▁▁▁▁▁▁▁▁';
+    this.waveformThinking = ['·  ', '·· ', '···', '·· ', '·  '];
+    this.waveformInterrupted = ['▇▁▇▁▇▁▇', '▁▇▁▇▁▇▁'];
     this.lastSentimentAt = new Map();
     this.sentimentCooldownMs = 10000;
     this.mediaSeen = new Map();
@@ -89,16 +99,11 @@ class EnhancedWebhookService {
       ssn: 'SSN',
       dob: 'DOB',
       routing_number: 'Routing',
-      bank_account: 'Bank Acct',
+      account_number: 'Account #',
       phone: 'Phone',
-      member_id: 'Member ID',
-      policy_number: 'Policy',
-      invoice_number: 'Invoice',
-      confirmation_code: 'Confirm',
       tax_id: 'Tax ID',
       ein: 'EIN',
       claim_number: 'Claim',
-      order_number: 'Order',
       reservation_number: 'Reservation',
       ticket_number: 'Ticket',
       case_number: 'Case',
@@ -106,12 +111,10 @@ class EnhancedWebhookService {
       zip: 'ZIP',
       extension: 'Ext',
       amount: 'Amount',
-      survey: 'Survey',
       callback_confirm: 'Callback',
       card_number: 'Card',
       cvv: 'CVV',
       card_expiry: 'Expiry',
-      menu: 'Menu',
       generic: 'Digits'
     };
 
@@ -1073,12 +1076,14 @@ class EnhancedWebhookService {
       status: `📡 Connecting to ${meta.customerName || 'customer'}…`,
       statusSource: 'provider',
       phase: this.getConsolePhaseLabel('waiting'),
+      phaseKey: 'waiting',
       lastEvents: [],
       previewTurns: { user: '—', agent: '—' },
       customerName: meta.customerName || 'Unknown',
       phoneNumber: meta.phoneNumber || 'Unknown',
       template: meta.template || '—',
       waveformIndex: 0,
+      waveformLevel: 0,
       sentimentFlag: ''
     };
 
@@ -1123,6 +1128,17 @@ class EnhancedWebhookService {
     return map[phaseKey] || phaseKey || '—';
   }
 
+  clampLevel(level) {
+    if (!Number.isFinite(level)) return null;
+    return Math.max(0, Math.min(1, level));
+  }
+
+  pickWaveformIndex(level) {
+    if (!Number.isFinite(level)) return 0;
+    const idx = Math.round(level * (this.waveformFrames.length - 1));
+    return Math.max(0, Math.min(this.waveformFrames.length - 1, idx));
+  }
+
   consoleButtons(callSid, entry) {
     if (entry?.actionLock) {
       return {
@@ -1152,9 +1168,15 @@ class EnhancedWebhookService {
     if (['answered', 'in-progress'].includes(status) && !entry.pickedUpAt) {
       entry.pickedUpAt = new Date();
       entry.phase = this.getConsolePhaseLabel('listening');
+      entry.phaseKey = 'listening';
+      entry.waveformIndex = 0;
+      entry.waveformLevel = 0;
     }
     if (['completed', 'failed', 'no-answer', 'busy', 'canceled', 'voicemail'].includes(status)) {
       entry.phase = this.getConsolePhaseLabel('ended');
+      entry.phaseKey = 'ended';
+      entry.waveformIndex = 0;
+      entry.waveformLevel = 0;
       entry.endedAt = new Date();
     }
 
@@ -1170,8 +1192,18 @@ class EnhancedWebhookService {
     if (!entry) return;
     const phase = this.getConsolePhaseLabel(phaseKey);
     entry.phase = phase;
-    if (phaseKey === 'agent_speaking') {
-      entry.waveformIndex = (entry.waveformIndex + 1) % this.waveformFrames.length;
+    entry.phaseKey = phaseKey;
+    if (phaseKey === 'agent_speaking' || phaseKey === 'user_speaking') {
+      const level = this.clampLevel(options.level);
+      entry.waveformLevel = level ?? entry.waveformLevel ?? 0;
+      entry.waveformIndex = Number.isFinite(level)
+        ? this.pickWaveformIndex(level)
+        : (entry.waveformIndex + 1) % this.waveformFrames.length;
+    } else if (phaseKey === 'interrupted') {
+      entry.waveformIndex = (entry.waveformIndex + 1) % this.waveformInterrupted.length;
+    } else {
+      entry.waveformIndex = 0;
+      entry.waveformLevel = 0;
     }
     const phaseEvent = this.phaseEventText(phaseKey);
     if (phaseEvent) {
@@ -1214,6 +1246,8 @@ class EnhancedWebhookService {
     if (speaker === 'user') {
       entry.previewTurns.user = cleaned;
       entry.phase = this.getConsolePhaseLabel('thinking');
+      entry.phaseKey = 'thinking';
+      entry.waveformIndex = 0;
     } else if (speaker === 'agent') {
       entry.previewTurns.agent = cleaned;
     }
@@ -1272,8 +1306,20 @@ class EnhancedWebhookService {
     const elapsed = this.formatElapsed(entry.createdAt, entry.endedAt);
     const events = entry.lastEvents.slice(-this.liveConsoleMaxEvents);
     while (events.length < this.liveConsoleMaxEvents) events.unshift('—');
-    const waveform = this.waveformFrames[entry.waveformIndex] || '';
-    const phaseLine = entry.phase.includes('Agent speaking') ? `${entry.phase} ${waveform}` : entry.phase;
+    const phaseKey = entry.phaseKey || '';
+    const speakingWaveform = this.waveformFrames[entry.waveformIndex] || this.waveformFrames[0];
+    const thinkingWaveform = this.waveformThinking[entry.waveformIndex % this.waveformThinking.length] || '·';
+    const interruptedWaveform = this.waveformInterrupted[entry.waveformIndex % this.waveformInterrupted.length] || this.waveformInterrupted[0];
+    let phaseLine = entry.phase;
+    if (phaseKey === 'agent_speaking' || phaseKey === 'user_speaking') {
+      phaseLine = `${entry.phase} ${speakingWaveform}`;
+    } else if (phaseKey === 'listening') {
+      phaseLine = `${entry.phase} ${this.waveformFlat}`;
+    } else if (phaseKey === 'thinking') {
+      phaseLine = `${entry.phase} ${thinkingWaveform}`;
+    } else if (phaseKey === 'interrupted') {
+      phaseLine = `${entry.phase} ${interruptedWaveform}`;
+    }
     const sentimentLine = entry.sentimentFlag ? `Mood: ${entry.sentimentFlag}` : null;
     const recentBlock = events.length ? events.map((e) => `• ${e}`).join('\n') : '• (no events yet)';
 

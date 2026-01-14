@@ -48,6 +48,24 @@ function createDigitCollectionService(options = {}) {
     minDtmfGapMs = 200
   } = settings;
 
+  const REMOVED_DIGIT_PROFILES = new Set([
+    'menu',
+    'member_id',
+    'survey',
+    'policy_number',
+    'invoice_number',
+    'confirmation_code',
+    'order_number'
+  ]);
+
+  function normalizeProfileId(profile) {
+    if (!profile) return null;
+    let normalized = String(profile || '').toLowerCase();
+    if (normalized === 'bank_account') normalized = 'account_number';
+    if (REMOVED_DIGIT_PROFILES.has(normalized)) return 'generic';
+    return normalized;
+  }
+
   function maskDigitsForPreview(digits = '') {
     if (showRawDigitsLive) return digits || '';
     const len = String(digits || '').length;
@@ -57,22 +75,18 @@ function createDigitCollectionService(options = {}) {
   }
 
   function labelForProfile(profile = 'generic') {
+    const normalizedProfile = normalizeProfileId(profile) || 'generic';
     const map = {
       verification: 'OTP',
       otp: 'OTP',
       ssn: 'SSN',
       dob: 'DOB',
       routing_number: 'Routing',
-      bank_account: 'Bank Acct',
+      account_number: 'Account #',
       phone: 'Phone',
-      member_id: 'Member ID',
-      policy_number: 'Policy',
-      invoice_number: 'Invoice',
-      confirmation_code: 'Confirm',
       tax_id: 'Tax ID',
       ein: 'EIN',
       claim_number: 'Claim',
-      order_number: 'Order',
       reservation_number: 'Reservation',
       ticket_number: 'Ticket',
       case_number: 'Case',
@@ -80,15 +94,13 @@ function createDigitCollectionService(options = {}) {
       zip: 'ZIP',
       extension: 'Ext',
       amount: 'Amount',
-      survey: 'Survey',
       callback_confirm: 'Callback',
       card_number: 'Card',
       cvv: 'CVV',
       card_expiry: 'Expiry',
-      menu: 'Menu',
       generic: 'Digits'
     };
-    return map[String(profile || 'generic').toLowerCase()] || profile || 'Digits';
+    return map[normalizedProfile] || normalizedProfile || 'Digits';
   }
 
   function estimateSpeechDurationMs(text = '') {
@@ -105,10 +117,8 @@ function createDigitCollectionService(options = {}) {
     const min = expectation.min_digits || 1;
     const max = expectation.max_digits || min;
     const digitLabel = min === max ? `${min}-digit` : `${min}-${max} digit`;
-    const profile = String(expectation.profile || 'generic').toLowerCase();
+    const profile = normalizeProfileId(expectation.profile) || 'generic';
     switch (profile) {
-      case 'menu':
-        return 'menu option';
       case 'extension':
         return 'extension';
       case 'zip':
@@ -123,8 +133,8 @@ function createDigitCollectionService(options = {}) {
         return 'expiry date';
       case 'amount':
         return 'amount';
-      case 'survey':
-        return 'rating';
+      case 'account_number':
+        return 'account number';
       case 'callback_confirm':
         return 'phone number';
       case 'ssn':
@@ -133,26 +143,14 @@ function createDigitCollectionService(options = {}) {
         return 'date of birth';
       case 'routing_number':
         return 'routing number';
-      case 'bank_account':
-        return 'bank account number';
       case 'phone':
         return 'phone number';
-      case 'member_id':
-        return 'member ID';
-      case 'policy_number':
-        return 'policy number';
-      case 'invoice_number':
-        return 'invoice number';
-      case 'confirmation_code':
-        return 'confirmation code';
       case 'tax_id':
         return 'tax ID';
       case 'ein':
         return 'employer ID';
       case 'claim_number':
         return 'claim number';
-      case 'order_number':
-        return 'order number';
       case 'reservation_number':
         return 'reservation number';
       case 'ticket_number':
@@ -169,23 +167,6 @@ function createDigitCollectionService(options = {}) {
 
   function buildDefaultReprompts(expectation = {}) {
     const label = buildExpectedLabel(expectation);
-    const profile = String(expectation.profile || 'generic').toLowerCase();
-    if (profile === 'menu') {
-      return {
-        invalid: [
-          'That option was not valid. Please press a valid menu option now.',
-          'Please press a valid menu option now.',
-          'Last try: press a valid menu option now.'
-        ],
-        timeout: [
-          'I did not receive a selection. Please press a menu option now.',
-          'Please press a menu option now.',
-          'Last try: press a menu option now.'
-        ],
-        failure: 'No valid selection was received. Thank you. Goodbye.',
-        timeout_failure: 'No selection was received. Thank you. Goodbye.'
-      };
-    }
     return {
       invalid: [
         `That did not match. Please enter the ${label} now.`,
@@ -229,11 +210,6 @@ function createDigitCollectionService(options = {}) {
   }
 
   const OTP_REGEX = /\b\d{4,8}\b/g;
-  const OTP_PROMPT_REGEX = /\b(otp|one[-\s]?time|verification code|passcode|pin|auth(?:entication)? code)\b/i;
-
-  function hasOtpPromptSignal(text = '') {
-    return OTP_PROMPT_REGEX.test(String(text || ''));
-  }
 
   const digitTimeouts = new Map();
   const digitFallbackStates = new Map();
@@ -247,47 +223,33 @@ function createDigitCollectionService(options = {}) {
     ssn: { min_digits: 9, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     dob: { min_digits: 6, max_digits: 8, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     routing_number: { min_digits: 9, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
-    bank_account: { min_digits: 6, max_digits: 17, timeout_s: 18, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
+    account_number: { min_digits: 6, max_digits: 17, timeout_s: 18, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     account: { min_digits: 6, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, confirmation_style: 'last4', end_call_on_success: false },
     phone: { min_digits: 10, max_digits: 10, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
-    member_id: { min_digits: 6, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
-    policy_number: { min_digits: 6, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
-    invoice_number: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
-    confirmation_code: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     tax_id: { min_digits: 9, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     ein: { min_digits: 9, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     claim_number: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
-    order_number: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     reservation_number: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     ticket_number: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     case_number: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     amount: { min_digits: 1, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
-    survey: { min_digits: 1, max_digits: 1, timeout_s: 10, max_retries: 2, min_collect_delay_ms: 800, end_call_on_success: false },
     callback_confirm: { min_digits: 10, max_digits: 10, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     cvv: { min_digits: 3, max_digits: 4, timeout_s: 12, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     card_number: { min_digits: 13, max_digits: 19, timeout_s: 25, max_retries: 2, min_collect_delay_ms: 1500, confirmation_style: 'last4', end_call_on_success: false },
     card_expiry: { min_digits: 4, max_digits: 6, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     zip: { min_digits: 5, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
-    extension: { min_digits: 1, max_digits: 6, timeout_s: 10, max_retries: 2, min_collect_delay_ms: 800, end_call_on_success: false },
-    menu: { min_digits: 1, max_digits: 1, timeout_s: 8, max_retries: 2, min_collect_delay_ms: 800, end_call_on_success: false }
+    extension: { min_digits: 1, max_digits: 6, timeout_s: 10, max_retries: 2, min_collect_delay_ms: 800, end_call_on_success: false }
   };
-  const KNOWN_DIGIT_PROFILES = new Set([
-    'generic',
-    'survey',
-    'amount',
-    'callback_confirm',
-    'account',
-    ...Object.keys(DIGIT_PROFILE_DEFAULTS)
-  ]);
-
-  function isKnownDigitProfile(profile = '') {
-    return KNOWN_DIGIT_PROFILES.has(String(profile || '').toLowerCase());
-  }
 
   function setCallDigitIntent(callSid, intent) {
     const callConfig = callConfigurations.get(callSid);
     if (!callConfig) return;
     callConfig.digit_intent = intent;
+    if (intent?.mode === 'dtmf') {
+      callConfig.digit_capture_active = true;
+    } else if (intent?.mode === 'normal') {
+      callConfig.digit_capture_active = false;
+    }
     callConfigurations.set(callSid, callConfig);
   }
 
@@ -302,19 +264,16 @@ function createDigitCollectionService(options = {}) {
 
   function normalizeDigitExpectation(params = {}) {
     const promptHint = `${params.prompt || ''} ${params.prompt_hint || ''}`.toLowerCase();
-    let profile = String(params.profile || 'generic').toLowerCase();
-    if (params.allow_profile_inference === true && profile === 'generic') {
-      if (hasOtpPromptSignal(promptHint)) {
-        profile = 'verification';
-      } else if (promptHint.match(/\b(press|option|menu)\b/)) {
-        profile = 'menu';
-      } else if (promptHint.match(/\b(rate|rating|survey|feedback)\b/)) {
-        profile = 'survey';
-      }
-    }
-    if (!isKnownDigitProfile(profile)) {
-      logger.warn(`Unknown digit profile "${profile}" - defaulting to generic.`);
-      profile = 'generic';
+    const hasExplicitProfile = params.profile !== undefined
+      && params.profile !== null
+      && String(params.profile).trim() !== '';
+    const hasExplicitLength = typeof params.min_digits === 'number'
+      || typeof params.max_digits === 'number'
+      || typeof params.force_exact_length === 'number';
+    const allowProfileInference = params.allow_profile_inference === true;
+    let profile = normalizeProfileId(hasExplicitProfile ? params.profile : 'generic') || 'generic';
+    if (allowProfileInference && !hasExplicitProfile && !hasExplicitLength && profile === 'generic' && promptHint.match(/\b(code|otp|verification|verify|passcode|pin)\b/)) {
+      profile = 'verification';
     }
     const defaults = getDigitProfileDefaults(profile);
     const minDigits = typeof params.min_digits === 'number'
@@ -340,7 +299,7 @@ function createDigitCollectionService(options = {}) {
     const endCallOnSuccess = typeof params.end_call_on_success === 'boolean'
       ? params.end_call_on_success
       : (typeof defaults.end_call_on_success === 'boolean' ? defaults.end_call_on_success : false);
-    const prompt = params.prompt && String(params.prompt).trim().length > 0
+    const rawPrompt = params.prompt && String(params.prompt).trim().length > 0
       ? params.prompt
       : '';
     const reprompt_message = params.reprompt_message || defaults.reprompt_message || '';
@@ -349,6 +308,7 @@ function createDigitCollectionService(options = {}) {
     const terminatorSuffix = allowTerminator
       ? ` You can end with ${terminatorChar} when finished.`
       : '';
+    const prompt = rawPrompt ? `${rawPrompt}${terminatorSuffix}` : '';
 
     let normalizedMin = minDigits;
     let normalizedMax = maxDigits < minDigits ? minDigits : maxDigits;
@@ -389,11 +349,11 @@ function createDigitCollectionService(options = {}) {
       params.timeout_failure_message ?? defaults.timeout_failure_message ?? repromptDefaults.timeout_failure
     );
 
-    const estimatedPromptMs = estimateSpeechDurationMs(params.prompt_hint || '');
+    const estimatedPromptMs = estimateSpeechDurationMs(params.prompt || params.prompt_hint || '');
     const adjustedDelayMs = Math.max(minCollectDelayMs, estimatedPromptMs, 3000);
 
     return {
-      prompt: `${prompt}${terminatorSuffix}`,
+      prompt,
       reprompt_message,
       reprompt_invalid,
       reprompt_incomplete,
@@ -406,9 +366,8 @@ function createDigitCollectionService(options = {}) {
       timeout_s: timeout,
       max_retries: maxRetries,
       min_collect_delay_ms: adjustedDelayMs,
-      menu_options: params.menu_options || [],
       confirmation_style: confirmationStyle,
-      allow_spoken_fallback: params.allow_spoken_fallback !== false,
+      allow_spoken_fallback: params.allow_spoken_fallback === true || defaults.allow_spoken_fallback === true,
       mask_for_gpt: maskForGpt,
       speak_confirmation: speakConfirmation,
       end_call_on_success: endCallOnSuccess,
@@ -447,8 +406,6 @@ function createDigitCollectionService(options = {}) {
     }
 
     switch (profile) {
-      case 'menu':
-        return 'Thanks, I have your selection.';
       case 'verification':
       case 'otp':
         return 'Thanks, your code is received.';
@@ -486,7 +443,18 @@ function createDigitCollectionService(options = {}) {
   function markDigitPrompted(callSid, gptService = null, interactionCount = 0, source = 'dtmf', options = {}) {
     const expectation = digitCollectionManager.expectations.get(callSid);
     if (!expectation) return false;
-    expectation.prompted_at = Date.now();
+    const now = Date.now();
+    const promptText = options?.prompt_text || options?.prompt || '';
+    const explicitDurationMs = options?.prompt_duration_ms;
+    const estimatedPromptMs = Number.isFinite(explicitDurationMs)
+      ? explicitDurationMs
+      : estimateSpeechDurationMs(promptText);
+    const baseDelayMs = Number.isFinite(expectation.min_collect_delay_ms)
+      ? expectation.min_collect_delay_ms
+      : 0;
+    const promptDelayMs = Math.max(1000, baseDelayMs, estimatedPromptMs || 0);
+    expectation.prompted_at = now;
+    expectation.prompted_delay_ms = promptDelayMs;
     digitCollectionManager.expectations.set(callSid, expectation);
     if (gptService) {
       void flushBufferedDigits(callSid, gptService, interactionCount, source, options);
@@ -562,7 +530,7 @@ function createDigitCollectionService(options = {}) {
       return { valid: false, reason: 'empty' };
     }
 
-    switch (String(profile || '').toLowerCase()) {
+    switch (normalizeProfileId(profile) || String(profile || '').toLowerCase()) {
       case 'verification':
       case 'otp':
         return { valid: true };
@@ -586,7 +554,7 @@ function createDigitCollectionService(options = {}) {
         return isValidRoutingNumber(value)
           ? { valid: true }
           : { valid: false, reason: 'invalid_routing' };
-      case 'bank_account':
+      case 'account_number':
         return value.length >= 6 && value.length <= 17
           ? { valid: true }
           : { valid: false, reason: 'invalid_length' };
@@ -648,7 +616,7 @@ function createDigitCollectionService(options = {}) {
       const isRepeating = (val) => val.length >= 6 && /^([0-9])\1+$/.test(val);
       const isAscending = (val) => val.length >= 6 && '0123456789'.includes(val);
 
-      if (meta.timestamp && exp.profile !== 'menu') {
+      if (meta.timestamp) {
         const lastTs = lastDtmfTimestamps.get(callSid) || 0;
         const gap = lastTs ? meta.timestamp - lastTs : null;
         if (gap !== null && gap < minDtmfGapMs && cleanDigits.length === 1) {
@@ -661,24 +629,6 @@ function createDigitCollectionService(options = {}) {
           return result;
         }
         lastDtmfTimestamps.set(callSid, meta.timestamp);
-      }
-
-      if (exp.profile === 'menu' && exp.menu_options.length) {
-        const hit = exp.menu_options.find((o) => String(o.digit) === String(cleanDigits || digits));
-        if (hit) {
-          result.digits = String(cleanDigits || digits);
-          result.len = result.digits.length;
-          result.masked = result.digits;
-          result.route = hit.route || hit.label || `menu_${digits}`;
-          result.accepted = true;
-        } else {
-          result.accepted = false;
-          result.reason = 'invalid_menu_option';
-        }
-        exp.collected.push(result.digits || digits);
-        exp.last_masked = result.masked || result.digits;
-        this.expectations.set(callSid, exp);
-        return result;
       }
 
       exp.buffer = `${exp.buffer || ''}${String(cleanDigits)}`;
@@ -765,8 +715,14 @@ function createDigitCollectionService(options = {}) {
     clearDigitTimeout(callSid);
 
     const timeoutMs = Math.max(5000, (exp.timeout_s || 10) * 1000);
-    const delayMs = Math.max(3000, exp.min_collect_delay_ms || 0);
-    const waitMs = delayMs + timeoutMs;
+    const promptAt = exp.prompted_at || Date.now();
+    const promptDelayMs = Number.isFinite(exp.prompted_delay_ms)
+      ? exp.prompted_delay_ms
+      : (exp.min_collect_delay_ms || 0);
+    const normalizedPromptDelayMs = Math.max(1000, promptDelayMs);
+    const elapsedSincePrompt = Date.now() - promptAt;
+    const remainingPromptDelayMs = Math.max(0, normalizedPromptDelayMs - elapsedSincePrompt);
+    const waitMs = remainingPromptDelayMs + timeoutMs;
 
     const timer = setTimeout(async () => {
       const current = digitCollectionManager.expectations.get(callSid);
@@ -811,6 +767,7 @@ function createDigitCollectionService(options = {}) {
         clearDigitTimeout(callSid);
         clearDigitFallbackState(callSid);
         clearDigitPlan(callSid);
+        clearDigitIntent(callSid, 'digit_collection_timeout');
         const finalTimeoutMessage = current.timeout_failure_message || callEndMessages.no_response;
         await speakAndEndCall(callSid, finalTimeoutMessage, 'digit_collection_timeout');
         return;
@@ -832,6 +789,7 @@ function createDigitCollectionService(options = {}) {
         try {
           gptService.updateUserContext('digit_timeout', 'system', `Digit timeout retry ${current.retries}/${current.max_retries}`);
         } catch (_) {}
+        markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', { prompt_text: prompt });
       }
 
       webhookService.addLiveEvent(callSid, `⏳ Awaiting digits retry ${current.retries}/${current.max_retries}`, { force: true });
@@ -884,7 +842,7 @@ function createDigitCollectionService(options = {}) {
     const client = twilioClient(accountSid, authToken);
     const twiml = buildTwilioGatherTwiml(callSid, expectation, options);
     await client.calls(callSid).update({ twiml });
-    markDigitPrompted(callSid);
+    markDigitPrompted(callSid, null, 0, 'dtmf', { prompt_text: options.prompt || '' });
 
     digitFallbackStates.set(callSid, {
       active: true,
@@ -1010,12 +968,11 @@ function createDigitCollectionService(options = {}) {
   }
 
   function buildExpectationFromConfig(callConfig = {}) {
-    const profile = String(callConfig.collection_profile || '').trim().toLowerCase();
+    const rawProfile = String(callConfig.collection_profile || '').trim().toLowerCase();
+    if (!rawProfile) return null;
+    if (REMOVED_DIGIT_PROFILES.has(rawProfile)) return null;
+    const profile = normalizeProfileId(rawProfile);
     if (!profile) return null;
-    if (!isKnownDigitProfile(profile)) {
-      logger.warn(`Unknown collection_profile "${profile}" - ignoring digit collection config.`);
-      return null;
-    }
     const defaults = getDigitProfileDefaults(profile);
     const expectedLength = Number(callConfig.collection_expected_length);
     const explicitLength = Number.isFinite(expectedLength) ? expectedLength : null;
@@ -1025,7 +982,6 @@ function createDigitCollectionService(options = {}) {
     const timeout_s = Number.isFinite(timeout) ? timeout : defaults.timeout_s;
     const retries = Number(callConfig.collection_max_retries);
     const max_retries = Number.isFinite(retries) ? retries : defaults.max_retries;
-    const menu_options = Array.isArray(callConfig.collection_menu_options) ? callConfig.collection_menu_options : [];
     const mask_for_gpt = typeof callConfig.collection_mask_for_gpt === 'boolean'
       ? callConfig.collection_mask_for_gpt
       : (typeof defaults.mask_for_gpt === 'boolean' ? defaults.mask_for_gpt : true);
@@ -1042,7 +998,6 @@ function createDigitCollectionService(options = {}) {
       max_digits: maxDigits,
       timeout_s,
       max_retries,
-      menu_options,
       mask_for_gpt,
       speak_confirmation,
       prompt,
@@ -1052,32 +1007,6 @@ function createDigitCollectionService(options = {}) {
 
   function resolveLockedExpectation(callConfig = {}) {
     if (!callConfig) return null;
-    const tpl = callConfig.template_policy || {};
-    if (tpl.requires_otp) {
-      const len = tpl.expected_length || otpLength;
-      const preferredProfile = isKnownDigitProfile(tpl.default_profile) ? tpl.default_profile : 'verification';
-      return normalizeDigitExpectation({
-        profile: preferredProfile,
-        min_digits: len,
-        max_digits: len,
-        force_exact_length: len,
-        prompt: ''
-      });
-    }
-    if (tpl.default_profile && tpl.default_profile !== 'generic') {
-      if (!isKnownDigitProfile(tpl.default_profile)) {
-        logger.warn(`Unknown template default_profile "${tpl.default_profile}" - skipping template default.`);
-      } else {
-        const len = tpl.expected_length || (tpl.default_profile === 'menu' ? 1 : otpLength);
-        return normalizeDigitExpectation({
-          profile: tpl.default_profile,
-          min_digits: len,
-          max_digits: len,
-          force_exact_length: tpl.default_profile === 'menu' ? undefined : len,
-          prompt: ''
-        });
-      }
-    }
     const fromConfig = buildExpectationFromConfig(callConfig);
     if (fromConfig?.profile) {
       return normalizeDigitExpectation({ ...fromConfig, prompt: '' });
@@ -1085,6 +1014,17 @@ function createDigitCollectionService(options = {}) {
     const fromIntent = callConfig?.digit_intent?.expectation;
     if (fromIntent?.profile) {
       return normalizeDigitExpectation({ ...fromIntent, prompt: fromIntent.prompt || '' });
+    }
+    const tpl = callConfig.template_policy || {};
+    if (tpl.requires_otp) {
+      const len = tpl.expected_length || otpLength;
+      return normalizeDigitExpectation({
+        profile: tpl.default_profile || 'verification',
+        min_digits: len,
+        max_digits: len,
+        force_exact_length: len,
+        prompt: ''
+      });
     }
     return null;
   }
@@ -1099,15 +1039,17 @@ function createDigitCollectionService(options = {}) {
     };
     const hasPress = contains(/\bpress\b/);
     const hasEnter = contains(/\b(enter|input|key in|type|dial)\b/);
-    const hasMenu = contains(/\b(option|menu)\b/);
-    const explicitLen = numberHint(/\b(\d{4,8})\b/);
+    const explicitDigitCount = numberHint(/\b(\d{1,2})\s*[- ]?digit\b/);
+    const explicitCodeCount = numberHint(/\b(\d{1,2})\s*[- ]?code\b/);
+    const explicitLen = explicitDigitCount || explicitCodeCount;
     const explicitCommand = hasPress || hasEnter;
-    const hasStrongOtpSignals = contains(/\b(otp|one[-\s]?time|verification code|passcode|pin|auth(?:entication)? code)\b/);
+    const hasStrongOtpSignals = contains(/\b(otp|one[-\s]?time|passcode|pin|password)\b/);
     const hasOtpDeliveryPhrase = contains(/\b(text message code|sms code|texted code)\b/);
+    const hasCodeSignals = contains(/\b(code|security code|auth(?:entication)? code)\b/);
     const hasOtpDelivery = contains(/\b(text message|sms|texted)\b/);
     const hasDigitWord = contains(/\bdigit(s)?\b/);
     const hasOtpDeliveryDigits = hasOtpDelivery && (hasDigitWord || explicitLen);
-    const hasConfirmationCode = contains(/\bconfirmation\s*(?:code|number|no\.?|id|#)\b/);
+    const hasActionOrCount = explicitCommand || explicitLen;
 
     if (tpl.requires_otp) {
       const len = tpl.expected_length || otpLength;
@@ -1127,32 +1069,27 @@ function createDigitCollectionService(options = {}) {
     }
 
     if (tpl.default_profile && tpl.default_profile !== 'generic') {
-      if (!isKnownDigitProfile(tpl.default_profile)) {
-        logger.warn(`Unknown template default_profile "${tpl.default_profile}" - skipping template default.`);
-      } else {
-        const len = tpl.expected_length || (tpl.default_profile === 'menu' ? 1 : otpLength);
-        return {
-          profile: tpl.default_profile,
-          min_digits: len,
-          max_digits: len,
-          force_exact_length: tpl.default_profile === 'menu' ? undefined : len,
-          prompt: '',
-          end_call_on_success: tpl.default_profile === 'verification',
-          max_retries: otpMaxRetries,
-          confidence: 0.8,
-          reason: 'template_default_profile',
-          allow_terminator: tpl.allow_terminator === true,
-          terminator_char: tpl.terminator_char || '#'
-        };
-      }
+      const len = tpl.expected_length || otpLength;
+      return {
+        profile: tpl.default_profile,
+        min_digits: len,
+        max_digits: len,
+        force_exact_length: len,
+        prompt: '',
+        end_call_on_success: tpl.default_profile === 'verification',
+        max_retries: otpMaxRetries,
+        confidence: 0.8,
+        reason: 'template_default_profile',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
     }
 
-    const hasOtpSignals = hasStrongOtpSignals
-      || hasOtpDeliveryPhrase
-      || hasOtpDeliveryDigits
-      || (hasConfirmationCode && hasOtpDelivery);
+    // OTP / verification should take precedence over other numeric labels
+    const hasOtpSignals = (hasStrongOtpSignals || hasOtpDeliveryPhrase || hasCodeSignals || hasOtpDeliveryDigits)
+      && hasActionOrCount;
 
-    if (hasOtpSignals && explicitCommand) {
+    if (hasOtpSignals) {
       const len = explicitLen || otpLength;
       return {
         profile: 'verification',
@@ -1172,21 +1109,16 @@ function createDigitCollectionService(options = {}) {
     // Specific deterministic profiles (requires action verb)
     const specificExpectation = (() => {
       if (contains(/\brouting number\b/)) return { profile: 'routing_number', min_digits: 9, max_digits: 9, force_exact_length: 9, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.7, reason: 'routing_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-      if (contains(/\b(bank account|bank acct)\b/)) return { profile: 'bank_account', min_digits: 6, max_digits: 17, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'bank_account_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
+      if (contains(/\b(bank account|bank acct)\b/)) return { profile: 'account_number', min_digits: 6, max_digits: 17, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'account_number_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
       if (contains(/\b(ssn|social security)\b/)) return { profile: 'ssn', min_digits: 9, max_digits: 9, force_exact_length: 9, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.8, reason: 'ssn_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
       if (contains(/\b(date of birth|dob|birth date)\b/)) return { profile: 'dob', min_digits: 6, max_digits: 8, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.7, reason: 'dob_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
       if (contains(/\b(phone number|callback number|call back number)\b/)) return { profile: 'phone', min_digits: 10, max_digits: 10, force_exact_length: 10, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.65, reason: 'phone_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-      if (contains(/\b(member id|member number)\b/)) return { profile: 'member_id', min_digits: 6, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'member_id_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
       if (contains(/\b(tax id|tax identification|tin)\b/)) return { profile: 'tax_id', min_digits: 9, max_digits: 9, force_exact_length: 9, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.65, reason: 'tax_id_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
       if (contains(/\b(ein|employer identification)\b/)) return { profile: 'ein', min_digits: 9, max_digits: 9, force_exact_length: 9, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.65, reason: 'ein_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-      if (contains(/\bpolicy\s*(?:number|no\.?|id|#)\b/)) return { profile: 'policy_number', min_digits: 6, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'policy_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-      if (contains(/\binvoice\s*(?:number|no\.?|id|#)\b/)) return { profile: 'invoice_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'invoice_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-      if (contains(/\bconfirmation\s*(?:code|number|no\.?|id|#)\b/)) return { profile: 'confirmation_code', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'confirmation_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-      if (contains(/\bclaim\s*(?:number|no\.?|id|#)\b/)) return { profile: 'claim_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'claim_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-      if (contains(/\border\s*(?:number|no\.?|id|#)\b/)) return { profile: 'order_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'order_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-      if (contains(/\breservation\s*(?:number|no\.?|id|#)\b/)) return { profile: 'reservation_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'reservation_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-      if (contains(/\bticket\s*(?:number|no\.?|id|#)\b/)) return { profile: 'ticket_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'ticket_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-      if (contains(/\bcase\s*(?:number|no\.?|id|#)\b/)) return { profile: 'case_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'case_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
+      if (contains(/\b(claim number|claim)\b/)) return { profile: 'claim_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'claim_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
+      if (contains(/\b(reservation number|reservation)\b/)) return { profile: 'reservation_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'reservation_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
+      if (contains(/\b(ticket number|ticket id|ticket)\b/)) return { profile: 'ticket_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'ticket_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
+      if (contains(/\b(case number|case id|case)\b/)) return { profile: 'case_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'case_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
       return null;
     })();
 
@@ -1202,24 +1134,7 @@ function createDigitCollectionService(options = {}) {
       return null;
     }
 
-    // Priority 3: menu (requires menu + command)
-    if (hasMenu && (hasPress || hasEnter)) {
-      return {
-        profile: 'menu',
-        min_digits: 1,
-        max_digits: 1,
-        force_exact_length: 1,
-        prompt: '',
-        end_call_on_success: false,
-        max_retries: 2,
-        confidence: 0.7,
-        reason: 'menu_keyword',
-        allow_terminator: tpl.allow_terminator === true,
-        terminator_char: tpl.terminator_char || '#'
-      };
-    }
-
-    // Priority 4: generic account (only when account+number present)
+    // Priority 3: generic account (only when account+number present)
     if (contains(/\b(account|customer|member)\b/) && contains(/\bnumber\b/)) {
       return {
         profile: 'account',
@@ -1241,15 +1156,31 @@ function createDigitCollectionService(options = {}) {
   }
 
   function determineDigitIntent(callConfig = {}) {
-    const locked = resolveLockedExpectation(callConfig);
-    if (locked) {
+    const explicit = buildExpectationFromConfig(callConfig);
+    if (explicit) {
       return {
         mode: 'dtmf',
         reason: 'explicit_config',
         confidence: 0.95,
-        expectation: locked
+        expectation: explicit
       };
     }
+
+    const text = `${callConfig.prompt || ''} ${callConfig.first_message || ''}`.trim();
+    if (!text) {
+      return { mode: 'normal', reason: 'no_prompt', confidence: 0 };
+    }
+
+    const inferred = inferDigitExpectationFromText(text, callConfig);
+    if (inferred) {
+      return {
+        mode: 'dtmf',
+        reason: inferred.reason || 'prompt_signal',
+        confidence: inferred.confidence || 0.6,
+        expectation: inferred
+      };
+    }
+
     return { mode: 'normal', reason: 'no_signal', confidence: 0 };
   }
 
@@ -1306,13 +1237,12 @@ function createDigitCollectionService(options = {}) {
       return;
     }
 
-    scheduleDigitTimeout(callSid, gptService, interactionCount);
+    const basePrompt = payload.prompt || buildDigitPrompt(payload);
+    const instruction = payload.plan_total_steps
+      ? `Step ${payload.plan_step_index} of ${payload.plan_total_steps}. ${basePrompt}`
+      : basePrompt;
 
     if (gptService) {
-      const basePrompt = payload.prompt || buildDigitPrompt(payload);
-      const instruction = payload.plan_total_steps
-        ? `Step ${payload.plan_step_index} of ${payload.plan_total_steps}. ${basePrompt}`
-        : basePrompt;
       gptService.emit('gptreply', {
         partialResponseIndex: null,
         partialResponse: instruction,
@@ -1322,27 +1252,24 @@ function createDigitCollectionService(options = {}) {
       try {
         gptService.updateUserContext('digit_collection_plan', 'system', `Digit plan step ${payload.plan_step_index}/${payload.plan_total_steps} (${payload.profile})`);
       } catch (_) {}
-      markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', { allowCallEnd: true });
     }
+
+    markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', {
+      allowCallEnd: true,
+      prompt_text: instruction
+    });
+    scheduleDigitTimeout(callSid, gptService, interactionCount);
   }
 
   async function requestDigitCollection(callSid, args = {}, gptService = null) {
-    const requestedProfile = args.profile ? String(args.profile).toLowerCase() : null;
-    if (requestedProfile && !isKnownDigitProfile(requestedProfile)) {
-      webhookService.addLiveEvent(callSid, `⚠️ Unknown digit profile "${requestedProfile}"`, { force: true });
-      return { error: 'unknown_profile', profile: requestedProfile };
-    }
     if (digitCollectionPlans.has(callSid)) {
       clearDigitPlan(callSid);
     }
     setCallDigitIntent(callSid, { mode: 'dtmf', reason: 'tool_request', confidence: 1 });
     const callConfig = callConfigurations.get(callSid);
     const lockedExpectation = resolveLockedExpectation(callConfig);
-    if (!lockedExpectation?.profile && !requestedProfile) {
-      webhookService.addLiveEvent(callSid, '⚠️ Digit profile required', { force: true });
-      return { error: 'profile_required' };
-    }
     if (lockedExpectation?.profile) {
+      const requestedProfile = args.profile ? String(args.profile).toLowerCase() : null;
       if (requestedProfile && requestedProfile !== lockedExpectation.profile) {
         logger.warn(`Digit profile override: ${requestedProfile} -> ${lockedExpectation.profile}`);
         webhookService.addLiveEvent(callSid, `🔒 Digit profile locked to ${lockedExpectation.profile}`, { force: true });
@@ -1386,9 +1313,8 @@ function createDigitCollectionService(options = {}) {
       if (!digitCollectionManager.expectations.has(callSid)) {
         return payload;
       }
-      scheduleDigitTimeout(callSid, gptService, 0);
+      const instruction = payload.prompt || buildDigitPrompt(payload);
       if (gptService) {
-        const instruction = payload.prompt || buildDigitPrompt(payload);
         const reply = {
           partialResponseIndex: null,
           partialResponse: instruction,
@@ -1397,8 +1323,9 @@ function createDigitCollectionService(options = {}) {
         };
         gptService.emit('gptreply', reply, 0);
         gptService.updateUserContext('digit_collection', 'system', `Collect digits requested (${payload.profile}): expecting ${payload.min_digits}-${payload.max_digits} digits.`);
-        markDigitPrompted(callSid, gptService, 0, 'dtmf', { allowCallEnd: true });
       }
+      markDigitPrompted(callSid, gptService, 0, 'dtmf', { allowCallEnd: true, prompt_text: instruction });
+      scheduleDigitTimeout(callSid, gptService, 0);
     } catch (err) {
       logger.error('collect_digits handler error:', err);
     }
@@ -1409,12 +1336,6 @@ function createDigitCollectionService(options = {}) {
     const steps = Array.isArray(args.steps) ? args.steps : [];
     if (!steps.length) {
       return { error: 'No steps provided' };
-    }
-    const unknownStep = steps.find((step) => step.profile && !isKnownDigitProfile(step.profile));
-    if (unknownStep?.profile) {
-      const invalidProfile = String(unknownStep.profile).toLowerCase();
-      webhookService.addLiveEvent(callSid, `⚠️ Unknown digit profile "${invalidProfile}"`, { force: true });
-      return { error: 'unknown_profile', profile: invalidProfile };
     }
 
     if (digitCollectionPlans.has(callSid)) {
@@ -1427,10 +1348,6 @@ function createDigitCollectionService(options = {}) {
 
     const callConfig = callConfigurations.get(callSid);
     const lockedExpectation = resolveLockedExpectation(callConfig);
-    if (!lockedExpectation?.profile && steps.some((step) => !step.profile)) {
-      webhookService.addLiveEvent(callSid, '⚠️ Digit profile required for plan steps', { force: true });
-      return { error: 'profile_required' };
-    }
     if (lockedExpectation?.profile) {
       const mismatched = steps.some((step) => step.profile && String(step.profile).toLowerCase() !== lockedExpectation.profile);
       if (mismatched || steps.length > 1) {
@@ -1551,12 +1468,7 @@ function createDigitCollectionService(options = {}) {
       digitCollectionManager.expectations.delete(callSid);
       const profile = String(collection.profile || '').toLowerCase();
       switch (profile) {
-        case 'menu':
         case 'extension':
-          if (collection.route) {
-            webhookService.addLiveEvent(callSid, `➡️ Routing via menu: ${collection.route}`, { force: true });
-            await db.updateCallState(callSid, 'route_requested', { reason: collection.route, via: 'menu' }).catch(() => {});
-          }
           break;
         case 'verification':
         case 'otp':
@@ -1599,9 +1511,12 @@ function createDigitCollectionService(options = {}) {
           }).catch(() => {});
           break;
         }
-        case 'survey':
-          webhookService.addLiveEvent(callSid, `📝 Survey response: ${collection.digits}`, { force: true });
-          await db.updateCallState(callSid, 'survey_response', { rating: collection.digits }).catch(() => {});
+        case 'account_number':
+          webhookService.addLiveEvent(callSid, '🏦 Account number captured', { force: true });
+          await db.updateCallState(callSid, 'account_number_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
           break;
         case 'callback_confirm':
           webhookService.addLiveEvent(callSid, `📞 Callback number confirmed (ending ${collection.masked.slice(-4)})`, { force: true });
@@ -1650,44 +1565,9 @@ function createDigitCollectionService(options = {}) {
             len: collection.len
           }).catch(() => {});
           break;
-        case 'bank_account':
-          webhookService.addLiveEvent(callSid, '🏦 Bank account captured', { force: true });
-          await db.updateCallState(callSid, 'bank_account_captured', {
-            masked_last4: collection.masked,
-            len: collection.len
-          }).catch(() => {});
-          break;
         case 'phone':
           webhookService.addLiveEvent(callSid, '📱 Phone number captured', { force: true });
           await db.updateCallState(callSid, 'phone_number_captured', {
-            masked_last4: collection.masked,
-            len: collection.len
-          }).catch(() => {});
-          break;
-        case 'member_id':
-          webhookService.addLiveEvent(callSid, '🧾 Member ID captured', { force: true });
-          await db.updateCallState(callSid, 'member_id_captured', {
-            masked_last4: collection.masked,
-            len: collection.len
-          }).catch(() => {});
-          break;
-        case 'policy_number':
-          webhookService.addLiveEvent(callSid, '📄 Policy number captured', { force: true });
-          await db.updateCallState(callSid, 'policy_number_captured', {
-            masked_last4: collection.masked,
-            len: collection.len
-          }).catch(() => {});
-          break;
-        case 'invoice_number':
-          webhookService.addLiveEvent(callSid, '🧾 Invoice number captured', { force: true });
-          await db.updateCallState(callSid, 'invoice_number_captured', {
-            masked_last4: collection.masked,
-            len: collection.len
-          }).catch(() => {});
-          break;
-        case 'confirmation_code':
-          webhookService.addLiveEvent(callSid, '✅ Confirmation code captured', { force: true });
-          await db.updateCallState(callSid, 'confirmation_code_captured', {
             masked_last4: collection.masked,
             len: collection.len
           }).catch(() => {});
@@ -1709,13 +1589,6 @@ function createDigitCollectionService(options = {}) {
         case 'claim_number':
           webhookService.addLiveEvent(callSid, '🧾 Claim number captured', { force: true });
           await db.updateCallState(callSid, 'claim_number_captured', {
-            masked_last4: collection.masked,
-            len: collection.len
-          }).catch(() => {});
-          break;
-        case 'order_number':
-          webhookService.addLiveEvent(callSid, '🧾 Order number captured', { force: true });
-          await db.updateCallState(callSid, 'order_number_captured', {
             masked_last4: collection.masked,
             len: collection.len
           }).catch(() => {});
@@ -1794,19 +1667,23 @@ function createDigitCollectionService(options = {}) {
       webhookService.addLiveEvent(callSid, `⚠️ Invalid digits (${collection.len})${reasonHint}; retry ${collection.retries}/${digitCollectionManager.expectations.get(callSid)?.max_retries || 0}`, { force: true });
       if (collection.fallback) {
         const failureMessage = expectation?.failure_message || callEndMessages.failure || 'I could not verify the digits. Thank you for your time.';
-        const fallbackMsg = fallbackToVoiceOnFailure
+        const allowSpokenFallback = expectation?.allow_spoken_fallback !== false;
+        const shouldFallbackToVoice = fallbackToVoiceOnFailure && allowSpokenFallback;
+        const fallbackMsg = shouldFallbackToVoice
           ? 'I could not verify the digits. I will continue the call without keypad entry.'
           : failureMessage;
-        webhookService.addLiveEvent(callSid, `⏳ No valid digits; ${fallbackToVoiceOnFailure ? 'switching to voice' : 'ending call'}`, { force: true });
+        webhookService.addLiveEvent(callSid, `⏳ No valid digits; ${shouldFallbackToVoice ? 'switching to voice' : 'ending call'}`, { force: true });
         digitCollectionManager.expectations.delete(callSid);
         clearDigitTimeout(callSid);
         clearDigitFallbackState(callSid);
         clearDigitPlan(callSid);
-        if (fallbackToVoiceOnFailure) {
+        if (shouldFallbackToVoice) {
+          clearDigitIntent(callSid, 'digit_collection_failed');
           emitReply(fallbackMsg);
           return;
         }
         if (allowCallEnd) {
+          clearDigitIntent(callSid, 'digit_collection_failed');
           await speakAndEndCall(callSid, failureMessage, 'digit_collection_failed');
           return;
         }
@@ -1826,6 +1703,7 @@ function createDigitCollectionService(options = {}) {
         }
         emitReply(prompt);
         if (gptService) {
+          markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', { prompt_text: prompt });
           scheduleDigitTimeout(callSid, gptService, interactionCount + 1);
         }
       }
@@ -1850,6 +1728,14 @@ function createDigitCollectionService(options = {}) {
     clearDigitPlan(callSid);
     lastDtmfTimestamps.delete(callSid);
     pendingDigits.delete(callSid);
+    const callConfig = callConfigurations.get(callSid);
+    if (callConfig) {
+      callConfig.digit_capture_active = false;
+      if (callConfig.digit_intent?.mode === 'dtmf') {
+        callConfig.digit_intent = { mode: 'normal', reason: 'call_end', confidence: 1 };
+      }
+      callConfigurations.set(callSid, callConfig);
+    }
   }
 
   return {

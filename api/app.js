@@ -92,21 +92,48 @@ function clearSilenceTimer(callSid) {
   }
 }
 
+function isCaptureActive(callSid) {
+  if (!callSid) return false;
+  const callConfig = callConfigurations.get(callSid);
+  return callConfig?.digit_intent?.mode === 'dtmf' && callConfig?.digit_capture_active === true;
+}
+
 function scheduleSilenceTimer(callSid, timeoutMs = 30000) {
   if (!callSid) return;
   if (callEndLocks.has(callSid)) {
     return;
   }
-  if (digitService?.hasExpectation(callSid)) {
+  if (digitService?.hasExpectation(callSid) || isCaptureActive(callSid)) {
     return;
   }
   clearSilenceTimer(callSid);
   const timer = setTimeout(() => {
-    if (!digitService?.hasExpectation(callSid)) {
+    if (!digitService?.hasExpectation(callSid) && !isCaptureActive(callSid)) {
       speakAndEndCall(callSid, CALL_END_MESSAGES.no_response, 'silence_timeout');
     }
   }, timeoutMs);
   silenceTimers.set(callSid, timer);
+}
+
+function estimateAudioLevelFromBase64(base64 = '') {
+  if (!base64) return null;
+  let buffer;
+  try {
+    buffer = Buffer.from(base64, 'base64');
+  } catch (_) {
+    return null;
+  }
+  if (!buffer.length) return null;
+  const step = Math.max(1, Math.floor(buffer.length / 800));
+  let sum = 0;
+  let count = 0;
+  for (let i = 0; i < buffer.length; i += step) {
+    sum += Math.abs(buffer[i] - 128);
+    count += 1;
+  }
+  if (!count) return null;
+  const level = sum / (count * 128);
+  return Math.max(0, Math.min(1, level));
 }
 
 async function applyInitialDigitIntent(callSid, callConfig, gptService = null, interactionCount = 0) {
@@ -116,6 +143,10 @@ async function applyInitialDigitIntent(callSid, callConfig, gptService = null, i
       intent: callConfig.digit_intent,
       expectation: digitService.getExpectation(callSid) || null
     };
+    if (existing.intent?.mode === 'dtmf' && callConfig.digit_capture_active !== true) {
+      callConfig.digit_capture_active = true;
+      callConfigurations.set(callSid, callConfig);
+    }
     if (existing.intent?.mode === 'dtmf' && existing.expectation) {
       try {
         await digitService.flushBufferedDigits(callSid, gptService, interactionCount, 'dtmf', { allowCallEnd: true });
@@ -127,6 +158,11 @@ async function applyInitialDigitIntent(callSid, callConfig, gptService = null, i
   }
   const result = digitService.prepareInitialExpectation(callSid, callConfig);
   callConfig.digit_intent = result.intent;
+  if (result.intent?.mode === 'dtmf') {
+    callConfig.digit_capture_active = true;
+  } else {
+    callConfig.digit_capture_active = false;
+  }
   callConfigurations.set(callSid, callConfig);
   if (result.intent?.mode === 'dtmf' && result.expectation) {
     webhookService.addLiveEvent(callSid, `🔢 DTMF intent detected (${result.intent.reason})`, { force: true });
@@ -450,8 +486,7 @@ const telephonyTools = [
           prompt: { type: 'string', description: 'Short instruction to the caller.' },
           min_digits: { type: 'integer', description: 'Minimum digits expected.', minimum: 1 },
           max_digits: { type: 'integer', description: 'Maximum digits expected.', minimum: 1 },
-          profile: { type: 'string', enum: ['generic', 'verification', 'ssn', 'dob', 'routing_number', 'bank_account', 'phone', 'member_id', 'policy_number', 'invoice_number', 'confirmation_code', 'tax_id', 'ein', 'claim_number', 'order_number', 'reservation_number', 'ticket_number', 'case_number', 'menu', 'account', 'extension', 'zip', 'amount', 'survey', 'callback_confirm', 'card_number', 'cvv', 'card_expiry'], description: 'Collection profile for downstream handling.' },
-          menu_options: { type: 'array', description: 'For menu profile, array of {digit,label,route}.', items: { type: 'object', properties: { digit: { type: 'string' }, label: { type: 'string' }, route: { type: 'string' } } } },
+          profile: { type: 'string', enum: ['generic', 'verification', 'ssn', 'dob', 'routing_number', 'account_number', 'phone', 'tax_id', 'ein', 'claim_number', 'reservation_number', 'ticket_number', 'case_number', 'account', 'extension', 'zip', 'amount', 'callback_confirm', 'card_number', 'cvv', 'card_expiry'], description: 'Collection profile for downstream handling.' },
           confirmation_style: { type: 'string', enum: ['none', 'last4', 'spoken_amount'], description: 'How to confirm receipt (masked, spoken summary only).' },
           timeout_s: { type: 'integer', description: 'Timeout in seconds before reprompt.', minimum: 3 },
           max_retries: { type: 'integer', description: 'Number of retries before fallback.', minimum: 0 },
@@ -483,8 +518,7 @@ const telephonyTools = [
                 prompt: { type: 'string', description: 'Short instruction to the caller.' },
                 min_digits: { type: 'integer', description: 'Minimum digits expected.', minimum: 1 },
                 max_digits: { type: 'integer', description: 'Maximum digits expected.', minimum: 1 },
-                profile: { type: 'string', enum: ['generic', 'verification', 'ssn', 'dob', 'routing_number', 'bank_account', 'phone', 'member_id', 'policy_number', 'invoice_number', 'confirmation_code', 'tax_id', 'ein', 'claim_number', 'order_number', 'reservation_number', 'ticket_number', 'case_number', 'menu', 'account', 'extension', 'zip', 'amount', 'survey', 'callback_confirm', 'card_number', 'cvv', 'card_expiry'], description: 'Collection profile for downstream handling.' },
-                menu_options: { type: 'array', description: 'For menu profile, array of {digit,label,route}.', items: { type: 'object', properties: { digit: { type: 'string' }, label: { type: 'string' }, route: { type: 'string' } } } },
+                profile: { type: 'string', enum: ['generic', 'verification', 'ssn', 'dob', 'routing_number', 'account_number', 'phone', 'tax_id', 'ein', 'claim_number', 'reservation_number', 'ticket_number', 'case_number', 'account', 'extension', 'zip', 'amount', 'callback_confirm', 'card_number', 'cvv', 'card_expiry'], description: 'Collection profile for downstream handling.' },
                 confirmation_style: { type: 'string', enum: ['none', 'last4', 'spoken_amount'], description: 'How to confirm receipt (masked, spoken summary only).' },
                 timeout_s: { type: 'integer', description: 'Timeout in seconds before reprompt.', minimum: 3 },
                 max_retries: { type: 'integer', description: 'Number of retries before fallback.', minimum: 0 },
@@ -694,16 +728,11 @@ const DIGIT_PROFILE_LABELS = {
   ssn: 'SSN',
   dob: 'DOB',
   routing_number: 'Routing',
-  bank_account: 'Bank Acct',
+  account_number: 'Account #',
   phone: 'Phone',
-  member_id: 'Member ID',
-  policy_number: 'Policy',
-  invoice_number: 'Invoice',
-  confirmation_code: 'Confirm',
   tax_id: 'Tax ID',
   ein: 'EIN',
   claim_number: 'Claim',
-  order_number: 'Order',
   reservation_number: 'Reservation',
   ticket_number: 'Ticket',
   case_number: 'Case',
@@ -711,12 +740,10 @@ const DIGIT_PROFILE_LABELS = {
   zip: 'ZIP',
   extension: 'Ext',
   amount: 'Amount',
-  survey: 'Survey',
   callback_confirm: 'Callback',
   card_number: 'Card',
   cvv: 'CVV',
   card_expiry: 'Expiry',
-  menu: 'Menu',
   generic: 'Digits'
 };
 
@@ -1092,7 +1119,9 @@ async function ensureAwsSession(callSid) {
   activeCalls.set(callSid, session);
 
   try {
-    const firstMessage = callConfig.first_message || 'Hello!';
+    const initialExpectation = digitService?.getExpectation(callSid);
+    const firstMessage = callConfig.first_message
+      || (initialExpectation ? digitService.buildDigitPrompt(initialExpectation) : 'Hello!');
     const ttsAdapter = getAwsTtsAdapter();
     const { key } = await ttsAdapter.synthesizeToS3(firstMessage);
     const contactId = callConfig?.provider_metadata?.contact_id;
@@ -1104,10 +1133,13 @@ async function ensureAwsSession(callSid) {
         });
         webhookService.recordTranscriptTurn(callSid, 'agent', firstMessage);
         webhookService.setLiveCallPhase(callSid, 'agent_speaking').catch(() => {});
-        if (digitService?.hasExpectation(callSid)) {
-          digitService.markDigitPrompted(callSid, gptService, 0, 'dtmf', { allowCallEnd: true });
-          digitService.scheduleDigitTimeout(callSid, gptService, 0);
-        }
+          if (digitService?.hasExpectation(callSid)) {
+            digitService.markDigitPrompted(callSid, gptService, 0, 'dtmf', {
+              allowCallEnd: true,
+              prompt_text: firstMessage
+            });
+            digitService.scheduleDigitTimeout(callSid, gptService, 0);
+          }
         scheduleSilenceTimer(callSid);
       }
   } catch (error) {
@@ -1351,9 +1383,10 @@ app.ws('/connection', (ws, req) => {
             } else {
             await recordingService(ttsService, callSid);
             
-            const firstMessage = callConfig ? 
-              callConfig.first_message : 
-              'Hello! what\'s your name and how can i help you today?';
+            const initialExpectation = digitService?.getExpectation(callSid);
+            const firstMessage = (callConfig && callConfig.first_message)
+              ? callConfig.first_message
+              : (initialExpectation ? digitService.buildDigitPrompt(initialExpectation) : 'Hello! what\'s your name and how can i help you today?');
             
             console.log(`First message (${functionSystem?.context.industry || 'default'}): ${firstMessage.substring(0, 50)}...`);
             
@@ -1378,7 +1411,10 @@ app.ws('/connection', (ws, req) => {
               callConfigurations.set(callSid, callConfig);
             }
             if (digitService?.hasExpectation(callSid)) {
-              digitService.markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', { allowCallEnd: true });
+              digitService.markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', {
+                allowCallEnd: true,
+                prompt_text: firstMessage
+              });
               digitService.scheduleDigitTimeout(callSid, gptService, 0);
             }
             scheduleSilenceTimer(callSid);
@@ -1394,9 +1430,10 @@ app.ws('/connection', (ws, req) => {
               console.log(`Stream reconnected for ${callSid} (skipping greeting)`);
             } else {
             
-            const firstMessage = callConfig ? 
-              callConfig.first_message : 
-              'Hello! what\'s your name and how can i help you today?';
+            const initialExpectation = digitService?.getExpectation(callSid);
+            const firstMessage = (callConfig && callConfig.first_message)
+              ? callConfig.first_message
+              : (initialExpectation ? digitService.buildDigitPrompt(initialExpectation) : 'Hello! what\'s your name and how can i help you today?');
             
             try {
               await db.addTranscript({
@@ -1419,7 +1456,10 @@ app.ws('/connection', (ws, req) => {
               callConfigurations.set(callSid, callConfig);
             }
             if (digitService?.hasExpectation(callSid)) {
-              digitService.markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', { allowCallEnd: true });
+              digitService.markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', {
+                allowCallEnd: true,
+                prompt_text: firstMessage
+              });
               digitService.scheduleDigitTimeout(callSid, gptService, 0);
             }
             scheduleSilenceTimer(callSid);
@@ -1449,7 +1489,18 @@ app.ws('/connection', (ws, req) => {
           if (digits) {
             clearSilenceTimer(callSid);
             const callConfig = callConfigurations.get(callSid);
-            const isDigitIntent = callConfig?.digit_intent?.mode === 'dtmf';
+            let isDigitIntent = callConfig?.digit_intent?.mode === 'dtmf';
+            if (!isDigitIntent && callConfig && digitService) {
+              const hasExplicitDigitConfig = !!(
+                callConfig.collection_profile
+                || callConfig.template_policy?.requires_otp
+                || callConfig.template_policy?.default_profile
+              );
+              if (hasExplicitDigitConfig) {
+                await applyInitialDigitIntent(callSid, callConfig, gptService, interactionCount);
+                isDigitIntent = callConfig?.digit_intent?.mode === 'dtmf';
+              }
+            }
             if (!isDigitIntent) {
               webhookService.addLiveEvent(callSid, `🔢 Keypad: ${digits} (ignored - normal flow)`, { force: true });
               return;
@@ -1474,10 +1525,6 @@ app.ws('/connection', (ws, req) => {
             webhookService.addLiveEvent(callSid, `🔢 ${display}`, { force: true });
             const collection = digitService.recordDigits(callSid, digits, { timestamp: Date.now() });
             await digitService.handleCollectionResult(callSid, collection, gptService, interactionCount, 'dtmf', { allowCallEnd: true });
-            if (collection.accepted && collection.route && !callEndLocks.has(callSid)) {
-              webhookService.addLiveEvent(callSid, `➡️ Routing via menu: ${collection.route}`, { force: true });
-              await db.updateCallState(callSid, 'route_requested', { reason: collection.route, via: 'menu' }).catch(() => {});
-            }
           }
         } else if (event === 'stop') {
           console.log(`Adaptive call stream ${streamSid} ended`.red);
@@ -1528,6 +1575,7 @@ app.ws('/connection', (ws, req) => {
 
       const callConfig = callConfigurations.get(callSid);
       const isDigitIntent = callConfig?.digit_intent?.mode === 'dtmf';
+      const captureActive = callConfig?.digit_capture_active === true;
       const otpContext = digitService.getOtpContext(text, callSid);
       console.log(`Customer: ${otpContext.maskedForLogs}`);
 
@@ -1552,7 +1600,7 @@ app.ws('/connection', (ws, req) => {
       }
       
       webhookService.recordTranscriptTurn(callSid, 'user', otpContext.raw);
-      if (isDigitIntent && otpContext.codes && otpContext.codes.length && digitService?.hasExpectation(callSid)) {
+      if ((isDigitIntent || captureActive) && otpContext.codes && otpContext.codes.length && digitService?.hasExpectation(callSid)) {
         const activeExpectation = digitService.getExpectation(callSid);
         const progress = digitService.formatOtpForDisplay(
           otpContext.codes[otpContext.codes.length - 1],
@@ -1563,7 +1611,7 @@ app.ws('/connection', (ws, req) => {
         const collection = digitService.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1], { timestamp: Date.now(), source: 'spoken' });
         await digitService.handleCollectionResult(callSid, collection, gptService, interactionCount, 'spoken', { allowCallEnd: true });
       }
-      if (isDigitIntent && digitService?.hasExpectation(callSid)) {
+      if (captureActive) {
         return;
       }
 
@@ -1618,7 +1666,8 @@ app.ws('/connection', (ws, req) => {
     });
     
     ttsService.on('speech', (responseIndex, audio, label, icount) => {
-      webhookService.setLiveCallPhase(callSid, 'agent_speaking').catch(() => {});
+      const level = estimateAudioLevelFromBase64(audio);
+      webhookService.setLiveCallPhase(callSid, 'agent_speaking', { level }).catch(() => {});
       if (callSid) {
         db.updateCallState(callSid, 'tts_ready', {
           response_index: responseIndex,
@@ -1748,7 +1797,8 @@ app.ws('/vonage/stream', async (ws, req) => {
     });
 
     ttsService.on('speech', (responseIndex, audio) => {
-      webhookService.setLiveCallPhase(callSid, 'agent_speaking').catch(() => {});
+      const level = estimateAudioLevelFromBase64(audio);
+      webhookService.setLiveCallPhase(callSid, 'agent_speaking', { level }).catch(() => {});
       if (callSid) {
         db.updateCallState(callSid, 'tts_ready', {
           response_index: responseIndex,
@@ -1777,6 +1827,7 @@ app.ws('/vonage/stream', async (ws, req) => {
       clearSilenceTimer(callSid);
       const callConfig = callConfigurations.get(callSid);
       const isDigitIntent = callConfig?.digit_intent?.mode === 'dtmf';
+      const captureActive = callConfig?.digit_capture_active === true;
       const otpContext = digitService.getOtpContext(text, callSid);
       try {
         await db.addTranscript({
@@ -1796,7 +1847,7 @@ app.ws('/vonage/stream', async (ws, req) => {
         console.error('Database error adding user transcript:', dbError);
       }
       webhookService.recordTranscriptTurn(callSid, 'user', otpContext.raw);
-      if (isDigitIntent && otpContext.codes && otpContext.codes.length && digitService?.hasExpectation(callSid)) {
+      if ((isDigitIntent || captureActive) && otpContext.codes && otpContext.codes.length && digitService?.hasExpectation(callSid)) {
         const activeExpectation = digitService.getExpectation(callSid);
         const progress = digitService.formatOtpForDisplay(
           otpContext.codes[otpContext.codes.length - 1],
@@ -1807,7 +1858,7 @@ app.ws('/vonage/stream', async (ws, req) => {
         const collection = digitService.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1], { timestamp: Date.now(), source: 'spoken' });
         await digitService.handleCollectionResult(callSid, collection, gptService, interactionCount, 'spoken', { allowCallEnd: true });
       }
-      if (isDigitIntent && digitService?.hasExpectation(callSid)) {
+      if (captureActive) {
         return;
       }
       if (!otpContext.maskedForGpt || !otpContext.maskedForGpt.trim()) {
@@ -1891,11 +1942,17 @@ app.ws('/vonage/stream', async (ws, req) => {
     });
 
     // Send first message once stream is ready
-    if (callConfig?.first_message) {
-      ttsService.generate({ partialResponseIndex: null, partialResponse: callConfig.first_message }, 0);
-      webhookService.recordTranscriptTurn(callSid, 'agent', callConfig.first_message);
+    const initialExpectation = digitService?.getExpectation(callSid);
+    const firstMessage = callConfig?.first_message
+      || (initialExpectation ? digitService.buildDigitPrompt(initialExpectation) : '');
+    if (firstMessage) {
+      ttsService.generate({ partialResponseIndex: null, partialResponse: firstMessage }, 0);
+      webhookService.recordTranscriptTurn(callSid, 'agent', firstMessage);
       if (digitService?.hasExpectation(callSid)) {
-        digitService.markDigitPrompted(callSid, gptService, 0, 'dtmf', { allowCallEnd: true });
+        digitService.markDigitPrompted(callSid, gptService, 0, 'dtmf', {
+          allowCallEnd: true,
+          prompt_text: firstMessage
+        });
         digitService.scheduleDigitTimeout(callSid, gptService, 0);
       }
       scheduleSilenceTimer(callSid);
@@ -1953,6 +2010,7 @@ app.ws('/aws/stream', (ws, req) => {
       clearSilenceTimer(callSid);
       const session = await sessionPromise;
       const isDigitIntent = session?.callConfig?.digit_intent?.mode === 'dtmf';
+      const captureActive = session?.callConfig?.digit_capture_active === true;
       const otpContext = digitService.getOtpContext(text, callSid);
       try {
         await db.addTranscript({
@@ -1973,7 +2031,7 @@ app.ws('/aws/stream', (ws, req) => {
       }
 
       webhookService.recordTranscriptTurn(callSid, 'user', otpContext.raw);
-      if (isDigitIntent && otpContext.codes && otpContext.codes.length && digitService?.hasExpectation(callSid)) {
+      if ((isDigitIntent || captureActive) && otpContext.codes && otpContext.codes.length && digitService?.hasExpectation(callSid)) {
         const activeExpectation = digitService.getExpectation(callSid);
         const progress = digitService.formatOtpForDisplay(
           otpContext.codes[otpContext.codes.length - 1],
@@ -1982,13 +2040,9 @@ app.ws('/aws/stream', (ws, req) => {
         );
         webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
         const collection = digitService.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1], { timestamp: Date.now(), source: 'spoken' });
-        if (collection.accepted && collection.route && !callEndLocks.has(callSid)) {
-          webhookService.addLiveEvent(callSid, `➡️ Routing via menu: ${collection.route}`, { force: true });
-          await db.updateCallState(callSid, 'route_requested', { reason: collection.route, via: 'menu' }).catch(() => {});
-        }
         await digitService.handleCollectionResult(callSid, collection, session.gptService, interactionCount, 'spoken', { allowCallEnd: true });
       }
-      if (isDigitIntent && digitService?.hasExpectation(callSid)) {
+      if (captureActive) {
         return;
       }
 
@@ -2783,7 +2837,6 @@ async function buildRetryPayload(callSid) {
     voice_model: callState?.voice_model || null,
     collection_profile: callState?.collection_profile || null,
     collection_expected_length: callState?.collection_expected_length || null,
-    collection_menu_options: callState?.collection_menu_options || [],
     collection_timeout_s: callState?.collection_timeout_s || null,
     collection_max_retries: callState?.collection_max_retries || null,
     collection_mask_for_gpt: callState?.collection_mask_for_gpt,
@@ -2808,7 +2861,6 @@ async function placeOutboundCall(payload, hostOverride = null) {
     voice_model,
     collection_profile,
     collection_expected_length,
-    collection_menu_options,
     collection_timeout_s,
     collection_max_retries,
     collection_mask_for_gpt,
@@ -2944,7 +2996,6 @@ async function placeOutboundCall(payload, hostOverride = null) {
     voice_model: voice_model || null,
     collection_profile: collection_profile || null,
     collection_expected_length: collection_expected_length || null,
-    collection_menu_options: collection_menu_options || [],
     collection_timeout_s: collection_timeout_s || null,
     collection_max_retries: collection_max_retries || null,
     collection_mask_for_gpt: collection_mask_for_gpt,
@@ -2979,7 +3030,6 @@ async function placeOutboundCall(payload, hostOverride = null) {
       provider_metadata: providerMetadata,
       collection_profile: collection_profile || null,
       collection_expected_length: collection_expected_length || null,
-      collection_menu_options: collection_menu_options || [],
       collection_timeout_s: collection_timeout_s || null,
       collection_max_retries: collection_max_retries || null,
       collection_mask_for_gpt: collection_mask_for_gpt,
@@ -3018,7 +3068,6 @@ app.post('/outbound-call', async (req, res) => {
       voice_model: req.body?.voice_model,
       collection_profile: req.body?.collection_profile,
       collection_expected_length: req.body?.collection_expected_length,
-      collection_menu_options: req.body?.collection_menu_options || [],
       collection_timeout_s: req.body?.collection_timeout_s,
       collection_max_retries: req.body?.collection_max_retries,
       collection_mask_for_gpt: req.body?.collection_mask_for_gpt,
