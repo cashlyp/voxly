@@ -132,6 +132,22 @@ function resolveTwilioSayVoice(callConfig) {
   return null;
 }
 
+function maskDigitsForLog(input = '') {
+  const digits = String(input || '').replace(/\D/g, '');
+  if (!digits) return '0 digits';
+  return `${digits.length} digits`;
+}
+
+function maskSmsBodyForLog(body = '') {
+  const digits = String(body || '').replace(/\D/g, '');
+  if (digits.length >= 2) {
+    return `[${digits.length} digits]`;
+  }
+  const text = String(body || '').trim();
+  if (!text) return '[empty]';
+  return text.length > 80 ? `${text.slice(0, 77)}...` : text;
+}
+
 function queuePendingDigitAction(callSid, action = {}) {
   if (!callSid) return false;
   const callConfig = callConfigurations.get(callSid);
@@ -693,6 +709,7 @@ const callConfigurations = new Map();
 const activeCalls = new Map();
 const callFunctionSystems = new Map(); // Store generated functions per call
 const callEndLocks = new Map();
+const gatherEventDedupe = new Map();
 const silenceTimers = new Map();
 const transcriptAudioJobs = new Map();
 const TRANSCRIPT_AUDIO_TTL_MS = 60 * 60 * 1000;
@@ -806,8 +823,36 @@ const DIGIT_SETTINGS = {
   fallbackToVoiceOnFailure: true,
   showRawDigitsLive: String(process.env.SHOW_RAW_DIGITS_LIVE || 'true').toLowerCase() === 'true',
   sendRawDigitsToUser: String(process.env.SEND_RAW_DIGITS_TO_USER || 'true').toLowerCase() === 'true',
-  minDtmfGapMs: 200
+  minDtmfGapMs: 200,
+  riskThresholds: {
+    confirm: Number(process.env.DIGIT_RISK_CONFIRM || 0.55),
+    dtmf_only: Number(process.env.DIGIT_RISK_DTMF_ONLY || 0.7),
+    route_agent: Number(process.env.DIGIT_RISK_ROUTE_AGENT || 0.9)
+  },
+  smsFallbackEnabled: String(process.env.DIGIT_SMS_FALLBACK_ENABLED || 'true').toLowerCase() === 'true',
+  smsFallbackMinRetries: Number(process.env.DIGIT_SMS_FALLBACK_MIN_RETRIES || 2),
+  healthThresholds: {
+    degraded: Number(process.env.DIGIT_HEALTH_DEGRADED || 30),
+    overloaded: Number(process.env.DIGIT_HEALTH_OVERLOADED || 60)
+  },
+  circuitBreaker: {
+    windowMs: Number(process.env.DIGIT_BREAKER_WINDOW_MS || 60000),
+    minSamples: Number(process.env.DIGIT_BREAKER_MIN_SAMPLES || 8),
+    errorRate: Number(process.env.DIGIT_BREAKER_ERROR_RATE || 0.3),
+    cooldownMs: Number(process.env.DIGIT_BREAKER_COOLDOWN_MS || 60000)
+  }
 };
+
+function getDigitSystemHealth() {
+  const active = callConfigurations.size;
+  const thresholds = DIGIT_SETTINGS.healthThresholds || {};
+  const status = active >= thresholds.overloaded
+    ? 'overloaded'
+    : active >= thresholds.degraded
+      ? 'degraded'
+      : 'healthy';
+  return { status, load: active };
+}
 
 // Built-in telephony function templates to give GPT deterministic controls
 const telephonyTools = [
@@ -1559,7 +1604,9 @@ async function startServer() {
       queuePendingDigitAction,
       callEndMessages: CALL_END_MESSAGES,
       closingMessage: CLOSING_MESSAGE,
-      settings: DIGIT_SETTINGS
+      settings: DIGIT_SETTINGS,
+      smsService,
+      healthProvider: getDigitSystemHealth
     });
 
     // Initialize function engine
@@ -1929,7 +1976,8 @@ app.ws('/connection', (ws, req) => {
           if (digits) {
             clearSilenceTimer(callSid);
             const callConfig = callConfigurations.get(callSid);
-            let isDigitIntent = callConfig?.digit_intent?.mode === 'dtmf';
+            const captureActive = callConfig?.digit_capture_active === true;
+            let isDigitIntent = callConfig?.digit_intent?.mode === 'dtmf' || captureActive;
             if (!isDigitIntent && callConfig && digitService) {
               const hasExplicitDigitConfig = !!(
                 callConfig.collection_profile
@@ -1941,17 +1989,18 @@ app.ws('/connection', (ws, req) => {
                 isDigitIntent = callConfig?.digit_intent?.mode === 'dtmf';
               }
             }
-            if (!isDigitIntent) {
+            const shouldBuffer = isDigitIntent || digitService?.hasPlan?.(callSid) || digitService?.hasExpectation?.(callSid);
+            if (!isDigitIntent && !shouldBuffer) {
               webhookService.addLiveEvent(callSid, `🔢 Keypad: ${digits} (ignored - normal flow)`, { force: true });
               return;
             }
             const expectation = digitService?.getExpectation(callSid);
-            console.log(`Media DTMF for ${callSid}: "${digits}" (expectation ${expectation ? 'present' : 'missing'})`);
+            console.log(`Media DTMF for ${callSid}: ${maskDigitsForLog(digits)} (expectation ${expectation ? 'present' : 'missing'})`);
             if (!expectation) {
               if (digitService?.bufferDigits) {
                 digitService.bufferDigits(callSid, digits, { timestamp: Date.now(), source: 'dtmf', early: true });
               }
-              webhookService.addLiveEvent(callSid, `🔢 Keypad: ${digits} (buffered)`, { force: true });
+              webhookService.addLiveEvent(callSid, `🔢 Keypad: ${digits} (buffered early)`, { force: true });
               return;
             }
             await digitService.flushBufferedDigits(callSid, gptService, interactionCount, 'dtmf', { allowCallEnd: true });
@@ -2592,6 +2641,11 @@ async function handleCallEnd(callSid, callStartTime) {
   try {
     const callEndTime = new Date();
     const duration = Math.round((callEndTime - callStartTime) / 1000);
+    for (const key of gatherEventDedupe.keys()) {
+      if (key.startsWith(`${callSid}:`)) {
+        gatherEventDedupe.delete(key);
+      }
+    }
     clearGptQueue(callSid);
     clearNormalFlowState(callSid);
     clearSpeechTicks(callSid);
@@ -4808,7 +4862,15 @@ app.post('/webhook/sms', async (req, res) => {
         warnOnInvalidTwilioSignature(req, '/webhook/sms');
         const { From, Body, MessageSid, SmsStatus } = req.body;
 
-        console.log(`SMS webhook: ${From} -> ${Body}`);
+        console.log(`SMS webhook: ${From} -> ${maskSmsBodyForLog(Body)}`);
+
+        if (digitService?.handleIncomingSms) {
+            const handled = await digitService.handleIncomingSms(From, Body);
+            if (handled?.handled) {
+                res.status(200).send('OK');
+                return;
+            }
+        }
 
         // Handle incoming SMS with AI
         const result = await smsService.handleIncomingSMS(From, Body, MessageSid);
@@ -4902,7 +4964,7 @@ app.post('/webhook/twilio-gather', async (req, res) => {
     if (!callSid) {
       return res.status(400).send('Missing CallSid');
     }
-    console.log(`Gather webhook hit: callSid=${callSid} digits="${Digits || ''}"`);
+    console.log(`Gather webhook hit: callSid=${callSid} digits=${maskDigitsForLog(Digits || '')}`);
 
     const expectation = digitService?.getExpectation(callSid);
     if (!expectation) {
@@ -4939,6 +5001,11 @@ app.post('/webhook/twilio-gather', async (req, res) => {
       res.end(twiml);
     };
     const respondWithHangup = (message) => {
+      if (callEndLocks.has(callSid)) {
+        respondWithStream();
+        return;
+      }
+      callEndLocks.set(callSid, true);
       const response = new VoiceResponse();
       if (message) {
         response.say(message);
@@ -4949,6 +5016,22 @@ app.post('/webhook/twilio-gather', async (req, res) => {
     };
 
     digitService.clearDigitTimeout(callSid);
+
+    const dedupeKey = `${callSid}:${Digits || ''}`;
+    const lastSeen = gatherEventDedupe.get(dedupeKey);
+    if (lastSeen && Date.now() - lastSeen < 2000) {
+      console.warn(`Duplicate gather webhook ignored for ${callSid}`);
+      const currentExpectation = digitService?.getExpectation(callSid);
+      if (currentExpectation) {
+        const prompt = currentExpectation.prompt || digitService.buildDigitPrompt(currentExpectation);
+        if (respondWithGather(currentExpectation, prompt)) {
+          return;
+        }
+      }
+      respondWithStream();
+      return;
+    }
+    gatherEventDedupe.set(dedupeKey, Date.now());
 
     const digits = String(Digits || '').trim();
     if (digits) {
