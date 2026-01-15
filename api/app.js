@@ -136,6 +136,64 @@ function estimateAudioLevelFromBase64(base64 = '') {
   return Math.max(0, Math.min(1, level));
 }
 
+function estimateAudioDurationMsFromBase64(base64 = '') {
+  if (!base64) return 0;
+  let buffer;
+  try {
+    buffer = Buffer.from(base64, 'base64');
+  } catch (_) {
+    return 0;
+  }
+  return Math.round((buffer.length / 8000) * 1000);
+}
+
+function estimateSpeechDurationMs(text = '') {
+  const words = String(text || '')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+  if (!words) return 0;
+  const wordsPerMinute = 150;
+  return Math.ceil((words / wordsPerMinute) * 60000);
+}
+
+function clearSpeechTicks(callSid) {
+  const timer = speechTickTimers.get(callSid);
+  if (timer) {
+    clearInterval(timer);
+    speechTickTimers.delete(callSid);
+  }
+}
+
+function scheduleSpeechTicks(callSid, phaseKey, durationMs, level = null) {
+  if (!callSid) return;
+  clearSpeechTicks(callSid);
+  const intervalMs = 250;
+  const safeDuration = Math.max(0, Number(durationMs) || 0);
+  if (!safeDuration || safeDuration <= intervalMs) {
+    webhookService.setLiveCallPhase(callSid, phaseKey, { level, logEvent: false }).catch(() => {});
+    return;
+  }
+  const start = Date.now();
+  webhookService.setLiveCallPhase(callSid, phaseKey, { level, logEvent: false }).catch(() => {});
+  const timer = setInterval(() => {
+    const elapsed = Date.now() - start;
+    if (elapsed >= safeDuration) {
+      clearSpeechTicks(callSid);
+      return;
+    }
+    webhookService.setLiveCallPhase(callSid, phaseKey, { level, logEvent: false }).catch(() => {});
+  }, intervalMs);
+  speechTickTimers.set(callSid, timer);
+}
+
+function scheduleSpeechTicksFromAudio(callSid, phaseKey, base64Audio = '') {
+  if (!base64Audio) return;
+  const durationMs = estimateAudioDurationMsFromBase64(base64Audio);
+  const level = estimateAudioLevelFromBase64(base64Audio);
+  scheduleSpeechTicks(callSid, phaseKey, durationMs, level);
+}
+
 async function applyInitialDigitIntent(callSid, callConfig, gptService = null, interactionCount = 0) {
   if (!digitService || !callConfig) return null;
   if (callConfig.digit_intent) {
@@ -337,6 +395,7 @@ const gptQueues = new Map();
 const normalFlowBuffers = new Map();
 const normalFlowProcessing = new Set();
 const normalFlowLastInput = new Map();
+const speechTickTimers = new Map();
 
 function enqueueGptTask(callSid, task) {
   if (!callSid || typeof task !== 'function') {
@@ -977,18 +1036,19 @@ async function speakAndEndCall(callSid, message, reason = 'completed') {
 
   const delayMs = estimateSpeechDurationMs(text);
 
-  if (provider === 'aws') {
-    try {
-      const ttsAdapter = getAwsTtsAdapter();
-      const { key } = await ttsAdapter.synthesizeToS3(text);
-      const contactId = callConfig?.provider_metadata?.contact_id;
-      if (contactId) {
-        const awsAdapter = getAwsConnectAdapter();
-        await awsAdapter.enqueueAudioPlayback({ contactId, audioKey: key });
+    if (provider === 'aws') {
+      try {
+        const ttsAdapter = getAwsTtsAdapter();
+        const { key } = await ttsAdapter.synthesizeToS3(text);
+        const contactId = callConfig?.provider_metadata?.contact_id;
+        if (contactId) {
+          const awsAdapter = getAwsConnectAdapter();
+          await awsAdapter.enqueueAudioPlayback({ contactId, audioKey: key });
+        }
+        scheduleSpeechTicks(callSid, 'agent_speaking', estimateSpeechDurationMs(text), 0.5);
+      } catch (ttsError) {
+        console.error('AWS closing TTS error:', ttsError);
       }
-    } catch (ttsError) {
-      console.error('AWS closing TTS error:', ttsError);
-    }
     setTimeout(() => {
       endCallForProvider(callSid).catch((err) => console.error('End call error:', err));
     }, delayMs);
@@ -1109,6 +1169,7 @@ async function ensureAwsSession(callSid) {
           audioKey: key
         });
         webhookService.setLiveCallPhase(callSid, 'agent_speaking').catch(() => {});
+        scheduleSpeechTicks(callSid, 'agent_speaking', estimateSpeechDurationMs(gptReply.partialResponse), 0.55);
         scheduleSilenceTimer(callSid);
       }
     } catch (ttsError) {
@@ -1133,6 +1194,7 @@ async function ensureAwsSession(callSid) {
         });
         webhookService.recordTranscriptTurn(callSid, 'agent', firstMessage);
         webhookService.setLiveCallPhase(callSid, 'agent_speaking').catch(() => {});
+        scheduleSpeechTicks(callSid, 'agent_speaking', estimateSpeechDurationMs(firstMessage), 0.5);
           if (digitService?.hasExpectation(callSid)) {
             digitService.markDigitPrompted(callSid, gptService, 0, 'dtmf', {
               allowCallEnd: true,
@@ -1668,6 +1730,10 @@ app.ws('/connection', (ws, req) => {
     ttsService.on('speech', (responseIndex, audio, label, icount) => {
       const level = estimateAudioLevelFromBase64(audio);
       webhookService.setLiveCallPhase(callSid, 'agent_speaking', { level }).catch(() => {});
+      scheduleSpeechTicksFromAudio(callSid, 'agent_speaking', audio);
+      if (digitService?.hasExpectation(callSid)) {
+        digitService.updatePromptDelay(callSid, estimateAudioDurationMsFromBase64(audio));
+      }
       if (callSid) {
         db.updateCallState(callSid, 'tts_ready', {
           response_index: responseIndex,
@@ -1681,12 +1747,16 @@ app.ws('/connection', (ws, req) => {
     streamService.on('audiosent', (markLabel) => {
       marks.push(markLabel);
     });
+    streamService.on('audiotick', (tick) => {
+      webhookService.setLiveCallPhase(callSid, 'agent_speaking', { level: tick?.level, logEvent: false }).catch(() => {});
+    });
 
     ws.on('close', () => {
       console.log(`WebSocket connection closed for adaptive call: ${callSid || 'unknown'}`);
       if (digitService) {
         digitService.clearCallState(callSid);
       }
+      clearSpeechTicks(callSid);
       clearGptQueue(callSid);
       clearNormalFlowState(callSid);
       clearCallEndLock(callSid);
@@ -1799,6 +1869,10 @@ app.ws('/vonage/stream', async (ws, req) => {
     ttsService.on('speech', (responseIndex, audio) => {
       const level = estimateAudioLevelFromBase64(audio);
       webhookService.setLiveCallPhase(callSid, 'agent_speaking', { level }).catch(() => {});
+      scheduleSpeechTicksFromAudio(callSid, 'agent_speaking', audio);
+      if (digitService?.hasExpectation(callSid)) {
+        digitService.updatePromptDelay(callSid, estimateAudioDurationMsFromBase64(audio));
+      }
       if (callSid) {
         db.updateCallState(callSid, 'tts_ready', {
           response_index: responseIndex,
@@ -1935,6 +2009,7 @@ app.ws('/vonage/stream', async (ws, req) => {
       if (digitService) {
         digitService.clearCallState(callSid);
       }
+      clearSpeechTicks(callSid);
       clearGptQueue(callSid);
       clearNormalFlowState(callSid);
       clearCallEndLock(callSid);
@@ -2130,6 +2205,7 @@ async function handleCallEnd(callSid, callStartTime) {
     const duration = Math.round((callEndTime - callStartTime) / 1000);
     clearGptQueue(callSid);
     clearNormalFlowState(callSid);
+    clearSpeechTicks(callSid);
     const terminalStatuses = new Set(['completed', 'no-answer', 'no_answer', 'busy', 'failed', 'canceled']);
     const normalizeStatus = (value) => String(value || '').toLowerCase().replace(/_/g, '-');
     const initialCallDetails = await db.getCall(callSid);

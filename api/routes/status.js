@@ -51,6 +51,10 @@ class EnhancedWebhookService {
     this.lastSentimentAt = new Map();
     this.sentimentCooldownMs = 10000;
     this.mediaSeen = new Map();
+    this.callActivityAt = new Map();
+    this.pendingTerminalStatus = new Map();
+    this.pendingTerminalTimers = new Map();
+    this.terminalQuietMs = 8000;
   }
 
   normalizeStatus(value) {
@@ -370,6 +374,12 @@ class EnhancedWebhookService {
         || this.isVoicemailAnswer(additionalData.answered_by);
 
       const consolePromise = this.ensureLiveConsole(call_sid, telegram_chat_id, callMeta);
+
+      if (this.isTerminalStatus(correctedStatus) && !additionalData.deferred && this.shouldDeferTerminalStatus(call_sid)) {
+        this.scheduleDeferredTerminalStatus(call_sid, correctedStatus, telegram_chat_id, additionalData);
+        console.log(`⏳ Deferring terminal status ${correctedStatus} for call ${call_sid} (recent activity)`);
+        return true;
+      }
 
       // Check if we should send this status
       if (!this.shouldSendStatus(call_sid, correctedStatus)) {
@@ -1128,6 +1138,40 @@ class EnhancedWebhookService {
     return map[phaseKey] || phaseKey || '—';
   }
 
+  markCallActivity(callSid) {
+    if (!callSid) return;
+    this.callActivityAt.set(callSid, Date.now());
+  }
+
+  shouldDeferTerminalStatus(callSid) {
+    const lastActivity = this.callActivityAt.get(callSid);
+    if (!lastActivity) return false;
+    return Date.now() - lastActivity < this.terminalQuietMs;
+  }
+
+  scheduleDeferredTerminalStatus(callSid, status, telegramChatId, additionalData = {}) {
+    if (!callSid) return;
+    this.pendingTerminalStatus.set(callSid, {
+      status,
+      telegramChatId,
+      additionalData
+    });
+    if (this.pendingTerminalTimers.has(callSid)) {
+      return;
+    }
+    const timer = setTimeout(async () => {
+      this.pendingTerminalTimers.delete(callSid);
+      const pending = this.pendingTerminalStatus.get(callSid);
+      if (!pending) return;
+      this.pendingTerminalStatus.delete(callSid);
+      await this.sendCallStatusUpdate(callSid, pending.status, pending.telegramChatId, {
+        ...pending.additionalData,
+        deferred: true
+      });
+    }, this.terminalQuietMs);
+    this.pendingTerminalTimers.set(callSid, timer);
+  }
+
   clampLevel(level) {
     if (!Number.isFinite(level)) return null;
     return Math.max(0, Math.min(1, level));
@@ -1190,6 +1234,7 @@ class EnhancedWebhookService {
   async setLiveCallPhase(callSid, phaseKey, options = {}) {
     const entry = this.liveConsoleByCallSid.get(callSid);
     if (!entry) return;
+    this.markCallActivity(callSid);
     const phase = this.getConsolePhaseLabel(phaseKey);
     entry.phase = phase;
     entry.phaseKey = phaseKey;
@@ -1206,7 +1251,7 @@ class EnhancedWebhookService {
       entry.waveformLevel = 0;
     }
     const phaseEvent = this.phaseEventText(phaseKey);
-    if (phaseEvent) {
+    if (phaseEvent && options.logEvent !== false) {
       this.addLiveEvent(callSid, phaseEvent, { force: !!options.force });
     }
     this.queueLiveConsoleUpdate(callSid, { force: !!options.force });
@@ -1228,6 +1273,7 @@ class EnhancedWebhookService {
   addLiveEvent(callSid, eventLine, options = {}) {
     const entry = this.liveConsoleByCallSid.get(callSid);
     if (!entry) return;
+    this.markCallActivity(callSid);
     const line = String(eventLine || '').trim();
     if (!line) return;
     entry.lastEvents.push(line);
@@ -1242,6 +1288,7 @@ class EnhancedWebhookService {
     if (!entry) return;
     const cleaned = this.truncatePreview(this.normalizePreviewText(text));
     if (!cleaned) return;
+    this.markCallActivity(callSid);
     this.mediaSeen.set(callSid, true);
     if (speaker === 'user') {
       entry.previewTurns.user = cleaned;
@@ -1602,6 +1649,13 @@ class EnhancedWebhookService {
     }
     this.lastSentimentAt.delete(callSid);
     this.mediaSeen.delete(callSid);
+    this.callActivityAt.delete(callSid);
+    this.pendingTerminalStatus.delete(callSid);
+    const pendingTimer = this.pendingTerminalTimers.get(callSid);
+    if (pendingTimer) {
+      clearTimeout(pendingTimer);
+      this.pendingTerminalTimers.delete(callSid);
+    }
   }
 
   // Enhanced immediate status update with better error handling

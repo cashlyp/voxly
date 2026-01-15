@@ -462,6 +462,21 @@ function createDigitCollectionService(options = {}) {
     return true;
   }
 
+  function updatePromptDelay(callSid, durationMs) {
+    const expectation = digitCollectionManager.expectations.get(callSid);
+    if (!expectation || !Number.isFinite(durationMs)) return false;
+    const baseDelayMs = Number.isFinite(expectation.min_collect_delay_ms)
+      ? expectation.min_collect_delay_ms
+      : 0;
+    const currentDelayMs = Number.isFinite(expectation.prompted_delay_ms)
+      ? expectation.prompted_delay_ms
+      : 0;
+    const nextDelayMs = Math.max(1000, baseDelayMs, currentDelayMs, durationMs);
+    expectation.prompted_delay_ms = nextDelayMs;
+    digitCollectionManager.expectations.set(callSid, expectation);
+    return true;
+  }
+
   function bufferDigits(callSid, digits = '', meta = {}) {
     if (!callSid || !digits) return;
     const existing = pendingDigits.get(callSid) || [];
@@ -1755,6 +1770,7 @@ function createDigitCollectionService(options = {}) {
     hasExpectation: (callSid) => digitCollectionManager.expectations.has(callSid),
     inferDigitExpectationFromText,
     markDigitPrompted,
+    updatePromptDelay,
     maskOtpForExternal,
     normalizeDigitExpectation,
     bufferDigits,
