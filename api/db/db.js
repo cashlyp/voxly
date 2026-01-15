@@ -1273,6 +1273,21 @@ class EnhancedDatabase {
                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
            )`;
 
+           const createSmsOptOutTable = `CREATE TABLE IF NOT EXISTS sms_opt_outs (
+               phone_number TEXT PRIMARY KEY,
+               reason TEXT,
+               opted_out INTEGER DEFAULT 1,
+               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+           )`;
+
+           const createSmsIdempotencyTable = `CREATE TABLE IF NOT EXISTS sms_idempotency (
+               idempotency_key TEXT PRIMARY KEY,
+               message_sid TEXT,
+               to_number TEXT,
+               body_hash TEXT,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+           )`;
+
            this.db.serialize(() => {
                this.db.run(createSMSTable, (err) => {
                    if (err) {
@@ -1286,10 +1301,24 @@ class EnhancedDatabase {
                    if (err) {
                        console.error('Error creating bulk SMS table:', err);
                        reject(err);
-                   } else {
-                       console.log('✅ SMS tables created successfully');
-                       resolve();
+                       return;
                    }
+                   this.db.run(createSmsOptOutTable, (optErr) => {
+                       if (optErr) {
+                           console.error('Error creating sms_opt_outs table:', optErr);
+                           reject(optErr);
+                           return;
+                       }
+                       this.db.run(createSmsIdempotencyTable, (idemErr) => {
+                           if (idemErr) {
+                               console.error('Error creating sms_idempotency table:', idemErr);
+                               reject(idemErr);
+                               return;
+                           }
+                           console.log('✅ SMS tables created successfully');
+                           resolve();
+                       });
+                   });
                });
            });
        });
@@ -1342,6 +1371,82 @@ class EnhancedDatabase {
                    reject(err);
                } else {
                    resolve(this.changes);
+               }
+           });
+       });
+   }
+
+   async setSmsOptOut(phoneNumber, reason = null) {
+       return new Promise((resolve, reject) => {
+           const sql = `INSERT INTO sms_opt_outs (phone_number, reason, opted_out, updated_at)
+               VALUES (?, ?, 1, CURRENT_TIMESTAMP)
+               ON CONFLICT(phone_number) DO UPDATE SET
+               reason = excluded.reason,
+               opted_out = 1,
+               updated_at = CURRENT_TIMESTAMP`;
+           this.db.run(sql, [phoneNumber, reason], function (err) {
+               if (err) {
+                   console.error('Error setting SMS opt-out:', err);
+                   reject(err);
+               } else {
+                   resolve(true);
+               }
+           });
+       });
+   }
+
+   async clearSmsOptOut(phoneNumber) {
+       return new Promise((resolve, reject) => {
+           const sql = `UPDATE sms_opt_outs SET opted_out = 0, updated_at = CURRENT_TIMESTAMP WHERE phone_number = ?`;
+           this.db.run(sql, [phoneNumber], function (err) {
+               if (err) {
+                   console.error('Error clearing SMS opt-out:', err);
+                   reject(err);
+               } else {
+                   resolve(true);
+               }
+           });
+       });
+   }
+
+   async isSmsOptedOut(phoneNumber) {
+       return new Promise((resolve, reject) => {
+           const sql = `SELECT opted_out FROM sms_opt_outs WHERE phone_number = ?`;
+           this.db.get(sql, [phoneNumber], (err, row) => {
+               if (err) {
+                   console.error('Error checking SMS opt-out:', err);
+                   reject(err);
+               } else {
+                   resolve(row ? row.opted_out === 1 : false);
+               }
+           });
+       });
+   }
+
+   async saveSmsIdempotency(idempotencyKey, messageSid, toNumber, bodyHash) {
+       return new Promise((resolve, reject) => {
+           const sql = `INSERT OR IGNORE INTO sms_idempotency (idempotency_key, message_sid, to_number, body_hash)
+               VALUES (?, ?, ?, ?)`;
+           this.db.run(sql, [idempotencyKey, messageSid, toNumber, bodyHash], function (err) {
+               if (err) {
+                   console.error('Error saving SMS idempotency:', err);
+                   reject(err);
+               } else {
+                   resolve(true);
+               }
+           });
+       });
+   }
+
+   async getSmsIdempotency(idempotencyKey) {
+       return new Promise((resolve, reject) => {
+           const sql = `SELECT * FROM sms_idempotency WHERE idempotency_key = ?`;
+           this.db.get(sql, [idempotencyKey], (err, row) => {
+               if (err) {
+                   console.error('Error fetching SMS idempotency:', err);
+                   reject(err);
+               } else {
+                   resolve(row || null);
                }
            });
        });

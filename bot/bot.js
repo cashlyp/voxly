@@ -605,30 +605,30 @@ bot.command('start', async (ctx) => {
             '👋 *Welcome to Voicednut Bot!*\n\nYou can make voice calls using AI agents.';
 
         const kb = new InlineKeyboard()
-          .text('📞 New Call', 'CALL')
-          .text('📚 Guide', 'GUIDE')
+          .text('📞 Call', 'CALL')
+          .text('💬 SMS', 'SMS')
             .row()
-            .text('💬 New Sms', 'SMS')
-            .text('⏰ Schedule SMS', 'SCHEDULE_SMS')
-            .row()
-            .text('📜 SMS Status', 'SMS_STATUS_HELP')
-            .text('🧾 SMS Threads', 'SMS_CONVO_HELP')
-            .row()
-            .text('🏥 Health', 'HEALTH')            
+            .text('⏰ Schedule', 'SCHEDULE_SMS')
             .text('📋 Menu', 'MENU')
             .row()
-            .text('❔ Help', 'HELP');
+            .text('📜 SMS Status', 'SMS_STATUS_HELP')
+            .text('🧾 Threads', 'SMS_CONVO_HELP')
+            .row()
+            .text('📚 Guide', 'GUIDE')
+            .text('🏥 Health', 'HEALTH')
+            .row()
+            .text('ℹ️ Help', 'HELP');
 
         if (isOwner) {
             kb.row()
-                .text('➕ Add User', 'ADDUSER')
-                .text('⬆️ Promote', 'PROMOTE')
+                .text('📤 Bulk', 'BULK_SMS')
+                .text('📊 Stats', 'SMS_STATS')
             .row()
                 .text('👥 Users', 'USERS')
-                .text('❌ Remove', 'REMOVE')
+                .text('➕ Add', 'ADDUSER')
             .row()
-                .text('📤 Bulk SMS', 'BULK_SMS')
-                .text('📊 SMS Stats', 'SMS_STATS')
+                .text('⬆️ Promote', 'PROMOTE')
+                .text('❌ Remove', 'REMOVE')
             .row()
                 .text('☎️ Provider', 'PROVIDER_STATUS')
                 .text('🔍 Status', 'STATUS');
@@ -956,16 +956,16 @@ async function executeHelpCommand(ctx) {
 • For issues or questions, contact support`;
         
         const kb = new InlineKeyboard()
-        .text('📞 New Call', 'CALL')
+        .text('📞 Call', 'CALL')
         .text('📋 Menu', 'MENU')
         .row()
-        .text('📱 New SMS', 'SMS')
-        .text('📚 Full Guide', 'GUIDE');
+        .text('💬 SMS', 'SMS')
+        .text('📚 Guide', 'GUIDE');
         
         if (isOwner) {
             kb.row()
             .text('👥 Users', 'USERS')
-            .text('➕ Add User', 'ADDUSER')
+            .text('➕ Add', 'ADDUSER')
             .row()
             .text('☎️ Provider', 'PROVIDER_STATUS');
         }
@@ -1055,11 +1055,11 @@ Contact: @${config.admin.username} for support.
 Version: 2.0.0`;
 
     const kb = new InlineKeyboard()
-        .text('📞 New Call', 'CALL')
+        .text('📞 Call', 'CALL')
         .text('📋 Commands', 'HELP')
         .row()
-        .text('🔄 Main Menu', 'MENU')
-        .text('New SMS', 'SMS');
+        .text('🔄 Menu', 'MENU')
+        .text('💬 SMS', 'SMS');
 
     await ctx.reply(mainGuide, {
         parse_mode: 'Markdown',
@@ -1069,37 +1069,37 @@ Version: 2.0.0`;
 
 async function executeMenuCommand(ctx, isAdminUser) {
     const kb = new InlineKeyboard()
-        .text('📞 New Call', 'CALL')
-        .text('📱 Send SMS', 'SMS')
+        .text('📞 Call', 'CALL')
+        .text('💬 SMS', 'SMS')
         .row()
-        .text('⏰ Schedule SMS', 'SCHEDULE_SMS')
+        .text('⏰ Schedule', 'SCHEDULE_SMS')
         .text('📜 SMS Status', 'SMS_STATUS_HELP')
         .row()
-        .text('📋 Recent Calls', 'CALLS')
-        .text('📚 Guide', 'GUIDE')
+        .text('📋 Calls', 'CALLS')
+        .text('🧾 Threads', 'SMS_CONVO_HELP')
         .row()
-        .text('🧾 SMS Threads', 'SMS_CONVO_HELP')
-        .text('🏥 Health Check', 'HEALTH')
+        .text('📚 Guide', 'GUIDE')
+        .text('🏥 Health', 'HEALTH')
         .row()
         .text('ℹ️ Help', 'HELP');
 
     if (isAdminUser) {
         kb.row()
-            .text('📤 Bulk SMS', 'BULK_SMS')
-            .row()
-            .text('➕ Add User', 'ADDUSER')
-            .text('⬆️ Promote', 'PROMOTE')
+            .text('📤 Bulk', 'BULK_SMS')
+            .text('📊 Stats', 'SMS_STATS')
             .row()
             .text('👥 Users', 'USERS')
+            .text('➕ Add', 'ADDUSER')
+            .row()
+            .text('⬆️ Promote', 'PROMOTE')
             .text('❌ Remove', 'REMOVE')
             .row()
             .text('🧰 Templates', 'TEMPLATES')
-            .text('📊 SMS Stats', 'SMS_STATS')
+            .text('📥 Recent', 'RECENT_SMS')
             .row()
-            .text('📥 Recent SMS', 'RECENT_SMS')
             .text('☎️ Provider', 'PROVIDER_STATUS')
-            .row()
             .text('🔍 Status', 'STATUS')
+            .row()
             .text('🧪 Test API', 'TEST_API');
     }
 

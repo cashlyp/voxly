@@ -577,7 +577,7 @@ async function callFlow(conversation, ctx) {
       detailLines.push(tipLine('⚙️', 'Mode: Auto'));
     }
 
-    const replyOptions = {};
+    const replyOptions = { parse_mode: 'Markdown' };
     if (hasAutoFields) {
       const detailsKey = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
       if (!ctx.session.callDetailsCache) {

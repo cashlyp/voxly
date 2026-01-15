@@ -108,16 +108,16 @@ module.exports = (bot) => {
             const kb = isAuthorized
                 ? (() => {
                     const keyboard = new InlineKeyboard()
-                        .text('📞 New Call', 'CALL')
+                        .text('📞 Call', 'CALL')
                         .text('📋 Menu', 'MENU')
                         .row()
-                        .text('💬 New Sms', 'SMS')
-                        .text('📚 Full Guide', 'GUIDE');
+                        .text('💬 SMS', 'SMS')
+                        .text('📚 Guide', 'GUIDE');
 
                     if (isOwner) {
                         keyboard.row()
                             .text('👥 Users', 'USERS')
-                            .text('➕ Add User', 'ADDUSER')
+                            .text('➕ Add', 'ADDUSER')
                             .row()
                             .text('☎️ Provider', 'PROVIDER_STATUS');
                     }

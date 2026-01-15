@@ -43,7 +43,7 @@ const HMAC_BYPASS_PATH_PREFIXES = ['/webhook/', '/incoming', '/aws/transcripts',
 let db;
 let digitService;
 const functionEngine = new DynamicFunctionEngine();
-const smsService = new EnhancedSmsService();
+let smsService = new EnhancedSmsService();
 
 function stableStringify(value) {
   if (value === null || typeof value !== 'object') {
@@ -1221,6 +1221,9 @@ async function startServer() {
     db = new Database();
     await db.initialize();
     console.log('✅ Enhanced database initialized successfully');
+    if (smsService?.setDb) {
+      smsService.setDb(db);
+    }
 
     // Start webhook service after database is ready
     console.log('Starting enhanced webhook service...');
@@ -4542,7 +4545,17 @@ app.post('/webhook/twilio-gather', async (req, res) => {
 // Send single SMS endpoint
 app.post('/api/sms/send', async (req, res) => {
     try {
-        const { to, message, from, user_chat_id } = req.body;
+        const {
+            to,
+            message,
+            from,
+            user_chat_id,
+            options = {},
+            idempotency_key,
+            allow_quiet_hours,
+            quiet_hours,
+            media_url
+        } = req.body;
 
         if (!to || !message) {
             return res.status(400).json({
@@ -4559,7 +4572,21 @@ app.post('/api/sms/send', async (req, res) => {
             });
         }
 
-        const result = await smsService.sendSMS(to, message, from);
+        const smsOptions = { ...(options || {}) };
+        if (idempotency_key && !smsOptions.idempotencyKey) {
+            smsOptions.idempotencyKey = idempotency_key;
+        }
+        if (allow_quiet_hours === false) {
+            smsOptions.allowQuietHours = false;
+        }
+        if (quiet_hours && !smsOptions.quietHours) {
+            smsOptions.quietHours = quiet_hours;
+        }
+        if (media_url && !smsOptions.mediaUrl) {
+            smsOptions.mediaUrl = media_url;
+        }
+
+        const result = await smsService.sendSMS(to, message, from, smsOptions);
 
         // Save to database
         if (db) {
@@ -4600,7 +4627,14 @@ app.post('/api/sms/send', async (req, res) => {
 // Send bulk SMS endpoint
 app.post('/api/sms/bulk', async (req, res) => {
     try {
-        const { recipients, message, options = {}, user_chat_id } = req.body;
+        const {
+            recipients,
+            message,
+            options = {},
+            user_chat_id,
+            from,
+            sms_options
+        } = req.body;
 
         if (!recipients || !Array.isArray(recipients) || recipients.length === 0) {
             return res.status(400).json({
@@ -4623,7 +4657,15 @@ app.post('/api/sms/bulk', async (req, res) => {
             });
         }
 
-        const result = await smsService.sendBulkSMS(recipients, message, options);
+        const bulkOptions = { ...(options || {}) };
+        if (from && !bulkOptions.from) {
+            bulkOptions.from = from;
+        }
+        if (sms_options && !bulkOptions.smsOptions) {
+            bulkOptions.smsOptions = sms_options;
+        }
+
+        const result = await smsService.sendBulkSMS(recipients, message, bulkOptions);
 
         // Log bulk operation
         if (db) {

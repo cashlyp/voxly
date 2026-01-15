@@ -35,6 +35,51 @@ function isValidPhoneNumber(number) {
     return e164Regex.test(number.trim());
 }
 
+const GSM7_BASIC_CHARS = new Set([
+    '@', '£', '$', '¥', 'è', 'é', 'ù', 'ì', 'ò', 'Ç', '\n', 'Ø', 'ø', '\r', 'Å', 'å',
+    'Δ', '_', 'Φ', 'Γ', 'Λ', 'Ω', 'Π', 'Ψ', 'Σ', 'Θ', 'Ξ', 'Æ', 'æ', 'ß', 'É', ' ',
+    '!', '"', '#', '¤', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/',
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ':', ';', '<', '=', '>', '?',
+    '¡', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O',
+    'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'Ä', 'Ö', 'Ñ', 'Ü', '§',
+    '¿', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o',
+    'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'ä', 'ö', 'ñ', 'ü', 'à'
+]);
+const GSM7_EXT_CHARS = new Set(['^', '{', '}', '\\', '[', '~', ']', '|', '€']);
+
+function getSmsSegmentInfo(text) {
+    const value = String(text || '');
+    if (!value) {
+        return { encoding: 'gsm-7', length: 0, units: 0, per_segment: 160, segments: 0 };
+    }
+
+    let units = 0;
+    let isGsm7 = true;
+    for (const ch of value) {
+        if (GSM7_BASIC_CHARS.has(ch)) {
+            units += 1;
+            continue;
+        }
+        if (GSM7_EXT_CHARS.has(ch)) {
+            units += 2;
+            continue;
+        }
+        isGsm7 = false;
+        break;
+    }
+
+    if (!isGsm7) {
+        const length = value.length;
+        const perSegment = length <= 70 ? 70 : 67;
+        const segments = Math.ceil(length / perSegment);
+        return { encoding: 'ucs-2', length, units: length, per_segment: perSegment, segments };
+    }
+
+    const perSegment = units <= 160 ? 160 : 153;
+    const segments = Math.ceil(units / perSegment);
+    return { encoding: 'gsm-7', length: value.length, units, per_segment: perSegment, segments };
+}
+
 // SMS sending flow (UNCHANGED - already working)
 async function smsFlow(conversation, ctx) {
     const opId = startOperation(ctx, 'sms');
@@ -351,21 +396,63 @@ Tap an option below to continue.`;
             payload.template_variables = templateVariables;
         }
 
-        const summaryLines = [
-            '📱 *SMS Details:*',
-            '',
-            `📞 To: ${number}`,
-            `💬 Message: ${message.substring(0, 100)}${message.length > 100 ? '...' : ''}`,
-            `📏 Length: ${message.length} characters`,
-        ];
+        let previewAction = null;
+        while (true) {
+            const segmentInfo = getSmsSegmentInfo(message);
+            const previewLines = [
+                '📱 SMS Preview',
+                '',
+                `📞 To: ${number}`,
+                `📏 Length: ${segmentInfo.length} characters`,
+                `📦 Segments: ${segmentInfo.segments} (${segmentInfo.encoding.toUpperCase()} ${segmentInfo.units}/${segmentInfo.per_segment})`,
+                '',
+                '💬 Message:',
+                message
+            ];
 
-        if (personaSummary.length > 0) {
-            summaryLines.push('', ...personaSummary.map((line) => `• ${line}`));
+            if (personaSummary.length > 0) {
+                previewLines.push('', 'Details:', ...personaSummary.map((line) => `• ${line}`));
+            }
+
+            previewAction = await askWithGuard(
+                conversation,
+                ctx,
+                previewLines.join('\n'),
+                [
+                    { id: 'send', label: '✅ Send now' },
+                    { id: 'edit', label: '✏️ Edit message' },
+                    { id: 'cancel', label: '🛑 Cancel' }
+                ],
+                { prefix: 'sms-preview', columns: 2 }
+            );
+
+            if (!previewAction || previewAction.id === 'cancel') {
+                await ctx.reply('🛑 SMS cancelled.');
+                return;
+            }
+
+            if (previewAction.id === 'edit') {
+                await ctx.reply('✏️ Edit the SMS message (max 1600 characters):');
+                const msgContent = await waitForMessage();
+                const edited = msgContent?.message?.text?.trim();
+                if (!edited) {
+                    await smsAlert(ctx, 'Please provide a message.');
+                    continue;
+                }
+                if (edited.length > 1600) {
+                    await ctx.reply('❌ Message too long. SMS messages must be under 1600 characters.');
+                    continue;
+                }
+                message = edited;
+                continue;
+            }
+
+            if (previewAction.id === 'send') {
+                break;
+            }
         }
 
-        summaryLines.push('', '⏳ Sending SMS...');
-
-        await ctx.reply(summaryLines.join('\n'), { parse_mode: 'Markdown' });
+        await ctx.reply('⏳ Sending SMS...');
 
         const response = await guardedPost(`${config.apiUrl}/api/sms/send`, {
             ...payload,
@@ -377,12 +464,14 @@ Tap an option below to continue.`;
         const data = response?.data || {};
 
         if (data.success) {
+            const segmentInfo = data.segment_info || getSmsSegmentInfo(message);
             const successMsg =
                 `✅ *SMS Sent Successfully!*\n\n` +
                 `📱 To: ${data.to}\n` +
                 `🆔 Message SID: \`${data.message_sid}\`\n` +
                 `📊 Status: ${data.status}\n` +
-                `📤 From: ${data.from}\n\n` +
+                `📤 From: ${data.from}\n` +
+                `📦 Segments: ${segmentInfo.segments} (${segmentInfo.encoding.toUpperCase()} ${segmentInfo.units}/${segmentInfo.per_segment})\n\n` +
                 `🔔 You'll receive delivery notifications`;
 
             await ctx.reply(successMsg, { parse_mode: 'Markdown' });
@@ -433,6 +522,11 @@ async function bulkSmsFlow(conversation, ctx) {
         }
         return update;
     };
+    const askWithGuard = async (...params) => {
+        const result = await askOptionWithButtons(...params);
+        ensureActive();
+        return result;
+    };
 
     try {
         ensureActive();
@@ -474,22 +568,67 @@ async function bulkSmsFlow(conversation, ctx) {
 
         await ctx.reply(`💬 Enter the message to send to ${numbers.length} recipients (max 1600 chars):`);
         const msgContent = await waitForMessage();
-        const message = msgContent?.message?.text?.trim();
+        let message = msgContent?.message?.text?.trim();
 
         if (!message) return smsAlert(ctx, 'Please provide a message.');
         if (message.length > 1600) {
             return ctx.reply('❌ Message too long. SMS messages must be under 1600 characters.');
         }
 
-        const confirmText =
-            `📱 *Bulk SMS Details:*\n\n` +
-            `👥 Recipients: ${numbers.length}\n` +
-            `📱 Numbers: ${numbers.slice(0, 3).join(', ')}${numbers.length > 3 ? '...' : ''}\n` +
-            `💬 Message: ${message.substring(0, 80)}${message.length > 80 ? '...' : ''}\n` +
-            `📏 Length: ${message.length} characters\n\n` +
-            `⏳ Sending bulk SMS...`;
+        let previewAction = null;
+        while (true) {
+            const segmentInfo = getSmsSegmentInfo(message);
+            const previewLines = [
+                '📣 Bulk SMS Preview',
+                '',
+                `👥 Recipients: ${numbers.length}`,
+                `📱 Sample: ${numbers.slice(0, 3).join(', ')}${numbers.length > 3 ? '...' : ''}`,
+                `📏 Length: ${segmentInfo.length} characters`,
+                `📦 Segments: ${segmentInfo.segments} (${segmentInfo.encoding.toUpperCase()} ${segmentInfo.units}/${segmentInfo.per_segment})`,
+                '',
+                '💬 Message:',
+                message
+            ];
 
-        await ctx.reply(confirmText, { parse_mode: 'Markdown' });
+            previewAction = await askWithGuard(
+                conversation,
+                ctx,
+                previewLines.join('\n'),
+                [
+                    { id: 'send', label: '✅ Send now' },
+                    { id: 'edit', label: '✏️ Edit message' },
+                    { id: 'cancel', label: '🛑 Cancel' }
+                ],
+                { prefix: 'bulk-sms-preview', columns: 2 }
+            );
+
+            if (!previewAction || previewAction.id === 'cancel') {
+                await ctx.reply('🛑 Bulk SMS cancelled.');
+                return;
+            }
+
+            if (previewAction.id === 'edit') {
+                await ctx.reply('✏️ Edit the bulk SMS message (max 1600 characters):');
+                const editedMsg = await waitForMessage();
+                const edited = editedMsg?.message?.text?.trim();
+                if (!edited) {
+                    await smsAlert(ctx, 'Please provide a message.');
+                    continue;
+                }
+                if (edited.length > 1600) {
+                    await ctx.reply('❌ Message too long. SMS messages must be under 1600 characters.');
+                    continue;
+                }
+                message = edited;
+                continue;
+            }
+
+            if (previewAction.id === 'send') {
+                break;
+            }
+        }
+
+        await ctx.reply('⏳ Sending bulk SMS...');
 
         const payload = {
             recipients: numbers,
@@ -506,19 +645,29 @@ async function bulkSmsFlow(conversation, ctx) {
 
         if (data.success) {
             const result = data;
+            const segmentInfo = result.segment_info || getSmsSegmentInfo(message);
+            const scheduledCount = Number(result.scheduled) || 0;
+            const suppressedCount = Number(result.suppressed) || 0;
+            const invalidCount = Number(result.invalid) || 0;
+            const hardFailed = Math.max(0, result.failed - suppressedCount - invalidCount);
+            const immediateSent = Math.max(0, result.successful - scheduledCount);
             const successMsg =
                 `✅ *Bulk SMS Completed!*\n\n` +
                 `👥 Total Recipients: ${result.total}\n` +
-                `✅ Successful: ${result.successful}\n` +
-                `❌ Failed: ${result.failed}\n` +
+                `✅ Sent now: ${immediateSent}\n` +
+                `🗓️ Scheduled: ${scheduledCount}\n` +
+                `🚫 Suppressed (opt-out): ${suppressedCount}\n` +
+                `⚠️ Invalid numbers: ${invalidCount}\n` +
+                `❌ Failed: ${hardFailed}\n` +
                 `📊 Success Rate: ${Math.round((result.successful / result.total) * 100)}%\n\n` +
+                `📦 Segments per SMS: ${segmentInfo.segments} (${segmentInfo.encoding.toUpperCase()} ${segmentInfo.units}/${segmentInfo.per_segment})\n\n` +
                 `🔔 Individual delivery reports will follow`;
 
             await ctx.reply(successMsg, { parse_mode: 'Markdown' });
 
-            if (result.failed > 0) {
-                const failedResults = result.results.filter(r => !r.success);
-                if (failedResults.length <= 10) {
+            if (hardFailed > 0) {
+                const failedResults = result.results.filter(r => !r.success && !r.suppressed && r.error !== 'invalid_phone_format');
+                if (failedResults.length <= 10 && failedResults.length > 0) {
                     let failedMsg = '❌ *Failed Numbers:*\n\n';
                     failedResults.forEach(r => {
                         failedMsg += `• ${r.recipient}: ${r.error}\n`;

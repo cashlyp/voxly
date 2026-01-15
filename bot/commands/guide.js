@@ -60,11 +60,11 @@ module.exports = (bot) => {
         const guideText = guideSections.join('\n\n');
 
         const kb = new InlineKeyboard()
-            .text('📞 New Call', 'CALL')
+            .text('📞 Call', 'CALL')
             .text('📋 Commands', 'HELP')
             .row()
-            .text('💬 New Sms', 'SMS')
-            .text('🔄 Main Menu', 'MENU');
+            .text('💬 SMS', 'SMS')
+            .text('🔄 Menu', 'MENU');
 
         await ctx.reply(guideText, {
             parse_mode: 'Markdown',

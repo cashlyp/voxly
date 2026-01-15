@@ -55,6 +55,11 @@ class EnhancedWebhookService {
     this.pendingTerminalStatus = new Map();
     this.pendingTerminalTimers = new Map();
     this.terminalQuietMs = 8000;
+    this.pendingTranscriptNotifs = new Map();
+    this.pendingTranscriptTimers = new Map();
+    this.transcriptRetryMs = 3000;
+    this.transcriptMaxWaitMs = 10 * 60 * 1000;
+    this.terminalStatusSent = new Map();
   }
 
   normalizeStatus(value) {
@@ -68,6 +73,17 @@ class EnhancedWebhookService {
 
   isTerminalStatus(status) {
     return ['completed', 'no-answer', 'busy', 'failed', 'canceled', 'voicemail'].includes(status);
+  }
+
+  isTerminalStatusForCall(callDetails, statusInfo) {
+    const persisted = this.normalizeStatus(callDetails?.status || callDetails?.twilio_status);
+    if (this.isTerminalStatus(persisted)) return true;
+    const last = statusInfo?.lastStatus;
+    return this.isTerminalStatus(last);
+  }
+
+  isTerminalMessageSent(callSid) {
+    return this.terminalStatusSent.get(callSid) === true;
   }
 
   formatContactLabel(phoneNumber) {
@@ -548,11 +564,18 @@ class EnhancedWebhookService {
         const replyMarkup = shouldOfferRetry ? this.buildRetryActions(call_sid) : null;
         await this.sendTelegramMessage(telegram_chat_id, fullMessage, false, { replyMarkup });
         console.log(`✅ Sent enhanced status update: ${correctedStatus} for call ${call_sid}`);
+        if (this.isTerminalStatus(correctedStatus)) {
+          this.terminalStatusSent.set(call_sid, true);
+        }
       } else {
         console.log(`⏭️ Console-only status ${correctedStatus} for call ${call_sid}`);
       }
       await consolePromise;
       await this.updateLiveConsoleStatus(call_sid, correctedStatus, telegram_chat_id, statusSource);
+
+      if (this.isTerminalStatus(correctedStatus)) {
+        await this.flushPendingTranscript(call_sid);
+      }
 
       // Log notification metric
       if (this.db && this.db.logNotificationMetric) {
@@ -744,6 +767,7 @@ class EnhancedWebhookService {
 
     try {
       let success = false;
+      let shouldMarkSent = true;
 
       switch (notification_type) {
         case 'call_initiated':
@@ -770,9 +794,14 @@ class EnhancedWebhookService {
           // Deprecated: recap options should not be pushed in status notifications
           success = true;
           break;
-        case 'call_transcript':
-          success = await this.sendCallTranscript(call_sid, telegram_chat_id);
+        case 'call_transcript': {
+          const result = await this.deferTranscriptIfNeeded(notification);
+          success = result?.ok === true;
+          if (result?.deferred) {
+            shouldMarkSent = false;
+          }
           break;
+        }
         case 'call_failed':
           const failedCall = await this.db.getCall(call_sid);
           success = await this.sendCallStatusUpdate(call_sid, 'failed', telegram_chat_id, { 
@@ -816,8 +845,12 @@ class EnhancedWebhookService {
       }
 
       if (success) {
-        await this.db.updateEnhancedWebhookNotification(id, 'sent', null, null);
-        console.log(`✅ Processed enhanced notification ${id} (${notification_type})`);
+        if (shouldMarkSent) {
+          await this.db.updateEnhancedWebhookNotification(id, 'sent', null, null);
+          console.log(`✅ Processed enhanced notification ${id} (${notification_type})`);
+        } else {
+          console.log(`✅ Deferred enhanced notification ${id} (${notification_type})`);
+        }
       } else {
         throw new Error('Failed to send notification');
       }
@@ -870,6 +903,17 @@ class EnhancedWebhookService {
       throw new Error(`Telegram API error: ${response.data.description || 'Unknown error'}`);
     }
 
+    return response.data;
+  }
+
+  async sendTelegramAudio(chatId, audioUrl, caption = '') {
+    const url = `https://api.telegram.org/bot${this.telegramBotToken}/sendAudio`;
+    const payload = {
+      chat_id: chatId,
+      audio: audioUrl,
+      caption: caption || undefined
+    };
+    const response = await axios.post(url, payload);
     return response.data;
   }
 
@@ -1655,6 +1699,76 @@ class EnhancedWebhookService {
     if (pendingTimer) {
       clearTimeout(pendingTimer);
       this.pendingTerminalTimers.delete(callSid);
+    }
+    this.pendingTranscriptNotifs.delete(callSid);
+    const transcriptTimer = this.pendingTranscriptTimers.get(callSid);
+    if (transcriptTimer) {
+      clearTimeout(transcriptTimer);
+      this.pendingTranscriptTimers.delete(callSid);
+    }
+    this.terminalStatusSent.delete(callSid);
+  }
+
+  async deferTranscriptIfNeeded(notification) {
+    const { id, call_sid, telegram_chat_id } = notification;
+    if (this.isTerminalMessageSent(call_sid)) {
+      const sent = await this.sendCallTranscript(call_sid, telegram_chat_id);
+      return { ok: sent, deferred: false };
+    }
+
+    if (!this.pendingTranscriptNotifs.has(call_sid)) {
+      this.pendingTranscriptNotifs.set(call_sid, {
+        id,
+        telegram_chat_id,
+        createdAt: Date.now(),
+        attempts: 0
+      });
+    }
+    this.scheduleTranscriptRetry(call_sid);
+    console.log(`⏳ Deferring transcript for ${call_sid} until call ends`);
+    return { ok: true, deferred: true };
+  }
+
+  scheduleTranscriptRetry(callSid) {
+    if (this.pendingTranscriptTimers.has(callSid)) return;
+    const timer = setTimeout(() => {
+      this.pendingTranscriptTimers.delete(callSid);
+      this.flushPendingTranscript(callSid).catch(() => {});
+    }, this.transcriptRetryMs);
+    this.pendingTranscriptTimers.set(callSid, timer);
+  }
+
+  async flushPendingTranscript(callSid) {
+    const pending = this.pendingTranscriptNotifs.get(callSid);
+    if (!pending) return;
+    const isTerminalSent = this.isTerminalMessageSent(callSid);
+    pending.attempts += 1;
+    const ageMs = Date.now() - pending.createdAt;
+
+    if (!isTerminalSent && ageMs < this.transcriptMaxWaitMs) {
+      this.pendingTranscriptNotifs.set(callSid, pending);
+      this.scheduleTranscriptRetry(callSid);
+      return;
+    }
+
+    if (!isTerminalSent) {
+      await this.db.updateEnhancedWebhookNotification(pending.id, 'failed', 'Transcript waiting for terminal status', null);
+      this.pendingTranscriptNotifs.delete(callSid);
+      return;
+    }
+
+    const sent = await this.sendCallTranscript(callSid, pending.telegram_chat_id);
+    if (sent) {
+      await this.db.updateEnhancedWebhookNotification(pending.id, 'sent', null, null);
+      this.pendingTranscriptNotifs.delete(callSid);
+    } else {
+      if (ageMs < this.transcriptMaxWaitMs) {
+        this.pendingTranscriptNotifs.set(callSid, pending);
+        this.scheduleTranscriptRetry(callSid);
+      } else {
+        await this.db.updateEnhancedWebhookNotification(pending.id, 'failed', 'Transcript deferred too long', null);
+        this.pendingTranscriptNotifs.delete(callSid);
+      }
     }
   }
 

@@ -1,10 +1,61 @@
 const EventEmitter = require('events');
 const axios = require('axios');
+const crypto = require('crypto');
 const config = require('../config');
 
+const GSM7_BASIC_CHARS = new Set([
+    '@', '£', '$', '¥', 'è', 'é', 'ù', 'ì', 'ò', 'Ç', '\n', 'Ø', 'ø', '\r', 'Å', 'å',
+    'Δ', '_', 'Φ', 'Γ', 'Λ', 'Ω', 'Π', 'Ψ', 'Σ', 'Θ', 'Ξ', 'Æ', 'æ', 'ß', 'É', ' ',
+    '!', '"', '#', '¤', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/',
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ':', ';', '<', '=', '>', '?',
+    '¡', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O',
+    'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'Ä', 'Ö', 'Ñ', 'Ü', '§',
+    '¿', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o',
+    'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'ä', 'ö', 'ñ', 'ü', 'à'
+]);
+const GSM7_EXT_CHARS = new Set(['^', '{', '}', '\\', '[', '~', ']', '|', '€']);
+
+function getSmsSegmentInfo(text) {
+    const value = String(text || '');
+    if (!value) {
+        return { encoding: 'gsm-7', length: 0, units: 0, per_segment: 160, segments: 0 };
+    }
+
+    let units = 0;
+    let isGsm7 = true;
+    for (const ch of value) {
+        if (GSM7_BASIC_CHARS.has(ch)) {
+            units += 1;
+            continue;
+        }
+        if (GSM7_EXT_CHARS.has(ch)) {
+            units += 2;
+            continue;
+        }
+        isGsm7 = false;
+        break;
+    }
+
+    if (!isGsm7) {
+        const length = value.length;
+        const perSegment = length <= 70 ? 70 : 67;
+        const segments = Math.ceil(length / perSegment);
+        return { encoding: 'ucs-2', length, units: length, per_segment: perSegment, segments };
+    }
+
+    const perSegment = units <= 160 ? 160 : 153;
+    const segments = Math.ceil(units / perSegment);
+    return { encoding: 'gsm-7', length: value.length, units, per_segment: perSegment, segments };
+}
+
+function isValidE164(number) {
+    return /^\+[1-9]\d{1,14}$/.test(String(number || '').trim());
+}
+
 class EnhancedSmsService extends EventEmitter {
-    constructor() {
+    constructor(options = {}) {
         super();
+        this.db = options.db || null;
         this.twilio = require('twilio')(
             config.twilio.accountSid,
             config.twilio.authToken
@@ -22,39 +73,203 @@ class EnhancedSmsService extends EventEmitter {
         // SMS conversation tracking
         this.activeConversations = new Map();
         this.messageQueue = new Map(); // Queue for outbound messages
+        this.optOutCache = new Map();
+        this.idempotencyCache = new Map();
+        this.lastSendAt = new Map();
+        this.defaultQuietHours = { start: 9, end: 20 };
+        this.defaultMaxRetries = 2;
+        this.defaultRetryDelayMs = 2000;
+        this.defaultMinIntervalMs = 2000;
+    }
+
+    setDb(db) {
+        this.db = db;
+    }
+
+    normalizePhone(phone) {
+        return String(phone || '').trim();
+    }
+
+    normalizeBody(body) {
+        return String(body || '').trim();
+    }
+
+    hashBody(body) {
+        const text = this.normalizeBody(body);
+        if (!text) return '';
+        return crypto.createHash('sha256').update(text).digest('hex');
+    }
+
+    isRetryableSmsError(error) {
+        const code = error?.code || error?.status || error?.statusCode;
+        const retryableCodes = new Set([30005, 30007, 30008, 21614, 21617]);
+        if (retryableCodes.has(code)) return true;
+        const msg = String(error?.message || '').toLowerCase();
+        return msg.includes('timeout') || msg.includes('rate') || msg.includes('temporarily');
+    }
+
+    matchesOptOut(text = '') {
+        const body = text.trim().toLowerCase();
+        return ['stop', 'unsubscribe', 'cancel', 'quit', 'end'].includes(body);
+    }
+
+    matchesOptIn(text = '') {
+        const body = text.trim().toLowerCase();
+        return ['start', 'unstop', 'subscribe', 'yes'].includes(body);
+    }
+
+    async isOptedOut(phone) {
+        const key = this.normalizePhone(phone);
+        if (this.optOutCache.has(key)) {
+            return this.optOutCache.get(key) === true;
+        }
+        if (this.db?.isSmsOptedOut) {
+            try {
+                const optedOut = await this.db.isSmsOptedOut(key);
+                this.optOutCache.set(key, optedOut);
+                return optedOut;
+            } catch {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    async setOptOut(phone, reason = null) {
+        const key = this.normalizePhone(phone);
+        this.optOutCache.set(key, true);
+        if (this.db?.setSmsOptOut) {
+            await this.db.setSmsOptOut(key, reason);
+        }
+    }
+
+    async clearOptOut(phone) {
+        const key = this.normalizePhone(phone);
+        this.optOutCache.set(key, false);
+        if (this.db?.clearSmsOptOut) {
+            await this.db.clearSmsOptOut(key);
+        }
+    }
+
+    isWithinQuietHours(date = new Date(), quietHours = null) {
+        const hours = quietHours || this.defaultQuietHours;
+        const hour = date.getHours();
+        return hour < hours.start || hour >= hours.end;
+    }
+
+    nextAllowedTime(date = new Date(), quietHours = null) {
+        const hours = quietHours || this.defaultQuietHours;
+        const next = new Date(date);
+        if (next.getHours() >= hours.end) {
+            next.setDate(next.getDate() + 1);
+        }
+        next.setHours(hours.start, 0, 0, 0);
+        return next;
     }
 
     // Send individual SMS
-    async sendSMS(to, message, from = null) {
+    async sendSMS(to, message, from = null, options = {}) {
         try {
             const fromNumber = from || config.twilio.fromNumber;
+            const normalizedTo = this.normalizePhone(to);
+            const body = this.normalizeBody(message);
+            const {
+                idempotencyKey = null,
+                allowQuietHours = true,
+                quietHours = null,
+                maxRetries = this.defaultMaxRetries,
+                retryDelayMs = this.defaultRetryDelayMs,
+                minIntervalMs = this.defaultMinIntervalMs,
+                mediaUrl = null
+            } = options;
 
             if (!fromNumber) {
                 throw new Error('No FROM_NUMBER configured for SMS');
             }
 
-            console.log(`📱 Sending SMS to ${to}: ${message.substring(0, 50)}...`);
+            if (!normalizedTo) {
+                throw new Error('No destination number provided');
+            }
 
-            const smsMessage = await this.twilio.messages.create({
-                body: message,
+            if (!body) {
+                throw new Error('No message body provided');
+            }
+
+            const segmentInfo = getSmsSegmentInfo(body);
+
+            if (await this.isOptedOut(normalizedTo)) {
+                return { success: false, suppressed: true, reason: 'opted_out', segment_info: segmentInfo };
+            }
+
+            if (allowQuietHours && this.isWithinQuietHours(new Date(), quietHours)) {
+                const scheduledTime = this.nextAllowedTime(new Date(), quietHours);
+                await this.scheduleSMS(normalizedTo, body, scheduledTime, { reason: 'quiet_hours' });
+                return { success: true, scheduled: true, scheduled_time: scheduledTime.toISOString(), segment_info: segmentInfo };
+            }
+
+            const lastSend = this.lastSendAt.get(normalizedTo) || 0;
+            if (Date.now() - lastSend < minIntervalMs) {
+                const scheduledTime = new Date(Date.now() + minIntervalMs);
+                await this.scheduleSMS(normalizedTo, body, scheduledTime, { reason: 'rate_limit' });
+                return { success: true, scheduled: true, scheduled_time: scheduledTime.toISOString(), segment_info: segmentInfo };
+            }
+
+            if (idempotencyKey) {
+                if (this.idempotencyCache.has(idempotencyKey)) {
+                    return { success: true, idempotent: true, message_sid: this.idempotencyCache.get(idempotencyKey), segment_info: segmentInfo };
+                }
+                if (this.db?.getSmsIdempotency) {
+                    const existing = await this.db.getSmsIdempotency(idempotencyKey);
+                    if (existing?.message_sid) {
+                        this.idempotencyCache.set(idempotencyKey, existing.message_sid);
+                        return { success: true, idempotent: true, message_sid: existing.message_sid, segment_info: segmentInfo };
+                    }
+                }
+            }
+
+            console.log(`📱 Sending SMS to ${normalizedTo}: ${body.substring(0, 50)}...`);
+
+            const payload = {
+                body,
                 from: fromNumber,
-                to: to,
+                to: normalizedTo,
                 statusCallback: config.server.hostname
                     ? `https://${config.server.hostname}/webhook/sms-status`
                     : undefined
-            });
+            };
+            if (mediaUrl) {
+                payload.mediaUrl = Array.isArray(mediaUrl) ? mediaUrl : [mediaUrl];
+            }
+
+            const smsMessage = await this.twilio.messages.create(payload);
 
             console.log(`✅ SMS sent successfully: ${smsMessage.sid}`);
+            this.lastSendAt.set(normalizedTo, Date.now());
+            if (idempotencyKey) {
+                this.idempotencyCache.set(idempotencyKey, smsMessage.sid);
+                if (this.db?.saveSmsIdempotency) {
+                    await this.db.saveSmsIdempotency(idempotencyKey, smsMessage.sid, normalizedTo, this.hashBody(body));
+                }
+            }
             return {
                 success: true,
                 message_sid: smsMessage.sid,
-                to: to,
+                to: normalizedTo,
                 from: fromNumber,
-                body: message,
-                status: smsMessage.status
+                body,
+                status: smsMessage.status,
+                segment_info: segmentInfo
             };
         } catch (error) {
             console.error('❌ SMS sending error:', error);
+            const attempts = Number.isFinite(options?.attempts) ? options.attempts : 0;
+            if (attempts < (options?.maxRetries ?? this.defaultMaxRetries) && this.isRetryableSmsError(error)) {
+                const delay = (options?.retryDelayMs ?? this.defaultRetryDelayMs) * Math.pow(2, attempts);
+                setTimeout(() => {
+                    this.sendSMS(to, message, from, { ...options, attempts: attempts + 1 }).catch(() => {});
+                }, delay);
+                return { success: false, queued_retry: true, retry_in_ms: delay };
+            }
             throw error;
         }
     }
@@ -63,8 +278,14 @@ class EnhancedSmsService extends EventEmitter {
     async sendBulkSMS(recipients, message, options = {}) {
         const results = [];
         const {
-            delay = 1000, batchSize = 10
+            delay = 1000,
+            batchSize = 10,
+            from = null,
+            smsOptions = {},
+            validateNumbers = true
         } = options;
+
+        const segmentInfo = getSmsSegmentInfo(message);
 
         console.log(`📱 Sending bulk SMS to ${recipients.length} recipients`);
 
@@ -72,17 +293,28 @@ class EnhancedSmsService extends EventEmitter {
         for (let i = 0; i < recipients.length; i += batchSize) {
             const batch = recipients.slice(i, i + batchSize);
             const batchPromises = batch.map(async (recipient) => {
+                const normalizedRecipient = this.normalizePhone(recipient);
+                if (validateNumbers && !isValidE164(normalizedRecipient)) {
+                    return {
+                        recipient: normalizedRecipient,
+                        success: false,
+                        error: 'invalid_phone_format',
+                        segment_info: segmentInfo
+                    };
+                }
                 try {
-                    const result = await this.sendSMS(recipient, message);
+                    const result = await this.sendSMS(normalizedRecipient, message, from, smsOptions);
                     return { ...result,
-                        recipient,
-                        success: true
+                        recipient: normalizedRecipient,
+                        success: result.success === true,
+                        segment_info: result.segment_info || segmentInfo
                     };
                 } catch (error) {
                     return {
-                        recipient,
+                        recipient: normalizedRecipient,
                         success: false,
-                        error: error.message
+                        error: error.message,
+                        segment_info: segmentInfo
                     };
                 }
             });
@@ -98,6 +330,9 @@ class EnhancedSmsService extends EventEmitter {
 
         const successful = results.filter(r => r.success).length;
         const failed = results.length - successful;
+        const scheduled = results.filter(r => r.scheduled).length;
+        const suppressed = results.filter(r => r.suppressed).length;
+        const invalid = results.filter(r => r.error === 'invalid_phone_format').length;
 
         console.log(`📊 Bulk SMS completed: ${successful} sent, ${failed} failed`);
 
@@ -105,6 +340,10 @@ class EnhancedSmsService extends EventEmitter {
             total: recipients.length,
             successful,
             failed,
+            scheduled,
+            suppressed,
+            invalid,
+            segment_info: segmentInfo,
             results
         };
     }
@@ -113,24 +352,40 @@ class EnhancedSmsService extends EventEmitter {
     async handleIncomingSMS(from, body, messageSid) {
         try {
             console.log(`📨 Incoming SMS from ${from}: ${body}`);
+            const normalizedFrom = this.normalizePhone(from);
+            const normalizedBody = this.normalizeBody(body);
+
+            if (this.matchesOptOut(normalizedBody)) {
+                await this.setOptOut(normalizedFrom, 'user_opt_out');
+                const confirm = "You’re unsubscribed. Reply START to re-enable SMS.";
+                await this.sendSMS(normalizedFrom, confirm, null, { allowQuietHours: false });
+                return { success: true, opted_out: true };
+            }
+
+            if (this.matchesOptIn(normalizedBody)) {
+                await this.clearOptOut(normalizedFrom);
+                const confirm = "You’re re-subscribed. Reply HELP for options.";
+                await this.sendSMS(normalizedFrom, confirm, null, { allowQuietHours: false });
+                return { success: true, opted_in: true };
+            }
 
             // Get or create conversation context
-            let conversation = this.activeConversations.get(from);
+            let conversation = this.activeConversations.get(normalizedFrom);
             if (!conversation) {
                 conversation = {
-                    phone: from,
+                    phone: normalizedFrom,
                     messages: [],
                     context: `You are a helpful SMS assistant. Keep responses concise (under 160 chars when possible). Be friendly and professional.`,
                     created_at: new Date(),
                     last_activity: new Date()
                 };
-                this.activeConversations.set(from, conversation);
+                this.activeConversations.set(normalizedFrom, conversation);
             }
 
             // Add incoming message to conversation
             conversation.messages.push({
                 role: 'user',
-                content: body,
+                content: normalizedBody,
                 timestamp: new Date(),
                 message_sid: messageSid
             });
@@ -140,7 +395,7 @@ class EnhancedSmsService extends EventEmitter {
             const aiResponse = await this.generateAIResponse(conversation);
 
             // Send response SMS
-            const smsResult = await this.sendSMS(from, aiResponse);
+            const smsResult = await this.sendSMS(normalizedFrom, aiResponse);
 
             // Add AI response to conversation
             conversation.messages.push({

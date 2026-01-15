@@ -365,10 +365,20 @@ async function askOptionWithButtons(
   { prefix, columns = 2, formatLabel, ensureActive } = {}
 ) {
   const keyboard = new InlineKeyboard();
-  options.forEach((option, index) => {
-    const label = formatLabel ? formatLabel(option) : formatOptionLabel(option);
+  const labels = options.map((option) => (formatLabel ? formatLabel(option) : formatOptionLabel(option)));
+  const hasLongLabel = labels.some((label) => String(label).length > 22);
+  let resolvedColumns = Number.isFinite(columns) ? columns : (labels.length > 6 || hasLongLabel ? 1 : 2);
+  if (resolvedColumns < 1) {
+    resolvedColumns = 1;
+  }
+  if (resolvedColumns > 1 && hasLongLabel) {
+    resolvedColumns = 1;
+  }
+
+  labels.forEach((label, index) => {
+    const option = options[index];
     keyboard.text(label, `${prefix}:${option.id}`);
-    if ((index + 1) % columns === 0) {
+    if ((index + 1) % resolvedColumns === 0) {
       keyboard.row();
     }
   });
