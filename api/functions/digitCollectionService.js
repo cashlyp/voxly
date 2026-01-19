@@ -43,6 +43,14 @@ const DEFAULT_CIRCUIT_BREAKER = {
   errorRate: 0.3,
   cooldownMs: 60000
 };
+const PLAN_STATES = Object.freeze({
+  INIT: 'INIT',
+  PLAY_FIRST_MESSAGE: 'PLAY_FIRST_MESSAGE',
+  COLLECT_STEP: 'COLLECT_STEP',
+  ADVANCE: 'ADVANCE',
+  COMPLETE: 'COMPLETE',
+  FAIL: 'FAIL'
+});
 const GROUP_MIN_SCORE = 2;
 const GROUP_MIN_CONFIDENCE = 0.75;
 const GROUP_KEYWORDS = {
@@ -350,13 +358,45 @@ function createDigitCollectionService(options = {}) {
     }
   }
 
+  function buildRepromptDetail(expectation = {}) {
+    const profile = normalizeProfileId(expectation.profile) || 'generic';
+    const min = expectation.min_digits || 1;
+    const max = expectation.max_digits || min;
+    const lengthHint = min === max ? `${min} digits` : `${min} to ${max} digits`;
+
+    switch (profile) {
+      case 'card_expiry':
+        return max >= 6 ? 'Use MMYY or MMYYYY.' : 'Use MMYY (4 digits).';
+      case 'dob':
+        return max >= 8 ? 'Use MMDDYY or MMDDYYYY.' : 'Use MMDDYY.';
+      case 'cvv':
+        return 'Use 3 or 4 digits.';
+      case 'zip':
+        return max >= 9 ? 'Use 5 or 9 digits.' : 'Use 5 digits.';
+      case 'card_number':
+        return 'Use 13 to 19 digits.';
+      case 'routing_number':
+        return 'Use 9 digits.';
+      case 'phone':
+        return 'Use 10 digits.';
+      case 'ssn':
+        return 'Use 9 digits.';
+      case 'pin':
+        return 'Use 4 to 8 digits.';
+      default:
+        return `Expected ${lengthHint}.`;
+    }
+  }
+
   function buildDefaultReprompts(expectation = {}) {
     const label = buildExpectedLabel(expectation);
+    const detail = buildRepromptDetail(expectation);
+    const detailedPrompt = detail ? `Please enter the ${label}. ${detail}` : `Please enter the ${label} now.`;
     return {
       invalid: [
-        `That did not match. Please enter the ${label} now.`,
         `Please enter the ${label} now.`,
-        `Last try: enter the ${label} now.`
+        detailedPrompt,
+        `Last attempt: please enter the ${label} now.`
       ],
       timeout: [
         `I did not receive any input. Please enter the ${label} now.`,
@@ -392,6 +432,48 @@ function createDigitCollectionService(options = {}) {
     }
     if (typeof key === 'string' && key.trim()) return key.trim();
     return '';
+  }
+
+  const isAdaptiveRepromptReason = (reason = '') => {
+    if (!reason) return false;
+    if (reason === 'incomplete' || reason === 'too_short' || reason === 'too_long') return true;
+    return String(reason).startsWith('invalid');
+  };
+
+  function buildAdaptiveReprompt(expectation = {}, reason = '', attemptCount = 1) {
+    const maxRetries = Number.isFinite(expectation?.max_retries) ? expectation.max_retries : 0;
+    const label = buildExpectedLabel(expectation);
+    const detail = buildRepromptDetail(expectation);
+    const shortPrompt = `Please enter the ${label} now.`;
+    const detailedPrompt = detail ? `Please enter the ${label}. ${detail}` : shortPrompt;
+    const finalPrompt = `Last attempt: please enter the ${label} now.`;
+    const kind = reason === 'incomplete' || reason === 'too_short' || reason === 'too_long' ? 'incomplete' : 'invalid';
+    const custom = chooseReprompt(expectation, kind, attemptCount);
+    const isFinalAttempt = maxRetries > 0 && attemptCount >= maxRetries;
+
+    if (isFinalAttempt) {
+      if (custom) {
+        return /last|final/i.test(custom)
+          ? custom
+          : `${custom}${custom.endsWith('.') ? '' : '.'} This is your last attempt.`;
+      }
+      return finalPrompt;
+    }
+
+    if (custom) {
+      return custom;
+    }
+
+    if (attemptCount >= 2) {
+      return detailedPrompt;
+    }
+
+    return shortPrompt;
+  }
+
+  function buildTimeoutPrompt(expectation = {}, attempt = 1) {
+    return chooseReprompt(expectation, 'timeout', attempt)
+      || `I did not catch that. Please re-enter the ${buildExpectedLabel(expectation)} now.`;
   }
 
   const OTP_REGEX = /\b\d{4,8}\b/g;
@@ -546,6 +628,8 @@ function createDigitCollectionService(options = {}) {
     const strictSources = [
       { value: callConfig.capture_group, source: 'capture_group' },
       { value: callConfig.captureGroup, source: 'capture_group' },
+      { value: callConfig.capture_plan, source: 'capture_plan' },
+      { value: callConfig.capturePlan, source: 'capture_plan' },
       { value: callConfig.digit_plan_id, source: 'digit_plan_id' },
       { value: callConfig.digitPlanId, source: 'digit_plan_id' }
     ];
@@ -639,6 +723,45 @@ function createDigitCollectionService(options = {}) {
   };
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const setCaptureActive = (callSid, active, meta = {}) => {
+    if (!callSid) return;
+    const callConfig = callConfigurations.get(callSid) || {};
+    if (active) {
+      callConfig.digit_capture_active = true;
+      callConfig.call_mode = 'dtmf_capture';
+      if (meta.group_id) {
+        callConfig.capture_group = meta.group_id;
+        callConfig.group_locked = true;
+      }
+    } else {
+      callConfig.digit_capture_active = false;
+      if (callConfig.call_mode === 'dtmf_capture') {
+        callConfig.call_mode = 'normal';
+      }
+    }
+    callConfigurations.set(callSid, callConfig);
+  };
+
+  const updatePlanState = (callSid, plan, state, meta = {}) => {
+    if (!plan || !state) return;
+    plan.state = state;
+    plan.state_updated_at = new Date().toISOString();
+    if (meta.step_index !== undefined) {
+      plan.state_step_index = meta.step_index;
+    }
+    if (meta.reason) {
+      plan.state_reason = meta.reason;
+    }
+    digitCollectionPlans.set(callSid, plan);
+    logDigitMetric('plan_state', {
+      callSid,
+      state,
+      step: meta.step_index ?? plan.index ?? null,
+      reason: meta.reason || null,
+      group: plan.group_id || null
+    });
+  };
 
   const getCallerAffect = (callSid) => {
     const state = callerAffect.get(callSid) || { attempts: 0, impatience: 0, started_at: Date.now() };
@@ -1709,6 +1832,7 @@ function createDigitCollectionService(options = {}) {
         plan_total_steps: Number.isFinite(params.plan_total_steps) ? params.plan_total_steps : null,
         prompted_at: params.prompted_at || null,
         retries: 0,
+        attempt_count: 0,
         buffer: '',
         collected: [],
         last_masked: null
@@ -1744,10 +1868,11 @@ function createDigitCollectionService(options = {}) {
         return { accepted: false, reason: 'exceeds_max_buffer', profile: exp.profile, mask_for_gpt: exp.mask_for_gpt };
       }
       
+      const source = meta.source || 'dtmf';
       const result = {
         profile: exp.profile,
         mask_for_gpt: exp.mask_for_gpt,
-        source: meta.source || 'dtmf'
+        source
       };
       const hasTerminator = exp.allow_terminator && digits.includes(exp.terminator_char || '#');
       const cleanDigits = cleanDigitsTemp;
@@ -1767,6 +1892,7 @@ function createDigitCollectionService(options = {}) {
           exp.buffer = '';
           this.expectations.set(callSid, exp);
           lastDtmfTimestamps.set(callSid, meta.timestamp);
+          result.attempt_count = exp.attempt_count || 0;
           return result;
         }
         lastDtmfTimestamps.set(callSid, meta.timestamp);
@@ -1829,6 +1955,11 @@ function createDigitCollectionService(options = {}) {
           exp.buffer = '';
           exp.retries += 1;
           result.retries = exp.retries;
+          exp.attempt_count = (exp.attempt_count || 0) + 1;
+          result.attempt_count = exp.attempt_count;
+          if (exp.retries > exp.max_retries) {
+            result.fallback = true;
+          }
           this.expectations.set(callSid, exp);
           return result;
         }
@@ -1836,11 +1967,18 @@ function createDigitCollectionService(options = {}) {
         if (hasTerminator) {
           exp.terminated = true;
         }
-      } else if (result.reason && result.reason !== 'incomplete') {
-        exp.retries += 1;
-        result.retries = exp.retries;
-        if (exp.retries > exp.max_retries) {
-          result.fallback = true;
+      } else {
+        const shouldCountRetry = result.reason && (result.reason !== 'incomplete' || source !== 'dtmf');
+        if (shouldCountRetry) {
+          exp.retries += 1;
+          result.retries = exp.retries;
+          exp.attempt_count = (exp.attempt_count || 0) + 1;
+          result.attempt_count = exp.attempt_count;
+          if (exp.retries > exp.max_retries) {
+            result.fallback = true;
+          }
+        } else if (Number.isFinite(exp.attempt_count)) {
+          result.attempt_count = exp.attempt_count;
         }
       }
 
@@ -1905,6 +2043,30 @@ function createDigitCollectionService(options = {}) {
         }
       }
 
+      const plan = digitCollectionPlans.get(callSid);
+      const callConfig = callConfigurations.get(callSid) || {};
+      const isGroupedPlan = Boolean(
+        plan
+        && ['banking', 'card'].includes(plan.group_id)
+        && callConfig.call_mode === 'dtmf_capture'
+        && callConfig.digit_capture_active === true
+        && current.plan_id === plan.id
+      );
+      if (isGroupedPlan) {
+        const timeoutMessage = current.timeout_failure_message || callEndMessages.no_response;
+        updatePlanState(callSid, plan, PLAN_STATES.FAIL, {
+          step_index: current.plan_step_index,
+          reason: 'timeout'
+        });
+        digitCollectionManager.expectations.delete(callSid);
+        clearDigitTimeout(callSid);
+        clearDigitFallbackState(callSid);
+        clearDigitPlan(callSid);
+        setCaptureActive(callSid, false);
+        await speakAndEndCall(callSid, timeoutMessage, 'digit_collection_timeout');
+        return;
+      }
+
       if (!digitFallbackStates.get(callSid)?.active && typeof triggerTwilioGatherFallback === 'function') {
         try {
           const fallbackPrompt = current?.reprompt_timeout || buildDigitPrompt(current);
@@ -1945,9 +2107,7 @@ function createDigitCollectionService(options = {}) {
         session: getSessionState(callSid),
         health: getSystemHealth(callSid)
       });
-      const prompt = policy.prompt
-        || chooseReprompt(current, 'timeout', current.retries)
-        || `I did not catch that. Please re-enter the ${buildExpectedLabel(current)} now.`;
+      const prompt = policy.prompt || buildTimeoutPrompt(current, current.retries);
 
       const personalityInfo = gptService?.personalityEngine?.getCurrentPersonality();
       const reply = {
@@ -2612,6 +2772,9 @@ function createDigitCollectionService(options = {}) {
 
   async function startNextDigitPlanStep(callSid, plan, gptService = null, interactionCount = 0) {
     if (!plan || !Array.isArray(plan.steps) || plan.index >= plan.steps.length) return;
+    if (plan.state === PLAN_STATES.INIT) {
+      updatePlanState(callSid, plan, PLAN_STATES.PLAY_FIRST_MESSAGE, { step_index: plan.index + 1 });
+    }
     const step = plan.steps[plan.index];
     const callConfig = callConfigurations.get(callSid);
     const promptHint = [callConfig?.first_message, callConfig?.prompt]
@@ -2628,6 +2791,8 @@ function createDigitCollectionService(options = {}) {
     }
 
     digitCollectionManager.setExpectation(callSid, payload);
+    updatePlanState(callSid, plan, PLAN_STATES.COLLECT_STEP, { step_index: payload.plan_step_index });
+    setCaptureActive(callSid, true, { group_id: plan.group_id });
     if (typeof clearSilenceTimer === 'function') {
       clearSilenceTimer(callSid);
     }
@@ -2928,10 +3093,13 @@ function createDigitCollectionService(options = {}) {
       created_at: new Date().toISOString(),
       last_completed_step: null,
       last_completed_fingerprint: null,
-      last_completed_at: null
+      last_completed_at: null,
+      state: PLAN_STATES.INIT,
+      state_updated_at: new Date().toISOString()
     };
 
     digitCollectionPlans.set(callSid, plan);
+    setCaptureActive(callSid, true, { group_id: groupId });
     logDigitMetric('plan_started', {
       callSid,
       steps: stepsToUse.length,
@@ -2966,38 +3134,44 @@ function createDigitCollectionService(options = {}) {
       const allowCallEnd = options.allowCallEnd === true;
       const deferCallEnd = options.deferCallEnd === true;
       const expectation = digitCollectionManager.expectations.get(callSid);
-    const shouldEndCall = allowCallEnd && expectation?.end_call_on_success !== false;
-    const expectedLabel = expectation ? buildExpectedLabel(expectation) : 'the code';
-    const stepTitle = formatPlanStepLabel(expectation);
-    const stepPrefix = stepTitle ? `${stepTitle} — ` : '';
-    const payload = {
-      profile: collection.profile,
-      raw_digits: collection.digits,
-      masked: collection.masked,
-      len: collection.len,
-      route: collection.route || null,
-      accepted: !!collection.accepted,
-      retries: collection.retries || 0,
-      fallback: !!collection.fallback,
-      reason: collection.reason || null,
-      heuristic: collection.heuristic || null
-    };
+      const shouldEndCall = allowCallEnd && expectation?.end_call_on_success !== false;
+      const expectedLabel = expectation ? buildExpectedLabel(expectation) : 'the code';
+      const stepTitle = formatPlanStepLabel(expectation);
+      const stepPrefix = stepTitle ? `${stepTitle} — ` : '';
+      const payload = {
+        profile: collection.profile,
+        raw_digits: collection.digits,
+        masked: collection.masked,
+        len: collection.len,
+        route: collection.route || null,
+        accepted: !!collection.accepted,
+        retries: collection.retries || 0,
+        fallback: !!collection.fallback,
+        reason: collection.reason || null,
+        heuristic: collection.heuristic || null
+      };
 
-    const source = collection.source || 'dtmf';
-    const candidate = buildDigitCandidate(collection, expectation, source);
-    collection.confidence = candidate.confidence;
-    collection.confidence_signals = candidate.signals;
-    collection.confidence_reason_codes = candidate.reasonCodes;
-    updateSessionState(callSid, { lastCandidate: candidate });
-    void emitAuditEvent(callSid, 'DigitCandidateProduced', {
-      profile: collection.profile,
-      len: collection.len,
-      source,
-      confidence: collection.confidence,
-      signals: collection.confidence_signals,
-      reason: collection.reason || null,
-      masked: collection.masked
-    });
+      const resolvedSource = collection.source || source || 'dtmf';
+      const attemptCount = Math.max(
+        1,
+        Number.isFinite(collection.attempt_count)
+          ? collection.attempt_count
+          : (Number.isFinite(expectation?.attempt_count) ? expectation.attempt_count : (collection.retries || 1))
+      );
+      const candidate = buildDigitCandidate(collection, expectation, resolvedSource);
+      collection.confidence = candidate.confidence;
+      collection.confidence_signals = candidate.signals;
+      collection.confidence_reason_codes = candidate.reasonCodes;
+      updateSessionState(callSid, { lastCandidate: candidate });
+      void emitAuditEvent(callSid, 'DigitCandidateProduced', {
+        profile: collection.profile,
+        len: collection.len,
+        source: resolvedSource,
+        confidence: collection.confidence,
+        signals: collection.confidence_signals,
+        reason: collection.reason || null,
+        masked: collection.masked
+      });
 
     if (collection.accepted && candidate.confidence < 0.45) {
       collection.accepted = false;
@@ -3021,7 +3195,7 @@ function createDigitCollectionService(options = {}) {
           callSid,
           profile: collection.profile,
           len: collection.len,
-          source
+          source: resolvedSource
         });
         return;
       }
@@ -3035,7 +3209,7 @@ function createDigitCollectionService(options = {}) {
       });
       await db.addCallDigitEvent({
         call_sid: callSid,
-        source,
+        source: resolvedSource,
         profile: collection.profile,
         digits: collection.digits,
         len: collection.len,
@@ -3061,7 +3235,7 @@ function createDigitCollectionService(options = {}) {
       accepted: collection.accepted,
       reason: collection.reason || null,
       retries: collection.retries || 0,
-      source,
+      source: resolvedSource,
       confidence: collection.confidence
     });
 
@@ -3078,11 +3252,11 @@ function createDigitCollectionService(options = {}) {
       webhookService.addLiveEvent(callSid, `⚠️ ${stepPrefix}${liveLabel} invalid${hint}: ${liveMasked}`, { force: true });
     }
 
-    if (!collection.accepted && collection.reason === 'incomplete') {
+    if (!collection.accepted && collection.reason === 'incomplete' && resolvedSource === 'dtmf') {
       void emitAuditEvent(callSid, 'DigitCaptureFailed', {
         profile: collection.profile,
         len: collection.len,
-        source,
+        source: resolvedSource,
         reason: collection.reason,
         confidence: collection.confidence,
         signals: collection.confidence_signals,
@@ -3116,7 +3290,7 @@ function createDigitCollectionService(options = {}) {
       void emitAuditEvent(callSid, 'DigitCaptureSucceeded', {
         profile: collection.profile,
         len: collection.len,
-        source,
+        source: resolvedSource,
         masked: collection.masked,
         confidence: collection.confidence
       });
@@ -3283,6 +3457,7 @@ function createDigitCollectionService(options = {}) {
       if (planId && digitCollectionPlans.has(callSid)) {
         const plan = digitCollectionPlans.get(callSid);
         if (plan?.id === planId && plan.active) {
+          updatePlanState(callSid, plan, PLAN_STATES.ADVANCE, { step_index: expectation.plan_step_index });
           const fingerprint = buildCollectionFingerprint(collection, expectation);
           if (
             plan.last_completed_step === expectation.plan_step_index
@@ -3307,7 +3482,9 @@ function createDigitCollectionService(options = {}) {
             return;
           }
           plan.active = false;
+          updatePlanState(callSid, plan, PLAN_STATES.COMPLETE, { step_index: expectation.plan_step_index });
           digitCollectionPlans.delete(callSid);
+          setCaptureActive(callSid, false);
           webhookService.addLiveEvent(callSid, '✅ Digit collection plan completed', { force: true });
           await db.updateCallState(callSid, 'digit_collection_plan_completed', {
             steps: plan.steps.length,
@@ -3360,7 +3537,7 @@ function createDigitCollectionService(options = {}) {
         void emitAuditEvent(callSid, 'DigitCaptureConfirmed', {
           profile: collection.profile,
           len: collection.len,
-          source
+          source: resolvedSource
         });
       }
       return;
@@ -3368,7 +3545,7 @@ function createDigitCollectionService(options = {}) {
       void emitAuditEvent(callSid, 'DigitCaptureFailed', {
         profile: collection.profile,
         len: collection.len,
-        source,
+        source: resolvedSource,
         reason: collection.reason,
         confidence: collection.confidence,
         signals: collection.confidence_signals,
@@ -3386,7 +3563,7 @@ function createDigitCollectionService(options = {}) {
             webhookService.addLiveEvent(callSid, '📩 SMS fallback sent for digit capture', { force: true });
             void emitAuditEvent(callSid, 'DigitCaptureAborted', {
               profile: expectation.profile,
-              source,
+              source: resolvedSource,
               reason: 'sms_fallback'
             });
             if (allowCallEnd) {
@@ -3412,7 +3589,7 @@ function createDigitCollectionService(options = {}) {
         clearDigitPlan(callSid);
         void emitAuditEvent(callSid, 'DigitCaptureAborted', {
           profile: expectation?.profile || collection.profile,
-          source,
+          source: resolvedSource,
           reason: shouldFallbackToVoice ? 'voice_fallback' : 'max_retries'
         });
         if (shouldFallbackToVoice) {
@@ -3432,20 +3609,27 @@ function createDigitCollectionService(options = {}) {
         const affect = recordCallerAffect(callSid, collection.reason || 'invalid');
         const policy = buildRetryPolicy({
           reason: collection.reason || 'invalid',
-          attempt: collection.retries || 1,
-          source,
+          attempt: attemptCount || collection.retries || 1,
+          source: resolvedSource,
           expectation,
           affect,
           session: getSessionState(callSid),
           health: getSystemHealth(callSid)
         });
-        let prompt = policy.prompt;
+        const adaptiveReason = isAdaptiveRepromptReason(collection.reason);
+        let prompt = adaptiveReason
+          ? buildAdaptiveReprompt(expectation || {}, collection.reason, attemptCount || collection.retries || 1)
+          : policy.prompt;
         if (!prompt) {
-          if (collection.reason === 'too_short') {
-            prompt = chooseReprompt(expectation || {}, 'incomplete', collection.retries || 1)
+          prompt = policy.prompt;
+        }
+        if (!prompt) {
+          const repromptAttempt = attemptCount || collection.retries || 1;
+          if (collection.reason === 'too_short' || collection.reason === 'incomplete') {
+            prompt = chooseReprompt(expectation || {}, 'incomplete', repromptAttempt)
               || `Please enter the ${expectedLabel} now.`;
           } else {
-            prompt = chooseReprompt(expectation || {}, 'invalid', collection.retries || 1)
+            prompt = chooseReprompt(expectation || {}, 'invalid', repromptAttempt)
               || `Please enter the ${expectedLabel} now.`;
           }
         }
@@ -3501,6 +3685,9 @@ function createDigitCollectionService(options = {}) {
       if (callConfig.digit_intent?.mode === 'dtmf') {
         callConfig.digit_intent = { mode: 'normal', reason: 'call_end', confidence: 1 };
       }
+      if (callConfig.call_mode === 'dtmf_capture') {
+        callConfig.call_mode = 'normal';
+      }
       callConfigurations.set(callSid, callConfig);
     }
     logDigitMetric('call_state_cleared', { callSid, timestamp: Date.now() });
@@ -3548,7 +3735,9 @@ function createDigitCollectionService(options = {}) {
 
   return {
     expectations: digitCollectionManager.expectations,
+    buildAdaptiveReprompt,
     buildDigitPrompt,
+    buildTimeoutPrompt,
     buildTwilioGatherTwiml,
     buildPlanStepPrompt,
     clearCallState,
@@ -3576,7 +3765,12 @@ function createDigitCollectionService(options = {}) {
     requestDigitCollectionPlan,
     getPlan: (callSid) => digitCollectionPlans.get(callSid),
     getLockedGroup: resolveLockedGroup,
+    updatePlanState,
     __test: {
+      buildAdaptiveReprompt,
+      buildRepromptDetail,
+      buildTimeoutPrompt,
+      isAdaptiveRepromptReason,
       normalizeCaptureText,
       resolveGroupFromPrompt,
       resolveExplicitGroup,

