@@ -1,8 +1,8 @@
 const { InlineKeyboard } = require('grammy');
 const config = require('../config');
 const { getUser } = require('../db/db');
-const { escapeHtml } = require('../utils/commandFormat');
-const { sendMenu } = require('../utils/menuCleanup');
+const { escapeHtml, renderMenu } = require('../utils/ui');
+const { buildCallbackData } = require('../utils/actions');
 
 async function handleGuide(ctx) {
     const user = await new Promise(r => getUser(ctx.from.id, r));
@@ -62,18 +62,15 @@ async function handleGuide(ctx) {
     const guideText = guideSections.join('\n\n');
 
     const kb = new InlineKeyboard()
-        .text('📞 Call', 'CALL')
-        .text('📋 Commands', 'HELP')
+        .text('📞 Call', buildCallbackData(ctx, 'CALL'))
+        .text('📋 Commands', buildCallbackData(ctx, 'HELP'))
         .row()
-        .text('💬 SMS', 'SMS')
-        .text('📧 Email', 'EMAIL')
+        .text('💬 SMS', buildCallbackData(ctx, 'SMS'))
+        .text('📧 Email', buildCallbackData(ctx, 'EMAIL'))
         .row()
-        .text('🔄 Menu', 'MENU');
+        .text('🔄 Menu', buildCallbackData(ctx, 'MENU'));
 
-    await sendMenu(ctx, guideText, {
-        parse_mode: 'HTML',
-        reply_markup: kb
-    });
+    await renderMenu(ctx, guideText, kb, { parseMode: 'HTML' });
 }
 
 function registerGuideCommand(bot) {

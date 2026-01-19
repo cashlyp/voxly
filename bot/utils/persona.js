@@ -1,8 +1,9 @@
 const { InlineKeyboard } = require('grammy');
-const axios = require('axios');
 const config = require('../config');
+const httpClient = require('./httpClient');
 const { ensureOperationActive, getCurrentOpId } = require('./sessionState');
-const { sendMenu } = require('./menuCleanup');
+const { sendMenu, clearMenuMessages } = require('./ui');
+const { buildCallbackData, matchesCallbackPrefix, parseCallbackData } = require('./actions');
 
 const FALLBACK_PERSONAS = [
   {
@@ -274,7 +275,7 @@ let personaCache = {
 
 async function fetchRemotePersonas() {
   try {
-    const response = await axios.get(`${config.apiUrl}/api/personas`, { timeout: 10000 });
+  const response = await httpClient.get(null, `${config.apiUrl}/api/personas`, { timeout: 10000 });
     const data = response.data || {};
     const builtin = Array.isArray(data.builtin) ? data.builtin : [];
     const custom = Array.isArray(data.custom) ? data.custom : [];
@@ -381,7 +382,8 @@ async function askOptionWithButtons(
 
   labels.forEach((label, index) => {
     const option = options[index];
-    keyboard.text(label, `${prefixKey}:${option.id}`);
+    const action = `${prefixKey}:${option.id}`;
+    keyboard.text(label, buildCallbackData(ctx, action));
     if ((index + 1) % resolvedColumns === 0) {
       keyboard.row();
     }
@@ -389,7 +391,7 @@ async function askOptionWithButtons(
 
   const message = await sendMenu(ctx, prompt, { parse_mode: 'Markdown', reply_markup: keyboard });
   const selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {
-    return callbackCtx.callbackQuery.data.startsWith(`${prefixKey}:`);
+    return matchesCallbackPrefix(callbackCtx.callbackQuery.data, prefixKey);
   });
   const activeChecker = typeof ensureActive === 'function'
     ? ensureActive
@@ -397,9 +399,15 @@ async function askOptionWithButtons(
   activeChecker();
 
   await selectionCtx.answerCallbackQuery();
-  await ctx.api.editMessageReplyMarkup(message.chat.id, message.message_id).catch(() => {});
+  try {
+    await ctx.api.deleteMessage(message.chat.id, message.message_id);
+  } catch (_) {
+    await ctx.api.editMessageReplyMarkup(message.chat.id, message.message_id).catch(() => {});
+  }
+  await clearMenuMessages(ctx);
 
-  const parts = selectionCtx.callbackQuery.data.split(':');
+  const selectionAction = parseCallbackData(selectionCtx.callbackQuery.data).action || selectionCtx.callbackQuery.data;
+  const parts = selectionAction.split(':');
   const selectedId = opId ? parts.slice(2).join(':') : parts.slice(1).join(':');
   return options.find((option) => option.id === selectedId);
 }

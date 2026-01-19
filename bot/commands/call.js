@@ -1,5 +1,5 @@
-const axios = require('axios');
 const config = require('../config');
+const httpClient = require('../utils/httpClient');
 const { getUser } = require('../db/db');
 const {
   getBusinessOptions,
@@ -24,8 +24,8 @@ async function notifyCallError(ctx, lines = []) {
   const body = Array.isArray(lines) ? lines : [lines];
   await ctx.reply(section('❌ Call Alert', body));
 }
-const { section, escapeMarkdown, tipLine, buildLine } = require('../utils/commandFormat');
-const { sendMenu } = require('../utils/menuCleanup');
+const { section, escapeMarkdown, tipLine, buildLine, renderMenu } = require('../utils/ui');
+const { buildCallbackData } = require('../utils/actions');
 
 const scriptsApiBase = config.scriptsApiUrl.replace(/\/+$/, '');
 const DEFAULT_FIRST_MESSAGE = 'Hello! This is an automated call. How can I help you today?';
@@ -67,39 +67,14 @@ function buildPersonalizedFirstMessage(baseMessage, victimName, personaLabel) {
   return `${greeting} ${remainder}`;
 }
 
-async function safeScriptsRequest(method, url, options = {}) {
-  try {
-    const response = await axios.request({
-      method,
-      url: `${scriptsApiBase}${url}`,
-      timeout: 15000,
-      ...options
-    });
+async function getCallScriptById(scriptId) {
+  const response = await httpClient.get(null, `${scriptsApiBase}/api/call-scripts/${scriptId}`, { timeout: 12000 });
+  return response.data;
+}
 
-    const contentType = response.headers?.['content-type'] || '';
-    if (!contentType.includes('application/json')) {
-      throw new Error('Scripts API returned non-JSON response');
-    }
-    if (response.data?.success === false) {
-      throw new Error(response.data.error || 'Scripts API reported failure');
-    }
-    return response.data;
-  } catch (error) {
-    const base = `Ensure the scripts service is reachable at ${scriptsApiBase} or update SCRIPTS_API_URL.`;
-    if (error.response) {
-      const status = error.response.status;
-      const contentType = error.response.headers?.['content-type'] || '';
-      if (!contentType.includes('application/json')) {
-        throw new Error(`Scripts API responded with HTTP ${status}. ${base}`);
-      }
-      const detail = error.response.data?.error || error.response.data?.message || `HTTP ${status}`;
-      throw new Error(`${detail}. ${base}`);
-    }
-    if (error.request) {
-      throw new Error(`No response from Scripts API. ${base}`);
-    }
-    throw new Error(`${error.message}. ${base}`);
-  }
+async function getCallScripts() {
+  const response = await httpClient.get(null, `${scriptsApiBase}/api/call-scripts`, { timeout: 12000 });
+  return response.data;
 }
 
 async function collectPlaceholderValues(conversation, ctx, placeholders, ensureActive) {
@@ -121,12 +96,12 @@ async function collectPlaceholderValues(conversation, ctx, placeholders, ensureA
 }
 
 async function fetchCallScripts() {
-  const data = await safeScriptsRequest('get', '/api/call-scripts');
+  const data = await getCallScripts();
   return data.scripts || [];
 }
 
 async function fetchCallScriptById(id) {
-  const data = await safeScriptsRequest('get', `/api/call-scripts/${id}`);
+  const data = await getCallScriptById(id);
   return data.script;
 }
 
@@ -601,11 +576,13 @@ async function callFlow(conversation, ctx) {
         }
       }
       replyOptions.reply_markup = {
-        inline_keyboard: [[{ text: 'ℹ️ Details', callback_data: `CALL_DETAILS:${detailsKey}` }]]
+        inline_keyboard: [[{ text: 'ℹ️ Details', callback_data: buildCallbackData(ctx, `CALL_DETAILS:${detailsKey}`) }]]
       };
     }
 
-    await sendMenu(ctx, section('🔍 Call Brief', detailLines), replyOptions);
+    await renderMenu(ctx, section('🔍 Call Brief', detailLines), replyOptions.reply_markup, {
+      payload: { parse_mode: 'Markdown' }
+    });
     await ctx.reply('⏳ Making the call…');
 
     const payloadForLog = { ...payload };
@@ -617,21 +594,20 @@ async function callFlow(conversation, ctx) {
 
     const controller = new AbortController();
     const release = registerAbortController(ctx, controller);
-    let response;
+    let data;
     try {
-      response = await axios.post(`${config.apiUrl}/outbound-call`, payload, {
+      const response = await httpClient.post(ctx, `${config.apiUrl}/outbound-call`, payload, {
         headers: {
           'Content-Type': 'application/json'
         },
         timeout: 30000,
         signal: controller.signal
       });
+      data = response?.data;
       ensureActive();
     } finally {
       release();
     }
-
-    const data = response?.data;
     if (data?.success && data.call_sid) {
       flow.touch('completed');
     } else {

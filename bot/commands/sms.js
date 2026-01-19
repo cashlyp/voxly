@@ -1,5 +1,5 @@
 const config = require('../config');
-const axios = require('axios');
+const httpClient = require('../utils/httpClient');
 const { getUser, isAdmin } = require('../db/db');
 const {
     startOperation,
@@ -23,7 +23,7 @@ const {
     extractScriptVariables,
     SCRIPT_METADATA
 } = require('../utils/scripts');
-const { section: formatSection, buildLine, tipLine } = require('../utils/commandFormat');
+const { section: formatSection, buildLine, tipLine } = require('../utils/ui');
 
 async function smsAlert(ctx, text) {
     await ctx.reply(formatSection('⚠️ SMS Alert', [text]));
@@ -102,7 +102,7 @@ async function smsFlow(conversation, ctx) {
         const controller = new AbortController();
         const release = registerAbortController(ctx, controller);
         try {
-            const response = await axios.get(url, { timeout: 20000, signal: controller.signal, ...options });
+            const response = await httpClient.get(null, url, { timeout: 20000, signal: controller.signal, ...options });
             ensureActive();
             return response;
         } finally {
@@ -113,7 +113,7 @@ async function smsFlow(conversation, ctx) {
         const controller = new AbortController();
         const release = registerAbortController(ctx, controller);
         try {
-            const response = await axios.post(url, data, { timeout: 30000, signal: controller.signal, ...options });
+            const response = await httpClient.post(null, url, data, { timeout: 30000, signal: controller.signal, ...options });
             ensureActive();
             return response;
         } finally {
@@ -707,7 +707,7 @@ async function scheduleSmsFlow(conversation, ctx) {
         const controller = new AbortController();
         const release = registerAbortController(ctx, controller);
         try {
-            const response = await axios.post(url, data, { timeout: 30000, signal: controller.signal, ...options });
+            const response = await httpClient.post(null, url, data, { timeout: 30000, signal: controller.signal, ...options });
             ensureActive();
             return response;
         } finally {
@@ -824,7 +824,8 @@ async function viewSmsConversation(ctx, phoneNumber) {
         console.log(`Fetching SMS conversation for ${phoneNumber}`);
         
         // First try to get conversation from SMS service (in-memory)
-        const response = await axios.get(
+        const response = await httpClient.get(
+            null,
             `${config.apiUrl}/api/sms/conversation/${encodeURIComponent(phoneNumber)}`,
             { timeout: 15000 }
         );
@@ -875,7 +876,8 @@ async function viewSmsConversation(ctx, phoneNumber) {
 async function viewStoredSmsConversation(ctx, phoneNumber) {
     try {
         // Call API endpoint to get stored SMS messages from database
-        const response = await axios.get(
+        const response = await httpClient.get(
+            null,
             `${config.apiUrl}/api/sms/messages/conversation/${encodeURIComponent(phoneNumber)}`,
             { timeout: 15000 }
         );
@@ -929,10 +931,10 @@ async function getSmsStats(ctx) {
         console.log('Fetching SMS stats...');
         
         // Get stats from SMS service (in-memory data)
-        const serviceResponse = await axios.get(`${config.apiUrl}/api/sms/stats`, { timeout: 10000 });
+        const serviceResponse = await httpClient.get(null, `${config.apiUrl}/api/sms/stats`, { timeout: 10000 });
         
         // Get additional stats from database
-        const dbStatsResponse = await axios.get(`${config.apiUrl}/api/sms/database-stats`, { timeout: 10000 });
+        const dbStatsResponse = await httpClient.get(null, `${config.apiUrl}/api/sms/database-stats`, { timeout: 10000 });
 
         let statsText = `📊 *SMS Statistics*\n\n`;
 
@@ -986,7 +988,7 @@ async function getSmsStats(ctx) {
         
         // Fallback: try to get basic stats
         try {
-            const basicResponse = await axios.get(`${config.apiUrl}/api/sms/database-stats`, { timeout: 5000 });
+            const basicResponse = await httpClient.get(null, `${config.apiUrl}/api/sms/database-stats`, { timeout: 5000 });
             if (basicResponse.data.success) {
                 const stats = basicResponse.data.statistics;
                 const basicStatsText = 
@@ -1140,7 +1142,7 @@ function registerSmsCommands(bot) {
             await ctx.reply(`🔍 Checking status for message: ${messageSid}...`);
             
             try {
-                const response = await axios.get(`${config.apiUrl}/api/sms/status/${messageSid}`, {
+                const response = await httpClient.get(null, `${config.apiUrl}/api/sms/status/${messageSid}`, {
                     timeout: 10000
                 });
                 
@@ -1198,7 +1200,7 @@ function registerSmsCommands(bot) {
             await ctx.reply(`📱 Fetching last ${limit} SMS messages...`);
             
             try {
-                const response = await axios.get(`${config.apiUrl}/api/sms/messages/recent`, {
+                const response = await httpClient.get(null, `${config.apiUrl}/api/sms/messages/recent`, {
                     params: { limit },
                     timeout: 10000
                 });

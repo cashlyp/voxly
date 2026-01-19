@@ -1,4 +1,4 @@
-const axios = require('axios');
+const httpClient = require('../utils/httpClient');
 const { InlineKeyboard } = require('grammy');
 const config = require('../config');
 const { getUser, isAdmin } = require('../db/db');
@@ -8,8 +8,8 @@ const {
   registerAbortController,
   guardAgainstCommandInterrupt
 } = require('../utils/sessionState');
-const { section, buildLine, tipLine, escapeMarkdown, emphasize } = require('../utils/commandFormat');
-const { sendMenu, activateMenuMessage } = require('../utils/menuCleanup');
+const { section, buildLine, tipLine, escapeMarkdown, emphasize, activateMenuMessage, renderMenu } = require('../utils/ui');
+const { buildCallbackData } = require('../utils/actions');
 const { askOptionWithButtons } = require('../utils/persona');
 
 function normalizeEmail(value) {
@@ -186,7 +186,7 @@ async function guardedGet(ctx, url, options = {}) {
   const controller = new AbortController();
   const release = registerAbortController(ctx, controller);
   try {
-    return await axios.get(url, { timeout: 20000, signal: controller.signal, ...options });
+    return await httpClient.get(ctx, url, { timeout: 20000, signal: controller.signal, ...options });
   } finally {
     release();
   }
@@ -196,7 +196,7 @@ async function guardedPost(ctx, url, data, options = {}) {
   const controller = new AbortController();
   const release = registerAbortController(ctx, controller);
   try {
-    return await axios.post(url, data, { timeout: 30000, signal: controller.signal, ...options });
+    return await httpClient.post(ctx, url, data, { timeout: 30000, signal: controller.signal, ...options });
   } finally {
     release();
   }
@@ -212,10 +212,10 @@ async function sendEmailStatusCard(ctx, messageId, options = {}) {
   }
   const text = formatEmailStatusCard(message, events);
   const keyboard = new InlineKeyboard()
-    .text('🔄 Refresh', `EMAIL_STATUS:${messageId}`)
-    .text('🧾 Timeline', `EMAIL_TIMELINE:${messageId}`);
+    .text('🔄 Refresh', buildCallbackData(ctx, `EMAIL_STATUS:${messageId}`))
+    .text('🧾 Timeline', buildCallbackData(ctx, `EMAIL_TIMELINE:${messageId}`));
   if (message.bulk_job_id) {
-    keyboard.row().text('📦 Bulk Job', `EMAIL_BULK:${message.bulk_job_id}`);
+    keyboard.row().text('📦 Bulk Job', buildCallbackData(ctx, `EMAIL_BULK:${message.bulk_job_id}`));
   }
   const payload = { parse_mode: 'Markdown', reply_markup: keyboard };
   if (ctx.callbackQuery?.message && !options.forceReply) {
@@ -227,7 +227,7 @@ async function sendEmailStatusCard(ctx, messageId, options = {}) {
       // fallback to sending a new message
     }
   }
-  await sendMenu(ctx, text, payload);
+  await renderMenu(ctx, text, keyboard, { payload });
 }
 
 async function sendEmailTimeline(ctx, messageId) {
@@ -257,7 +257,7 @@ async function sendBulkStatusCard(ctx, jobId, options = {}) {
   }
   const text = formatBulkStatusCard(job);
   const keyboard = new InlineKeyboard()
-    .text('🔄 Refresh', `EMAIL_BULK:${jobId}`);
+    .text('🔄 Refresh', buildCallbackData(ctx, `EMAIL_BULK:${jobId}`));
   const payload = { parse_mode: 'Markdown', reply_markup: keyboard };
   if (ctx.callbackQuery?.message && !options.forceReply) {
     try {
@@ -268,7 +268,7 @@ async function sendBulkStatusCard(ctx, jobId, options = {}) {
       // fallback to sending a new message
     }
   }
-  await sendMenu(ctx, text, payload);
+  await renderMenu(ctx, text, keyboard, { payload });
 }
 
 async function askSchedule(conversation, ctx, ensureActive) {

@@ -1,0 +1,172 @@
+const crypto = require('crypto');
+const config = require('../config');
+const { ensureSession } = require('./sessionState');
+
+const DEFAULT_CALLBACK_TTL_MS = 15 * 60 * 1000;
+const DEFAULT_DEDUPE_TTL_MS = 8000;
+const SIGN_PREFIX = 'cb';
+
+function getCallbackSecret() {
+  return config.botToken || config.apiAuth?.hmacSecret || 'callback-secret';
+}
+
+function signPayload(payload) {
+  const secret = getCallbackSecret();
+  return crypto.createHmac('sha256', secret).update(payload).digest('hex').slice(0, 8);
+}
+
+function buildCallbackData(ctx, action, options = {}) {
+  const safeAction = String(action || '');
+  if (!safeAction) {
+    return '';
+  }
+  const ttlMs = Number.isFinite(options.ttlMs) ? options.ttlMs : DEFAULT_CALLBACK_TTL_MS;
+  ensureSession(ctx);
+  const token = options.token || ctx.session?.currentOp?.token || '';
+  const ts = options.timestamp || Date.now();
+  const payload = `${safeAction}|${token}|${ts}`;
+  const sig = signPayload(payload);
+  const data = `${SIGN_PREFIX}|${safeAction}|${token}|${ts}|${sig}`;
+  if (data.length > 64) {
+    return safeAction;
+  }
+  if (ttlMs <= 0) {
+    return safeAction;
+  }
+  return data;
+}
+
+function parseCallbackData(rawAction) {
+  const text = String(rawAction || '');
+  if (!text.startsWith(`${SIGN_PREFIX}|`)) {
+    return { action: text, signed: false };
+  }
+  const parts = text.split('|');
+  if (parts.length < 5) {
+    return { action: text, signed: true, valid: false, reason: 'format' };
+  }
+  const [, action, token, ts, sig] = parts;
+  const payload = `${action}|${token}|${ts}`;
+  const expected = signPayload(payload);
+  const timestamp = Number(ts);
+  return {
+    action,
+    signed: true,
+    token,
+    timestamp,
+    valid: sig === expected,
+    reason: sig === expected ? null : 'signature'
+  };
+}
+
+function extractLegacyOpToken(rawAction) {
+  const parts = String(rawAction || '').split(':');
+  if (parts.length < 2) {
+    return null;
+  }
+  const candidate = parts[1];
+  if (/^[0-9a-fA-F-]{8,}$/.test(candidate)) {
+    return candidate.replace(/-/g, '').slice(0, 8);
+  }
+  return null;
+}
+
+function validateCallback(ctx, rawAction, options = {}) {
+  ensureSession(ctx);
+  const ttlMs = Number.isFinite(options.ttlMs) ? options.ttlMs : DEFAULT_CALLBACK_TTL_MS;
+  const parsed = parseCallbackData(rawAction);
+  const now = Date.now();
+
+  if (parsed.signed) {
+    if (!parsed.valid) {
+      return { status: 'invalid', reason: parsed.reason, action: parsed.action };
+    }
+    if (parsed.timestamp && now - parsed.timestamp > ttlMs) {
+      return { status: 'expired', reason: 'ttl', action: parsed.action };
+    }
+    const currentToken = ctx.session?.currentOp?.token;
+    if (parsed.token && currentToken && parsed.token !== currentToken) {
+      return { status: 'stale', reason: 'token_mismatch', action: parsed.action };
+    }
+    return { status: 'ok', action: parsed.action };
+  }
+
+  const legacyToken = extractLegacyOpToken(rawAction);
+  const currentToken = ctx.session?.currentOp?.token;
+  if (legacyToken && currentToken && legacyToken !== currentToken) {
+    return { status: 'stale', reason: 'token_mismatch', action: parsed.action };
+  }
+  const startedAt = ctx.session?.currentOp?.startedAt;
+  if (startedAt && now - startedAt > ttlMs) {
+    return { status: 'expired', reason: 'ttl', action: parsed.action };
+  }
+  return { status: 'ok', action: parsed.action };
+}
+
+function matchesCallbackPrefix(rawAction, prefix) {
+  const parsed = parseCallbackData(rawAction);
+  const action = parsed.action || '';
+  return action === prefix || action.startsWith(`${prefix}:`);
+}
+
+function cleanupHistory(history, ttlMs) {
+  const now = Date.now();
+  Object.entries(history).forEach(([key, timestamp]) => {
+    if (!timestamp || now - timestamp > ttlMs) {
+      delete history[key];
+    }
+  });
+}
+
+function isDuplicateAction(ctx, key, ttlMs = DEFAULT_DEDUPE_TTL_MS) {
+  ensureSession(ctx);
+  if (!key) return false;
+  const history = ctx.session.actionHistory || {};
+  cleanupHistory(history, ttlMs);
+  const now = Date.now();
+  const lastSeen = history[key];
+  if (lastSeen && now - lastSeen < ttlMs) {
+    return true;
+  }
+  history[key] = now;
+  ctx.session.actionHistory = history;
+  return false;
+}
+
+function startActionMetric(ctx, name, meta = {}) {
+  ensureSession(ctx);
+  return {
+    name,
+    start: Date.now(),
+    userId: ctx.from?.id || null,
+    chatId: ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id || null,
+    opId: ctx.session?.currentOp?.id || null,
+    ...meta
+  };
+}
+
+function finishActionMetric(metric, status = 'ok', extra = {}) {
+  if (!metric) return;
+  const durationMs = Date.now() - metric.start;
+  const payload = {
+    type: 'metric',
+    action: metric.name,
+    status,
+    duration_ms: durationMs,
+    user_id: metric.userId,
+    chat_id: metric.chatId,
+    op_id: metric.opId,
+    ...extra
+  };
+  console.log(JSON.stringify(payload));
+}
+
+module.exports = {
+  buildCallbackData,
+  parseCallbackData,
+  validateCallback,
+  matchesCallbackPrefix,
+  isDuplicateAction,
+  startActionMetric,
+  finishActionMetric
+};

@@ -1,5 +1,6 @@
 const axios = require('axios');
 const config = require('../config');
+const { withRetry } = require('../utils/httpClient');
 const { getUser, isAdmin } = require('../db/db');
 const { attachHmacAuth } = require('../utils/apiAuth');
 const {
@@ -26,7 +27,7 @@ const {
   buildLine,
   escapeMarkdown,
   emphasize
-} = require('../utils/commandFormat');
+} = require('../utils/ui');
 
 const personaApi = axios.create({
   baseURL: config.apiUrl.replace(/\/+$/, ''),
@@ -61,10 +62,10 @@ async function personaApiRequest(ctx, ensureActive, options) {
   const controller = new AbortController();
   const release = registerAbortController(ctx, controller);
   try {
-    const response = await personaApi.request({
+    const response = await withRetry(() => personaApi.request({
       ...options,
       signal: controller.signal
-    });
+    }), options.retry || {});
     ensureActive();
     return response.data;
   } finally {

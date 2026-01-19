@@ -16,10 +16,18 @@ try {
 }
 const { conversations, createConversation } = conversationsPkg;
 const axios = require('axios');
+const httpClient = require('./utils/httpClient');
 const config = require('./config');
 const { attachHmacAuth } = require('./utils/apiAuth');
-const { sendMenu, clearMenuMessages } = require('./utils/menuCleanup');
-const { normalizeReply, logCommandError } = require('./utils/commandFormat');
+const { clearMenuMessages, getLatestMenuMessageId, isLatestMenuExpired, renderMenu } = require('./utils/ui');
+const {
+    buildCallbackData,
+    validateCallback,
+    isDuplicateAction,
+    startActionMetric,
+    finishActionMetric
+} = require('./utils/actions');
+const { normalizeReply, logCommandError } = require('./utils/ui');
 
 const apiOrigins = new Set();
 try {
@@ -87,6 +95,22 @@ bot.use(async (ctx, next) => {
     return next();
 });
 
+// Metrics for slash commands
+bot.use(async (ctx, next) => {
+    const command = ctx.message?.text?.startsWith('/') ? ctx.message.text.split(' ')[0].toLowerCase() : null;
+    if (!command) {
+        return next();
+    }
+    const metric = startActionMetric(ctx, `command:${command}`);
+    try {
+        const result = await next();
+        finishActionMetric(metric, 'ok');
+        return result;
+    } catch (error) {
+        finishActionMetric(metric, 'error', { error: error?.message || String(error) });
+        throw error;
+    }
+});
 // Normalize command replies to HTML formatting
 bot.use(async (ctx, next) => {
     const isCommand = Boolean(
@@ -138,15 +162,15 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
     try {
         switch (action) {
             case 'mute':
-                await axios.post(`${API_BASE}/api/calls/${callSid}/operator`, { action: 'mute_alerts' }, { timeout: 8000 });
+                await httpClient.post(ctx, `${API_BASE}/api/calls/${callSid}/operator`, { action: 'mute_alerts' }, { timeout: 8000 });
                 await ctx.answerCallbackQuery({ text: '🔕 Alerts muted for this call', show_alert: false });
                 break;
             case 'retry':
-                await axios.post(`${API_BASE}/api/calls/${callSid}/operator`, { action: 'clarify', text: 'Let me retry that step.' }, { timeout: 8000 });
+                await httpClient.post(ctx, `${API_BASE}/api/calls/${callSid}/operator`, { action: 'clarify', text: 'Let me retry that step.' }, { timeout: 8000 });
                 await ctx.answerCallbackQuery({ text: '🔄 Retry requested', show_alert: false });
                 break;
             case 'transfer':
-                await axios.post(`${API_BASE}/api/calls/${callSid}/operator`, { action: 'transfer' }, { timeout: 8000 });
+                await httpClient.post(ctx, `${API_BASE}/api/calls/${callSid}/operator`, { action: 'transfer' }, { timeout: 8000 });
                 await ctx.answerCallbackQuery({ text: '📞 Transfer request noted', show_alert: false });
                 break;
             default:
@@ -163,7 +187,7 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
 bot.callbackQuery(/^lc:/, async (ctx) => {
     try {
         await ctx.answerCallbackQuery();
-        await axios.post(`${config.apiUrl}/webhook/telegram`, ctx.update, { timeout: 8000 });
+        await httpClient.post(ctx, `${config.apiUrl}/webhook/telegram`, ctx.update, { timeout: 8000 });
         return;
     } catch (error) {
         console.error('Live call action proxy error:', error?.message || error);
@@ -191,7 +215,7 @@ bot.catch((err) => {
 async function validateTemplatesApiConnectivity() {
     const healthUrl = new URL('/health', config.scriptsApiUrl).toString();
     try {
-        const response = await axios.get(healthUrl, { timeout: 5000 });
+        const response = await httpClient.get(null, healthUrl, { timeout: 5000 });
         const contentType = response.headers?.['content-type'] || '';
         if (!contentType.includes('application/json')) {
             throw new Error(`healthcheck returned ${contentType || 'unknown'} content`);
@@ -395,7 +419,7 @@ async function sendFullTranscriptFromApi(ctx, callSid) {
     let transcripts = [];
 
     try {
-        const response = await axios.get(`${config.apiUrl}/api/calls/${callSid}`, { timeout: 15000 });
+        const response = await httpClient.get(ctx, `${config.apiUrl}/api/calls/${callSid}`, { timeout: 15000 });
         callData = response.data?.call || response.data;
         transcripts = response.data?.transcripts || [];
     } catch (error) {
@@ -448,7 +472,7 @@ async function sendTranscriptAudioFromApi(ctx, callSid) {
 
     let callData;
     try {
-        const response = await axios.get(`${config.apiUrl}/api/calls/${callSid}`, { timeout: 15000 });
+        const response = await httpClient.get(ctx, `${config.apiUrl}/api/calls/${callSid}`, { timeout: 15000 });
         callData = response.data?.call || response.data;
     } catch (error) {
         console.error('Transcript audio call fetch error:', error?.message || error);
@@ -467,7 +491,7 @@ async function sendTranscriptAudioFromApi(ctx, callSid) {
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
         let response;
         try {
-            response = await axios.get(`${config.apiUrl}/api/calls/${callSid}/transcript/audio`, {
+            response = await httpClient.get(ctx, `${config.apiUrl}/api/calls/${callSid}/transcript/audio`, {
                 responseType: 'arraybuffer',
                 timeout: 20000,
                 validateStatus: () => true
@@ -542,7 +566,7 @@ async function handleCallFollowUp(ctx, callSid, followAction) {
     let transcripts = [];
 
     try {
-        const response = await axios.get(`${config.apiUrl}/api/calls/${callSid}`, {
+        const response = await httpClient.get(ctx, `${config.apiUrl}/api/calls/${callSid}`, {
             timeout: 15000
         });
 
@@ -762,13 +786,15 @@ bot.command('start', async (ctx) => {
             const kb = new InlineKeyboard()
                 .url('📱 Contact Admin', `https://t.me/${adminUsername}`);
             
-            return sendMenu(ctx, '*Access Restricted* ⚠️\n\n' +
-                'This bot requires authorization.\n' +
-                'Please contact an administrator to get access.\n\n' +
-                'You can still use /help to learn how the bot works.', {
-                parse_mode: 'Markdown',
-                reply_markup: kb
-            });
+            return renderMenu(
+                ctx,
+                '*Access Restricted* ⚠️\n\n' +
+                    'This bot requires authorization.\n' +
+                    'Please contact an administrator to get access.\n\n' +
+                    'You can still use /help to learn how the bot works.',
+                kb,
+                { parseMode: 'Markdown' }
+            );
         }
 
         const isOwner = await new Promise(r => isAdmin(ctx.from.id, r));
@@ -785,55 +811,52 @@ bot.command('start', async (ctx) => {
             '👋 *Welcome to Voicednut Bot!*\n\nYou can make voice calls using AI agents.';
 
         const kb = new InlineKeyboard()
-          .text('📞 Call', 'CALL')
-          .text('💬 SMS', 'SMS')
+          .text('📞 Call', buildCallbackData(ctx, 'CALL'))
+          .text('💬 SMS', buildCallbackData(ctx, 'SMS'))
             .row()
-            .text('📧 Email', 'EMAIL')
-            .text('⏰ Schedule', 'SCHEDULE_SMS')
+            .text('📧 Email', buildCallbackData(ctx, 'EMAIL'))
+            .text('⏰ Schedule', buildCallbackData(ctx, 'SCHEDULE_SMS'))
             .row()
-            .text('📋 Calls', 'CALLS');
+            .text('📋 Calls', buildCallbackData(ctx, 'CALLS'));
 
         if (isOwner) {
-            kb.text('🧾 Threads', 'SMS_CONVO_HELP');
+            kb.text('🧾 Threads', buildCallbackData(ctx, 'SMS_CONVO_HELP'));
         }
 
         kb.row()
-            .text('📜 SMS Status', 'SMS_STATUS_HELP')
-            .text('📨 Email Status', 'EMAIL_STATUS_HELP')
+            .text('📜 SMS Status', buildCallbackData(ctx, 'SMS_STATUS_HELP'))
+            .text('📨 Email Status', buildCallbackData(ctx, 'EMAIL_STATUS_HELP'))
             .row()
-            .text('📚 Guide', 'GUIDE')
-            .text('🏥 Health', 'HEALTH')
+            .text('📚 Guide', buildCallbackData(ctx, 'GUIDE'))
+            .text('🏥 Health', buildCallbackData(ctx, 'HEALTH'))
             .row()
-            .text('ℹ️ Help', 'HELP')
-            .text('📋 Menu', 'MENU');
+            .text('ℹ️ Help', buildCallbackData(ctx, 'HELP'))
+            .text('📋 Menu', buildCallbackData(ctx, 'MENU'));
 
         if (isOwner) {
             kb.row()
-                .text('📤 Bulk SMS', 'BULK_SMS')
-                .text('📧 Bulk Email', 'BULK_EMAIL')
+                .text('📤 Bulk SMS', buildCallbackData(ctx, 'BULK_SMS'))
+                .text('📧 Bulk Email', buildCallbackData(ctx, 'BULK_EMAIL'))
             .row()
-                .text('📊 SMS Stats', 'SMS_STATS')
-                .text('📥 Recent', 'RECENT_SMS')
+                .text('📊 SMS Stats', buildCallbackData(ctx, 'SMS_STATS'))
+                .text('📥 Recent', buildCallbackData(ctx, 'RECENT_SMS'))
             .row()
-                .text('👥 Users', 'USERS')
-                .text('➕ Add', 'ADDUSER')
+                .text('👥 Users', buildCallbackData(ctx, 'USERS'))
+                .text('➕ Add', buildCallbackData(ctx, 'ADDUSER'))
             .row()
-                .text('⬆️ Promote', 'PROMOTE')
-                .text('❌ Remove', 'REMOVE')
+                .text('⬆️ Promote', buildCallbackData(ctx, 'PROMOTE'))
+                .text('❌ Remove', buildCallbackData(ctx, 'REMOVE'))
             .row()
-                .text('🧰 Scripts', 'SCRIPTS')
-                .text('☎️ Provider', 'PROVIDER_STATUS')
+                .text('🧰 Scripts', buildCallbackData(ctx, 'SCRIPTS'))
+                .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER_STATUS'))
             .row()
-                .text('🔍 Status', 'STATUS')
-                .text('🧪 Test API', 'TEST_API');
+                .text('🔍 Status', buildCallbackData(ctx, 'STATUS'))
+                .text('🧪 Test API', buildCallbackData(ctx, 'TEST_API'));
         }
 
         const message = `${welcomeText}\n\n${userStats}\n\nUse the buttons below or type /help for available commands.`;
         
-        await sendMenu(ctx, message, {
-            parse_mode: 'Markdown',
-            reply_markup: kb
-        });
+        await renderMenu(ctx, message, kb, { parseMode: 'Markdown' });
     } catch (error) {
         console.error('Start command error:', error);
         await ctx.reply('❌ An error occurred. Please try again or contact support.');
@@ -842,11 +865,40 @@ bot.command('start', async (ctx) => {
 
 // Enhanced callback query handler
 bot.on('callback_query:data', async (ctx) => {
+    const rawAction = ctx.callbackQuery.data;
+    const metric = startActionMetric(ctx, 'callback', { raw_action: rawAction });
+    const finishMetric = (status, extra = {}) => {
+        finishActionMetric(metric, status, extra);
+    };
     try {
-        const action = ctx.callbackQuery.data;
-        if (action && action.startsWith('lc:')) {
+        if (rawAction && rawAction.startsWith('lc:')) {
+            finishMetric('skipped');
             return;
         }
+        const menuExemptPrefixes = ['alert:', 'lc:', 'recap:', 'FOLLOWUP_CALL:', 'FOLLOWUP_SMS:', 'tr:', 'rca:'];
+        const isMenuExempt = menuExemptPrefixes.some((prefix) => rawAction.startsWith(prefix));
+        const validation = isMenuExempt
+            ? { status: 'ok', action: rawAction }
+            : validateCallback(ctx, rawAction);
+        if (validation.status !== 'ok') {
+            const message = validation.status === 'expired'
+                ? '⌛ This menu expired. Opening the latest view…'
+                : '⚠️ This menu is no longer active.';
+            await ctx.answerCallbackQuery({ text: message, show_alert: false });
+            await clearMenuMessages(ctx);
+            await handleMenu(ctx);
+            finishMetric(validation.status, { reason: validation.reason });
+            return;
+        }
+
+        const action = validation.action;
+        const actionKey = `${action}|${ctx.callbackQuery?.message?.message_id || ''}`;
+        if (isDuplicateAction(ctx, actionKey)) {
+            await ctx.answerCallbackQuery({ text: 'Already processed.', show_alert: false });
+            finishMetric('duplicate');
+            return;
+        }
+
         // Answer callback query immediately to prevent timeout
         await ctx.answerCallbackQuery();
         console.log(`Callback query received: ${action} from user ${ctx.from.id}`);
@@ -867,6 +919,24 @@ bot.on('callback_query:data', async (ctx) => {
 
         if (requiresAdmin && !isAdminUser) {
             await ctx.reply("❌ This action is for administrators only.");
+            finishMetric('forbidden');
+            return;
+        }
+
+        const isMenuExemptAction = menuExemptPrefixes.some((prefix) => action.startsWith(prefix));
+        const menuMessageId = ctx.callbackQuery?.message?.message_id;
+        const menuChatId = ctx.callbackQuery?.message?.chat?.id;
+        const latestMenuId = getLatestMenuMessageId(ctx, menuChatId);
+        if (!isMenuExemptAction && isLatestMenuExpired(ctx, menuChatId)) {
+            await clearMenuMessages(ctx);
+            await handleMenu(ctx);
+            finishMetric('expired');
+            return;
+        }
+        if (!isMenuExemptAction && menuMessageId && latestMenuId && menuMessageId !== latestMenuId) {
+            await clearMenuMessages(ctx);
+            await handleMenu(ctx);
+            finishMetric('stale');
             return;
         }
 
@@ -875,9 +945,11 @@ bot.on('callback_query:data', async (ctx) => {
             const detailsMessage = ctx.session?.callDetailsCache?.[detailsKey];
             if (!detailsMessage) {
                 await ctx.reply('ℹ️ Details are no longer available for this call.');
+                finishMetric('not_found');
                 return;
             }
             await ctx.reply(detailsMessage);
+            finishMetric('ok');
             return;
         }
 
@@ -886,6 +958,7 @@ bot.on('callback_query:data', async (ctx) => {
             await cancelActiveFlow(ctx, `callback:${action}`);
             resetSession(ctx);
             await sendFullTranscriptFromApi(ctx, callSid);
+            finishMetric('ok');
             return;
         }
 
@@ -894,6 +967,7 @@ bot.on('callback_query:data', async (ctx) => {
             await cancelActiveFlow(ctx, `callback:${action}`);
             resetSession(ctx);
             await sendTranscriptAudioFromApi(ctx, callSid);
+            finishMetric('ok');
             return;
         }
 
@@ -903,12 +977,13 @@ bot.on('callback_query:data', async (ctx) => {
             resetSession(ctx);
             if (recapAction === 'skip') {
                 await ctx.reply('👍 Skipping recap for now.');
+                finishMetric('ok');
                 return;
             }
             if (recapAction === 'sms') {
                 await ctx.reply('📩 Sending recap via SMS...');
                 try {
-                    const response = await axios.get(`${config.apiUrl}/api/calls/${callSid}`, { timeout: 15000 });
+                    const response = await httpClient.get(ctx, `${config.apiUrl}/api/calls/${callSid}`, { timeout: 15000 });
                     const callData = response.data?.call || response.data;
                     if (!callData?.phone_number) {
                         await ctx.reply('❌ Unable to send recap: phone number missing.');
@@ -924,15 +999,17 @@ bot.on('callback_query:data', async (ctx) => {
                     const name = callData.customer_name || callData.victim_name || callData.client_name || null;
                     const nameSuffix = name ? ` with ${name}` : '';
                     const message = `VoicedNut call recap${nameSuffix}: ${summary} Status: ${status}.${duration}`;
-                    await axios.post(`${config.apiUrl}/api/sms/send`, {
+                    await httpClient.post(ctx, `${config.apiUrl}/api/sms/send`, {
                         to: callData.phone_number,
                         message,
                         user_chat_id: ctx.from.id
                     }, { timeout: 15000 });
                     await ctx.reply('✅ Recap SMS sent.');
+                    finishMetric('ok');
                 } catch (error) {
                     console.error('Recap SMS error:', error?.message || error);
                     await ctx.reply('❌ Failed to send recap SMS. Please try again later.');
+                    finishMetric('error', { error: error?.message || String(error) });
                 }
                 return;
             }
@@ -943,6 +1020,7 @@ bot.on('callback_query:data', async (ctx) => {
             resetSession(ctx);
             const [, callSid, followAction] = action.split(':');
             await handleCallFollowUp(ctx, callSid, followAction || 'recap');
+            finishMetric('ok');
             return;
         }
 
@@ -951,6 +1029,7 @@ bot.on('callback_query:data', async (ctx) => {
             resetSession(ctx);
             const [, phone, followAction] = action.split(':');
             await handleSmsFollowUp(ctx, phone, followAction || 'new');
+            finishMetric('ok');
             return;
         }
 
@@ -959,6 +1038,7 @@ bot.on('callback_query:data', async (ctx) => {
             await cancelActiveFlow(ctx, `callback:${action}`);
             resetSession(ctx);
             await executeProviderSwitchCommand(ctx, provider?.toLowerCase());
+            finishMetric('ok');
             return;
         }
 
@@ -968,9 +1048,11 @@ bot.on('callback_query:data', async (ctx) => {
             resetSession(ctx);
             if (!messageId) {
                 await ctx.reply('❌ Missing email message id.');
+                finishMetric('invalid');
                 return;
             }
             await sendEmailStatusCard(ctx, messageId);
+            finishMetric('ok');
             return;
         }
 
@@ -980,9 +1062,11 @@ bot.on('callback_query:data', async (ctx) => {
             resetSession(ctx);
             if (!messageId) {
                 await ctx.reply('❌ Missing email message id.');
+                finishMetric('invalid');
                 return;
             }
             await sendEmailTimeline(ctx, messageId);
+            finishMetric('ok');
             return;
         }
 
@@ -992,9 +1076,11 @@ bot.on('callback_query:data', async (ctx) => {
             resetSession(ctx);
             if (!jobId) {
                 await ctx.reply('❌ Missing bulk job id.');
+                finishMetric('invalid');
                 return;
             }
             await sendBulkStatusCard(ctx, jobId);
+            finishMetric('ok');
             return;
         }
 
@@ -1008,7 +1094,9 @@ bot.on('callback_query:data', async (ctx) => {
                     resetSession(ctx);
                     await ctx.reply('↩️ Reopening the menu so you can continue.');
                     await ctx.conversation.enter(conversationTarget);
+                    finishMetric('stale');
                 }
+                finishMetric('routed');
                 return;
             }
         }
@@ -1034,89 +1122,106 @@ bot.on('callback_query:data', async (ctx) => {
             startOperation(ctx, action.toLowerCase());
             await ctx.reply(`Starting ${action.toLowerCase()} process...`);
             await ctx.conversation.enter(conversations[action]);
+            finishMetric('ok');
             return;
         }
 
         // Handle direct command actions
         await cancelActiveFlow(ctx, `callback:${action}`);
         resetSession(ctx);
+        await clearMenuMessages(ctx);
 
         switch (action) {
             case 'HELP':
                 await handleHelp(ctx);
+                finishMetric('ok');
                 break;
                 
             case 'USERS':
                 if (isAdminUser) {
                     try {
                         await executeUsersCommand(ctx);
+                        finishMetric('ok');
                     } catch (usersError) {
                         console.error('Users callback error:', usersError);
                         await ctx.reply('❌ Error displaying users list. Please try again.');
+                        finishMetric('error', { error: usersError?.message || String(usersError) });
                     }
                 }
                 break;
                 
             case 'GUIDE':
                 await handleGuide(ctx);
+                finishMetric('ok');
                 break;
                 
             case 'MENU':
                 await handleMenu(ctx);
+                finishMetric('ok');
                 break;
                 
             case 'HEALTH':
                 await handleHealthCommand(ctx);
+                finishMetric('ok');
                 break;
                 
             case 'STATUS':
                 if (isAdminUser) {
                     await handleStatusCommand(ctx);
+                    finishMetric('ok');
                 }
                 break;
 
             case 'TEST_API':
                 if (isAdminUser) {
                     await handleTestApiCommand(ctx);
+                    finishMetric('ok');
                 }
                 break;
 
             case 'PROVIDER_STATUS':
                 if (isAdminUser) {
                     await executeProviderStatusCommand(ctx);
+                    finishMetric('ok');
                 }
                 break;
 
             case 'CALLS':
                 await executeCallsCommand(ctx);
+                finishMetric('ok');
                 break;
 
             case 'SMS':
                 await ctx.reply(`Starting SMS process...`);
                 await ctx.conversation.enter('sms-conversation');
+                finishMetric('ok');
                 break;
                 
             case 'BULK_SMS':
                 if (isAdminUser) {
                     await ctx.reply(`Starting bulk SMS process...`);
                     await ctx.conversation.enter('bulk-sms-conversation');
+                    finishMetric('ok');
                 }
                 break;
             
             case 'SCHEDULE_SMS':
                 await ctx.reply(`Starting SMS scheduling...`);
                 await ctx.conversation.enter('schedule-sms-conversation');
+                finishMetric('ok');
                 break;
             
             case 'SMS_STATS':
                 if (isAdminUser) {
                     await executeSmsStatsCommand(ctx);
+                    finishMetric('ok');
                 }
                 break;
 
             case 'RECENT_SMS':
                 if (isAdminUser) {
                     await executeRecentSmsCommand(ctx);
+                    finishMetric('ok');
                 }
                 break;
 
@@ -1125,6 +1230,7 @@ bot.on('callback_query:data', async (ctx) => {
                     'Use <code>/smsstatus &lt;message_sid&gt;</code> to check delivery status.\nExample: <code>/smsstatus SM1234567890abcdef</code>',
                     { parse_mode: 'HTML' }
                 );
+                finishMetric('ok');
                 break;
 
             case 'SMS_CONVO_HELP':
@@ -1133,6 +1239,7 @@ bot.on('callback_query:data', async (ctx) => {
                         'Use <code>/smsconversation &lt;phone_number&gt;</code> to view a thread.\nExample: <code>/smsconversation +1234567890</code>',
                         { parse_mode: 'HTML' }
                     );
+                    finishMetric('ok');
                 }
                 break;
 
@@ -1141,21 +1248,25 @@ bot.on('callback_query:data', async (ctx) => {
                     'Use <code>/emailstatus &lt;message_id&gt;</code> to check email status.\nExample: <code>/emailstatus email_1234...</code>',
                     { parse_mode: 'HTML' }
                 );
+                finishMetric('ok');
                 break;
                 
             default:
                 if (action.includes(':')) {
                     console.log(`Stale callback action: ${action}`);
                     await ctx.reply('⚠️ That menu is no longer active. Use /menu to start again.');
+                    finishMetric('stale');
                 } else {
                     console.log(`Unknown callback action: ${action}`);
                     await ctx.reply("❌ Unknown action. Please try again.");
+                    finishMetric('unknown');
                 }
         }
 
     } catch (error) {
         console.error('Callback query error:', error);
         await ctx.reply("❌ An error occurred processing your request. Please try again.");
+        finishMetric('error', { error: error?.message || String(error) });
     }
 });
 
@@ -1214,7 +1325,7 @@ async function executeSmsStatsCommand(ctx) {
 async function executeRecentSmsCommand(ctx) {
     try {
         const limit = 10;
-        const response = await axios.get(`${config.apiUrl}/api/sms/messages/recent`, {
+        const response = await httpClient.get(ctx, `${config.apiUrl}/api/sms/messages/recent`, {
             params: { limit },
             timeout: 10000
         });
@@ -1255,8 +1366,6 @@ async function executeRecentSmsCommand(ctx) {
 }
 
 async function executeCallsCommand(ctx) {
-    const axios = require('axios');
-
     try {
         console.log('Executing calls command via callback...');
         
@@ -1276,7 +1385,7 @@ async function executeCallsCommand(ctx) {
             try {
                 console.log(`Trying endpoint: ${endpoint}`);
                 
-                response = await axios.get(endpoint, {
+                response = await httpClient.get(ctx, endpoint, {
                     timeout: 15000,
                     headers: {
                         'Accept': 'application/json',
@@ -1376,13 +1485,13 @@ async function executeCallsCommand(ctx) {
     }
 }
 
-function buildProviderKeyboard(activeProvider = '') {
+function buildProviderKeyboard(ctx, activeProvider = '') {
     const keyboard = new InlineKeyboard();
     SUPPORTED_PROVIDERS.forEach((provider, index) => {
         const normalized = provider.toLowerCase();
         const isActive = normalized === activeProvider;
         const label = isActive ? `✅ ${normalized.toUpperCase()}` : normalized.toUpperCase();
-        keyboard.text(label, `PROVIDER_SET:${normalized}`);
+        keyboard.text(label, buildCallbackData(ctx, `PROVIDER_SET:${normalized}`));
 
         const shouldInsertRow = index % 2 === 1 && index < SUPPORTED_PROVIDERS.length - 1;
         if (shouldInsertRow) {
@@ -1390,7 +1499,7 @@ function buildProviderKeyboard(activeProvider = '') {
         }
     });
 
-    keyboard.row().text('🔄 Refresh', 'PROVIDER_STATUS');
+    keyboard.row().text('🔄 Refresh', buildCallbackData(ctx, 'PROVIDER_STATUS'));
     return keyboard;
 }
 
@@ -1398,15 +1507,12 @@ async function executeProviderStatusCommand(ctx) {
     try {
         const status = await fetchProviderStatus();
         const active = (status.provider || '').toLowerCase();
-        const keyboard = buildProviderKeyboard(active);
+        const keyboard = buildProviderKeyboard(ctx, active);
 
         let message = formatProviderStatus(status);
         message += '\n\nTap a provider below to switch.';
 
-        await sendMenu(ctx, message, {
-            parse_mode: 'Markdown',
-            reply_markup: keyboard,
-        });
+        await renderMenu(ctx, message, keyboard, { parseMode: 'Markdown' });
     } catch (error) {
         console.error('Provider status command error:', error);
         if (error.response) {
@@ -1431,7 +1537,7 @@ async function executeProviderSwitchCommand(ctx, provider) {
         const result = await updateProvider(normalized);
         const status = await fetchProviderStatus();
         const active = (status.provider || '').toLowerCase();
-        const keyboard = buildProviderKeyboard(active);
+        const keyboard = buildProviderKeyboard(ctx, active);
 
         const targetLabel = active ? active.toUpperCase() : normalized.toUpperCase();
         let message = result.changed === false
@@ -1442,10 +1548,7 @@ async function executeProviderSwitchCommand(ctx, provider) {
         message += formatProviderStatus(status);
         message += '\n\nTap a provider below to switch again.';
 
-        await sendMenu(ctx, message, {
-            parse_mode: 'Markdown',
-            reply_markup: keyboard,
-        });
+        await renderMenu(ctx, message, keyboard, { parseMode: 'Markdown' });
     } catch (error) {
         console.error('Provider switch command error:', error);
         if (error.response) {

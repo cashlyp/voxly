@@ -1,7 +1,7 @@
 const config = require('../config');
-const axios = require('axios');
+const httpClient = require('../utils/httpClient');
 const { getUser, isAdmin } = require('../db/db');
-const { escapeMarkdown, buildLine } = require('../utils/commandFormat');
+const { escapeMarkdown, buildLine } = require('../utils/ui');
 
 function parseRecentFilter(filter) {
     const trimmed = (filter || '').trim();
@@ -31,7 +31,7 @@ async function fetchRecentCalls({ limit = 10, filter } = {}) {
     let lastError;
     for (const candidate of candidates) {
         try {
-            const res = await axios.get(candidate.url, {
+            const res = await httpClient.get(null, candidate.url, {
                 params: candidate.params,
                 timeout: 10000
             });
@@ -66,7 +66,7 @@ async function handleTestApiCommand(ctx) {
 
         console.log('Testing API connection to:', config.apiUrl);
         const startTime = Date.now();
-        const response = await axios.get(`${config.apiUrl}/health`, {
+        const response = await httpClient.get(null, `${config.apiUrl}/health`, {
             timeout: 10000,
             headers: {
                 'Accept': 'application/json',
@@ -145,7 +145,7 @@ async function handleStatusCommand(ctx) {
         await ctx.reply('🔍 Checking system status...');
 
         const startTime = Date.now();
-        const response = await axios.get(`${config.apiUrl}/health`, {
+        const response = await httpClient.get(null, `${config.apiUrl}/health`, {
             timeout: 15000,
             headers: {
                 'Accept': 'application/json',
@@ -252,7 +252,7 @@ async function handleSearchCommand(ctx) {
         }
 
         await ctx.reply(`🔍 Searching calls for “${query}”…`);
-        const res = await axios.get(`${config.apiUrl}/api/calls/search`, {
+        const res = await httpClient.get(null, `${config.apiUrl}/api/calls/search`, {
             params: { q: query, limit: 10 },
             timeout: 12000
         });
@@ -317,7 +317,7 @@ async function handleLatencyCommand(ctx) {
         if (!callSid) {
             return ctx.reply('⏱️ <b>Usage:</b> <code>/latency &lt;callSid&gt;</code>', { parse_mode: 'HTML' });
         }
-        const res = await axios.get(`${config.apiUrl}/api/calls/${callSid}/latency`, { timeout: 8000 });
+        const res = await httpClient.get(null, `${config.apiUrl}/api/calls/${callSid}/latency`, { timeout: 8000 });
         const lat = res.data?.latency_metrics || {};
         const lines = [
             `⏱️ Latency for ${callSid}`,
@@ -338,7 +338,7 @@ async function handleVersionCommand(ctx) {
         const user = await new Promise(r => getUser(ctx.from.id, r));
         if (!user) return ctx.reply('❌ You are not authorized.');
 
-        const res = await axios.get(`${config.apiUrl}/api/version`, { timeout: 6000 });
+        const res = await httpClient.get(null, `${config.apiUrl}/api/version`, { timeout: 6000 });
         const v = res.data;
         const message = [
             `🧭 Version: ${v.version || 'unknown'}`,
@@ -361,7 +361,7 @@ async function handleDigestCommand(ctx) {
         let summary = null;
         let notificationsError = null;
         try {
-            const res = await axios.get(`${config.apiUrl}/api/analytics/notifications`, {
+            const res = await httpClient.get(null, `${config.apiUrl}/api/analytics/notifications`, {
                 params: { hours: 24, limit: 50 },
                 timeout: 12000
             });
@@ -421,7 +421,7 @@ async function handleHealthCommand(ctx) {
         const startTime = Date.now();
 
         try {
-            const response = await axios.get(`${config.apiUrl}/health`, {
+            const response = await httpClient.get(null, `${config.apiUrl}/health`, {
                 timeout: 8000,
                 headers: {
                     'Accept': 'application/json',

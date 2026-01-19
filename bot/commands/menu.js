@@ -1,8 +1,8 @@
 const { InlineKeyboard } = require('grammy');
 const { getUser, isAdmin } = require('../db/db');
 const { cancelActiveFlow, resetSession } = require('../utils/sessionState');
-const { escapeHtml } = require('../utils/commandFormat');
-const { sendMenu } = require('../utils/menuCleanup');
+const { escapeHtml, renderMenu } = require('../utils/ui');
+const { buildCallbackData } = require('../utils/actions');
 
 async function handleMenu(ctx) {
     try {
@@ -17,56 +17,53 @@ async function handleMenu(ctx) {
         const isOwner = await new Promise(r => isAdmin(ctx.from.id, r));
 
         const kb = new InlineKeyboard()
-            .text('📞 Call', 'CALL')
-            .text('💬 SMS', 'SMS')
+            .text('📞 Call', buildCallbackData(ctx, 'CALL'))
+            .text('💬 SMS', buildCallbackData(ctx, 'SMS'))
             .row()
-            .text('📧 Email', 'EMAIL')
-            .text('⏰ Schedule', 'SCHEDULE_SMS')
+            .text('📧 Email', buildCallbackData(ctx, 'EMAIL'))
+            .text('⏰ Schedule', buildCallbackData(ctx, 'SCHEDULE_SMS'))
             .row()
-            .text('📋 Calls', 'CALLS');
+            .text('📋 Calls', buildCallbackData(ctx, 'CALLS'));
 
         if (isOwner) {
-            kb.text('🧾 Threads', 'SMS_CONVO_HELP');
+            kb.text('🧾 Threads', buildCallbackData(ctx, 'SMS_CONVO_HELP'));
         }
 
         kb.row()
-            .text('📜 SMS Status', 'SMS_STATUS_HELP')
-            .text('📨 Email Status', 'EMAIL_STATUS_HELP')
+            .text('📜 SMS Status', buildCallbackData(ctx, 'SMS_STATUS_HELP'))
+            .text('📨 Email Status', buildCallbackData(ctx, 'EMAIL_STATUS_HELP'))
             .row()
-            .text('📚 Guide', 'GUIDE')
-            .text('🏥 Health', 'HEALTH')
+            .text('📚 Guide', buildCallbackData(ctx, 'GUIDE'))
+            .text('🏥 Health', buildCallbackData(ctx, 'HEALTH'))
             .row()
-            .text('ℹ️ Help', 'HELP');
+            .text('ℹ️ Help', buildCallbackData(ctx, 'HELP'));
 
         if (isOwner) {
             kb.row()
-                .text('📤 Bulk SMS', 'BULK_SMS')
-                .text('📧 Bulk Email', 'BULK_EMAIL')
+                .text('📤 Bulk SMS', buildCallbackData(ctx, 'BULK_SMS'))
+                .text('📧 Bulk Email', buildCallbackData(ctx, 'BULK_EMAIL'))
                 .row()
-                .text('📊 SMS Stats', 'SMS_STATS')
-                .text('📥 Recent', 'RECENT_SMS')
+                .text('📊 SMS Stats', buildCallbackData(ctx, 'SMS_STATS'))
+                .text('📥 Recent', buildCallbackData(ctx, 'RECENT_SMS'))
                 .row()
-                .text('👥 Users', 'USERS')
-                .text('➕ Add', 'ADDUSER')
+                .text('👥 Users', buildCallbackData(ctx, 'USERS'))
+                .text('➕ Add', buildCallbackData(ctx, 'ADDUSER'))
                 .row()
-                .text('⬆️ Promote', 'PROMOTE')
-                .text('❌ Remove', 'REMOVE')
+                .text('⬆️ Promote', buildCallbackData(ctx, 'PROMOTE'))
+                .text('❌ Remove', buildCallbackData(ctx, 'REMOVE'))
                 .row()
-                .text('🧰 Scripts', 'SCRIPTS')
-                .text('☎️ Provider', 'PROVIDER_STATUS')
+                .text('🧰 Scripts', buildCallbackData(ctx, 'SCRIPTS'))
+                .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER_STATUS'))
                 .row()
-                .text('🔍 Status', 'STATUS')
-                .text('🧪 Test API', 'TEST_API');
+                .text('🔍 Status', buildCallbackData(ctx, 'STATUS'))
+                .text('🧪 Test API', buildCallbackData(ctx, 'TEST_API'));
         }
 
         const menuText = isOwner
             ? `<b>${escapeHtml('Administrator Menu')}</b>\n${escapeHtml('Choose an action')}\n• ${escapeHtml('Access advanced tools below')}`
             : `<b>${escapeHtml('Quick Actions Menu')}</b>\n${escapeHtml('Tap a shortcut')}\n• ${escapeHtml('Get calling, texting and status tools fast')}`;
 
-        await sendMenu(ctx, menuText, {
-            parse_mode: 'HTML',
-            reply_markup: kb
-        });
+        await renderMenu(ctx, menuText, kb, { parseMode: 'HTML' });
     } catch (error) {
         console.error('Menu command error:', error);
         await ctx.reply('❌ Error displaying menu. Please try again.');

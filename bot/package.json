@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node bot.js",
     "dev": "nodemon bot.js",
-    "setup": "node setup-env.js"
+    "setup": "node setup-env.js",
+    "test": "echo \"No tests configured\""
   },
   "dependencies": {
     "@grammyjs/conversations": "^1.2.0",

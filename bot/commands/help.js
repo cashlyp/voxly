@@ -1,8 +1,8 @@
 const { InlineKeyboard } = require('grammy');
 const { isAdmin, getUser } = require('../db/db');
 const config = require('../config');
-const { escapeHtml } = require('../utils/commandFormat');
-const { sendMenu } = require('../utils/menuCleanup');
+const { escapeHtml, renderMenu } = require('../utils/ui');
+const { buildCallbackData } = require('../utils/actions');
 
 async function handleHelp(ctx) {
     try {
@@ -115,29 +115,26 @@ async function handleHelp(ctx) {
         const kb = isAuthorized
             ? (() => {
                 const keyboard = new InlineKeyboard()
-                    .text('📞 Call', 'CALL')
-                    .text('📋 Menu', 'MENU')
+                    .text('📞 Call', buildCallbackData(ctx, 'CALL'))
+                    .text('📋 Menu', buildCallbackData(ctx, 'MENU'))
                     .row()
-                    .text('💬 SMS', 'SMS')
-                    .text('📧 Email', 'EMAIL')
+                    .text('💬 SMS', buildCallbackData(ctx, 'SMS'))
+                    .text('📧 Email', buildCallbackData(ctx, 'EMAIL'))
                     .row()
-                    .text('📚 Guide', 'GUIDE');
+                    .text('📚 Guide', buildCallbackData(ctx, 'GUIDE'));
 
                 if (isOwner) {
                     keyboard.row()
-                        .text('👥 Users', 'USERS')
-                        .text('➕ Add', 'ADDUSER')
+                        .text('👥 Users', buildCallbackData(ctx, 'USERS'))
+                        .text('➕ Add', buildCallbackData(ctx, 'ADDUSER'))
                         .row()
-                        .text('☎️ Provider', 'PROVIDER_STATUS');
+                        .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER_STATUS'));
                 }
                 return keyboard;
             })()
             : new InlineKeyboard().url('📱 Contact Admin', `https://t.me/${adminUsername}`);
 
-        await sendMenu(ctx, helpText, {
-            parse_mode: 'HTML',
-            reply_markup: kb
-        });
+        await renderMenu(ctx, helpText, kb, { parseMode: 'HTML' });
 
     } catch (error) {
         console.error('Help command error:', error);

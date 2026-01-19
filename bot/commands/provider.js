@@ -1,7 +1,7 @@
-const axios = require('axios');
 const config = require('../config');
+const httpClient = require('../utils/httpClient');
 const { getUser, isAdmin } = require('../db/db');
-const { buildLine, section, escapeMarkdown } = require('../utils/commandFormat');
+const { buildLine, section, escapeMarkdown } = require('../utils/ui');
 
 const ADMIN_HEADER_NAME = 'x-admin-token';
 const SUPPORTED_PROVIDERS = ['twilio', 'aws', 'vonage'];
@@ -33,7 +33,7 @@ function formatProviderStatus(status) {
 }
 
 async function fetchProviderStatus() {
-    const response = await axios.get(`${config.apiUrl}/admin/provider`, {
+    const response = await httpClient.get(null, `${config.apiUrl}/admin/provider`, {
         timeout: 10000,
         headers: {
             [ADMIN_HEADER_NAME]: config.admin.apiToken,
@@ -44,7 +44,8 @@ async function fetchProviderStatus() {
 }
 
 async function updateProvider(provider) {
-    const response = await axios.post(
+    const response = await httpClient.post(
+        null,
         `${config.apiUrl}/admin/provider`,
         { provider },
         {

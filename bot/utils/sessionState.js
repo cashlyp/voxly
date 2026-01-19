@@ -47,7 +47,8 @@ const initialSessionState = () => ({
   meta: {},
   flow: null,
   errors: [],
-  menuMessages: []
+  menuMessages: [],
+  actionHistory: {}
 });
 
 function ensureSession(ctx) {
@@ -60,6 +61,13 @@ function ensureSession(ctx) {
     ctx.session.flow = ctx.session.flow || null;
     ctx.session.errors = Array.isArray(ctx.session.errors) ? ctx.session.errors : [];
     ctx.session.menuMessages = Array.isArray(ctx.session.menuMessages) ? ctx.session.menuMessages : [];
+    ctx.session.actionHistory =
+      ctx.session.actionHistory && typeof ctx.session.actionHistory === 'object'
+        ? ctx.session.actionHistory
+        : {};
+    if (ctx.session.currentOp && ctx.session.currentOp.id && !ctx.session.currentOp.token) {
+      ctx.session.currentOp.token = ctx.session.currentOp.id.replace(/-/g, '').slice(0, 8);
+    }
   }
 }
 
@@ -73,8 +81,10 @@ function generateOpId() {
 function startOperation(ctx, command, metadata = {}) {
   ensureSession(ctx);
   const opId = generateOpId();
+  const opToken = opId.replace(/-/g, '').slice(0, 8);
   ctx.session.currentOp = {
     id: opId,
+    token: opToken,
     command,
     metadata,
     startedAt: Date.now()

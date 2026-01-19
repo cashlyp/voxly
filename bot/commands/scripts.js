@@ -1,5 +1,7 @@
 const axios = require('axios');
 const config = require('../config');
+const httpClient = require('../utils/httpClient');
+const { withRetry } = require('../utils/httpClient');
 const { getUser, isAdmin } = require('../db/db');
 const {
   getBusinessOptions,
@@ -19,7 +21,7 @@ const {
   getCurrentOpId,
   guardAgainstCommandInterrupt
 } = require('../utils/sessionState');
-const { section, buildLine, tipLine } = require('../utils/commandFormat');
+const { section, buildLine, tipLine } = require('../utils/ui');
 const { attachHmacAuth } = require('../utils/apiAuth');
 
 const scriptsApi = axios.create({
@@ -62,7 +64,7 @@ function nonJsonResponseError(endpoint, response) {
 async function scriptsApiRequest(options) {
   const endpoint = `${(options.method || 'GET').toUpperCase()} ${options.url}`;
   try {
-    const response = await scriptsApi.request(options);
+    const response = await withRetry(() => scriptsApi.request(options), options.retry || {});
     const contentType = response.headers?.['content-type'] || '';
     if (!contentType.includes('application/json')) {
       throw nonJsonResponseError(endpoint, response);
@@ -679,7 +681,7 @@ async function previewCallScript(conversation, ctx, script, ensureActive) {
   }
 
   try {
-    await axios.post(`${config.apiUrl}/outbound-call`, payload, {
+    await httpClient.post(null, `${config.apiUrl}/outbound-call`, payload, {
       headers: { 'Content-Type': 'application/json' },
       timeout: 30000
     });
