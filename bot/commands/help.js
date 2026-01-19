@@ -2,6 +2,7 @@ const { InlineKeyboard } = require('grammy');
 const { isAdmin, getUser } = require('../db/db');
 const config = require('../config');
 const { escapeHtml } = require('../utils/commandFormat');
+const { sendMenu } = require('../utils/menuCleanup');
 
 async function handleHelp(ctx) {
     try {
@@ -81,7 +82,7 @@ async function handleHelp(ctx) {
                 '📬 /emailbulk <job_id> — bulk email job status',
                 '🧪 /status — deep system status',
                 '🧪 /testapi — hit the API health endpoint',
-                '🧰 /templates — manage reusable prompts',
+                '🧰 /scripts — manage reusable prompts',
                 '🍃 /persona — sculpt adaptive agents',
                 '🔀 /provider — view or switch voice providers'
             ];
@@ -98,7 +99,7 @@ async function handleHelp(ctx) {
             `<b>What this bot can do</b>\n${formatLines([
                 '🤖 Run AI-powered voice calls and SMS outreach',
                 '🧾 Track conversations and delivery status',
-                '🛡️ Admins manage users, templates, and providers'
+                '🛡️ Admins manage users, scripts, and providers'
             ])}`,
             `<b>Get access</b>\n${formatLines([
                 `🆘 Contact admin: @${escapeHtml(config.admin.username || '')}`,
@@ -133,7 +134,7 @@ async function handleHelp(ctx) {
             })()
             : new InlineKeyboard().url('📱 Contact Admin', `https://t.me/${adminUsername}`);
 
-        await ctx.reply(helpText, {
+        await sendMenu(ctx, helpText, {
             parse_mode: 'HTML',
             reply_markup: kb
         });

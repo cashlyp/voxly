@@ -561,9 +561,9 @@ class EnhancedSmsService extends EventEmitter {
         return toSend.length;
     }
 
-    // SMS templates system
-    getTemplate(templateName, variables = {}) {
-        const templates = {
+    // SMS scripts system
+    getScript(scriptName, variables = {}) {
+        const scripts = {
             welcome: "Welcome to our service! We're excited to have you aboard. Reply HELP for assistance or STOP to unsubscribe.",
             appointment_reminder: "Reminder: You have an appointment on {date} at {time}. Reply CONFIRM to confirm or RESCHEDULE to change.",
             verification: "Your verification code is: {code}. This code will expire in 10 minutes. Do not share this code with anyone.",
@@ -574,17 +574,17 @@ class EnhancedSmsService extends EventEmitter {
             survey: "How was your experience with us? Rate us 1-5 stars by replying with a number. Your feedback helps us improve!"
         };
 
-        let template = templates[templateName];
-        if (!template) {
-            throw new Error(`Template '${templateName}' not found`);
+        let script = scripts[scriptName];
+        if (!script) {
+            throw new Error(`Script '${scriptName}' not found`);
         }
 
         // Replace variables
         for (const [key, value] of Object.entries(variables)) {
-            template = template.replace(new RegExp(`{${key}}`, 'g'), value);
+            script = script.replace(new RegExp(`{${key}}`, 'g'), value);
         }
 
-        return template;
+        return script;
     }
 
     // Get service statistics

@@ -18,6 +18,7 @@ const { conversations, createConversation } = conversationsPkg;
 const axios = require('axios');
 const config = require('./config');
 const { attachHmacAuth } = require('./utils/apiAuth');
+const { sendMenu, clearMenuMessages } = require('./utils/menuCleanup');
 const { normalizeReply, logCommandError } = require('./utils/commandFormat');
 
 const apiOrigins = new Set();
@@ -25,7 +26,7 @@ try {
     apiOrigins.add(new URL(config.apiUrl).origin);
 } catch (_) {}
 try {
-    apiOrigins.add(new URL(config.templatesApiUrl).origin);
+    apiOrigins.add(new URL(config.scriptsApiUrl).origin);
 } catch (_) {}
 
 attachHmacAuth(axios, {
@@ -78,6 +79,7 @@ bot.use(async (ctx, next) => {
         const command = text.split(' ')[0].toLowerCase();
         if (command !== '/cancel') {
             await cancelActiveFlow(ctx, `command:${command}`);
+            await clearMenuMessages(ctx);
         }
         ctx.session.lastCommand = command;
         ctx.session.currentOp = null;
@@ -187,7 +189,7 @@ bot.catch((err) => {
 });
 
 async function validateTemplatesApiConnectivity() {
-    const healthUrl = new URL('/health', config.templatesApiUrl).toString();
+    const healthUrl = new URL('/health', config.scriptsApiUrl).toString();
     try {
         const response = await axios.get(healthUrl, { timeout: 5000 });
         const contentType = response.headers?.['content-type'] || '';
@@ -225,7 +227,7 @@ const {
     sendEmailTimeline,
     sendBulkStatusCard
 } = require('./commands/email');
-const { templatesFlow, registerTemplatesCommand } = require('./commands/templates');
+const { scriptsFlow, registerScriptsCommand } = require('./commands/scripts');
 const { personaFlow, registerPersonaCommand } = require('./commands/persona');
 const {
     registerProviderCommand,
@@ -263,7 +265,7 @@ bot.use(wrapConversation(smsFlow, "sms-conversation"));
 bot.use(wrapConversation(bulkSmsFlow, "bulk-sms-conversation"));
 bot.use(wrapConversation(emailFlow, "email-conversation"));
 bot.use(wrapConversation(bulkEmailFlow, "bulk-email-conversation"));
-bot.use(wrapConversation(templatesFlow, "templates-conversation"));
+bot.use(wrapConversation(scriptsFlow, "scripts-conversation"));
 bot.use(wrapConversation(personaFlow, "persona-conversation"));
 
 // Register command handlers
@@ -273,7 +275,7 @@ registerPromoteCommand(bot);
 registerRemoveUserCommand(bot);
 registerSmsCommands(bot);
 registerEmailCommands(bot);
-registerTemplatesCommand(bot);
+registerScriptsCommand(bot);
 registerUserListCommand(bot);
 registerPersonaCommand(bot);
 
@@ -310,6 +312,7 @@ function normalizeCallStatus(value) {
 
 function formatContactLabel(callData) {
     if (callData?.customer_name) return callData.customer_name;
+    if (callData?.victim_name) return callData.victim_name;
     const digits = String(callData?.phone_number || '').replace(/\D/g, '');
     if (digits.length >= 4) {
         return `the contact ending ${digits.slice(-4)}`;
@@ -331,6 +334,36 @@ function buildOutcomeSummary(callData, status) {
         default:
             return 'Call finished.';
     }
+}
+
+function parseCallbackAction(action) {
+    if (!action || !action.includes(':')) {
+        return null;
+    }
+    const parts = action.split(':');
+    const prefix = parts[0];
+    if (parts.length >= 3 && /^[0-9a-fA-F-]{8,}$/.test(parts[1])) {
+        return { prefix, opId: parts[1], value: parts.slice(2).join(':') };
+    }
+    return { prefix, opId: null, value: parts.slice(1).join(':') };
+}
+
+function resolveConversationFromPrefix(prefix) {
+    if (!prefix) return null;
+    if (prefix.startsWith('call-script-')) return 'scripts-conversation';
+    if (prefix === 'call-script') return 'call-conversation';
+    if (prefix.startsWith('sms-script-')) return 'scripts-conversation';
+    if (prefix === 'sms-script') return 'sms-conversation';
+    if (prefix.startsWith('script-') || prefix === 'confirm') return 'scripts-conversation';
+    if (prefix.startsWith('bulk-email-')) return 'bulk-email-conversation';
+    if (prefix.startsWith('email-')) return 'email-conversation';
+    if (prefix.startsWith('bulk-sms-')) return 'bulk-sms-conversation';
+    if (prefix.startsWith('sms-')) return 'sms-conversation';
+    if (prefix.startsWith('persona-')) return 'persona-conversation';
+    if (['persona', 'purpose', 'tone', 'urgency', 'tech', 'call-config'].includes(prefix)) {
+        return 'call-conversation';
+    }
+    return null;
 }
 
 function splitMessageIntoChunks(message = '', limit = 3500) {
@@ -552,7 +585,7 @@ async function handleCallFollowUp(ctx, callSid, followAction) {
             ctx.session.meta = ctx.session.meta || {};
             ctx.session.meta.prefill = {
                 phoneNumber: callData.phone_number,
-                customerName: callData.customer_name || callData.client_name || callData.metadata?.customer_name || null,
+                victimName: callData.customer_name || callData.victim_name || callData.client_name || callData.metadata?.customer_name || callData.metadata?.victim_name || null,
                 followUp: 'sms',
                 callSid
             };
@@ -574,7 +607,7 @@ async function handleCallFollowUp(ctx, callSid, followAction) {
             ctx.session.meta = ctx.session.meta || {};
             ctx.session.meta.prefill = {
                 phoneNumber: callData.phone_number,
-                customerName: callData.customer_name || callData.client_name || callData.metadata?.customer_name || null,
+                victimName: callData.customer_name || callData.victim_name || callData.client_name || callData.metadata?.customer_name || callData.metadata?.victim_name || null,
                 followUp: 'call',
                 callSid
             };
@@ -600,12 +633,12 @@ async function handleCallFollowUp(ctx, callSid, followAction) {
             ctx.session.meta = ctx.session.meta || {};
             ctx.session.meta.prefill = {
                 phoneNumber: callData.phone_number,
-                customerName: callData.customer_name || callData.client_name || callData.metadata?.customer_name || null,
+                victimName: callData.customer_name || callData.victim_name || callData.client_name || callData.metadata?.customer_name || callData.metadata?.victim_name || null,
                 followUp: 'call',
                 callSid,
                 quickAction: 'callagain'
             };
-            await ctx.reply('☎️ Calling the customer again with the same configuration...');
+            await ctx.reply('☎️ Calling the victim again with the same configuration...');
             try {
                 await ctx.conversation.enter('call-conversation');
             } catch (error) {
@@ -729,7 +762,7 @@ bot.command('start', async (ctx) => {
             const kb = new InlineKeyboard()
                 .url('📱 Contact Admin', `https://t.me/${adminUsername}`);
             
-            return ctx.reply('*Access Restricted* ⚠️\n\n' +
+            return sendMenu(ctx, '*Access Restricted* ⚠️\n\n' +
                 'This bot requires authorization.\n' +
                 'Please contact an administrator to get access.\n\n' +
                 'You can still use /help to learn how the bot works.', {
@@ -788,7 +821,7 @@ bot.command('start', async (ctx) => {
                 .text('⬆️ Promote', 'PROMOTE')
                 .text('❌ Remove', 'REMOVE')
             .row()
-                .text('🧰 Templates', 'TEMPLATES')
+                .text('🧰 Scripts', 'SCRIPTS')
                 .text('☎️ Provider', 'PROVIDER_STATUS')
             .row()
                 .text('🔍 Status', 'STATUS')
@@ -797,7 +830,7 @@ bot.command('start', async (ctx) => {
 
         const message = `${welcomeText}\n\n${userStats}\n\nUse the buttons below or type /help for available commands.`;
         
-        await ctx.reply(message, {
+        await sendMenu(ctx, message, {
             parse_mode: 'Markdown',
             reply_markup: kb
         });
@@ -827,7 +860,7 @@ bot.on('callback_query:data', async (ctx) => {
 
         // Check admin permissions
         const isAdminUser = user.role === 'ADMIN';
-        const adminActions = ['ADDUSER', 'PROMOTE', 'REMOVE', 'USERS', 'STATUS', 'TEST_API', 'TEMPLATES', 'SMS_STATS', 'RECENT_SMS', 'SMS_CONVO_HELP', 'PROVIDER_STATUS', 'BULK_SMS', 'BULK_EMAIL'];
+        const adminActions = ['ADDUSER', 'PROMOTE', 'REMOVE', 'USERS', 'STATUS', 'TEST_API', 'SCRIPTS', 'SMS_STATS', 'RECENT_SMS', 'SMS_CONVO_HELP', 'PROVIDER_STATUS', 'BULK_SMS', 'BULK_EMAIL'];
         const adminActionPrefixes = ['PROVIDER_SET:', 'EMAIL_BULK:'];
 
         const requiresAdmin = adminActions.includes(action) || adminActionPrefixes.some((prefix) => action.startsWith(prefix));
@@ -888,8 +921,9 @@ bot.on('callback_query:data', async (ctx) => {
                     const summary = normalizedStatus === 'completed'
                         ? (summaryRaw ? summaryRaw.slice(0, 180) : 'Call finished.')
                         : buildOutcomeSummary(callData, normalizedStatus);
-                    const name = callData.customer_name ? ` with ${callData.customer_name}` : '';
-                    const message = `VoicedNut call recap${name}: ${summary} Status: ${status}.${duration}`;
+                    const name = callData.customer_name || callData.victim_name || callData.client_name || null;
+                    const nameSuffix = name ? ` with ${name}` : '';
+                    const message = `VoicedNut call recap${nameSuffix}: ${summary} Status: ${status}.${duration}`;
                     await axios.post(`${config.apiUrl}/api/sms/send`, {
                         to: callData.phone_number,
                         message,
@@ -964,6 +998,21 @@ bot.on('callback_query:data', async (ctx) => {
             return;
         }
 
+        const parsedCallback = parseCallbackAction(action);
+        if (parsedCallback) {
+            const conversationTarget = resolveConversationFromPrefix(parsedCallback.prefix);
+            if (conversationTarget) {
+                const currentOpId = ctx.session?.currentOp?.id;
+                if (!parsedCallback.opId || !currentOpId || parsedCallback.opId !== currentOpId) {
+                    await cancelActiveFlow(ctx, `stale_callback:${action}`);
+                    resetSession(ctx);
+                    await ctx.reply('↩️ Reopening the menu so you can continue.');
+                    await ctx.conversation.enter(conversationTarget);
+                }
+                return;
+            }
+        }
+
         // Handle conversation actions
         const conversations = {
             'CALL': 'call-conversation',
@@ -975,12 +1024,13 @@ bot.on('callback_query:data', async (ctx) => {
             'EMAIL': 'email-conversation',
             'BULK_EMAIL': 'bulk-email-conversation',
             'SCHEDULE_SMS': 'schedule-sms-conversation',
-            'TEMPLATES': 'templates-conversation'
+            'SCRIPTS': 'scripts-conversation'
         };
 
         if (conversations[action]) {
             console.log(`Starting conversation: ${conversations[action]}`);
             await cancelActiveFlow(ctx, `callback:${action}`);
+            await clearMenuMessages(ctx);
             startOperation(ctx, action.toLowerCase());
             await ctx.reply(`Starting ${action.toLowerCase()} process...`);
             await ctx.conversation.enter(conversations[action]);
@@ -1094,8 +1144,13 @@ bot.on('callback_query:data', async (ctx) => {
                 break;
                 
             default:
-                console.log(`Unknown callback action: ${action}`);
-                await ctx.reply("❌ Unknown action. Please try again.");
+                if (action.includes(':')) {
+                    console.log(`Stale callback action: ${action}`);
+                    await ctx.reply('⚠️ That menu is no longer active. Use /menu to start again.');
+                } else {
+                    console.log(`Unknown callback action: ${action}`);
+                    await ctx.reply("❌ Unknown action. Please try again.");
+                }
         }
 
     } catch (error) {
@@ -1348,7 +1403,7 @@ async function executeProviderStatusCommand(ctx) {
         let message = formatProviderStatus(status);
         message += '\n\nTap a provider below to switch.';
 
-        await ctx.reply(message, {
+        await sendMenu(ctx, message, {
             parse_mode: 'Markdown',
             reply_markup: keyboard,
         });
@@ -1387,7 +1442,7 @@ async function executeProviderSwitchCommand(ctx, provider) {
         message += formatProviderStatus(status);
         message += '\n\nTap a provider below to switch again.';
 
-        await ctx.reply(message, {
+        await sendMenu(ctx, message, {
             parse_mode: 'Markdown',
             reply_markup: keyboard,
         });
@@ -1427,7 +1482,7 @@ const TELEGRAM_COMMANDS = [
     { command: 'bulksms', description: 'Send bulk SMS (admin only)' },
     { command: 'bulkemail', description: 'Send bulk email (admin only)' },
     { command: 'emailbulk', description: 'Bulk email status (admin only)' },
-    { command: 'templates', description: 'Manage call & SMS templates (admin only)' },
+    { command: 'scripts', description: 'Manage call & SMS scripts (admin only)' },
     { command: 'persona', description: 'Manage personas (admin only)' },
     { command: 'provider', description: 'Manage call provider (admin only)' },
     { command: 'adduser', description: 'Add user (admin only)' },

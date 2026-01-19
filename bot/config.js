@@ -15,13 +15,13 @@ if (missing.length > 0) {
   process.exit(1);
 }
 
-const templatesApiUrl = process.env.TEMPLATES_API_URL || process.env.API_URL;
+const scriptsApiUrl = process.env.SCRIPTS_API_URL || process.env.TEMPLATES_API_URL || process.env.API_URL;
 
 try {
   // eslint-disable-next-line no-new
-  new URL(templatesApiUrl);
+  new URL(scriptsApiUrl);
 } catch (error) {
-  console.error(`❌ Invalid TEMPLATES_API_URL: ${templatesApiUrl || 'undefined'} (${error.message})`);
+  console.error(`❌ Invalid SCRIPTS_API_URL: ${scriptsApiUrl || 'undefined'} (${error.message})`);
   process.exit(1);
 }
 
@@ -35,7 +35,7 @@ module.exports = {
   },
   apiUrl: process.env.API_URL,
   botToken: process.env.BOT_TOKEN,
-  templatesApiUrl,
+  scriptsApiUrl,
   defaultVoiceModel: process.env.DEFAULT_VOICE_MODEL || 'aura-asteria-en',
   defaultBusinessId: process.env.DEFAULT_BUSINESS_ID || 'general',
   defaultPurpose: process.env.DEFAULT_CALL_PURPOSE || 'general',

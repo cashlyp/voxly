@@ -3,6 +3,53 @@ const axios = require('axios');
 const { getUser, isAdmin } = require('../db/db');
 const { escapeMarkdown, buildLine } = require('../utils/commandFormat');
 
+function parseRecentFilter(filter) {
+    const trimmed = (filter || '').trim();
+    if (!trimmed) return null;
+    const looksLikePhone = /^[+\d\s().-]+$/.test(trimmed);
+    if (looksLikePhone) {
+        return { phone: trimmed };
+    }
+    return { status: trimmed };
+}
+
+async function fetchRecentCalls({ limit = 10, filter } = {}) {
+    const filterParams = parseRecentFilter(filter);
+    const candidates = [
+        {
+            url: `${config.apiUrl}/api/calls/list`,
+            params: { limit, ...(filterParams || {}) },
+            filtered: Boolean(filterParams),
+        },
+        {
+            url: `${config.apiUrl}/api/calls`,
+            params: { limit },
+            filtered: false,
+        }
+    ];
+
+    let lastError;
+    for (const candidate of candidates) {
+        try {
+            const res = await axios.get(candidate.url, {
+                params: candidate.params,
+                timeout: 10000
+            });
+            return {
+                calls: res.data?.calls || [],
+                filtered: candidate.filtered
+            };
+        } catch (error) {
+            lastError = error;
+            if (error.response?.status === 404) {
+                continue;
+            }
+            throw error;
+        }
+    }
+    throw lastError || new Error('Failed to fetch calls');
+}
+
 async function handleTestApiCommand(ctx) {
     try {
         const user = await new Promise(r => getUser(ctx.from.id, r));
@@ -51,7 +98,7 @@ async function handleTestApiCommand(ctx) {
 
             if (health.adaptation_engine) {
                 message += `\n${buildLine('🤖', 'Adaptation Engine', '✅ Active')}\n`;
-                message += `${buildLine('🧩', 'Function Templates', health.adaptation_engine.available_templates || 0)}\n`;
+                message += `${buildLine('🧩', 'Function Scripts', health.adaptation_engine.available_scripts || 0)}\n`;
             }
         } else {
             message += `${buildLine('🗄️', 'Database', health.database_connected ? '✅ Connected' : '❌ Unknown')}\n`;
@@ -147,7 +194,7 @@ async function handleStatusCommand(ctx) {
         if (health.adaptation_engine) {
             message += `\n*🤖 AI Features:*\n`;
             message += `${buildLine('🧠', 'Adaptation Engine', '✅ Active')}\n`;
-            message += `${buildLine('🧩', 'Function Templates', health.adaptation_engine.available_templates || 0)}\n`;
+            message += `${buildLine('🧩', 'Function Scripts', health.adaptation_engine.available_scripts || 0)}\n`;
             message += `${buildLine('⚙️', 'Active Systems', health.adaptation_engine.active_function_systems || 0)}\n`;
         }
 
@@ -238,11 +285,7 @@ async function handleRecentCommand(ctx) {
         const limit = Math.min(parseInt(parts[0], 10) || 10, 30);
         const filter = parts[1] || '';
 
-        const res = await axios.get(`${config.apiUrl}/api/calls/recent`, {
-            params: { limit, filter },
-            timeout: 10000
-        });
-        const calls = res.data?.calls || [];
+        const { calls, filtered } = await fetchRecentCalls({ limit, filter });
         if (!calls.length) {
             return ctx.reply('ℹ️ No recent calls.');
         }
@@ -254,7 +297,10 @@ async function handleRecentCommand(ctx) {
             const lastMsg = c.last_message_at ? ` | 🗨️ ${new Date(c.last_message_at).toLocaleTimeString()}` : '';
             return `• ${c.call_sid} (${status})\n📞 ${c.phone_number}\n⏱️ ${duration} | 🕒 ${when}${lastMsg}`;
         });
-        await ctx.reply(lines.join('\n\n'));
+        const header = filter && !filtered
+            ? 'ℹ️ Filter unavailable on this API; showing latest calls.\n\n'
+            : '';
+        await ctx.reply(`${header}${lines.join('\n\n')}`);
     } catch (error) {
         console.error('Recent command error:', error?.message || error);
         await ctx.reply('❌ Failed to fetch recent calls. Please try again later.');
@@ -312,25 +358,45 @@ async function handleDigestCommand(ctx) {
         const user = await new Promise(r => getUser(ctx.from.id, r));
         if (!user) return ctx.reply('❌ You are not authorized.');
 
-        const res = await axios.get(`${config.apiUrl}/api/analytics/notifications`, {
-            params: { hours: 24, limit: 50 },
-            timeout: 12000
-        });
-        const summary = res.data?.summary || {};
-        const callsRes = await axios.get(`${config.apiUrl}/api/calls/recent`, {
-            params: { limit: 10 },
-            timeout: 8000
-        });
-        const calls = callsRes.data?.calls || [];
+        let summary = null;
+        let notificationsError = null;
+        try {
+            const res = await axios.get(`${config.apiUrl}/api/analytics/notifications`, {
+                params: { hours: 24, limit: 50 },
+                timeout: 12000
+            });
+            summary = res.data?.summary || {};
+        } catch (error) {
+            notificationsError = error;
+            console.warn('Digest notifications fetch failed:', error?.message || error);
+        }
 
-        const lines = [
-            `📊 24h Digest`,
-            `Notifications: ${summary.total_notifications ?? 0} (✅ ${summary.successful_notifications ?? 0}, ❌ ${(summary.total_notifications || 0) - (summary.successful_notifications || 0)})`,
-            `Success rate: ${summary.success_rate_percent ?? 0}%`,
-            `Avg delivery: ${summary.average_delivery_time_seconds ?? 'N/A'}s`,
-            '',
-            `Recent calls (${calls.length}):`
-        ];
+        let calls = [];
+        try {
+            const result = await fetchRecentCalls({ limit: 10 });
+            calls = result.calls || [];
+        } catch (error) {
+            console.warn('Digest calls fetch failed:', error?.message || error);
+            if (!summary) {
+                throw error;
+            }
+        }
+
+        const lines = [`📊 24h Digest`];
+
+        if (summary) {
+            lines.push(
+                `Notifications: ${summary.total_notifications ?? 0} (✅ ${summary.successful_notifications ?? 0}, ❌ ${(summary.total_notifications || 0) - (summary.successful_notifications || 0)})`,
+                `Success rate: ${summary.success_rate_percent ?? 0}%`,
+                `Avg delivery: ${summary.average_delivery_time_seconds ?? 'N/A'}s`
+            );
+        } else if (notificationsError?.response?.status === 404) {
+            lines.push(`Notifications: unavailable (endpoint missing)`);
+        } else {
+            lines.push(`Notifications: unavailable`);
+        }
+
+        lines.push('', `Recent calls (${calls.length}):`);
 
         calls.slice(0, 5).forEach((c) => {
             const status = c.status || 'unknown';

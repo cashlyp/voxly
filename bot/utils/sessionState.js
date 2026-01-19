@@ -46,7 +46,8 @@ const initialSessionState = () => ({
   pendingControllers: [],
   meta: {},
   flow: null,
-  errors: []
+  errors: [],
+  menuMessages: []
 });
 
 function ensureSession(ctx) {
@@ -58,6 +59,7 @@ function ensureSession(ctx) {
     ctx.session.meta = ctx.session.meta || {};
     ctx.session.flow = ctx.session.flow || null;
     ctx.session.errors = Array.isArray(ctx.session.errors) ? ctx.session.errors : [];
+    ctx.session.menuMessages = Array.isArray(ctx.session.menuMessages) ? ctx.session.menuMessages : [];
   }
 }
 

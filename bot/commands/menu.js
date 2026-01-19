@@ -2,6 +2,7 @@ const { InlineKeyboard } = require('grammy');
 const { getUser, isAdmin } = require('../db/db');
 const { cancelActiveFlow, resetSession } = require('../utils/sessionState');
 const { escapeHtml } = require('../utils/commandFormat');
+const { sendMenu } = require('../utils/menuCleanup');
 
 async function handleMenu(ctx) {
     try {
@@ -51,7 +52,7 @@ async function handleMenu(ctx) {
                 .text('⬆️ Promote', 'PROMOTE')
                 .text('❌ Remove', 'REMOVE')
                 .row()
-                .text('🧰 Templates', 'TEMPLATES')
+                .text('🧰 Scripts', 'SCRIPTS')
                 .text('☎️ Provider', 'PROVIDER_STATUS')
                 .row()
                 .text('🔍 Status', 'STATUS')
@@ -62,7 +63,7 @@ async function handleMenu(ctx) {
             ? `<b>${escapeHtml('Administrator Menu')}</b>\n${escapeHtml('Choose an action')}\n• ${escapeHtml('Access advanced tools below')}`
             : `<b>${escapeHtml('Quick Actions Menu')}</b>\n${escapeHtml('Tap a shortcut')}\n• ${escapeHtml('Get calling, texting and status tools fast')}`;
 
-        await ctx.reply(menuText, {
+        await sendMenu(ctx, menuText, {
             parse_mode: 'HTML',
             reply_markup: kb
         });

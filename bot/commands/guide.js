@@ -2,6 +2,7 @@ const { InlineKeyboard } = require('grammy');
 const config = require('../config');
 const { getUser } = require('../db/db');
 const { escapeHtml } = require('../utils/commandFormat');
+const { sendMenu } = require('../utils/menuCleanup');
 
 async function handleGuide(ctx) {
     const user = await new Promise(r => getUser(ctx.from.id, r));
@@ -69,7 +70,7 @@ async function handleGuide(ctx) {
         .row()
         .text('🔄 Menu', 'MENU');
 
-    await ctx.reply(guideText, {
+    await sendMenu(ctx, guideText, {
         parse_mode: 'HTML',
         reply_markup: kb
     });

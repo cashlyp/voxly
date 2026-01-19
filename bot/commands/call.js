@@ -10,7 +10,7 @@ const {
   askOptionWithButtons,
   getOptionLabel
 } = require('../utils/persona');
-const { extractTemplateVariables } = require('../utils/templates');
+const { extractScriptVariables } = require('../utils/scripts');
 const {
   startOperation,
   ensureOperationActive,
@@ -25,8 +25,9 @@ async function notifyCallError(ctx, lines = []) {
   await ctx.reply(section('❌ Call Alert', body));
 }
 const { section, escapeMarkdown, tipLine, buildLine } = require('../utils/commandFormat');
+const { sendMenu } = require('../utils/menuCleanup');
 
-const templatesApiBase = config.templatesApiUrl.replace(/\/+$/, '');
+const scriptsApiBase = config.scriptsApiUrl.replace(/\/+$/, '');
 const DEFAULT_FIRST_MESSAGE = 'Hello! This is an automated call. How can I help you today?';
 
 function isValidPhoneNumber(number) {
@@ -43,7 +44,7 @@ function replacePlaceholders(text = '', values = {}) {
   return output;
 }
 
-function sanitizeCustomerName(rawName) {
+function sanitizeVictimName(rawName) {
   if (!rawName) {
     return null;
   }
@@ -51,11 +52,11 @@ function sanitizeCustomerName(rawName) {
   return cleaned || null;
 }
 
-function buildPersonalizedFirstMessage(baseMessage, customerName, personaLabel) {
-  if (!customerName) {
+function buildPersonalizedFirstMessage(baseMessage, victimName, personaLabel) {
+  if (!victimName) {
     return baseMessage;
   }
-  const greeting = `Hello ${customerName}!`;
+  const greeting = `Hello ${victimName}!`;
   const trimmedBase = (baseMessage || '').trim();
   if (!trimmedBase) {
     const brandLabel = personaLabel || 'our team';
@@ -66,36 +67,36 @@ function buildPersonalizedFirstMessage(baseMessage, customerName, personaLabel) 
   return `${greeting} ${remainder}`;
 }
 
-async function safeTemplatesRequest(method, url, options = {}) {
+async function safeScriptsRequest(method, url, options = {}) {
   try {
     const response = await axios.request({
       method,
-      url: `${templatesApiBase}${url}`,
+      url: `${scriptsApiBase}${url}`,
       timeout: 15000,
       ...options
     });
 
     const contentType = response.headers?.['content-type'] || '';
     if (!contentType.includes('application/json')) {
-      throw new Error('Templates API returned non-JSON response');
+      throw new Error('Scripts API returned non-JSON response');
     }
     if (response.data?.success === false) {
-      throw new Error(response.data.error || 'Templates API reported failure');
+      throw new Error(response.data.error || 'Scripts API reported failure');
     }
     return response.data;
   } catch (error) {
-    const base = `Ensure the templates service is reachable at ${templatesApiBase} or update TEMPLATES_API_URL.`;
+    const base = `Ensure the scripts service is reachable at ${scriptsApiBase} or update SCRIPTS_API_URL.`;
     if (error.response) {
       const status = error.response.status;
       const contentType = error.response.headers?.['content-type'] || '';
       if (!contentType.includes('application/json')) {
-        throw new Error(`Templates API responded with HTTP ${status}. ${base}`);
+        throw new Error(`Scripts API responded with HTTP ${status}. ${base}`);
       }
       const detail = error.response.data?.error || error.response.data?.message || `HTTP ${status}`;
       throw new Error(`${detail}. ${base}`);
     }
     if (error.request) {
-      throw new Error(`No response from Templates API. ${base}`);
+      throw new Error(`No response from Scripts API. ${base}`);
     }
     throw new Error(`${error.message}. ${base}`);
   }
@@ -119,40 +120,40 @@ async function collectPlaceholderValues(conversation, ctx, placeholders, ensureA
   return values;
 }
 
-async function fetchCallTemplates() {
-  const data = await safeTemplatesRequest('get', '/api/call-templates');
-  return data.templates || [];
+async function fetchCallScripts() {
+  const data = await safeScriptsRequest('get', '/api/call-scripts');
+  return data.scripts || [];
 }
 
-async function fetchCallTemplateById(id) {
-  const data = await safeTemplatesRequest('get', `/api/call-templates/${id}`);
-  return data.template;
+async function fetchCallScriptById(id) {
+  const data = await safeScriptsRequest('get', `/api/call-scripts/${id}`);
+  return data.script;
 }
 
-async function selectCallTemplate(conversation, ctx, ensureActive) {
-  let templates;
+async function selectCallScript(conversation, ctx, ensureActive) {
+  let scripts;
   try {
-    templates = await fetchCallTemplates();
+    scripts = await fetchCallScripts();
     ensureActive();
   } catch (error) {
-    await ctx.reply(error.message || '❌ Failed to load call templates.');
+    await ctx.reply(error.message || '❌ Failed to load call scripts.');
     return null;
   }
 
-  if (!templates.length) {
-    await ctx.reply('ℹ️ No call templates available. Use /templates to create one.');
+  if (!scripts.length) {
+    await ctx.reply('ℹ️ No call scripts available. Use /scripts to create one.');
     return null;
   }
 
-  const options = templates.map((template) => ({ id: template.id.toString(), label: `📄 ${template.name}` }));
+  const options = scripts.map((script) => ({ id: script.id.toString(), label: `📄 ${script.name}` }));
   options.push({ id: 'back', label: '⬅️ Back' });
 
   const selection = await askOptionWithButtons(
     conversation,
     ctx,
-    '📚 *Call Templates*\nChoose a template to use for this call.',
+    '📚 *Call Scripts*\nChoose a script to use for this call.',
     options,
-    { prefix: 'call-template', columns: 1 }
+    { prefix: 'call-script', columns: 1 }
   );
   ensureActive();
 
@@ -160,71 +161,71 @@ async function selectCallTemplate(conversation, ctx, ensureActive) {
     return null;
   }
 
-  const templateId = Number(selection.id);
-  if (Number.isNaN(templateId)) {
-    await ctx.reply('❌ Invalid template selection.');
+  const scriptId = Number(selection.id);
+  if (Number.isNaN(scriptId)) {
+    await ctx.reply('❌ Invalid script selection.');
     return null;
   }
 
-  let template;
+  let script;
   try {
-    template = await fetchCallTemplateById(templateId);
+    script = await fetchCallScriptById(scriptId);
     ensureActive();
   } catch (error) {
-    await ctx.reply(error.message || '❌ Failed to load template.');
+    await ctx.reply(error.message || '❌ Failed to load script.');
     return null;
   }
 
-  if (!template) {
-    await ctx.reply('❌ Template not found.');
+  if (!script) {
+    await ctx.reply('❌ Script not found.');
     return null;
   }
 
-  if (!template.first_message) {
-    await ctx.reply('⚠️ This template does not define a first message. Please edit it before using.');
+  if (!script.first_message) {
+    await ctx.reply('⚠️ This script does not define a first message. Please edit it before using.');
     return null;
   }
 
   const placeholderSet = new Set();
-  extractTemplateVariables(template.prompt || '').forEach((token) => placeholderSet.add(token));
-  extractTemplateVariables(template.first_message || '').forEach((token) => placeholderSet.add(token));
+  extractScriptVariables(script.prompt || '').forEach((token) => placeholderSet.add(token));
+  extractScriptVariables(script.first_message || '').forEach((token) => placeholderSet.add(token));
 
   const placeholderValues = {};
   if (placeholderSet.size > 0) {
-    await ctx.reply('🧩 This template contains placeholders. Provide values where applicable (type skip to leave as-is).');
+    await ctx.reply('🧩 This script contains placeholders. Provide values where applicable (type skip to leave as-is).');
     Object.assign(placeholderValues, await collectPlaceholderValues(conversation, ctx, Array.from(placeholderSet), ensureActive));
   }
 
-  const filledPrompt = template.prompt ? replacePlaceholders(template.prompt, placeholderValues) : undefined;
-  const filledFirstMessage = replacePlaceholders(template.first_message, placeholderValues);
+  const filledPrompt = script.prompt ? replacePlaceholders(script.prompt, placeholderValues) : undefined;
+  const filledFirstMessage = replacePlaceholders(script.first_message, placeholderValues);
 
   const payloadUpdates = {
     channel: 'voice',
-    business_id: template.business_id || config.defaultBusinessId,
+    business_id: script.business_id || config.defaultBusinessId,
     prompt: filledPrompt,
     first_message: filledFirstMessage,
-    voice_model: template.voice_model || config.defaultVoiceModel,
-    template: template.name,
-    template_id: template.id
+    voice_model: script.voice_model || config.defaultVoiceModel,
+    script: script.name,
+    script_id: script.id
   };
 
-  const summary = [`Template: ${template.name}`];
-  if (template.description) {
-    summary.push(`Description: ${template.description}`);
+  const summary = [`Script: ${script.name}`];
+  if (script.description) {
+    summary.push(`Description: ${script.description}`);
   }
 
-  const businessOption = template.business_id ? findBusinessOption(template.business_id) : null;
+  const businessOption = script.business_id ? findBusinessOption(script.business_id) : null;
   if (businessOption) {
     summary.push(`Persona: ${businessOption.label}`);
-  } else if (template.business_id) {
-    summary.push(`Persona: ${template.business_id}`);
+  } else if (script.business_id) {
+    summary.push(`Persona: ${script.business_id}`);
   }
 
   if (!payloadUpdates.purpose && businessOption?.defaultPurpose) {
     payloadUpdates.purpose = businessOption.defaultPurpose;
   }
 
-  const personaConfig = template.persona_config || {};
+  const personaConfig = script.persona_config || {};
   if (personaConfig.purpose) {
     summary.push(`Purpose: ${personaConfig.purpose}`);
     payloadUpdates.purpose = personaConfig.purpose;
@@ -254,9 +255,9 @@ async function selectCallTemplate(conversation, ctx, ensureActive) {
     payloadUpdates,
     summary,
     meta: {
-      templateName: template.name,
-      templateDescription: template.description || 'No description provided',
-      personaLabel: businessOption?.label || template.business_id || 'Custom'
+      scriptName: script.name,
+      scriptDescription: script.description || 'No description provided',
+      personaLabel: businessOption?.label || script.business_id || 'Custom'
     }
   };
 }
@@ -286,7 +287,7 @@ async function buildCustomCallConfig(conversation, ctx, ensureActive, businessOp
     channel: 'voice',
     business_id: resolvedBusinessId,
     voice_model: config.defaultVoiceModel,
-    template: selectedBusiness.custom ? 'custom' : resolvedBusinessId,
+    script: selectedBusiness.custom ? 'custom' : resolvedBusinessId,
     purpose: selectedBusiness.defaultPurpose || config.defaultPurpose
   };
   const summary = [];
@@ -408,8 +409,8 @@ async function buildCustomCallConfig(conversation, ctx, ensureActive, businessOp
     payloadUpdates,
     summary,
     meta: {
-      templateName: personaOptions?.label || 'Custom',
-      templateDescription: 'Custom persona configuration',
+      scriptName: personaOptions?.label || 'Custom',
+      scriptDescription: 'Custom persona configuration',
       personaLabel: personaOptions?.label || 'Custom'
     }
   };
@@ -446,7 +447,7 @@ async function callFlow(conversation, ctx) {
 
     const prefill = ctx.session.meta?.prefill || {};
     let number = prefill.phoneNumber || null;
-    let customerName = prefill.customerName || null;
+    let victimName = prefill.victimName || null;
 
     if (number) {
       await ctx.reply(`📞 Using follow-up number: ${number}`);
@@ -471,17 +472,17 @@ async function callFlow(conversation, ctx) {
       flow.touch('number-captured');
     }
 
-    if (customerName) {
-      await ctx.reply(`👤 Using customer name: ${customerName}`);
+    if (victimName) {
+      await ctx.reply(`👤 Using victim name: ${victimName}`);
     } else {
-      await ctx.reply('👤 Please enter the customer\'s name (as it should be spoken on the call):\nType skip to leave blank.');
+      await ctx.reply('👤 Please enter the victim\'s name (as it should be spoken on the call):\nType skip to leave blank.');
       const nameMsg = await waitForMessage();
       const providedName = nameMsg?.message?.text?.trim();
       if (providedName && providedName.toLowerCase() !== 'skip') {
-        const sanitized = sanitizeCustomerName(providedName);
+        const sanitized = sanitizeVictimName(providedName);
         if (sanitized) {
-          customerName = sanitized;
-          flow.touch('customer-name');
+          victimName = sanitized;
+          flow.touch('victim-name');
         }
       }
     }
@@ -491,7 +492,7 @@ async function callFlow(conversation, ctx) {
       ctx,
       '⚙️ How would you like to configure this call?',
       [
-        { id: 'template', label: '📁 Use call template' },
+        { id: 'script', label: '📁 Use call script' },
         { id: 'custom', label: '🛠️ Build custom persona' }
       ],
       { prefix: 'call-config', columns: 1 }
@@ -499,10 +500,10 @@ async function callFlow(conversation, ctx) {
     ensureActive();
 
     let configuration = null;
-    if (configurationMode.id === 'template') {
-      configuration = await selectCallTemplate(conversation, ctx, ensureActive);
+    if (configurationMode.id === 'script') {
+      configuration = await selectCallScript(conversation, ctx, ensureActive);
       if (!configuration) {
-        await ctx.reply('ℹ️ No template selected. Switching to custom persona builder.');
+        await ctx.reply('ℹ️ No script selected. Switching to custom persona builder.');
       }
     }
     flow.touch('mode-selected');
@@ -520,23 +521,23 @@ async function callFlow(conversation, ctx) {
     const payload = {
       number,
       user_chat_id: ctx.from.id.toString(),
-      customer_name: customerName || null,
+      customer_name: victimName || null,
       ...configuration.payloadUpdates
     };
 
     payload.business_id = payload.business_id || config.defaultBusinessId;
     payload.purpose = payload.purpose || config.defaultPurpose;
     payload.voice_model = payload.voice_model || config.defaultVoiceModel;
-    payload.template = payload.template || 'custom';
+    payload.script = payload.script || 'custom';
     payload.technical_level = payload.technical_level || 'auto';
 
-    const templateName =
-      configuration.meta?.templateName ||
-      configuration.payloadUpdates?.template ||
+    const scriptName =
+      configuration.meta?.scriptName ||
+      configuration.payloadUpdates?.script ||
       'Custom';
-    const templateDescription =
-      configuration.meta?.templateDescription ||
-      configuration.payloadUpdates?.template_description ||
+    const scriptDescription =
+      configuration.meta?.scriptDescription ||
+      configuration.payloadUpdates?.script_description ||
       'No description provided';
     const personaLabel =
       configuration.meta?.personaLabel ||
@@ -548,7 +549,7 @@ async function callFlow(conversation, ctx) {
     }
     payload.first_message = buildPersonalizedFirstMessage(
       payload.first_message,
-      customerName,
+      victimName,
       personaLabel
     );
 
@@ -559,8 +560,8 @@ async function callFlow(conversation, ctx) {
 
     const detailLines = [
       buildLine('📋', 'To', number),
-      customerName ? buildLine('👤', 'Customer', escapeMarkdown(customerName)) : null,
-      buildLine('🧩', 'Template', escapeMarkdown(templateName)),
+      victimName ? buildLine('👤', 'Victim', escapeMarkdown(victimName)) : null,
+      buildLine('🧩', 'Script', escapeMarkdown(scriptName)),
       payload.purpose ? buildLine('🎯', 'Purpose', escapeMarkdown(payload.purpose)) : null
     ].filter(Boolean);
 
@@ -604,7 +605,7 @@ async function callFlow(conversation, ctx) {
       };
     }
 
-    await ctx.reply(section('🔍 Call Brief', detailLines), replyOptions);
+    await sendMenu(ctx, section('🔍 Call Brief', detailLines), replyOptions);
     await ctx.reply('⏳ Making the call…');
 
     const payloadForLog = { ...payload };

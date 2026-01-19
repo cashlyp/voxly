@@ -1205,8 +1205,8 @@ function createDigitCollectionService(options = {}) {
         }
       }
     }
-    if (callConfig.template_policy?.default_profile) {
-      pushScore(callConfig.template_policy.default_profile, 0.9, 'template_policy');
+    if (callConfig.script_policy?.default_profile) {
+      pushScore(callConfig.script_policy.default_profile, 0.9, 'script_policy');
     }
     const history = intentHistory.get(callSid);
     if (history?.lastProfile) {
@@ -2438,7 +2438,7 @@ function createDigitCollectionService(options = {}) {
     if (fromIntent?.profile) {
       return normalizeDigitExpectation({ ...fromIntent, prompt: fromIntent.prompt || '' });
     }
-    const tpl = callConfig.template_policy || {};
+    const tpl = callConfig.script_policy || {};
     if (tpl.requires_otp) {
       const len = tpl.expected_length || otpLength;
       return normalizeDigitExpectation({
@@ -2475,7 +2475,7 @@ function createDigitCollectionService(options = {}) {
 
   function inferDigitExpectationFromText(text = '', callConfig = {}) {
     const lower = String(text || '').toLowerCase();
-    const tpl = callConfig.template_policy || {};
+    const tpl = callConfig.script_policy || {};
     const contains = (re) => re.test(lower);
     const explicitProfile = normalizeProfileId(
       callConfig.collection_profile
@@ -2517,7 +2517,7 @@ function createDigitCollectionService(options = {}) {
         end_call_on_success: true,
         max_retries: otpMaxRetries,
         confidence: 0.95,
-        reason: 'template_requires_otp',
+        reason: 'script_requires_otp',
         allow_terminator: tpl.allow_terminator === true,
         terminator_char: tpl.terminator_char || '#'
       };
@@ -2534,7 +2534,7 @@ function createDigitCollectionService(options = {}) {
         end_call_on_success: tpl.default_profile === 'verification',
         max_retries: otpMaxRetries,
         confidence: 0.8,
-        reason: 'template_default_profile',
+        reason: 'script_default_profile',
         allow_terminator: tpl.allow_terminator === true,
         terminator_char: tpl.terminator_char || '#'
       };

@@ -2,6 +2,7 @@ const { InlineKeyboard } = require('grammy');
 const axios = require('axios');
 const config = require('../config');
 const { ensureOperationActive, getCurrentOpId } = require('./sessionState');
+const { sendMenu } = require('./menuCleanup');
 
 const FALLBACK_PERSONAS = [
   {
@@ -14,7 +15,7 @@ const FALLBACK_PERSONAS = [
     id: 'technical_support',
     label: 'Technical Support',
     emoji: '🛠️',
-    description: 'Guides customers through troubleshooting steps and software onboarding.',
+    description: 'Guides victims through troubleshooting steps and software onboarding.',
     defaultPurpose: 'general',
     defaultEmotion: 'frustrated',
     defaultUrgency: 'normal',
@@ -257,8 +258,8 @@ function normalizePersonaProfile(profile) {
     defaultEmotion: profile.defaultEmotion || profile.default_emotion || null,
     defaultUrgency: profile.defaultUrgency || profile.default_urgency || null,
     defaultTechnicalLevel: profile.defaultTechnicalLevel || profile.default_technical_level || null,
-    call_template_id: profile.call_template_id || profile.callTemplateId || null,
-    sms_template_name: profile.sms_template_name || profile.smsTemplateName || null,
+    call_script_id: profile.call_script_id || profile.callScriptId || profile.call_template_id || profile.callTemplateId || null,
+    sms_script_name: profile.sms_script_name || profile.smsScriptName || profile.sms_template_name || profile.smsTemplateName || null,
     custom: Boolean(profile.custom || id === 'custom'),
     dynamic: Boolean(profile.slug && profile.slug !== 'custom')
   };
@@ -365,6 +366,9 @@ async function askOptionWithButtons(
   { prefix, columns = 2, formatLabel, ensureActive } = {}
 ) {
   const keyboard = new InlineKeyboard();
+  const opId = getCurrentOpId(ctx);
+  const basePrefix = prefix || 'option';
+  const prefixKey = opId ? `${basePrefix}:${opId}` : basePrefix;
   const labels = options.map((option) => (formatLabel ? formatLabel(option) : formatOptionLabel(option)));
   const hasLongLabel = labels.some((label) => String(label).length > 22);
   let resolvedColumns = Number.isFinite(columns) ? columns : (labels.length > 6 || hasLongLabel ? 1 : 2);
@@ -377,15 +381,15 @@ async function askOptionWithButtons(
 
   labels.forEach((label, index) => {
     const option = options[index];
-    keyboard.text(label, `${prefix}:${option.id}`);
+    keyboard.text(label, `${prefixKey}:${option.id}`);
     if ((index + 1) % resolvedColumns === 0) {
       keyboard.row();
     }
   });
 
-  const message = await ctx.reply(prompt, { parse_mode: 'Markdown', reply_markup: keyboard });
+  const message = await sendMenu(ctx, prompt, { parse_mode: 'Markdown', reply_markup: keyboard });
   const selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {
-    return callbackCtx.callbackQuery.data.startsWith(`${prefix}:`);
+    return callbackCtx.callbackQuery.data.startsWith(`${prefixKey}:`);
   });
   const activeChecker = typeof ensureActive === 'function'
     ? ensureActive
@@ -395,7 +399,8 @@ async function askOptionWithButtons(
   await selectionCtx.answerCallbackQuery();
   await ctx.api.editMessageReplyMarkup(message.chat.id, message.message_id).catch(() => {});
 
-  const selectedId = selectionCtx.callbackQuery.data.split(':')[1];
+  const parts = selectionCtx.callbackQuery.data.split(':');
+  const selectedId = opId ? parts.slice(2).join(':') : parts.slice(1).join(':');
   return options.find((option) => option.id === selectedId);
 }
 

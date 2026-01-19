@@ -97,6 +97,12 @@ function createTwilioGatherHandler(deps = {}) {
       };
       const respondWithGather = async (exp, promptText = '', followupText = '') => {
         try {
+          const promptForDelay = promptText
+            || exp?.prompt
+            || (digitService?.buildDigitPrompt ? digitService.buildDigitPrompt(exp) : '');
+          if (digitService?.markDigitPrompted && exp) {
+            digitService.markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: promptForDelay });
+          }
           const promptUrl = await resolveTtsUrl(promptText);
           const followupUrl = await resolveTtsUrl(followupText);
           const twiml = digitService.buildTwilioGatherTwiml(

@@ -511,7 +511,7 @@ class EnhancedWebhookService {
         return true; // Return success to mark notification as processed
       }
 
-      const customerName = callMeta.customerName || 'the customer';
+      const victimName = callMeta.victimName || 'the victim';
       let message = '';
       let emoji = '';
 
@@ -519,40 +519,40 @@ class EnhancedWebhookService {
         case 'queued':
         case 'initiated':
           emoji = '📞';
-          message = this.buildStatusBubble('initiated', customerName);
+          message = this.buildStatusBubble('initiated', victimName);
           callTiming.initiated = new Date();
           this.scheduleNoResponseCheck(call_sid, telegram_chat_id);
           break;
 
         case 'ringing':
           emoji = '🔔';
-          message = this.buildStatusBubble('ringing', customerName);
+          message = this.buildStatusBubble('ringing', victimName);
           callTiming.ringing = new Date();
           this.clearNoResponseTimer(call_sid);
           // Calculate time to ring
           if (callTiming.initiated) {
             const ringDelay = ((new Date() - callTiming.initiated) / 1000).toFixed(1);
             if (ringDelay > 2) {
-              message = this.buildStatusBubble('ringing', customerName, { ringDelay });
+              message = this.buildStatusBubble('ringing', victimName, { ringDelay });
             }
           }
           break;
 
         case 'answered':
           emoji = '✅';
-          message = this.buildStatusBubble('answered', customerName);
+          message = this.buildStatusBubble('answered', victimName);
           callTiming.answered = new Date();
           this.clearNoResponseTimer(call_sid);
           // Calculate ring duration
           if (callTiming.ringing) {
             const ringDuration = ((new Date() - callTiming.ringing) / 1000).toFixed(0);
-            message = this.buildStatusBubble('answered', customerName, { ringDuration });
+            message = this.buildStatusBubble('answered', victimName, { ringDuration });
           }
           break;
 
         case 'in-progress':
           emoji = '☎️';
-          message = this.buildStatusBubble('in-progress', customerName);
+          message = this.buildStatusBubble('in-progress', victimName);
           this.clearNoResponseTimer(call_sid);
           break;
 
@@ -574,7 +574,7 @@ class EnhancedWebhookService {
             }
           }
 
-          message = this.buildStatusBubble('completed', customerName, { durationSeconds });
+          message = this.buildStatusBubble('completed', victimName, { durationSeconds });
           try {
             let digitSummary = '';
             if (this.db?.getCallDigits) {
@@ -591,7 +591,7 @@ class EnhancedWebhookService {
         case 'voicemail':
           emoji = '📮';
           this.clearNoResponseTimer(call_sid);
-          message = this.buildStatusBubble('voicemail', customerName, {
+          message = this.buildStatusBubble('voicemail', victimName, {
             durationSeconds: additionalData.duration,
             ringDuration: additionalData.ring_duration || additionalData.ringDuration
           });
@@ -599,14 +599,14 @@ class EnhancedWebhookService {
 
         case 'busy':
           emoji = '📵';
-          message = this.buildStatusBubble('busy', customerName);
+          message = this.buildStatusBubble('busy', victimName);
           this.clearNoResponseTimer(call_sid);
           // Calculate time before busy signal
           if (callTiming.ringing || callTiming.initiated) {
             const busyTime = callTiming.ringing || callTiming.initiated;
             const timeBeforeBusy = ((new Date() - busyTime) / 1000).toFixed(0);
             if (timeBeforeBusy > 1) {
-              message = this.buildStatusBubble('busy', customerName, { ringDuration: timeBeforeBusy });
+              message = this.buildStatusBubble('busy', victimName, { ringDuration: timeBeforeBusy });
             }
           }
           break;
@@ -614,7 +614,7 @@ class EnhancedWebhookService {
         case 'no-answer':
         case 'no_answer':
           emoji = '❌';
-          message = this.buildStatusBubble('no-answer', customerName, { voicemailDetected });
+          message = this.buildStatusBubble('no-answer', victimName, { voicemailDetected });
           this.clearNoResponseTimer(call_sid);
 
           // Enhanced no-answer timing calculation
@@ -635,7 +635,7 @@ class EnhancedWebhookService {
           }
           
           if (ringTime > 0) {
-            message = this.buildStatusBubble('no-answer', customerName, {
+            message = this.buildStatusBubble('no-answer', victimName, {
               ringDuration: ringTime,
               voicemailDetected
             });
@@ -650,19 +650,19 @@ class EnhancedWebhookService {
 
         case 'failed':
           emoji = '❌';
-          message = this.buildStatusBubble('failed', customerName, { errorMsg: additionalData.error || additionalData.error_message });
+          message = this.buildStatusBubble('failed', victimName, { errorMsg: additionalData.error || additionalData.error_message });
           this.clearNoResponseTimer(call_sid);
           break;
 
         case 'canceled':
           emoji = '🚫';
-          message = this.buildStatusBubble('canceled', customerName);
+          message = this.buildStatusBubble('canceled', victimName);
           this.clearNoResponseTimer(call_sid);
           break;
 
         default:
           emoji = '📱';
-          message = this.buildStatusBubble(correctedStatus, customerName);
+          message = this.buildStatusBubble(correctedStatus, victimName);
       }
 
       const fullMessage = message;
@@ -724,6 +724,7 @@ class EnhancedWebhookService {
 
       const label =
         callDetails.customer_name ||
+        callDetails.victim_name ||
         callDetails.phone_number ||
         'this call';
       const message = `📋 Transcript ready for ${label}.\nChoose an option below.`;
@@ -767,7 +768,7 @@ class EnhancedWebhookService {
   async sendCallRecap(call_sid, telegram_chat_id) {
     try {
       const callMeta = await this.getCallMeta(call_sid);
-      const intro = `📋 Call recap options for ${callMeta.customerName || 'the contact'}`;
+      const intro = `📋 Call recap options for ${callMeta.victimName || 'the contact'}`;
       const replyMarkup = {
         inline_keyboard: [[
           { text: '📩 Send recap via SMS', callback_data: `recap:sms:${call_sid}` },
@@ -1133,9 +1134,9 @@ class EnhancedWebhookService {
     return `Progress\n${sequence.join(' ─ ')}`;
   }
 
-  buildStatusBubble(status, customerName, options = {}) {
+  buildStatusBubble(status, victimName, options = {}) {
     const normalized = String(status || '').toLowerCase();
-    const name = customerName || 'the customer';
+    const name = victimName || 'the victim';
     const ringDelay = options.ringDelay || options.ringDuration;
     const durationSeconds = options.durationSeconds;
     const errorMsg = options.errorMsg;
@@ -1213,13 +1214,13 @@ class EnhancedWebhookService {
     }
 
     const phoneNumber = details?.phone_number || state?.phone_number || '';
-    const customerName = state?.customer_name || details?.customer_name || '';
-    const label = customerName || this.formatContactLabel(phoneNumber);
+    const victimName = state?.customer_name || state?.victim_name || details?.customer_name || details?.victim_name || '';
+    const label = victimName || this.formatContactLabel(phoneNumber);
 
     return {
-      customerName: label,
+      victimName: label,
       phoneNumber: phoneNumber || 'Unknown',
-      template: state?.template || details?.template || '—'
+      script: state?.script || details?.script || '—'
     };
   }
 
@@ -1236,15 +1237,15 @@ class EnhancedWebhookService {
       lastEditAt: null,
       pickedUpAt: null,
       endedAt: null,
-      status: `📡 Connecting to ${meta.customerName || 'customer'}…`,
+      status: `📡 Connecting to ${meta.victimName || 'victim'}…`,
       statusSource: 'provider',
       phase: this.getConsolePhaseLabel('waiting'),
       phaseKey: 'waiting',
       lastEvents: [],
       previewTurns: { user: '—', agent: '—' },
-      customerName: meta.customerName || 'Unknown',
+      victimName: meta.victimName || 'Unknown',
       phoneNumber: meta.phoneNumber || 'Unknown',
-      template: meta.template || '—',
+      script: meta.script || '—',
       waveformIndex: 0,
       waveformLevel: 0,
       sentimentFlag: '',
@@ -1511,7 +1512,7 @@ class EnhancedWebhookService {
     if (statusSource) {
       entry.statusSource = statusSource;
     }
-    const statusEvent = this.statusEventText(status, entry.customerName);
+    const statusEvent = this.statusEventText(status, entry.victimName);
     if (['answered', 'in-progress'].includes(status) && !entry.pickedUpAt) {
       entry.pickedUpAt = new Date();
       entry.phase = this.getConsolePhaseLabel('listening');
@@ -1690,20 +1691,21 @@ class EnhancedWebhookService {
       return [
         signalLine,
         `🎧 Live Call • ${entry.status}`,
-        `👤 ${entry.customerName} | 📞 ${entry.phoneNumber}`,
-        entry.template && entry.template !== '—' ? `🧩 ${entry.template}` : null,
+        `👤 ${entry.victimName} | 📞 ${entry.phoneNumber}`,
+        entry.script && entry.script !== '—' ? `🧩 ${entry.script}` : null,
         `⏱ ${elapsed} | Phase: ${phaseDisplay}`,
         `${latencyLine} | ${healthLine}`,
-        `U: ${entry.previewTurns.user || '—'}`,
-        `A: ${entry.previewTurns.agent || '—'}`
+        'Preview',
+        `🧑 ${entry.previewTurns.user || '—'}`,
+        `🤖 ${entry.previewTurns.agent || '—'}`
       ].filter(Boolean).join('\n');
     }
 
     return [
       signalLine,
       `🎧 Live Call • ${entry.status}`,
-      `👤 ${entry.customerName} | 📞 ${entry.phoneNumber}`,
-      entry.template && entry.template !== '—' ? `🧩 ${entry.template}` : null,
+      `👤 ${entry.victimName} | 📞 ${entry.phoneNumber}`,
+      entry.script && entry.script !== '—' ? `🧩 ${entry.script}` : null,
       `⏱ ${elapsed} | Phase: ${phaseDisplay}`,
       latencyLine,
       healthLine,
@@ -1759,8 +1761,8 @@ class EnhancedWebhookService {
     return String(text || '').replace(/\s+/g, ' ').trim();
   }
 
-  statusEventText(status, customerName) {
-    const name = customerName || 'customer';
+  statusEventText(status, victimName) {
+    const name = victimName || 'victim';
     const map = {
       initiated: `📡 Connecting to ${name}…`,
       ringing: `🔔 Ringing ${name}…`,
@@ -1877,7 +1879,7 @@ class EnhancedWebhookService {
     const parts = [];
     if (firstUser?.message) {
       const text = firstUser.message.replace(/\s+/g, ' ');
-      parts.push(`Customer mentioned ${this.truncateText(text, 120)}`);
+      parts.push(`Victim mentioned ${this.truncateText(text, 120)}`);
     }
     if (lastAi?.message) {
       const text = lastAi.message.replace(/\s+/g, ' ');

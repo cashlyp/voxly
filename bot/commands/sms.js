@@ -18,11 +18,11 @@ const {
 } = require('../utils/persona');
 
 const {
-    buildTemplateOption,
-    CUSTOM_TEMPLATE_OPTION,
-    extractTemplateVariables,
-    TEMPLATE_METADATA
-} = require('../utils/templates');
+    buildScriptOption,
+    CUSTOM_SCRIPT_OPTION,
+    extractScriptVariables,
+    SCRIPT_METADATA
+} = require('../utils/scripts');
 const { section: formatSection, buildLine, tipLine } = require('../utils/commandFormat');
 
 async function smsAlert(ctx, text) {
@@ -181,9 +181,9 @@ Choose the business profile for this message.`,
         let selectedPurpose = null;
         let recommendedEmotion = 'neutral';
         let recommendedUrgency = 'normal';
-        let templateSelection = null;
-        let templateName = null;
-        let templateVariables = {};
+        let scriptSelection = null;
+        let scriptName = null;
+        let scriptVariables = {};
         let message = '';
 
         if (!selectedBusiness.custom) {
@@ -270,56 +270,56 @@ How comfortable is the recipient with technical details?`,
             }
         }
 
-        // Fetch available templates
-        let templateChoices = [];
+        // Fetch available scripts
+        let scriptChoices = [];
         try {
-            const templateResponse = await guardedGet(`${config.apiUrl}/api/sms/templates`, {
+            const scriptResponse = await guardedGet(`${config.apiUrl}/api/sms/scripts`, {
                 params: { include_builtins: true, detailed: true }
             });
 
-            const builtinTemplates = (templateResponse.data.builtin || []).map((template) => ({
-                id: template.name,
-                label: buildTemplateOption(template.name).label,
-                description: buildTemplateOption(template.name).description,
-                content: template.content,
+            const builtinScripts = (scriptResponse.data.builtin || []).map((script) => ({
+                id: script.name,
+                label: buildScriptOption(script.name).label,
+                description: buildScriptOption(script.name).description,
+                content: script.content,
                 is_builtin: true
             }));
 
-            const customTemplates = (templateResponse.data.templates || []).map((template) => ({
-                id: template.name,
-                label: `📝 ${template.name}`,
-                description: template.description || 'Custom template',
-                content: template.content,
+            const customScripts = (scriptResponse.data.scripts || []).map((script) => ({
+                id: script.name,
+                label: `📝 ${script.name}`,
+                description: script.description || 'Custom script',
+                content: script.content,
                 is_builtin: false
             }));
 
-            templateChoices = [...builtinTemplates, ...customTemplates];
-        } catch (templateError) {
-            console.error('❌ Failed to fetch SMS templates:', templateError);
-            templateChoices = Object.keys(TEMPLATE_METADATA || {})
-                .map(buildTemplateOption);
+            scriptChoices = [...builtinScripts, ...customScripts];
+        } catch (scriptError) {
+            console.error('❌ Failed to fetch SMS scripts:', scriptError);
+            scriptChoices = Object.keys(SCRIPT_METADATA || {})
+                .map(buildScriptOption);
         }
 
-        templateChoices.push(CUSTOM_TEMPLATE_OPTION);
+        scriptChoices.push(CUSTOM_SCRIPT_OPTION);
 
-        const templateListText = templateChoices
+        const scriptListText = scriptChoices
             .map((option) => `• ${option.label}${option.description ? ` - ${option.description}` : ''}`)
             .join('\n');
 
-        const templatePrompt = `📝 *Choose SMS template:*
-${templateListText}
+        const scriptPrompt = `📝 *Choose SMS script:*
+${scriptListText}
 
 Tap an option below to continue.`;
 
-        templateSelection = await askWithGuard(
+        scriptSelection = await askWithGuard(
             conversation,
             ctx,
-            templatePrompt,
-            templateChoices,
-            { prefix: 'sms-template', columns: 1, formatLabel: (option) => option.label }
+            scriptPrompt,
+            scriptChoices,
+            { prefix: 'sms-script', columns: 1, formatLabel: (option) => option.label }
         );
 
-        if (templateSelection.id === 'custom') {
+        if (scriptSelection.id === 'custom') {
             await ctx.reply('💬 Enter the SMS message (max 1600 characters):');
             const msgContent = await waitForMessage();
             message = msgContent?.message?.text?.trim();
@@ -328,21 +328,21 @@ Tap an option below to continue.`;
             if (message.length > 1600) {
                 return ctx.reply('❌ Message too long. SMS messages must be under 1600 characters.');
             }
-            personaSummary.push('Template: Custom message');
+            personaSummary.push('Script: Custom message');
         } else {
-            templateName = templateSelection.id;
+            scriptName = scriptSelection.id;
 
             try {
-                const templateResponse = await guardedGet(`${config.apiUrl}/api/sms/templates/${templateName}`, {
+                const scriptResponse = await guardedGet(`${config.apiUrl}/api/sms/scripts/${scriptName}`, {
                     params: { detailed: true }
                 });
 
-                const templatePayload = templateResponse.data.template;
-                let templateText = templatePayload?.content || '';
-                const placeholders = extractTemplateVariables(templatePayload?.content || '');
+                const scriptPayload = scriptResponse.data.script;
+                let scriptText = scriptPayload?.content || '';
+                const placeholders = extractScriptVariables(scriptPayload?.content || '');
 
                 if (placeholders.length > 0) {
-                    await ctx.reply('🧩 This template includes placeholders. Provide values or type skip to leave them unchanged.');
+                    await ctx.reply('🧩 This script includes placeholders. Provide values or type skip to leave them unchanged.');
 
                     for (const token of placeholders) {
                         await ctx.reply(`✏️ Enter value for *${token}* (type skip to leave as is):`, { parse_mode: 'Markdown' });
@@ -350,23 +350,23 @@ Tap an option below to continue.`;
                         const value = valueMsg?.message?.text?.trim();
 
                         if (value && value.toLowerCase() !== 'skip') {
-                            templateVariables[token] = value;
+                            scriptVariables[token] = value;
                         }
                     }
 
-                    for (const [token, value] of Object.entries(templateVariables)) {
-                        templateText = templateText.replace(new RegExp(`{${token}}`, 'g'), value);
+                    for (const [token, value] of Object.entries(scriptVariables)) {
+                        scriptText = scriptText.replace(new RegExp(`{${token}}`, 'g'), value);
                     }
                 }
 
-                message = templateText;
-                personaSummary.push(`Template: ${templateSelection.label}`);
-                if (Object.keys(templateVariables).length > 0) {
-                    personaSummary.push(`Filled variables: ${Object.keys(templateVariables).join(', ')}`);
+                message = scriptText;
+                personaSummary.push(`Script: ${scriptSelection.label}`);
+                if (Object.keys(scriptVariables).length > 0) {
+                    personaSummary.push(`Filled variables: ${Object.keys(scriptVariables).join(', ')}`);
                 }
-            } catch (templateFetchError) {
-                console.error('❌ Failed to load template content:', templateFetchError);
-                await ctx.reply('⚠️ Could not load the selected template. Please type a custom message instead.');
+            } catch (scriptFetchError) {
+                console.error('❌ Failed to load script content:', scriptFetchError);
+                await ctx.reply('⚠️ Could not load the selected script. Please type a custom message instead.');
 
                 await ctx.reply('💬 Enter the SMS message (max 1600 characters):');
                 const msgContent = await waitForMessage();
@@ -376,7 +376,7 @@ Tap an option below to continue.`;
                 if (message.length > 1600) {
                     return ctx.reply('❌ Message too long. SMS messages must be under 1600 characters.');
                 }
-                personaSummary.push('Template: Custom message (fallback)');
+                personaSummary.push('Script: Custom message (fallback)');
             }
         }
 
@@ -388,12 +388,12 @@ Tap an option below to continue.`;
             return ctx.reply(`❌ Message too long (${message.length} characters). Please shorten it below 1600 characters.`);
         }
 
-        if (templateName) {
-            payload.template_name = templateName;
+        if (scriptName) {
+            payload.script_name = scriptName;
         }
 
-        if (Object.keys(templateVariables).length > 0) {
-            payload.template_variables = templateVariables;
+        if (Object.keys(scriptVariables).length > 0) {
+            payload.script_variables = scriptVariables;
         }
 
         let previewAction = null;
@@ -845,7 +845,7 @@ async function viewSmsConversation(ctx, phoneNumber) {
             const recentMessages = messages.slice(-10);
             recentMessages.forEach(msg => {
                 const time = new Date(msg.timestamp).toLocaleTimeString();
-                const sender = msg.role === 'user' ? '👤 Customer' : '🤖 AI';
+                const sender = msg.role === 'user' ? '👤 Victim' : '🤖 AI';
                 const cleanMsg = msg.content.replace(/[*_`[\]()~>#+=|{}.!-]/g, '\\$&');
                 conversationText += `\n${sender} _(${time})_\n${cleanMsg}\n`;
             });
@@ -1006,7 +1006,7 @@ async function getSmsStats(ctx) {
     }
 }
 
-// FIXED: SMS templates - now properly handles the API response
+// FIXED: SMS scripts - now properly handles the API response
 // Register SMS command handlers with conversation flows
 function registerSmsCommands(bot) {
 
@@ -1115,7 +1115,7 @@ function registerSmsCommands(bot) {
         }
     });
 
-    // Template designer commands are managed through /templates (see bot/commands/templates.js)
+    // Script designer commands are managed through /scripts (see bot/commands/scripts.js)
 
     // NEW: SMS delivery status check command
     bot.command('smsstatus', async ctx => {

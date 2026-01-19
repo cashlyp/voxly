@@ -1,4 +1,4 @@
-const TEMPLATE_METADATA = {
+const SCRIPT_METADATA = {
   welcome: {
     label: 'Welcome Message',
     description: 'Friendly greeting for new contacts'
@@ -13,7 +13,7 @@ const TEMPLATE_METADATA = {
   },
   order_update: {
     label: 'Order Update',
-    description: 'Inform customers about order status'
+    description: 'Inform victims about order status'
   },
   payment_reminder: {
     label: 'Payment Reminder',
@@ -24,7 +24,7 @@ const TEMPLATE_METADATA = {
     description: 'Broadcast limited-time promotions'
   },
   customer_service: {
-    label: 'Customer Service',
+    label: 'Victim Service',
     description: 'Acknowledge support inquiries'
   },
   survey: {
@@ -33,30 +33,30 @@ const TEMPLATE_METADATA = {
   }
 };
 
-const CUSTOM_TEMPLATE_OPTION = {
+const CUSTOM_SCRIPT_OPTION = {
   id: 'custom',
   label: '✍️ Custom message',
   description: 'Write your own SMS text'
 };
 
-function buildTemplateOption(templateId) {
-  const meta = TEMPLATE_METADATA[templateId] || {};
-  const label = meta.label || templateId.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+function buildScriptOption(scriptId) {
+  const meta = SCRIPT_METADATA[scriptId] || {};
+  const label = meta.label || scriptId.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
   return {
-    id: templateId,
+    id: scriptId,
     label,
-    description: meta.description || 'Predefined SMS template'
+    description: meta.description || 'Predefined SMS script'
   };
 }
 
-function extractTemplateVariables(templateText = '') {
-  const matches = templateText.match(/\{(\w+)\}/g) || [];
+function extractScriptVariables(scriptText = '') {
+  const matches = scriptText.match(/\{(\w+)\}/g) || [];
   return Array.from(new Set(matches.map((token) => token.replace(/[{}]/g, ''))));
 }
 
 module.exports = {
-  TEMPLATE_METADATA,
-  CUSTOM_TEMPLATE_OPTION,
-  buildTemplateOption,
-  extractTemplateVariables
+  SCRIPT_METADATA,
+  CUSTOM_SCRIPT_OPTION,
+  buildScriptOption,
+  extractScriptVariables
 };

@@ -330,11 +330,11 @@ class EmailService {
     return headers;
   }
 
-  validateVariables(template, variables) {
+  validateVariables(script, variables) {
     const required = new Set();
-    extractTemplateVariables(template.subject).forEach((v) => required.add(v));
-    extractTemplateVariables(template.html).forEach((v) => required.add(v));
-    extractTemplateVariables(template.text).forEach((v) => required.add(v));
+    extractTemplateVariables(script.subject).forEach((v) => required.add(v));
+    extractTemplateVariables(script.html).forEach((v) => required.add(v));
+    extractTemplateVariables(script.text).forEach((v) => required.add(v));
     const missing = [];
     required.forEach((key) => {
       const value = getNestedValue(variables, key);
@@ -345,32 +345,32 @@ class EmailService {
     return missing;
   }
 
-  renderTemplate(template, variables) {
+  renderTemplate(script, variables) {
     return {
-      subject: renderTemplateString(template.subject, variables),
-      html: renderTemplateString(template.html, variables),
-      text: renderTemplateString(template.text, variables)
+      subject: renderTemplateString(script.subject, variables),
+      html: renderTemplateString(script.html, variables),
+      text: renderTemplateString(script.text, variables)
     };
   }
 
   async resolveTemplate(payload) {
-    if (payload.template_id) {
-      const template = await this.db.getEmailTemplate(payload.template_id);
+    if (payload.script_id) {
+      const template = await this.db.getEmailTemplate(payload.script_id);
       if (!template) {
-        throw new Error(`Template ${payload.template_id} not found`);
+        throw new Error(`Script ${payload.script_id} not found`);
       }
       return {
         subject: template.subject || payload.subject || '',
         html: template.html || payload.html || '',
         text: template.text || payload.text || '',
-        template_id: payload.template_id
+        script_id: payload.script_id
       };
     }
     return {
       subject: payload.subject || '',
       html: payload.html || '',
       text: payload.text || '',
-      template_id: null
+      script_id: null
     };
   }
 
@@ -388,22 +388,22 @@ class EmailService {
       throw new Error('Sender domain not verified');
     }
 
-    const template = await this.resolveTemplate(payload);
+    const script = await this.resolveTemplate(payload);
     const variables = payload.variables || {};
-    const missing = this.validateVariables(template, variables);
+    const missing = this.validateVariables(script, variables);
     if (missing.length) {
-      const error = new Error(`Missing template variables: ${missing.join(', ')}`);
+      const error = new Error(`Missing script variables: ${missing.join(', ')}`);
       error.code = 'missing_variables';
       error.missing = missing;
       throw error;
     }
 
-    const rendered = this.renderTemplate(template, variables);
+    const rendered = this.renderTemplate(script, variables);
     const requestHash = hashPayload({
       to,
       from,
       subject: rendered.subject,
-      template_id: template.template_id,
+      script_id: script.script_id,
       variables,
       html: rendered.html,
       text: rendered.text,
@@ -434,7 +434,7 @@ class EmailService {
       subject: rendered.subject,
       html: rendered.html,
       text: rendered.text,
-      template_id: template.template_id,
+      template_id: script.script_id,
       variables_json: JSON.stringify(variables),
       variables_hash: hashPayload(variables),
       metadata_json: JSON.stringify(metadata),
@@ -476,7 +476,7 @@ class EmailService {
 
     const requestHash = hashPayload({
       recipients: recipients.map((r) => normalizeEmail(r.email)),
-      template_id: payload.template_id,
+      script_id: payload.script_id,
       subject: payload.subject,
       variables: payload.variables || {},
       send_at: payload.send_at || null
@@ -501,7 +501,7 @@ class EmailService {
       total: recipients.length,
       queued: 0,
       tenant_id: payload.tenant_id || null,
-      template_id: payload.template_id || null
+      template_id: payload.script_id || null
     });
 
     if (idempotencyKey) {
@@ -893,14 +893,14 @@ class EmailService {
     return events;
   }
 
-  async previewTemplate(payload) {
-    const template = await this.resolveTemplate(payload);
+  async previewScript(payload) {
+    const script = await this.resolveTemplate(payload);
     const variables = payload.variables || {};
-    const missing = this.validateVariables(template, variables);
+    const missing = this.validateVariables(script, variables);
     if (missing.length) {
       return { ok: false, missing };
     }
-    const rendered = this.renderTemplate(template, variables);
+    const rendered = this.renderTemplate(script, variables);
     return { ok: true, subject: rendered.subject, html: rendered.html, text: rendered.text };
   }
 }

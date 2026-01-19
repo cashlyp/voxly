@@ -11,7 +11,7 @@ const {
   getOptionLabel,
   invalidatePersonaCache
 } = require('../utils/persona');
-const { extractTemplateVariables } = require('../utils/templates');
+const { extractScriptVariables } = require('../utils/scripts');
 const {
   startOperation,
   ensureOperationActive,
@@ -22,8 +22,8 @@ const {
 const { section, buildLine, tipLine } = require('../utils/commandFormat');
 const { attachHmacAuth } = require('../utils/apiAuth');
 
-const templatesApi = axios.create({
-  baseURL: config.templatesApiUrl.replace(/\/+$/, ''),
+const scriptsApi = axios.create({
+  baseURL: config.scriptsApiUrl.replace(/\/+$/, ''),
   timeout: 15000,
   headers: {
     'Content-Type': 'application/json',
@@ -31,10 +31,10 @@ const templatesApi = axios.create({
   }
 });
 
-attachHmacAuth(templatesApi, {
+attachHmacAuth(scriptsApi, {
   secret: config.apiAuth?.hmacSecret,
-  allowedOrigins: [new URL(config.templatesApiUrl).origin],
-  defaultBaseUrl: config.templatesApiUrl
+  allowedOrigins: [new URL(config.scriptsApiUrl).origin],
+  defaultBaseUrl: config.scriptsApiUrl
 });
 
 function styledNotice(ctx, title, lines) {
@@ -49,9 +49,9 @@ function nonJsonResponseError(endpoint, response) {
       ? response.data.replace(/\s+/g, ' ').trim().slice(0, 140)
       : '';
   const error = new Error(
-    `Templates API returned non-JSON response (content-type: ${contentType})`
+    `Scripts API returned non-JSON response (content-type: ${contentType})`
   );
-  error.isTemplatesApiError = true;
+  error.isScriptsApiError = true;
   error.reason = 'non_json_response';
   error.endpoint = endpoint;
   error.contentType = contentType;
@@ -59,17 +59,17 @@ function nonJsonResponseError(endpoint, response) {
   return error;
 }
 
-async function templatesApiRequest(options) {
+async function scriptsApiRequest(options) {
   const endpoint = `${(options.method || 'GET').toUpperCase()} ${options.url}`;
   try {
-    const response = await templatesApi.request(options);
+    const response = await scriptsApi.request(options);
     const contentType = response.headers?.['content-type'] || '';
     if (!contentType.includes('application/json')) {
       throw nonJsonResponseError(endpoint, response);
     }
     if (response.data && response.data.success === false) {
-      const apiError = new Error(response.data.error || 'Templates API reported failure');
-      apiError.isTemplatesApiError = true;
+      const apiError = new Error(response.data.error || 'Scripts API reported failure');
+      apiError.isScriptsApiError = true;
       apiError.reason = 'api_failure';
       apiError.endpoint = endpoint;
       throw apiError;
@@ -82,28 +82,28 @@ async function templatesApiRequest(options) {
         throw nonJsonResponseError(endpoint, error.response);
       }
     }
-    error.templatesApi = { endpoint };
+    error.scriptsApi = { endpoint };
     throw error;
   }
 }
 
-function formatTemplatesApiError(error, action) {
-  const baseHelp = `Ensure the templates service is reachable at ${config.templatesApiUrl} or update TEMPLATES_API_URL.`;
+function formatScriptsApiError(error, action) {
+  const baseHelp = `Ensure the scripts service is reachable at ${config.scriptsApiUrl} or update SCRIPTS_API_URL.`;
 
   const apiCode = error.response?.data?.code || error.code;
-  if (apiCode === 'TEMPLATE_NAME_DUPLICATE') {
+  if (apiCode === 'SCRIPT_NAME_DUPLICATE') {
     const suggested = error.response?.data?.suggested_name;
     const suggestionLine = suggested ? ` Suggested name: ${suggested}` : '';
-    return `⚠️ ${action}: Template name already exists.${suggestionLine}`;
+    return `⚠️ ${action}: Script name already exists.${suggestionLine}`;
   }
 
-  if (error.isTemplatesApiError && error.reason === 'non_json_response') {
-    return `❌ ${action}: Templates API returned unexpected content (type: ${error.contentType}). ${baseHelp}${
+  if (error.isScriptsApiError && error.reason === 'non_json_response') {
+    return `❌ ${action}: Scripts API returned unexpected content (type: ${error.contentType}). ${baseHelp}${
       error.snippet ? `\nSnippet: ${error.snippet}` : ''
     }`;
   }
 
-  if (error.isTemplatesApiError && error.reason === 'api_failure') {
+  if (error.isScriptsApiError && error.reason === 'api_failure') {
     return `❌ ${action}: ${error.message}. ${baseHelp}`;
   }
 
@@ -121,7 +121,7 @@ function formatTemplatesApiError(error, action) {
         typeof error.response.data === 'string'
           ? error.response.data.replace(/\s+/g, ' ').trim().slice(0, 140)
           : '';
-      return `❌ ${action}: Templates API responded with HTTP ${status} ${statusText}. ${baseHelp}${
+      return `❌ ${action}: Scripts API responded with HTTP ${status} ${statusText}. ${baseHelp}${
         snippet ? `\nSnippet: ${snippet}` : ''
       }`;
     }
@@ -130,7 +130,7 @@ function formatTemplatesApiError(error, action) {
   }
 
   if (error.request) {
-    return `❌ ${action}: No response from Templates API. ${baseHelp}`;
+    return `❌ ${action}: No response from Scripts API. ${baseHelp}`;
   }
 
   return `❌ ${action}: ${error.message}`;
@@ -286,13 +286,13 @@ function toPersonaOverrides(personaResult) {
   return Object.keys(overrides).length ? overrides : null;
 }
 
-function buildPersonaSummaryFromConfig(template) {
+function buildPersonaSummaryFromConfig(script) {
   const summary = [];
-  if (template.business_id) {
-    const business = findBusinessOption(template.business_id);
-    summary.push(`Persona: ${business ? business.label : template.business_id}`);
+  if (script.business_id) {
+    const business = findBusinessOption(script.business_id);
+    summary.push(`Persona: ${business ? business.label : script.business_id}`);
   }
-  const persona = template.persona_config || {};
+  const persona = script.persona_config || {};
   if (persona.purpose) {
     summary.push(`Purpose: ${persona.purpose}`);
   }
@@ -354,11 +354,11 @@ async function collectPersonaConfig(conversation, ctx, defaults = {}, options = 
   const businessChoice = await askOptionWithButtons(
     conversation,
     ctx,
-    `🎭 *Select persona for this template:*
+    `🎭 *Select persona for this script:*
 Choose the primary business context.`,
     selectionOptions,
     {
-      prefix: 'template-business',
+      prefix: 'script-business',
       columns: 2,
       ensureActive: safeEnsureActive,
       formatLabel: (option) => (option.custom && option.id !== 'cancel' ? '✍️ Custom persona' : option.label)
@@ -388,10 +388,10 @@ Choose the primary business context.`,
         : null;
 
       const purposePrompt = currentPurposeLabel
-        ? `🎯 *Choose template purpose:*
+        ? `🎯 *Choose script purpose:*
 This helps align tone and follow-up actions.
 _Current: ${currentPurposeLabel}_`
-        : `🎯 *Choose template purpose:*
+        : `🎯 *Choose script purpose:*
 This helps align tone and follow-up actions.`;
 
       const purposeSelection = await askOptionWithButtons(
@@ -400,7 +400,7 @@ This helps align tone and follow-up actions.`;
         purposePrompt,
         availablePurposes,
         {
-          prefix: 'template-purpose',
+          prefix: 'script-purpose',
           columns: 1,
            ensureActive: safeEnsureActive,
           formatLabel: (option) => `${option.emoji || '•'} ${option.label}`
@@ -414,16 +414,16 @@ This helps align tone and follow-up actions.`;
     }
 
     const tonePrompt = personaConfig.emotion
-      ? `🎙️ *Preferred tone for this template:*
+      ? `🎙️ *Preferred tone for this script:*
 _Current: ${getOptionLabel(MOOD_OPTIONS, personaConfig.emotion)}_`
-      : `🎙️ *Preferred tone for this template:*`;
+      : `🎙️ *Preferred tone for this script:*`;
 
     const moodSelection = await askOptionWithButtons(
       conversation,
       ctx,
       tonePrompt,
       MOOD_OPTIONS,
-      { prefix: 'template-tone', columns: 2, ensureActive: safeEnsureActive }
+      { prefix: 'script-tone', columns: 2, ensureActive: safeEnsureActive }
     );
     personaConfig.emotion = moodSelection.id;
     personaSummary.push(`Tone: ${moodSelection.label}`);
@@ -438,7 +438,7 @@ _Current: ${getOptionLabel(URGENCY_OPTIONS, personaConfig.urgency)}_`
       ctx,
       urgencyPrompt,
       URGENCY_OPTIONS,
-      { prefix: 'template-urgency', columns: 2, ensureActive: safeEnsureActive }
+      { prefix: 'script-urgency', columns: 2, ensureActive: safeEnsureActive }
     );
     personaConfig.urgency = urgencySelection.id;
     personaSummary.push(`Urgency: ${urgencySelection.label}`);
@@ -453,7 +453,7 @@ _Current: ${getOptionLabel(TECH_LEVEL_OPTIONS, personaConfig.technical_level)}_`
       ctx,
       techPrompt,
       TECH_LEVEL_OPTIONS,
-      { prefix: 'template-tech', columns: 2, ensureActive: safeEnsureActive }
+      { prefix: 'script-tech', columns: 2, ensureActive: safeEnsureActive }
     );
     personaConfig.technical_level = techSelection.id;
     personaSummary.push(`Technical level: ${techSelection.label}`);
@@ -479,7 +479,7 @@ async function collectPromptAndVoice(conversation, ctx, defaults = {}, ensureAct
   const prompt = await promptText(
     conversation,
     ctx,
-    '🧠 Provide the system prompt for this call template. This sets the AI behavior.',
+    '🧠 Provide the system prompt for this call script. This sets the AI behavior.',
     {
       allowEmpty: false,
       allowSkip: !!defaults.prompt,
@@ -514,7 +514,7 @@ async function collectPromptAndVoice(conversation, ctx, defaults = {}, ensureAct
   const voiceModel = await promptText(
     conversation,
     ctx,
-    '🎤 Enter the Deepgram voice model for this template (or type skip to use the default).',
+    '🎤 Enter the Deepgram voice model for this script (or type skip to use the default).',
     {
       allowEmpty: true,
       allowSkip: true,
@@ -535,77 +535,77 @@ async function collectPromptAndVoice(conversation, ctx, defaults = {}, ensureAct
   };
 }
 
-async function fetchCallTemplates() {
-  const data = await templatesApiRequest({ method: 'get', url: '/api/call-templates' });
-  return data.templates || [];
+async function fetchCallScripts() {
+  const data = await scriptsApiRequest({ method: 'get', url: '/api/call-scripts' });
+  return data.scripts || [];
 }
 
-async function fetchCallTemplateById(id) {
-  const data = await templatesApiRequest({ method: 'get', url: `/api/call-templates/${id}` });
-  return data.template;
+async function fetchCallScriptById(id) {
+  const data = await scriptsApiRequest({ method: 'get', url: `/api/call-scripts/${id}` });
+  return data.script;
 }
 
-async function createCallTemplate(payload) {
-  const data = await templatesApiRequest({ method: 'post', url: '/api/call-templates', data: payload });
-  return data.template;
+async function createCallScript(payload) {
+  const data = await scriptsApiRequest({ method: 'post', url: '/api/call-scripts', data: payload });
+  return data.script;
 }
 
-async function updateCallTemplate(id, payload) {
-  const data = await templatesApiRequest({ method: 'put', url: `/api/call-templates/${id}`, data: payload });
-  return data.template;
+async function updateCallScript(id, payload) {
+  const data = await scriptsApiRequest({ method: 'put', url: `/api/call-scripts/${id}`, data: payload });
+  return data.script;
 }
 
-async function deleteCallTemplate(id) {
-  await templatesApiRequest({ method: 'delete', url: `/api/call-templates/${id}` });
+async function deleteCallScript(id) {
+  await scriptsApiRequest({ method: 'delete', url: `/api/call-scripts/${id}` });
 }
 
-async function cloneCallTemplate(id, payload) {
-  const data = await templatesApiRequest({ method: 'post', url: `/api/call-templates/${id}/clone`, data: payload });
-  return data.template;
+async function cloneCallScript(id, payload) {
+  const data = await scriptsApiRequest({ method: 'post', url: `/api/call-scripts/${id}/clone`, data: payload });
+  return data.script;
 }
 
-function formatCallTemplateSummary(template) {
+function formatCallScriptSummary(script) {
   const summary = [];
-  summary.push(`📛 *${escapeMarkdown(template.name)}*`);
-  if (template.description) {
-    summary.push(`📝 ${escapeMarkdown(template.description)}`);
+  summary.push(`📛 *${escapeMarkdown(script.name)}*`);
+  if (script.description) {
+    summary.push(`📝 ${escapeMarkdown(script.description)}`);
   }
-  if (template.business_id) {
-    const business = findBusinessOption(template.business_id);
-    summary.push(`🏢 Persona: ${escapeMarkdown(business ? business.label : template.business_id)}`);
+  if (script.business_id) {
+    const business = findBusinessOption(script.business_id);
+    summary.push(`🏢 Persona: ${escapeMarkdown(business ? business.label : script.business_id)}`);
   }
-  const personaSummary = buildPersonaSummaryFromConfig(template);
+  const personaSummary = buildPersonaSummaryFromConfig(script);
   if (personaSummary.length) {
     personaSummary.forEach((line) => summary.push(`• ${escapeMarkdown(line)}`));
   }
 
-  if (template.voice_model) {
-    summary.push(`🎤 Voice model: ${escapeMarkdown(template.voice_model)}`);
+  if (script.voice_model) {
+    summary.push(`🎤 Voice model: ${escapeMarkdown(script.voice_model)}`);
   }
 
   const placeholders = new Set([
-    ...extractTemplateVariables(template.prompt || ''),
-    ...extractTemplateVariables(template.first_message || '')
+    ...extractScriptVariables(script.prompt || ''),
+    ...extractScriptVariables(script.first_message || '')
   ]);
   if (placeholders.size > 0) {
     summary.push(`🧩 Placeholders: ${Array.from(placeholders).map(escapeMarkdown).join(', ')}`);
   }
 
-  if (template.prompt) {
-    const snippet = template.prompt.substring(0, 160);
-    summary.push(`📜 Prompt snippet: ${escapeMarkdown(snippet)}${template.prompt.length > 160 ? '…' : ''}`);
+  if (script.prompt) {
+    const snippet = script.prompt.substring(0, 160);
+    summary.push(`📜 Prompt snippet: ${escapeMarkdown(snippet)}${script.prompt.length > 160 ? '…' : ''}`);
   }
-  if (template.first_message) {
-    const snippet = template.first_message.substring(0, 160);
-    summary.push(`🗨️ First message: ${escapeMarkdown(snippet)}${template.first_message.length > 160 ? '…' : ''}`);
+  if (script.first_message) {
+    const snippet = script.first_message.substring(0, 160);
+    summary.push(`🗨️ First message: ${escapeMarkdown(snippet)}${script.first_message.length > 160 ? '…' : ''}`);
   }
   summary.push(
-    `📅 Updated: ${escapeMarkdown(new Date(template.updated_at || template.created_at).toLocaleString())}`
+    `📅 Updated: ${escapeMarkdown(new Date(script.updated_at || script.created_at).toLocaleString())}`
   );
   return summary.join('\n');
 }
 
-async function previewCallTemplate(conversation, ctx, template, ensureActive) {
+async function previewCallScript(conversation, ctx, script, ensureActive) {
   const safeEnsureActive = typeof ensureActive === 'function'
     ? ensureActive
     : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
@@ -626,14 +626,14 @@ async function previewCallTemplate(conversation, ctx, template, ensureActive) {
   }
 
   const placeholderSet = new Set();
-  extractTemplateVariables(template.prompt || '').forEach((token) => placeholderSet.add(token));
-  extractTemplateVariables(template.first_message || '').forEach((token) => placeholderSet.add(token));
+  extractScriptVariables(script.prompt || '').forEach((token) => placeholderSet.add(token));
+  extractScriptVariables(script.first_message || '').forEach((token) => placeholderSet.add(token));
 
-  let prompt = template.prompt;
-  let firstMessage = template.first_message;
+  let prompt = script.prompt;
+  let firstMessage = script.first_message;
 
   if (placeholderSet.size > 0) {
-    await ctx.reply('🧩 This template has placeholders. Provide values where needed (type skip to leave unchanged).');
+    await ctx.reply('🧩 This script has placeholders. Provide values where needed (type skip to leave unchanged).');
     const values = await collectPlaceholderValues(conversation, ctx, Array.from(placeholderSet), safeEnsureActive);
     if (values === null) {
       await ctx.reply('❌ Preview cancelled.');
@@ -652,18 +652,18 @@ async function previewCallTemplate(conversation, ctx, template, ensureActive) {
     user_chat_id: ctx.from.id.toString()
   };
 
-  if (template.business_id) {
-    payload.business_id = template.business_id;
+  if (script.business_id) {
+    payload.business_id = script.business_id;
   }
-  const persona = template.persona_config || {};
+  const persona = script.persona_config || {};
   if (prompt) {
     payload.prompt = prompt;
   }
   if (firstMessage) {
     payload.first_message = firstMessage;
   }
-  if (template.voice_model) {
-    payload.voice_model = template.voice_model;
+  if (script.voice_model) {
+    payload.voice_model = script.voice_model;
   }
   if (persona.purpose) {
     payload.purpose = persona.purpose;
@@ -691,14 +691,14 @@ async function previewCallTemplate(conversation, ctx, template, ensureActive) {
   }
 }
 
-async function createCallTemplateFlow(conversation, ctx, ensureActive) {
+async function createCallScriptFlow(conversation, ctx, ensureActive) {
   const safeEnsureActive = typeof ensureActive === 'function'
     ? ensureActive
     : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
   const name = await promptText(
     conversation,
     ctx,
-    '🆕 *Template name*\nEnter a unique name for this call template.',
+    '🆕 *Script name*\nEnter a unique name for this call script.',
     {
       allowEmpty: false,
       parse: (value) => value.trim(),
@@ -707,14 +707,14 @@ async function createCallTemplateFlow(conversation, ctx, ensureActive) {
   );
 
   if (!name) {
-    await ctx.reply('❌ Template creation cancelled.');
+    await ctx.reply('❌ Script creation cancelled.');
     return;
   }
 
   const description = await promptText(
     conversation,
     ctx,
-    '📝 Provide an optional description for this template (or type skip).',
+    '📝 Provide an optional description for this script (or type skip).',
     {
       allowEmpty: true,
       allowSkip: true,
@@ -723,23 +723,23 @@ async function createCallTemplateFlow(conversation, ctx, ensureActive) {
     }
   );
   if (description === null) {
-    await ctx.reply('❌ Template creation cancelled.');
+    await ctx.reply('❌ Script creation cancelled.');
     return;
   }
 
   const personaResult = await collectPersonaConfig(conversation, ctx, {}, { allowCancel: true, ensureActive: safeEnsureActive });
   if (!personaResult) {
-    await ctx.reply('❌ Template creation cancelled.');
+    await ctx.reply('❌ Script creation cancelled.');
     return;
   }
 
   const promptAndVoice = await collectPromptAndVoice(conversation, ctx, {}, safeEnsureActive);
   if (!promptAndVoice) {
-    await ctx.reply('❌ Template creation cancelled.');
+    await ctx.reply('❌ Script creation cancelled.');
     return;
   }
 
-  const templatePayload = {
+  const scriptPayload = {
     name,
     description: description === undefined ? null : (description.length ? description : null),
     business_id: personaResult.business_id,
@@ -750,15 +750,15 @@ async function createCallTemplateFlow(conversation, ctx, ensureActive) {
   };
 
   try {
-    const template = await createCallTemplate(templatePayload);
-    await ctx.reply(`✅ Template *${escapeMarkdown(template.name)}* created successfully!`, { parse_mode: 'Markdown' });
+    const script = await createCallScript(scriptPayload);
+    await ctx.reply(`✅ Script *${escapeMarkdown(script.name)}* created successfully!`, { parse_mode: 'Markdown' });
   } catch (error) {
-    console.error('Failed to create template:', error);
-    await ctx.reply(formatTemplatesApiError(error, 'Failed to create template'));
+    console.error('Failed to create script:', error);
+    await ctx.reply(formatScriptsApiError(error, 'Failed to create script'));
   }
 }
 
-async function editCallTemplateFlow(conversation, ctx, template, ensureActive) {
+async function editCallScriptFlow(conversation, ctx, script, ensureActive) {
   const safeEnsureActive = typeof ensureActive === 'function'
     ? ensureActive
     : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
@@ -767,11 +767,11 @@ async function editCallTemplateFlow(conversation, ctx, template, ensureActive) {
   const name = await promptText(
     conversation,
     ctx,
-    '✏️ Update template name (or type skip to keep current).',
+    '✏️ Update script name (or type skip to keep current).',
     {
       allowEmpty: false,
       allowSkip: true,
-      defaultValue: template.name,
+      defaultValue: script.name,
       parse: (value) => value.trim(),
       ensureActive: safeEnsureActive
     }
@@ -782,7 +782,7 @@ async function editCallTemplateFlow(conversation, ctx, template, ensureActive) {
   }
   if (name !== undefined) {
     if (!name.length) {
-      await ctx.reply('❌ Template name cannot be empty.');
+      await ctx.reply('❌ Script name cannot be empty.');
       return;
     }
     updates.name = name;
@@ -795,7 +795,7 @@ async function editCallTemplateFlow(conversation, ctx, template, ensureActive) {
     {
       allowEmpty: true,
       allowSkip: true,
-      defaultValue: template.description || '',
+      defaultValue: script.description || '',
       parse: (value) => value.trim(),
       ensureActive: safeEnsureActive
     }
@@ -810,7 +810,7 @@ async function editCallTemplateFlow(conversation, ctx, template, ensureActive) {
 
   const adjustPersona = await confirm(conversation, ctx, 'Would you like to update the persona settings?', safeEnsureActive);
   if (adjustPersona) {
-    const personaResult = await collectPersonaConfig(conversation, ctx, template, { allowCancel: true, ensureActive: safeEnsureActive });
+    const personaResult = await collectPersonaConfig(conversation, ctx, script, { allowCancel: true, ensureActive: safeEnsureActive });
     if (!personaResult) {
       await ctx.reply('❌ Update cancelled.');
       return;
@@ -821,7 +821,7 @@ async function editCallTemplateFlow(conversation, ctx, template, ensureActive) {
 
   const adjustPrompt = await confirm(conversation, ctx, 'Update prompt, first message, or voice settings?', safeEnsureActive);
   if (adjustPrompt) {
-    const promptAndVoice = await collectPromptAndVoice(conversation, ctx, template, safeEnsureActive);
+    const promptAndVoice = await collectPromptAndVoice(conversation, ctx, script, safeEnsureActive);
     if (!promptAndVoice) {
       await ctx.reply('❌ Update cancelled.');
       return;
@@ -837,22 +837,22 @@ async function editCallTemplateFlow(conversation, ctx, template, ensureActive) {
   }
 
   try {
-    const updated = await updateCallTemplate(template.id, updates);
-    await ctx.reply(`✅ Template *${escapeMarkdown(updated.name)}* updated.`, { parse_mode: 'Markdown' });
+    const updated = await updateCallScript(script.id, updates);
+    await ctx.reply(`✅ Script *${escapeMarkdown(updated.name)}* updated.`, { parse_mode: 'Markdown' });
   } catch (error) {
-    console.error('Failed to update template:', error);
-    await ctx.reply(formatTemplatesApiError(error, 'Failed to update template'));
+    console.error('Failed to update script:', error);
+    await ctx.reply(formatScriptsApiError(error, 'Failed to update script'));
   }
 }
 
-async function cloneCallTemplateFlow(conversation, ctx, template, ensureActive) {
+async function cloneCallScriptFlow(conversation, ctx, script, ensureActive) {
   const safeEnsureActive = typeof ensureActive === 'function'
     ? ensureActive
     : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
   const name = await promptText(
     conversation,
     ctx,
-    `🆕 Enter a name for the clone of *${escapeMarkdown(template.name)}*.`,
+    `🆕 Enter a name for the clone of *${escapeMarkdown(script.name)}*.`,
     {
       allowEmpty: false,
       parse: (value) => value.trim(),
@@ -868,11 +868,11 @@ async function cloneCallTemplateFlow(conversation, ctx, template, ensureActive) 
   const description = await promptText(
     conversation,
     ctx,
-    '📝 Optionally provide a description for the new template (or type skip).',
+    '📝 Optionally provide a description for the new script (or type skip).',
     {
       allowEmpty: true,
       allowSkip: true,
-      defaultValue: template.description || '',
+      defaultValue: script.description || '',
       parse: (value) => value.trim(),
       ensureActive: safeEnsureActive
     }
@@ -883,25 +883,25 @@ async function cloneCallTemplateFlow(conversation, ctx, template, ensureActive) 
   }
 
   try {
-    const cloned = await cloneCallTemplate(template.id, {
+    const cloned = await cloneCallScript(script.id, {
       name,
-      description: description === undefined ? template.description : (description.length ? description : null)
+      description: description === undefined ? script.description : (description.length ? description : null)
     });
-    await ctx.reply(`✅ Template cloned as *${escapeMarkdown(cloned.name)}*.`, { parse_mode: 'Markdown' });
+    await ctx.reply(`✅ Script cloned as *${escapeMarkdown(cloned.name)}*.`, { parse_mode: 'Markdown' });
   } catch (error) {
-    console.error('Failed to clone template:', error);
-    await ctx.reply(formatTemplatesApiError(error, 'Failed to clone template'));
+    console.error('Failed to clone script:', error);
+    await ctx.reply(formatScriptsApiError(error, 'Failed to clone script'));
   }
 }
 
-async function deleteCallTemplateFlow(conversation, ctx, template, ensureActive) {
+async function deleteCallScriptFlow(conversation, ctx, script, ensureActive) {
   const safeEnsureActive = typeof ensureActive === 'function'
     ? ensureActive
     : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
   const confirmed = await confirm(
     conversation,
     ctx,
-    `Are you sure you want to delete *${escapeMarkdown(template.name)}*?`,
+    `Are you sure you want to delete *${escapeMarkdown(script.name)}*?`,
     safeEnsureActive
   );
   if (!confirmed) {
@@ -910,27 +910,27 @@ async function deleteCallTemplateFlow(conversation, ctx, template, ensureActive)
   }
 
   try {
-    await deleteCallTemplate(template.id);
-    await ctx.reply(`🗑️ Template *${escapeMarkdown(template.name)}* deleted.`, { parse_mode: 'Markdown' });
+    await deleteCallScript(script.id);
+    await ctx.reply(`🗑️ Script *${escapeMarkdown(script.name)}* deleted.`, { parse_mode: 'Markdown' });
   } catch (error) {
-    console.error('Failed to delete template:', error);
-    await ctx.reply(formatTemplatesApiError(error, 'Failed to delete template'));
+    console.error('Failed to delete script:', error);
+    await ctx.reply(formatScriptsApiError(error, 'Failed to delete script'));
   }
 }
 
-async function showCallTemplateDetail(conversation, ctx, template, ensureActive) {
+async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
   const safeEnsureActive = typeof ensureActive === 'function'
     ? ensureActive
     : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
   let viewing = true;
   while (viewing) {
-    const summary = formatCallTemplateSummary(template);
+    const summary = formatCallScriptSummary(script);
     await ctx.reply(summary, { parse_mode: 'Markdown' });
 
     const action = await askOptionWithButtons(
       conversation,
       ctx,
-      'Choose an action for this template.',
+      'Choose an action for this script.',
       [
         { id: 'preview', label: '📞 Preview' },
         { id: 'edit', label: '✏️ Edit' },
@@ -938,28 +938,28 @@ async function showCallTemplateDetail(conversation, ctx, template, ensureActive)
         { id: 'delete', label: '🗑️ Delete' },
         { id: 'back', label: '⬅️ Back' }
       ],
-      { prefix: 'call-template-action', columns: 2, ensureActive: safeEnsureActive }
+      { prefix: 'call-script-action', columns: 2, ensureActive: safeEnsureActive }
     );
 
     switch (action.id) {
       case 'preview':
-        await previewCallTemplate(conversation, ctx, template, safeEnsureActive);
+        await previewCallScript(conversation, ctx, script, safeEnsureActive);
         break;
       case 'edit':
-        await editCallTemplateFlow(conversation, ctx, template, safeEnsureActive);
+        await editCallScriptFlow(conversation, ctx, script, safeEnsureActive);
         try {
-          template = await fetchCallTemplateById(template.id);
+          script = await fetchCallScriptById(script.id);
         } catch (error) {
-          console.error('Failed to refresh call template after edit:', error);
-          await ctx.reply(formatTemplatesApiError(error, 'Failed to refresh template details'));
+          console.error('Failed to refresh call script after edit:', error);
+          await ctx.reply(formatScriptsApiError(error, 'Failed to refresh script details'));
           viewing = false;
         }
         break;
       case 'clone':
-        await cloneCallTemplateFlow(conversation, ctx, template, safeEnsureActive);
+        await cloneCallScriptFlow(conversation, ctx, script, safeEnsureActive);
         break;
       case 'delete':
-        await deleteCallTemplateFlow(conversation, ctx, template, safeEnsureActive);
+        await deleteCallScriptFlow(conversation, ctx, script, safeEnsureActive);
         viewing = false;
         break;
       case 'back':
@@ -971,53 +971,53 @@ async function showCallTemplateDetail(conversation, ctx, template, ensureActive)
   }
 }
 
-async function listCallTemplatesFlow(conversation, ctx, ensureActive) {
+async function listCallScriptsFlow(conversation, ctx, ensureActive) {
   const safeEnsureActive = typeof ensureActive === 'function'
     ? ensureActive
     : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
   try {
-    const templates = await fetchCallTemplates();
+    const scripts = await fetchCallScripts();
     safeEnsureActive();
-    const list = Array.isArray(templates) ? templates : [];
-    const validTemplates = list.filter((template) => template && typeof template.id !== 'undefined' && template.id !== null);
+    const list = Array.isArray(scripts) ? scripts : [];
+    const validScripts = list.filter((script) => script && typeof script.id !== 'undefined' && script.id !== null);
 
-    if (!validTemplates.length) {
-      if (templates && templates.length && templates.some((t) => !t || typeof t.id === 'undefined')) {
-        console.warn('Template list contained invalid entries, ignoring malformed records.');
+    if (!validScripts.length) {
+      if (scripts && scripts.length && scripts.some((t) => !t || typeof t.id === 'undefined')) {
+        console.warn('Script list contained invalid entries, ignoring malformed records.');
       }
-      await ctx.reply('ℹ️ No call templates found. Use the create action to add one.');
+      await ctx.reply('ℹ️ No call scripts found. Use the create action to add one.');
       return;
     }
 
-    const summaryLines = validTemplates.slice(0, 15).map((template, index) => {
-      const parts = [`${index + 1}. ${template.name}`];
-      if (template.description) {
-        parts.push(`– ${template.description}`);
+    const summaryLines = validScripts.slice(0, 15).map((script, index) => {
+      const parts = [`${index + 1}. ${script.name}`];
+      if (script.description) {
+        parts.push(`– ${script.description}`);
       }
       return parts.join(' ');
     });
 
-    let message = '☎️ Call Templates\n\n';
+    let message = '☎️ Call Scripts\n\n';
     message += summaryLines.join('\n');
-    if (validTemplates.length > 15) {
-      message += `\n… and ${validTemplates.length - 15} more.`;
+    if (validScripts.length > 15) {
+      message += `\n… and ${validScripts.length - 15} more.`;
     }
-    message += '\n\nSelect a template below to view details.';
+    message += '\n\nSelect a script below to view details.';
 
     await ctx.reply(message);
 
-    const options = validTemplates.map((template) => ({
-      id: template.id.toString(),
-      label: `📄 ${template.name}`
+    const options = validScripts.map((script) => ({
+      id: script.id.toString(),
+      label: `📄 ${script.name}`
     }));
     options.push({ id: 'back', label: '⬅️ Back' });
 
     const selection = await askOptionWithButtons(
       conversation,
       ctx,
-      'Choose a call template to manage.',
+      'Choose a call script to manage.',
       options,
-      { prefix: 'call-template-select', columns: 1, formatLabel: (option) => option.label, ensureActive: safeEnsureActive }
+      { prefix: 'call-script-select', columns: 1, formatLabel: (option) => option.label, ensureActive: safeEnsureActive }
     );
 
     if (!selection || !selection.id) {
@@ -1029,32 +1029,32 @@ async function listCallTemplatesFlow(conversation, ctx, ensureActive) {
       return;
     }
 
-    const templateId = Number(selection.id);
-    if (Number.isNaN(templateId)) {
-      await ctx.reply('❌ Invalid template selection.');
+    const scriptId = Number(selection.id);
+    if (Number.isNaN(scriptId)) {
+      await ctx.reply('❌ Invalid script selection.');
       return;
     }
 
     try {
-      const template = await fetchCallTemplateById(templateId);
+      const script = await fetchCallScriptById(scriptId);
       safeEnsureActive();
-      if (!template) {
-        await ctx.reply('❌ Template not found.');
+      if (!script) {
+        await ctx.reply('❌ Script not found.');
         return;
       }
 
-      await showCallTemplateDetail(conversation, ctx, template, safeEnsureActive);
+      await showCallScriptDetail(conversation, ctx, script, safeEnsureActive);
     } catch (error) {
-      console.error('Failed to load call template details:', error);
-      await ctx.reply(formatTemplatesApiError(error, 'Failed to load template details'));
+      console.error('Failed to load call script details:', error);
+      await ctx.reply(formatScriptsApiError(error, 'Failed to load script details'));
     }
   } catch (error) {
-    console.error('Failed to list templates:', error);
-    await ctx.reply(formatTemplatesApiError(error, 'Failed to list call templates'));
+    console.error('Failed to list scripts:', error);
+    await ctx.reply(formatScriptsApiError(error, 'Failed to list call scripts'));
   }
 }
 
-async function callTemplatesMenu(conversation, ctx, ensureActive) {
+async function callScriptsMenu(conversation, ctx, ensureActive) {
   const safeEnsureActive = typeof ensureActive === 'function'
     ? ensureActive
     : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
@@ -1063,21 +1063,21 @@ async function callTemplatesMenu(conversation, ctx, ensureActive) {
     const action = await askOptionWithButtons(
       conversation,
       ctx,
-      '☎️ *Call Template Designer*\nChoose an action.',
+      '☎️ *Call Script Designer*\nChoose an action.',
       [
-        { id: 'list', label: '📄 List templates' },
-        { id: 'create', label: '➕ Create template' },
+        { id: 'list', label: '📄 List scripts' },
+        { id: 'create', label: '➕ Create script' },
         { id: 'back', label: '⬅️ Back' }
       ],
-      { prefix: 'call-template-main', columns: 1, ensureActive: safeEnsureActive }
+      { prefix: 'call-script-main', columns: 1, ensureActive: safeEnsureActive }
     );
 
     switch (action.id) {
       case 'list':
-        await listCallTemplatesFlow(conversation, ctx, safeEnsureActive);
+        await listCallScriptsFlow(conversation, ctx, safeEnsureActive);
         break;
       case 'create':
-        await createCallTemplateFlow(conversation, ctx, safeEnsureActive);
+        await createCallScriptFlow(conversation, ctx, safeEnsureActive);
         break;
       case 'back':
         open = false;
@@ -1088,104 +1088,104 @@ async function callTemplatesMenu(conversation, ctx, ensureActive) {
   }
 }
 
-async function fetchSmsTemplates({ includeContent = false } = {}) {
-  const data = await templatesApiRequest({
+async function fetchSmsScripts({ includeContent = false } = {}) {
+  const data = await scriptsApiRequest({
     method: 'get',
-    url: '/api/sms/templates',
+    url: '/api/sms/scripts',
     params: {
       include_builtins: true,
       detailed: includeContent
     }
   });
 
-  const custom = (data.templates || []).map((template) => ({
-    ...template,
-    is_builtin: !!template.is_builtin,
-    metadata: template.metadata || {}
+  const custom = (data.scripts || []).map((script) => ({
+    ...script,
+    is_builtin: !!script.is_builtin,
+    metadata: script.metadata || {}
   }));
 
-  const builtin = (data.builtin || []).map((template) => ({
-    ...template,
+  const builtin = (data.builtin || []).map((script) => ({
+    ...script,
     is_builtin: true,
-    metadata: template.metadata || {}
+    metadata: script.metadata || {}
   }));
 
   return [...custom, ...builtin];
 }
 
-async function fetchSmsTemplateByName(name, { detailed = true } = {}) {
-  const data = await templatesApiRequest({
+async function fetchSmsScriptByName(name, { detailed = true } = {}) {
+  const data = await scriptsApiRequest({
     method: 'get',
-    url: `/api/sms/templates/${encodeURIComponent(name)}`,
+    url: `/api/sms/scripts/${encodeURIComponent(name)}`,
     params: { detailed }
   });
 
-  const template = data.template;
-  if (template) {
-    template.is_builtin = !!template.is_builtin;
-    template.metadata = template.metadata || {};
+  const script = data.script;
+  if (script) {
+    script.is_builtin = !!script.is_builtin;
+    script.metadata = script.metadata || {};
   }
-  return template;
+  return script;
 }
 
-async function createSmsTemplate(payload) {
-  const data = await templatesApiRequest({ method: 'post', url: '/api/sms/templates', data: payload });
-  return data.template;
+async function createSmsScript(payload) {
+  const data = await scriptsApiRequest({ method: 'post', url: '/api/sms/scripts', data: payload });
+  return data.script;
 }
 
-async function updateSmsTemplate(name, payload) {
-  const data = await templatesApiRequest({ method: 'put', url: `/api/sms/templates/${encodeURIComponent(name)}`, data: payload });
-  return data.template;
+async function updateSmsScript(name, payload) {
+  const data = await scriptsApiRequest({ method: 'put', url: `/api/sms/scripts/${encodeURIComponent(name)}`, data: payload });
+  return data.script;
 }
 
-async function deleteSmsTemplate(name) {
-  await templatesApiRequest({ method: 'delete', url: `/api/sms/templates/${encodeURIComponent(name)}` });
+async function deleteSmsScript(name) {
+  await scriptsApiRequest({ method: 'delete', url: `/api/sms/scripts/${encodeURIComponent(name)}` });
 }
 
-async function requestSmsTemplatePreview(name, payload) {
-  const data = await templatesApiRequest({
+async function requestSmsScriptPreview(name, payload) {
+  const data = await scriptsApiRequest({
     method: 'post',
-    url: `/api/sms/templates/${encodeURIComponent(name)}/preview`,
+    url: `/api/sms/scripts/${encodeURIComponent(name)}/preview`,
     data: payload
   });
   return data.preview;
 }
 
-function formatSmsTemplateSummary(template) {
+function formatSmsScriptSummary(script) {
   const summary = [];
-  summary.push(`${template.is_builtin ? '📦' : '📛'} *${escapeMarkdown(template.name)}*`);
-  if (template.description) {
-    summary.push(`📝 ${escapeMarkdown(template.description)}`);
+  summary.push(`${script.is_builtin ? '📦' : '📛'} *${escapeMarkdown(script.name)}*`);
+  if (script.description) {
+    summary.push(`📝 ${escapeMarkdown(script.description)}`);
   }
-  summary.push(template.is_builtin ? '🏷️ Type: Built-in (read-only)' : '🏷️ Type: Custom template');
+  summary.push(script.is_builtin ? '🏷️ Type: Built-in (read-only)' : '🏷️ Type: Custom script');
 
-  const personaSummary = buildPersonaSummaryFromOverrides(template.metadata?.persona);
+  const personaSummary = buildPersonaSummaryFromOverrides(script.metadata?.persona);
   if (personaSummary.length) {
     personaSummary.forEach((line) => summary.push(`• ${escapeMarkdown(line)}`));
   }
 
-  const placeholders = extractTemplateVariables(template.content || '');
+  const placeholders = extractScriptVariables(script.content || '');
   if (placeholders.length) {
     summary.push(`🧩 Placeholders: ${placeholders.map(escapeMarkdown).join(', ')}`);
   }
 
-  if (template.content) {
-    const snippet = template.content.substring(0, 160);
-    summary.push(`💬 Preview: ${escapeMarkdown(snippet)}${template.content.length > 160 ? '…' : ''}`);
+  if (script.content) {
+    const snippet = script.content.substring(0, 160);
+    summary.push(`💬 Preview: ${escapeMarkdown(snippet)}${script.content.length > 160 ? '…' : ''}`);
   }
 
   summary.push(
-    `📅 Updated: ${escapeMarkdown(new Date(template.updated_at || template.created_at).toLocaleString())}`
+    `📅 Updated: ${escapeMarkdown(new Date(script.updated_at || script.created_at).toLocaleString())}`
   );
 
   return summary.join('\n');
 }
 
-async function createSmsTemplateFlow(conversation, ctx) {
+async function createSmsScriptFlow(conversation, ctx) {
   const name = await promptText(
     conversation,
     ctx,
-    '🆕 *Template name*\nUse lowercase letters, numbers, dashes, or underscores.',
+    '🆕 *Script name*\nUse lowercase letters, numbers, dashes, or underscores.',
     {
       allowEmpty: false,
       parse: (value) => {
@@ -1198,7 +1198,7 @@ async function createSmsTemplateFlow(conversation, ctx) {
     }
   );
   if (!name) {
-    await ctx.reply('❌ Template creation cancelled.');
+    await ctx.reply('❌ Script creation cancelled.');
     return;
   }
 
@@ -1209,7 +1209,7 @@ async function createSmsTemplateFlow(conversation, ctx) {
     { allowEmpty: true, allowSkip: true, parse: (value) => value.trim() }
   );
   if (description === null) {
-    await ctx.reply('❌ Template creation cancelled.');
+    await ctx.reply('❌ Script creation cancelled.');
     return;
   }
 
@@ -1220,16 +1220,16 @@ async function createSmsTemplateFlow(conversation, ctx) {
     { allowEmpty: false, parse: (value) => value.trim() }
   );
   if (!content) {
-    await ctx.reply('❌ Template creation cancelled.');
+    await ctx.reply('❌ Script creation cancelled.');
     return;
   }
 
   const metadata = {};
-  const configurePersona = await confirm(conversation, ctx, 'Add persona guidance for this template?');
+  const configurePersona = await confirm(conversation, ctx, 'Add persona guidance for this script?');
   if (configurePersona) {
     const personaResult = await collectPersonaConfig(conversation, ctx, {}, { allowCancel: true });
     if (!personaResult) {
-      await ctx.reply('❌ Template creation cancelled.');
+      await ctx.reply('❌ Script creation cancelled.');
       return;
     }
     const overrides = toPersonaOverrides(personaResult);
@@ -1247,17 +1247,17 @@ async function createSmsTemplateFlow(conversation, ctx) {
   };
 
   try {
-    const template = await createSmsTemplate(payload);
-    await ctx.reply(`✅ SMS template *${escapeMarkdown(template.name)}* created.`, { parse_mode: 'Markdown' });
+    const script = await createSmsScript(payload);
+    await ctx.reply(`✅ SMS script *${escapeMarkdown(script.name)}* created.`, { parse_mode: 'Markdown' });
   } catch (error) {
-    console.error('Failed to create SMS template:', error);
-    await ctx.reply(formatTemplatesApiError(error, 'Failed to create SMS template'));
+    console.error('Failed to create SMS script:', error);
+    await ctx.reply(formatScriptsApiError(error, 'Failed to create SMS script'));
   }
 }
 
-async function editSmsTemplateFlow(conversation, ctx, template) {
-  if (template.is_builtin) {
-    await ctx.reply('ℹ️ Built-in templates are read-only. Clone the template to modify it.');
+async function editSmsScriptFlow(conversation, ctx, script) {
+  if (script.is_builtin) {
+    await ctx.reply('ℹ️ Built-in scripts are read-only. Clone the script to modify it.');
     return;
   }
 
@@ -1267,7 +1267,7 @@ async function editSmsTemplateFlow(conversation, ctx, template) {
     conversation,
     ctx,
     '📝 Update description (or type skip).',
-    { allowEmpty: true, allowSkip: true, defaultValue: template.description || '', parse: (value) => value.trim() }
+    { allowEmpty: true, allowSkip: true, defaultValue: script.description || '', parse: (value) => value.trim() }
   );
   if (description === null) {
     await ctx.reply('❌ Update cancelled.');
@@ -1283,7 +1283,7 @@ async function editSmsTemplateFlow(conversation, ctx, template) {
       conversation,
       ctx,
       '💬 Enter the new SMS content.',
-      { allowEmpty: false, defaultValue: template.content, parse: (value) => value.trim() }
+      { allowEmpty: false, defaultValue: script.content, parse: (value) => value.trim() }
     );
     if (!content) {
       await ctx.reply('❌ Update cancelled.');
@@ -1292,7 +1292,7 @@ async function editSmsTemplateFlow(conversation, ctx, template) {
     updates.content = content;
   }
 
-  const adjustPersona = await confirm(conversation, ctx, 'Update persona guidance for this template?');
+  const adjustPersona = await confirm(conversation, ctx, 'Update persona guidance for this script?');
   if (adjustPersona) {
     const personaResult = await collectPersonaConfig(conversation, ctx, {}, { allowCancel: true });
     if (!personaResult) {
@@ -1300,17 +1300,17 @@ async function editSmsTemplateFlow(conversation, ctx, template) {
       return;
     }
     const overrides = toPersonaOverrides(personaResult);
-    const metadata = { ...(template.metadata || {}) };
+    const metadata = { ...(script.metadata || {}) };
     if (overrides) {
       metadata.persona = overrides;
     } else {
       delete metadata.persona;
     }
     updates.metadata = metadata;
-  } else if (template.metadata?.persona) {
+  } else if (script.metadata?.persona) {
     const clearPersona = await confirm(conversation, ctx, 'Remove existing persona guidance?');
     if (clearPersona) {
-      const metadata = { ...(template.metadata || {}) };
+      const metadata = { ...(script.metadata || {}) };
       delete metadata.persona;
       updates.metadata = metadata;
     }
@@ -1323,19 +1323,19 @@ async function editSmsTemplateFlow(conversation, ctx, template) {
   }
 
   try {
-    const updated = await updateSmsTemplate(template.name, updates);
-    await ctx.reply(`✅ SMS template *${escapeMarkdown(updated.name)}* updated.`, { parse_mode: 'Markdown' });
+    const updated = await updateSmsScript(script.name, updates);
+    await ctx.reply(`✅ SMS script *${escapeMarkdown(updated.name)}* updated.`, { parse_mode: 'Markdown' });
   } catch (error) {
-    console.error('Failed to update SMS template:', error);
-    await ctx.reply(formatTemplatesApiError(error, 'Failed to update SMS template'));
+    console.error('Failed to update SMS script:', error);
+    await ctx.reply(formatScriptsApiError(error, 'Failed to update SMS script'));
   }
 }
 
-async function cloneSmsTemplateFlow(conversation, ctx, template) {
+async function cloneSmsScriptFlow(conversation, ctx, script) {
   const name = await promptText(
     conversation,
     ctx,
-    `🆕 Enter a name for the clone of *${escapeMarkdown(template.name)}*.`,
+    `🆕 Enter a name for the clone of *${escapeMarkdown(script.name)}*.`,
     {
       allowEmpty: false,
       parse: (value) => {
@@ -1355,8 +1355,8 @@ async function cloneSmsTemplateFlow(conversation, ctx, template) {
   const description = await promptText(
     conversation,
     ctx,
-    '📝 Optional description for the cloned template (or type skip).',
-    { allowEmpty: true, allowSkip: true, defaultValue: template.description || '', parse: (value) => value.trim() }
+    '📝 Optional description for the cloned script (or type skip).',
+    { allowEmpty: true, allowSkip: true, defaultValue: script.description || '', parse: (value) => value.trim() }
   );
   if (description === null) {
     await ctx.reply('❌ Clone cancelled.');
@@ -1365,43 +1365,43 @@ async function cloneSmsTemplateFlow(conversation, ctx, template) {
 
   const payload = {
     name,
-    description: description === undefined ? template.description : (description.length ? description : null),
-    content: template.content,
-    metadata: template.metadata,
+    description: description === undefined ? script.description : (description.length ? description : null),
+    content: script.content,
+    metadata: script.metadata,
     created_by: ctx.from.id.toString()
   };
 
   try {
-    const cloned = await createSmsTemplate(payload);
-    await ctx.reply(`✅ Template cloned as *${escapeMarkdown(cloned.name)}*.`, { parse_mode: 'Markdown' });
+    const cloned = await createSmsScript(payload);
+    await ctx.reply(`✅ Script cloned as *${escapeMarkdown(cloned.name)}*.`, { parse_mode: 'Markdown' });
   } catch (error) {
-    console.error('Failed to clone SMS template:', error);
-    await ctx.reply(formatTemplatesApiError(error, 'Failed to clone SMS template'));
+    console.error('Failed to clone SMS script:', error);
+    await ctx.reply(formatScriptsApiError(error, 'Failed to clone SMS script'));
   }
 }
 
-async function deleteSmsTemplateFlow(conversation, ctx, template) {
-  if (template.is_builtin) {
-    await ctx.reply('ℹ️ Built-in templates cannot be deleted.');
+async function deleteSmsScriptFlow(conversation, ctx, script) {
+  if (script.is_builtin) {
+    await ctx.reply('ℹ️ Built-in scripts cannot be deleted.');
     return;
   }
 
-  const confirmed = await confirm(conversation, ctx, `Delete SMS template *${escapeMarkdown(template.name)}*?`);
+  const confirmed = await confirm(conversation, ctx, `Delete SMS script *${escapeMarkdown(script.name)}*?`);
   if (!confirmed) {
     await ctx.reply('Deletion cancelled.');
     return;
   }
 
   try {
-    await deleteSmsTemplate(template.name);
-    await ctx.reply(`🗑️ Template *${escapeMarkdown(template.name)}* deleted.`, { parse_mode: 'Markdown' });
+    await deleteSmsScript(script.name);
+    await ctx.reply(`🗑️ Script *${escapeMarkdown(script.name)}* deleted.`, { parse_mode: 'Markdown' });
   } catch (error) {
-    console.error('Failed to delete SMS template:', error);
-    await ctx.reply(formatTemplatesApiError(error, 'Failed to delete SMS template'));
+    console.error('Failed to delete SMS script:', error);
+    await ctx.reply(formatScriptsApiError(error, 'Failed to delete SMS script'));
   }
 }
 
-async function previewSmsTemplate(conversation, ctx, template) {
+async function previewSmsScript(conversation, ctx, script) {
   const to = await promptText(
     conversation,
     ctx,
@@ -1418,10 +1418,10 @@ async function previewSmsTemplate(conversation, ctx, template) {
     return;
   }
 
-  const placeholders = extractTemplateVariables(template.content || '');
+  const placeholders = extractScriptVariables(script.content || '');
   let variables = {};
   if (placeholders.length > 0) {
-    await ctx.reply('🧩 This template includes placeholders. Provide values or type skip to leave unchanged.');
+    await ctx.reply('🧩 This script includes placeholders. Provide values or type skip to leave unchanged.');
     const values = await collectPlaceholderValues(conversation, ctx, placeholders);
     if (values === null) {
       await ctx.reply('❌ Preview cancelled.');
@@ -1433,7 +1433,7 @@ async function previewSmsTemplate(conversation, ctx, template) {
   const payload = {
     to,
     variables,
-    persona_overrides: template.metadata?.persona
+    persona_overrides: script.metadata?.persona
   };
 
   if (!Object.keys(variables).length) {
@@ -1445,7 +1445,7 @@ async function previewSmsTemplate(conversation, ctx, template) {
   }
 
   try {
-    const preview = await requestSmsTemplatePreview(template.name, payload);
+    const preview = await requestSmsScriptPreview(script.name, payload);
     const snippet = preview.content.substring(0, 200);
     await ctx.reply(
       `✅ Preview SMS sent!\n\n📱 To: ${preview.to}\n🆔 Message SID: \`${preview.message_sid}\`\n💬 Content: ${escapeMarkdown(snippet)}${preview.content.length > 200 ? '…' : ''}`,
@@ -1453,14 +1453,14 @@ async function previewSmsTemplate(conversation, ctx, template) {
     );
   } catch (error) {
     console.error('Failed to send SMS preview:', error);
-    await ctx.reply(formatTemplatesApiError(error, 'Failed to send SMS preview'));
+    await ctx.reply(formatScriptsApiError(error, 'Failed to send SMS preview'));
   }
 }
 
-async function showSmsTemplateDetail(conversation, ctx, template) {
+async function showSmsScriptDetail(conversation, ctx, script) {
   let viewing = true;
   while (viewing) {
-    const summary = formatSmsTemplateSummary(template);
+    const summary = formatSmsScriptSummary(script);
     await ctx.reply(summary, { parse_mode: 'Markdown' });
 
     const actions = [
@@ -1468,7 +1468,7 @@ async function showSmsTemplateDetail(conversation, ctx, template) {
       { id: 'clone', label: '🧬 Clone' }
     ];
 
-    if (!template.is_builtin) {
+    if (!script.is_builtin) {
       actions.splice(1, 0, { id: 'edit', label: '✏️ Edit' });
       actions.push({ id: 'delete', label: '🗑️ Delete' });
     }
@@ -1478,30 +1478,30 @@ async function showSmsTemplateDetail(conversation, ctx, template) {
     const action = await askOptionWithButtons(
       conversation,
       ctx,
-      'Choose an action for this SMS template.',
+      'Choose an action for this SMS script.',
       actions,
-      { prefix: 'sms-template-action', columns: 2 }
+      { prefix: 'sms-script-action', columns: 2 }
     );
 
     switch (action.id) {
       case 'preview':
-        await previewSmsTemplate(conversation, ctx, template);
+        await previewSmsScript(conversation, ctx, script);
         break;
       case 'edit':
-        await editSmsTemplateFlow(conversation, ctx, template);
+        await editSmsScriptFlow(conversation, ctx, script);
         try {
-          template = await fetchSmsTemplateByName(template.name, { detailed: true });
+          script = await fetchSmsScriptByName(script.name, { detailed: true });
         } catch (error) {
-          console.error('Failed to refresh SMS template after edit:', error);
-          await ctx.reply(formatTemplatesApiError(error, 'Failed to refresh template details'));
+          console.error('Failed to refresh SMS script after edit:', error);
+          await ctx.reply(formatScriptsApiError(error, 'Failed to refresh script details'));
           viewing = false;
         }
         break;
       case 'clone':
-        await cloneSmsTemplateFlow(conversation, ctx, template);
+        await cloneSmsScriptFlow(conversation, ctx, script);
         break;
       case 'delete':
-        await deleteSmsTemplateFlow(conversation, ctx, template);
+        await deleteSmsScriptFlow(conversation, ctx, script);
         viewing = false;
         break;
       case 'back':
@@ -1513,53 +1513,53 @@ async function showSmsTemplateDetail(conversation, ctx, template) {
   }
 }
 
-async function listSmsTemplatesFlow(conversation, ctx) {
+async function listSmsScriptsFlow(conversation, ctx) {
   try {
-    const templates = await fetchSmsTemplates();
-    if (!templates.length) {
-      await ctx.reply('ℹ️ No SMS templates found. Use the create action to add one.');
+    const scripts = await fetchSmsScripts();
+    if (!scripts.length) {
+      await ctx.reply('ℹ️ No SMS scripts found. Use the create action to add one.');
       return;
     }
 
-    const custom = templates.filter((template) => !template.is_builtin);
-    const builtin = templates.filter((template) => template.is_builtin);
+    const custom = scripts.filter((script) => !script.is_builtin);
+    const builtin = scripts.filter((script) => script.is_builtin);
 
-    let message = '💬 SMS Templates\n\n';
+    let message = '💬 SMS Scripts\n\n';
     if (custom.length) {
-      message += 'Custom templates:\n';
+      message += 'Custom scripts:\n';
       message += custom
         .slice(0, 15)
-        .map((template) => `• ${template.name}${template.description ? ` – ${template.description}` : ''}`)
+        .map((script) => `• ${script.name}${script.description ? ` – ${script.description}` : ''}`)
         .join('\n');
       message += '\n\n';
     } else {
-      message += 'No custom templates yet.\n\n';
+      message += 'No custom scripts yet.\n\n';
     }
 
     if (builtin.length) {
-      message += 'Built-in templates:\n';
+      message += 'Built-in scripts:\n';
       message += builtin
-        .map((template) => `• ${template.name}${template.description ? ` – ${template.description}` : ''}`)
+        .map((script) => `• ${script.name}${script.description ? ` – ${script.description}` : ''}`)
         .join('\n');
       message += '\n\n';
     }
 
-    message += 'Select a template below to view details.';
+    message += 'Select a script below to view details.';
     await ctx.reply(message);
 
-    const options = templates.map((template) => ({
-      id: template.name,
-      label: `${template.is_builtin ? '📦' : '📝'} ${template.name}`,
-      is_builtin: template.is_builtin
+    const options = scripts.map((script) => ({
+      id: script.name,
+      label: `${script.is_builtin ? '📦' : '📝'} ${script.name}`,
+      is_builtin: script.is_builtin
     }));
     options.push({ id: 'back', label: '⬅️ Back' });
 
     const selection = await askOptionWithButtons(
       conversation,
       ctx,
-      'Choose an SMS template to manage.',
+      'Choose an SMS script to manage.',
       options,
-      { prefix: 'sms-template-select', columns: 1, formatLabel: (option) => option.label }
+      { prefix: 'sms-script-select', columns: 1, formatLabel: (option) => option.label }
     );
 
     if (selection.id === 'back') {
@@ -1567,44 +1567,44 @@ async function listSmsTemplatesFlow(conversation, ctx) {
     }
 
     try {
-      const template = await fetchSmsTemplateByName(selection.id, { detailed: true });
-      if (!template) {
-        await ctx.reply('❌ Template not found.');
+      const script = await fetchSmsScriptByName(selection.id, { detailed: true });
+      if (!script) {
+        await ctx.reply('❌ Script not found.');
         return;
       }
 
-      await showSmsTemplateDetail(conversation, ctx, template);
+      await showSmsScriptDetail(conversation, ctx, script);
     } catch (error) {
-      console.error('Failed to load SMS template details:', error);
-      await ctx.reply(formatTemplatesApiError(error, 'Failed to load template details'));
+      console.error('Failed to load SMS script details:', error);
+      await ctx.reply(formatScriptsApiError(error, 'Failed to load script details'));
     }
   } catch (error) {
-    console.error('Failed to list SMS templates:', error);
-    await ctx.reply(formatTemplatesApiError(error, 'Failed to list SMS templates'));
+    console.error('Failed to list SMS scripts:', error);
+    await ctx.reply(formatScriptsApiError(error, 'Failed to list SMS scripts'));
   }
 }
 
-async function smsTemplatesMenu(conversation, ctx) {
+async function smsScriptsMenu(conversation, ctx) {
   let open = true;
   while (open) {
     const action = await askOptionWithButtons(
       conversation,
       ctx,
-      '💬 *SMS Template Designer*\nChoose an action.',
+      '💬 *SMS Script Designer*\nChoose an action.',
       [
-        { id: 'list', label: '📄 List templates' },
-        { id: 'create', label: '➕ Create template' },
+        { id: 'list', label: '📄 List scripts' },
+        { id: 'create', label: '➕ Create script' },
         { id: 'back', label: '⬅️ Back' }
       ],
-      { prefix: 'sms-template-main', columns: 1 }
+      { prefix: 'sms-script-main', columns: 1 }
     );
 
     switch (action.id) {
       case 'list':
-        await listSmsTemplatesFlow(conversation, ctx);
+        await listSmsScriptsFlow(conversation, ctx);
         break;
       case 'create':
-        await createSmsTemplateFlow(conversation, ctx);
+        await createSmsScriptFlow(conversation, ctx);
         break;
       case 'back':
         open = false;
@@ -1615,8 +1615,8 @@ async function smsTemplatesMenu(conversation, ctx) {
   }
 }
 
-async function templatesFlow(conversation, ctx) {
-  const opId = startOperation(ctx, 'templates');
+async function scriptsFlow(conversation, ctx) {
+  const opId = startOperation(ctx, 'scripts');
   const ensureActive = () => ensureOperationActive(ctx, opId);
 
   try {
@@ -1643,21 +1643,21 @@ async function templatesFlow(conversation, ctx) {
       const selection = await askOptionWithButtons(
         conversation,
         ctx,
-        '🧰 *Template Designer*\nChoose which templates to manage.',
+        '🧰 *Script Designer*\nChoose which scripts to manage.',
         [
-          { id: 'call', label: '☎️ Call templates' },
-          { id: 'sms', label: '💬 SMS templates' },
+          { id: 'call', label: '☎️ Call scripts' },
+          { id: 'sms', label: '💬 SMS scripts' },
           { id: 'exit', label: '🚪 Exit' }
         ],
-        { prefix: 'template-channel', columns: 1, ensureActive }
+        { prefix: 'script-channel', columns: 1, ensureActive }
       );
 
       switch (selection.id) {
         case 'call':
-          await callTemplatesMenu(conversation, ctx, ensureActive);
+          await callScriptsMenu(conversation, ctx, ensureActive);
           break;
         case 'sms':
-          await smsTemplatesMenu(conversation, ctx, ensureActive);
+          await smsScriptsMenu(conversation, ctx, ensureActive);
           break;
         case 'exit':
           active = false;
@@ -1667,10 +1667,10 @@ async function templatesFlow(conversation, ctx) {
       }
     }
 
-    await ctx.reply('✅ Template designer closed.');
+    await ctx.reply('✅ Script designer closed.');
   } catch (error) {
     if (error instanceof OperationCancelledError) {
-      console.log('Templates flow cancelled:', error.message);
+      console.log('Scripts flow cancelled:', error.message);
       return;
     }
     throw error;
@@ -1681,8 +1681,8 @@ async function templatesFlow(conversation, ctx) {
   }
 }
 
-function registerTemplatesCommand(bot) {
-  bot.command('templates', async (ctx) => {
+function registerScriptsCommand(bot) {
+  bot.command('scripts', async (ctx) => {
     const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
     if (!user) {
       return ctx.reply('❌ You are not authorized to use this bot.');
@@ -1693,11 +1693,11 @@ function registerTemplatesCommand(bot) {
       return ctx.reply('❌ This command is for administrators only.');
     }
 
-    await ctx.conversation.enter('templates-conversation');
+    await ctx.conversation.enter('scripts-conversation');
   });
 }
 
 module.exports = {
-  templatesFlow,
-  registerTemplatesCommand
+  scriptsFlow,
+  registerScriptsCommand
 };

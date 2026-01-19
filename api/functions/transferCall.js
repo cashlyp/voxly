@@ -14,7 +14,7 @@ const transferCall = async function (call) {
       return 'The call was transferred successfully, say goodbye to the customer.';
     })
     .catch(() => {
-      return 'The call was not transferred successfully, advise customer to call back later.';
+      return 'The call was not transferred successfully, advise the customer to call back later.';
     });
 };
 

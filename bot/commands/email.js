@@ -9,6 +9,7 @@ const {
   guardAgainstCommandInterrupt
 } = require('../utils/sessionState');
 const { section, buildLine, tipLine, escapeMarkdown, emphasize } = require('../utils/commandFormat');
+const { sendMenu, activateMenuMessage } = require('../utils/menuCleanup');
 const { askOptionWithButtons } = require('../utils/persona');
 
 function normalizeEmail(value) {
@@ -220,12 +221,13 @@ async function sendEmailStatusCard(ctx, messageId, options = {}) {
   if (ctx.callbackQuery?.message && !options.forceReply) {
     try {
       await ctx.editMessageText(text, payload);
+      await activateMenuMessage(ctx, ctx.callbackQuery.message.message_id, ctx.callbackQuery.message.chat?.id);
       return;
     } catch (error) {
       // fallback to sending a new message
     }
   }
-  await ctx.reply(text, payload);
+  await sendMenu(ctx, text, payload);
 }
 
 async function sendEmailTimeline(ctx, messageId) {
@@ -260,12 +262,13 @@ async function sendBulkStatusCard(ctx, jobId, options = {}) {
   if (ctx.callbackQuery?.message && !options.forceReply) {
     try {
       await ctx.editMessageText(text, payload);
+      await activateMenuMessage(ctx, ctx.callbackQuery.message.message_id, ctx.callbackQuery.message.chat?.id);
       return;
     } catch (error) {
       // fallback to sending a new message
     }
   }
-  await ctx.reply(text, payload);
+  await sendMenu(ctx, text, payload);
 }
 
 async function askSchedule(conversation, ctx, ensureActive) {
@@ -384,7 +387,7 @@ async function emailFlow(conversation, ctx) {
     }
 
     const modeOptions = [
-      { id: 'template', label: 'Use template' },
+      { id: 'script', label: 'Use script' },
       { id: 'custom', label: 'Custom content' }
     ];
     const mode = await askOptionWithButtons(
@@ -404,12 +407,12 @@ async function emailFlow(conversation, ctx) {
       from: fromEmail || undefined
     };
 
-    if (mode.id === 'template') {
-      await ctx.reply(section('📄 Template', ['Enter template_id to use.']), { parse_mode: 'Markdown' });
-      const templateMsg = await waitForMessage();
-      const templateId = templateMsg?.message?.text?.trim();
-      if (!templateId) {
-        await ctx.reply('❌ Template ID is required.');
+    if (mode.id === 'script') {
+      await ctx.reply(section('📄 Script', ['Enter script_id to use.']), { parse_mode: 'Markdown' });
+      const scriptMsg = await waitForMessage();
+      const scriptId = scriptMsg?.message?.text?.trim();
+      if (!scriptId) {
+        await ctx.reply('❌ Script ID is required.');
         return;
       }
 
@@ -421,7 +424,7 @@ async function emailFlow(conversation, ctx) {
       const variables = await promptVariables(conversation, ctx, ensureActive);
 
       const previewResponse = await guardedPost(ctx, `${config.apiUrl}/email/preview`, {
-        template_id: templateId,
+        script_id: scriptId,
         subject: subjectOverride && subjectOverride.toLowerCase() !== 'skip' ? subjectOverride : undefined,
         variables
       });
@@ -429,14 +432,14 @@ async function emailFlow(conversation, ctx) {
       if (!previewResponse.data?.success) {
         const missing = previewResponse.data?.missing || [];
         await ctx.reply(section('⚠️ Missing variables', [
-          missing.length ? missing.join(', ') : 'Unknown template issue'
+          missing.length ? missing.join(', ') : 'Unknown script issue'
         ]), { parse_mode: 'Markdown' });
         return;
       }
 
       payload = {
         ...payload,
-        template_id: templateId,
+        script_id: scriptId,
         subject: subjectOverride && subjectOverride.toLowerCase() !== 'skip' ? subjectOverride : undefined,
         variables
       };
@@ -565,7 +568,7 @@ async function bulkEmailFlow(conversation, ctx) {
     }
 
     const modeOptions = [
-      { id: 'template', label: 'Use template' },
+      { id: 'script', label: 'Use script' },
       { id: 'custom', label: 'Custom content' }
     ];
     const mode = await askOptionWithButtons(
@@ -585,12 +588,12 @@ async function bulkEmailFlow(conversation, ctx) {
       from: fromEmail || undefined
     };
 
-    if (mode.id === 'template') {
-      await ctx.reply(section('📄 Template', ['Enter template_id to use.']), { parse_mode: 'Markdown' });
-      const templateMsg = await waitForMessage();
-      const templateId = templateMsg?.message?.text?.trim();
-      if (!templateId) {
-        await ctx.reply('❌ Template ID is required.');
+    if (mode.id === 'script') {
+      await ctx.reply(section('📄 Script', ['Enter script_id to use.']), { parse_mode: 'Markdown' });
+      const scriptMsg = await waitForMessage();
+      const scriptId = scriptMsg?.message?.text?.trim();
+      if (!scriptId) {
+        await ctx.reply('❌ Script ID is required.');
         return;
       }
 
@@ -603,7 +606,7 @@ async function bulkEmailFlow(conversation, ctx) {
 
       payload = {
         ...payload,
-        template_id: templateId,
+        script_id: scriptId,
         subject: subjectOverride && subjectOverride.toLowerCase() !== 'skip' ? subjectOverride : undefined,
         variables
       };
