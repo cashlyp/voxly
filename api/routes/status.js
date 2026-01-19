@@ -30,58 +30,52 @@ class EnhancedWebhookService {
     this.liveConsoleMaxEvents = 5;
     this.liveConsoleMaxPreviewChars = 200;
     this.waveformFrames = [
-      '▁▁▁▂▁▁▁▁▁',
-      '▁▁▂▃▂▁▁▁▁',
-      '▁▂▃▄▃▂▁▁▁',
-      '▂▃▄▅▄▃▂▁▁',
-      '▂▄▅▆▅▄▃▂▁',
-      '▃▄▅▆▇▆▅▄▃',
-      '▃▄▆▇█▇▆▄▃',
-      '▄▅▆▇█▇▆▅▄',
-      '▄▅▆▇▇▇▆▅▄',
-      '▃▄▅▆▇▆▅▄▃',
-      '▂▄▅▆▅▄▃▂▁',
-      '▂▃▄▅▄▃▂▁▁',
-      '▁▂▃▄▃▂▁▁▁',
-      '▁▁▂▃▂▁▁▁▁',
-      '▁▂▄▅▄▂▃▂▁',
-      '▂▄▅▆▅▄▃▂▂',
-      '▂▃▄▅▆▅▄▃▂',
-      '▁▂▃▄▅▄▃▂▁',
-      '▁▁▂▃▄▃▂▁▁',
-      '▁▁▁▂▃▂▁▁▁'
+      '▁▁▂▁▁▁▁',
+      '▁▁▂▃▂▁▁',
+      '▁▂▃▄▃▂▁',
+      '▂▃▄▅▄▃▂',
+      '▂▄▅▆▅▄▂',
+      '▃▄▅▆▇▆▅',
+      '▄▅▆▇█▇▆',
+      '▅▆▇█▇▆▅',
+      '▄▅▆▇█▇▆',
+      '▃▄▅▆▇▆▅',
+      '▂▄▅▆▅▄▂',
+      '▂▃▄▅▄▃▂',
+      '▁▂▃▄▃▂▁',
+      '▁▁▂▃▂▁▁',
+      '▁▁▂▁▁▁▁'
     ];
     this.waveformUserFrames = [
-      '▁▁▁▁▂▁▁▁▁',
-      '▁▁▁▂▂▂▁▁▁',
-      '▁▁▂▃▂▃▂▁▁',
-      '▁▂▃▄▃▄▃▂▁',
-      '▂▃▄▅▄▅▄▃▂',
-      '▃▄▅▆▅▆▅▄▃',
-      '▄▅▆▇▆▇▆▅▄',
-      '▅▆▇█▇█▇▆▅',
-      '▄▅▆▇▆▇▆▅▄',
-      '▃▄▅▆▅▆▅▄▃',
-      '▂▃▄▅▄▅▄▃▂',
-      '▁▂▃▄▃▄▃▂▁',
-      '▁▁▂▃▂▃▂▁▁',
-      '▁▁▁▂▂▂▁▁▁',
-      '▁▁▁▁▂▁▁▁▁'
+      '▁▁▁▂▁▁▁',
+      '▁▁▂▃▂▁▁',
+      '▁▂▃▄▃▂▁',
+      '▂▃▄▅▄▃▂',
+      '▂▄▅▆▅▄▂',
+      '▃▄▅▆▇▆▅',
+      '▄▅▆▇█▇▆',
+      '▅▆▇█▇▆▅',
+      '▄▅▆▇█▇▆',
+      '▃▄▅▆▇▆▅',
+      '▂▄▅▆▅▄▂',
+      '▂▃▄▅▄▃▂',
+      '▁▂▃▄▃▂▁',
+      '▁▁▂▃▂▁▁',
+      '▁▁▁▂▁▁▁'
     ];
     this.waveformListeningFrames = [
-      '▁▁▁▁▁▁▁▁▁',
-      '▁▁▁▂▁▁▂▁▁',
-      '▁▁▂▁▁▂▁▁▂',
-      '▁▂▁▁▂▁▁▂▁',
-      '▂▁▁▂▁▁▂▁▁'
+      '▁▁▁▁▁▁▁',
+      '▁▁▂▁▁▂▁',
+      '▁▂▁▁▂▁▁',
+      '▂▁▁▂▁▁▂'
     ];
     this.waveformThinkingFrames = ['·   ', '··  ', '··· ', ' ···', '  ··', '   ·'];
-    this.waveformInterruptedFrames = ['▇▁▇▁▇▁▇▁▇', '▁▇▁▇▁▇▁▇▁', '▇▁▇▁▇▁▇▁▇', '█▁█▁█▁█▁█'];
-    this.signalCarrier = 'VOICEDNUT LTE';
-    this.signalBarsMax = 5;
+    this.waveformInterruptedFrames = ['▇▁▇▁▇▁▇', '▁▇▁▇▁▇▁', '▇▁▇▁▇▁▇', '█▁█▁█▁█'];
+    this.signalCarrier = String(config.liveConsole?.carrier || 'VOICEDNUT LTE');
+    this.signalBarsMax = 4;
     this.signalBarFilled = '▮';
-    this.signalBarEmpty = '▁';
-    this.signalBarGlyphs = ['▂', '▄', '▆', '▇', '█'];
+    this.signalBarEmpty = '·';
+    this.signalBarGlyphs = ['▂', '▄', '▆', '█'];
     this.lastSentimentAt = new Map();
     this.sentimentCooldownMs = 10000;
     this.mediaSeen = new Map();
@@ -1253,7 +1247,8 @@ class EnhancedWebhookService {
       template: meta.template || '—',
       waveformIndex: 0,
       waveformLevel: 0,
-      sentimentFlag: ''
+      sentimentFlag: '',
+      compact: false
     };
 
     const text = this.buildLiveConsoleMessage(entry);
@@ -1416,7 +1411,81 @@ class EnhancedWebhookService {
       'ending'
     ].includes(phaseKey);
     const badge = isEnded ? '🔴 OFFLINE' : (isConnected ? '🟢 LIVE' : '🟡 CONNECTING');
-    return `📶 ${this.signalCarrier} ${bars}  ${badge}`;
+    return `📶 ${this.signalCarrier} ${bars} ${badge}`;
+  }
+
+  getPhaseAccent(phaseKey) {
+    const map = {
+      waiting: '🟡',
+      listening: '🟢',
+      user_speaking: '🔵',
+      thinking: '🟣',
+      agent_responding: '🟣',
+      agent_speaking: '🟦',
+      interrupted: '🟠',
+      ending: '🟠',
+      ended: '⚫'
+    };
+    return map[phaseKey] || '🟡';
+  }
+
+  getWaveformPrefix(phaseKey) {
+    if (phaseKey === 'user_speaking') return 'U:';
+    if (phaseKey === 'agent_speaking') return 'A:';
+    return '';
+  }
+
+  getLatencyMs(entry) {
+    const phaseKey = entry?.phaseKey || 'waiting';
+    if (phaseKey === 'ended') return null;
+    const baseMap = {
+      waiting: 210,
+      listening: 130,
+      user_speaking: 95,
+      thinking: 180,
+      agent_responding: 160,
+      agent_speaking: 110,
+      interrupted: 220,
+      ending: 160
+    };
+    const base = baseMap[phaseKey] ?? 150;
+    const level = Number.isFinite(entry?.waveformLevel) ? entry.waveformLevel : 0;
+    const jitter = Number.isFinite(entry?.waveformIndex) ? ((entry.waveformIndex % 7) - 3) * 6 : 0;
+    const levelShift = Math.round((0.55 - level) * 18);
+    const value = base + jitter + levelShift;
+    return Math.max(60, Math.min(420, value));
+  }
+
+  formatLatencyLine(entry) {
+    const latency = this.getLatencyMs(entry);
+    if (!latency) return '📡 RTT —';
+    return `📡 RTT ${latency}ms`;
+  }
+
+  getHealthSummary(entry) {
+    const phaseKey = entry?.phaseKey || 'waiting';
+    const statusText = String(entry?.status || '').toLowerCase();
+    if (phaseKey === 'ended' || /completed/.test(statusText)) {
+      return { emoji: '⚫', label: 'Ended', dropRisk: '—' };
+    }
+    if (/failed|no answer|busy|canceled|voicemail/.test(statusText)) {
+      return { emoji: '🚨', label: 'Critical', dropRisk: 'High' };
+    }
+
+    const eventsText = (entry?.lastEvents || []).join(' ').toLowerCase();
+    let score = 0;
+    if (/error|failed|timeout|no answer|busy|canceled|voicemail/.test(eventsText)) score += 2;
+    if (/retry|transfer|interrupted/.test(eventsText)) score += 1;
+    if (entry?.sentimentFlag) score += 1;
+
+    if (score >= 3) return { emoji: '🚨', label: 'At risk', dropRisk: 'High' };
+    if (score >= 2) return { emoji: '⚠️', label: 'Degraded', dropRisk: 'Medium' };
+    return { emoji: '✅', label: 'Stable', dropRisk: 'Low' };
+  }
+
+  formatHealthLine(entry) {
+    const summary = this.getHealthSummary(entry);
+    return `🩺 ${summary.emoji} ${summary.label} · Drop risk: ${summary.dropRisk}`;
   }
 
   consoleButtons(callSid, entry) {
@@ -1425,12 +1494,16 @@ class EnhancedWebhookService {
         inline_keyboard: [[{ text: `⏳ ${entry.actionLock}`, callback_data: 'noop' }]]
       };
     }
+    const compactLabel = entry?.compact ? '🧭 Full view' : '🧭 Compact view';
     return {
       inline_keyboard: [
         [
           { text: '⏺️ Record', callback_data: `lc:rec:${callSid}` },
           { text: '⏹ End', callback_data: `lc:end:${callSid}` },
           { text: '🔀 Transfer', callback_data: `lc:xfer:${callSid}` }
+        ],
+        [
+          { text: compactLabel, callback_data: `lc:compact:${callSid}` }
         ]
       ]
     };
@@ -1465,6 +1538,22 @@ class EnhancedWebhookService {
     }
 
     this.queueLiveConsoleUpdate(callSid, { force: ['completed', 'failed', 'no-answer', 'busy', 'canceled', 'voicemail'].includes(status) });
+  }
+
+  toggleConsoleCompact(callSid) {
+    const entry = this.liveConsoleByCallSid.get(callSid);
+    if (!entry) return null;
+    entry.compact = !entry.compact;
+    this.queueLiveConsoleUpdate(callSid, { force: true });
+    return entry.compact;
+  }
+
+  setConsoleCompact(callSid, compact) {
+    const entry = this.liveConsoleByCallSid.get(callSid);
+    if (!entry) return false;
+    entry.compact = !!compact;
+    this.queueLiveConsoleUpdate(callSid, { force: true });
+    return true;
   }
 
   async setLiveCallPhase(callSid, phaseKey, options = {}) {
@@ -1593,18 +1682,39 @@ class EnhancedWebhookService {
     let phaseLine = entry.phase;
     if (frames && frames.length) {
       const frame = frames[entry.waveformIndex % frames.length] || frames[0];
-      phaseLine = `${entry.phase} ${frame}`;
+      const prefix = this.getWaveformPrefix(phaseKey);
+      const waveform = prefix ? `${prefix} ${frame}` : frame;
+      phaseLine = `${entry.phase} ${waveform}`;
     }
+    const phaseAccent = this.getPhaseAccent(phaseKey);
+    const phaseDisplay = `${phaseAccent} ${phaseLine}`;
     const sentimentLine = entry.sentimentFlag ? `Mood: ${entry.sentimentFlag}` : null;
     const recentBlock = events.length ? events.map((e) => `• ${e}`).join('\n') : '• (no events yet)';
     const signalLine = this.buildSignalLine(entry);
+    const latencyLine = this.formatLatencyLine(entry);
+    const healthLine = this.formatHealthLine(entry);
+
+    if (entry.compact) {
+      return [
+        signalLine,
+        `🎧 Live Call • ${entry.status}`,
+        `👤 ${entry.customerName} | 📞 ${entry.phoneNumber}`,
+        entry.template && entry.template !== '—' ? `🧩 ${entry.template}` : null,
+        `⏱ ${elapsed} | Phase: ${phaseDisplay}`,
+        `${latencyLine} | ${healthLine}`,
+        `U: ${entry.previewTurns.user || '—'}`,
+        `A: ${entry.previewTurns.agent || '—'}`
+      ].filter(Boolean).join('\n');
+    }
 
     return [
       signalLine,
       `🎧 Live Call • ${entry.status}`,
       `👤 ${entry.customerName} | 📞 ${entry.phoneNumber}`,
       entry.template && entry.template !== '—' ? `🧩 ${entry.template}` : null,
-      `⏱ ${elapsed} | Phase: ${phaseLine}`,
+      `⏱ ${elapsed} | Phase: ${phaseDisplay}`,
+      latencyLine,
+      healthLine,
       sentimentLine,
       '',
       'Recent',

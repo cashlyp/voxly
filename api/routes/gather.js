@@ -76,10 +76,10 @@ function createTwilioGatherHandler(deps = {}) {
       const respondWithGather = async (exp, promptText = '', followupText = '') => {
         try {
           const promptUrl = usePlayForGrouped && getTwilioTtsAudioUrl
-            ? await getTwilioTtsAudioUrl(promptText, callConfig)
+            ? await getTwilioTtsAudioUrl(promptText, callConfig, { cacheOnly: true })
             : null;
           const followupUrl = usePlayForGrouped && getTwilioTtsAudioUrl
-            ? await getTwilioTtsAudioUrl(followupText, callConfig)
+            ? await getTwilioTtsAudioUrl(followupText, callConfig, { cacheOnly: true })
             : null;
           const twiml = digitService.buildTwilioGatherTwiml(
             callSid,
@@ -109,7 +109,7 @@ function createTwilioGatherHandler(deps = {}) {
         const response = new VoiceResponse();
         if (message) {
           if (usePlayForGrouped && getTwilioTtsAudioUrl) {
-            const url = await getTwilioTtsAudioUrl(message, callConfig);
+            const url = await getTwilioTtsAudioUrl(message, callConfig, { cacheOnly: true });
             if (url) {
               response.play(url);
             } else if (sayOptions) {
@@ -130,23 +130,24 @@ function createTwilioGatherHandler(deps = {}) {
 
       digitService?.clearDigitTimeout?.(callSid);
 
-      const dedupeKey = `${callSid}:${Digits || ''}`;
-      const lastSeen = gatherEventDedupe?.get(dedupeKey);
-      if (lastSeen && Date.now() - lastSeen < 2000) {
-        console.warn(`Duplicate gather webhook ignored for ${callSid}`);
-        const currentExpectation = digitService?.getExpectation?.(callSid);
-        if (currentExpectation) {
-          const prompt = currentExpectation.prompt || digitService.buildDigitPrompt(currentExpectation);
-          if (await respondWithGather(currentExpectation, prompt)) {
-            return;
-          }
-        }
-        respondWithStream();
-        return;
-      }
-      gatherEventDedupe?.set(dedupeKey, Date.now());
-
       const digits = String(Digits || '').trim();
+      const dedupeKey = digits ? `${callSid}:${digits}` : null;
+      if (dedupeKey) {
+        const lastSeen = gatherEventDedupe?.get(dedupeKey);
+        if (lastSeen && Date.now() - lastSeen < 2000) {
+          console.warn(`Duplicate gather webhook ignored for ${callSid}`);
+          const currentExpectation = digitService?.getExpectation?.(callSid);
+          if (currentExpectation) {
+            const prompt = currentExpectation.prompt || digitService.buildDigitPrompt(currentExpectation);
+            if (await respondWithGather(currentExpectation, prompt)) {
+              return;
+            }
+          }
+          respondWithStream();
+          return;
+        }
+        gatherEventDedupe?.set(dedupeKey, Date.now());
+      }
       if (digits) {
         const expectation = digitService.getExpectation(callSid);
         const plan = digitService?.getPlan ? digitService.getPlan(callSid) : null;

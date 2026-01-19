@@ -110,6 +110,7 @@ const liveConsoleAudioTickMs = Number(readEnv('LIVE_CONSOLE_AUDIO_TICK_MS') || '
 const liveConsoleEditDebounceMs = Number(readEnv('LIVE_CONSOLE_EDIT_DEBOUNCE_MS') || '700');
 const liveConsoleUserLevelThreshold = Number(readEnv('LIVE_CONSOLE_USER_LEVEL_THRESHOLD') || '0.08');
 const liveConsoleUserHoldMs = Number(readEnv('LIVE_CONSOLE_USER_HOLD_MS') || '450');
+const liveConsoleCarrier = readEnv('LIVE_CONSOLE_CARRIER') || 'VOICEDNUT LTE';
 const emailProvider = (readEnv('EMAIL_PROVIDER') || 'sendgrid').toLowerCase();
 const emailDefaultFrom = readEnv('EMAIL_DEFAULT_FROM') || '';
 const emailVerifiedDomains = (readEnv('EMAIL_VERIFIED_DOMAINS') || '')
@@ -232,6 +233,7 @@ module.exports = {
     editDebounceMs: Number.isFinite(liveConsoleEditDebounceMs) ? liveConsoleEditDebounceMs : 700,
     userLevelThreshold: Number.isFinite(liveConsoleUserLevelThreshold) ? liveConsoleUserLevelThreshold : 0.08,
     userHoldMs: Number.isFinite(liveConsoleUserHoldMs) ? liveConsoleUserHoldMs : 450,
+    carrier: liveConsoleCarrier
   },
   email: {
     provider: emailProvider,

@@ -2891,14 +2891,12 @@ function createDigitCollectionService(options = {}) {
       } catch (_) {}
     }
 
-    if (channel !== 'sms') {
+    if (channel !== 'sms' && captureMode !== 'ivr_gather') {
       markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', {
         allowCallEnd: true,
         prompt_text: instruction
       });
-      if (captureMode !== 'ivr_gather') {
-        scheduleDigitTimeout(callSid, gptService, interactionCount);
-      }
+      scheduleDigitTimeout(callSid, gptService, interactionCount);
     }
   }
 

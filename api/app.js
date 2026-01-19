@@ -214,10 +214,11 @@ async function synthesizeTwilioTtsAudio(text, voiceModel) {
   };
 }
 
-async function getTwilioTtsAudioUrl(text, callConfig) {
+async function getTwilioTtsAudioUrl(text, callConfig, options = {}) {
   const cleaned = normalizeTwilioTtsText(text);
   if (!cleaned) return null;
   if (!shouldUseTwilioPlay(callConfig)) return null;
+  const cacheOnly = options?.cacheOnly === true;
   const voiceModel = resolveDeepgramVoiceModel(callConfig);
   const key = buildTwilioTtsCacheKey(cleaned, voiceModel);
   const now = Date.now();
@@ -227,11 +228,37 @@ async function getTwilioTtsAudioUrl(text, callConfig) {
   }
   const pending = twilioTtsPending.get(key);
   if (pending) {
+    if (cacheOnly) {
+      return null;
+    }
     await pending;
     const refreshed = twilioTtsCache.get(key);
     if (refreshed && refreshed.expiresAt > Date.now()) {
       return `https://${config.server.hostname}/webhook/twilio-tts?key=${encodeURIComponent(key)}`;
     }
+    return null;
+  }
+  if (cacheOnly) {
+    const job = (async () => {
+      try {
+        const audio = await synthesizeTwilioTtsAudio(cleaned, voiceModel);
+        if (!audio) return;
+        twilioTtsCache.set(key, {
+          ...audio,
+          createdAt: Date.now(),
+          expiresAt: Date.now() + TWILIO_TTS_CACHE_TTL_MS
+        });
+        pruneTwilioTtsCache();
+      } catch (err) {
+        console.error('Twilio TTS synthesis error:', err);
+      }
+    })();
+    twilioTtsPending.set(key, job);
+    job.finally(() => {
+      if (twilioTtsPending.get(key) === job) {
+        twilioTtsPending.delete(key);
+      }
+    });
     return null;
   }
   const job = (async () => {
@@ -627,8 +654,8 @@ function startGroupedGather(callSid, callConfig, options = {}) {
       if (activeExpectation.prompted_at && options.force !== true) return;
       if (activeExpectation.plan_id && activePlan.id && activeExpectation.plan_id !== activePlan.id) return;
       const usePlay = shouldUseTwilioPlay(callConfig);
-      const preambleUrl = usePlay ? await getTwilioTtsAudioUrl(preamble, callConfig) : null;
-      const promptUrl = usePlay ? await getTwilioTtsAudioUrl(prompt, callConfig) : null;
+      const preambleUrl = usePlay ? await getTwilioTtsAudioUrl(preamble, callConfig, { cacheOnly: true }) : null;
+      const promptUrl = usePlay ? await getTwilioTtsAudioUrl(prompt, callConfig, { cacheOnly: true }) : null;
       await digitService.sendTwilioGather(callSid, activeExpectation, {
         prompt,
         preamble,
@@ -3277,6 +3304,16 @@ app.post('/webhook/telegram', async (req, res) => {
         webhookService.answerCallbackQuery(cb.id, `Failed: ${e.message}`.slice(0, 180)).catch(() => {});
       }
       setTimeout(() => webhookService.unlockConsoleButtons(callSid), 1200);
+      return;
+    }
+
+    if (action === 'compact') {
+      const isCompact = webhookService.toggleConsoleCompact(callSid);
+      if (isCompact === null) {
+        webhookService.answerCallbackQuery(cb.id, 'Console not active').catch(() => {});
+        return;
+      }
+      webhookService.answerCallbackQuery(cb.id, isCompact ? 'Compact view enabled' : 'Full view enabled').catch(() => {});
       return;
     }
 
