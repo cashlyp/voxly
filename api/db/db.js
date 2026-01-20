@@ -1960,6 +1960,101 @@ class EnhancedDatabase {
        });
    }
 
+   async listEmailTemplates(limit = 50) {
+       return new Promise((resolve, reject) => {
+           const sql = `
+               SELECT template_id, subject, required_vars, created_at, updated_at
+               FROM email_templates
+               ORDER BY updated_at DESC
+               LIMIT ?
+           `;
+           this.db.all(sql, [limit], (err, rows) => {
+               if (err) {
+                   console.error('Error listing email templates:', err);
+                   reject(err);
+               } else {
+                   resolve(rows || []);
+               }
+           });
+       });
+   }
+
+   async createEmailTemplate(payload) {
+       const {
+           template_id,
+           subject = '',
+           html = '',
+           text = '',
+           required_vars = null
+       } = payload || {};
+       return new Promise((resolve, reject) => {
+           const sql = `
+               INSERT INTO email_templates (
+                   template_id, subject, html, text, required_vars, created_at, updated_at
+               )
+               VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+           `;
+           this.db.run(
+               sql,
+               [template_id, subject, html, text, required_vars],
+               function (err) {
+                   if (err) {
+                       console.error('Error creating email template:', err);
+                       reject(err);
+                   } else {
+                       resolve(this.changes);
+                   }
+               }
+           );
+       });
+   }
+
+   async updateEmailTemplate(templateId, payload) {
+       const fields = [];
+       const values = [];
+       const mapping = {
+           subject: 'subject',
+           html: 'html',
+           text: 'text',
+           required_vars: 'required_vars'
+       };
+       Object.entries(mapping).forEach(([key, column]) => {
+           if (payload[key] !== undefined) {
+               fields.push(`${column} = ?`);
+               values.push(payload[key]);
+           }
+       });
+       if (!fields.length) {
+           return 0;
+       }
+       fields.push('updated_at = CURRENT_TIMESTAMP');
+       values.push(templateId);
+       return new Promise((resolve, reject) => {
+           const sql = `UPDATE email_templates SET ${fields.join(', ')} WHERE template_id = ?`;
+           this.db.run(sql, values, function (err) {
+               if (err) {
+                   console.error('Error updating email template:', err);
+                   reject(err);
+               } else {
+                   resolve(this.changes);
+               }
+           });
+       });
+   }
+
+   async deleteEmailTemplate(templateId) {
+       return new Promise((resolve, reject) => {
+           this.db.run('DELETE FROM email_templates WHERE template_id = ?', [templateId], function (err) {
+               if (err) {
+                   console.error('Error deleting email template:', err);
+                   reject(err);
+               } else {
+                   resolve(this.changes);
+               }
+           });
+       });
+   }
+
    async saveEmailIdempotency(idempotencyKey, messageId, bulkJobId, requestHash) {
        return new Promise((resolve, reject) => {
            const sql = `INSERT OR IGNORE INTO email_idempotency (idempotency_key, message_id, bulk_job_id, request_hash)

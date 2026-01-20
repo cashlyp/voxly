@@ -476,6 +476,12 @@ function createDigitCollectionService(options = {}) {
       || `I did not catch that. Please re-enter the ${buildExpectedLabel(expectation)} now.`;
   }
 
+  function buildSoftTimeoutPrompt(expectation = {}) {
+    const label = buildExpectedLabel(expectation);
+    return expectation?.soft_timeout_prompt
+      || `Just a reminder—please enter the ${label} when you're ready.`;
+  }
+
   const OTP_REGEX = /\b\d{4,8}\b/g;
 
   const digitTimeouts = new Map();
@@ -841,6 +847,18 @@ function createDigitCollectionService(options = {}) {
       load,
       meta: health?.meta || null
     };
+  };
+
+  const getCallQualityScore = (callSid) => {
+    if (!callSid || !webhookService || typeof webhookService.getCallQualityScore !== 'function') {
+      return null;
+    }
+    try {
+      const score = webhookService.getCallQualityScore(callSid);
+      return Number.isFinite(score) ? score : null;
+    } catch (_) {
+      return null;
+    }
   };
 
   const applyHealthPolicy = (callSid, expectation) => {
@@ -1307,13 +1325,14 @@ function createDigitCollectionService(options = {}) {
     };
   };
 
-  const buildRetryPolicy = ({ reason, attempt, source, expectation, affect, session, health }) => {
+  const buildRetryPolicy = ({ reason, attempt, source, expectation, affect, session, health, qualityScore }) => {
     const label = buildExpectedLabel(expectation || {});
     const patience = affect?.patience || 'high';
     const partial = session?.partialDigits || '';
     const allowPartialReplay = partial && !isSensitiveProfile(expectation?.profile);
     const partialSpoken = allowPartialReplay ? formatDigitsForSpeech(partial) : '';
     const status = health?.status || 'healthy';
+    const poorQuality = Number.isFinite(qualityScore) && qualityScore <= 2;
     if (status === 'overloaded') {
       return {
         delayMs: 0,
@@ -1538,6 +1557,9 @@ function createDigitCollectionService(options = {}) {
     const timeout = typeof params.timeout_s === 'number'
       ? params.timeout_s
       : (typeof defaults.timeout_s === 'number' ? defaults.timeout_s : 20);
+    const softTimeout = typeof params.soft_timeout_s === 'number'
+      ? params.soft_timeout_s
+      : (typeof defaults.soft_timeout_s === 'number' ? defaults.soft_timeout_s : null);
     const maxRetries = typeof params.max_retries === 'number'
       ? params.max_retries
       : (typeof defaults.max_retries === 'number' ? defaults.max_retries : 2);
@@ -1606,10 +1628,16 @@ function createDigitCollectionService(options = {}) {
     const timeout_failure_message = normalizeRepromptValue(
       params.timeout_failure_message ?? defaults.timeout_failure_message ?? repromptDefaults.timeout_failure
     );
+    const soft_timeout_prompt = normalizeRepromptValue(
+      params.soft_timeout_prompt ?? defaults.soft_timeout_prompt ?? ''
+    );
 
     const estimatedPromptMs = estimateSpeechDurationMs(params.prompt || params.prompt_hint || '');
     const adjustedDelayMs = Math.max(minCollectDelayMs, estimatedPromptMs, 3000);
     const safeTimeout = Math.min(SAFE_TIMEOUT_MAX_S, Math.max(SAFE_TIMEOUT_MIN_S, timeout));
+    const safeSoftTimeout = Number.isFinite(softTimeout)
+      ? Math.max(1, Math.min(safeTimeout - 1, softTimeout))
+      : Math.max(2, Math.round(safeTimeout * 0.6));
     const safeMaxRetries = Math.min(SAFE_RETRY_MAX, Math.max(0, maxRetries));
     const safeCollectDelayMs = Math.max(800, adjustedDelayMs);
 
@@ -1625,6 +1653,8 @@ function createDigitCollectionService(options = {}) {
       min_digits: normalizedMin,
       max_digits: normalizedMax,
       timeout_s: safeTimeout,
+      soft_timeout_s: safeSoftTimeout,
+      soft_timeout_prompt,
       max_retries: safeMaxRetries,
       min_collect_delay_ms: safeCollectDelayMs,
       confirmation_style: confirmationStyle,
@@ -1690,6 +1720,11 @@ function createDigitCollectionService(options = {}) {
       clearTimeout(timer);
       digitTimeouts.delete(callSid);
     }
+    const softTimer = digitTimeouts.get(`${callSid}:soft`);
+    if (softTimer) {
+      clearTimeout(softTimer);
+      digitTimeouts.delete(`${callSid}:soft`);
+    }
   }
 
   function clearDigitFallbackState(callSid) {
@@ -1729,6 +1764,7 @@ function createDigitCollectionService(options = {}) {
       expectation.last_masked = null;
       expectation.buffered_at = null;
       expectation.attempt_id = (expectation.attempt_id || 0) + 1;
+      expectation.soft_timeout_fired = false;
       pendingDigits.delete(callSid);
       updateSessionState(callSid, { partialDigits: '' });
     }
@@ -1899,17 +1935,18 @@ function createDigitCollectionService(options = {}) {
     expectations: new Map(),
     setExpectation(callSid, params = {}) {
       const normalized = applyHealthPolicy(callSid, applyRiskPolicy(callSid, normalizeDigitExpectation(params)));
-      this.expectations.set(callSid, {
-        ...normalized,
-        plan_id: params.plan_id || null,
-        plan_step_index: Number.isFinite(params.plan_step_index) ? params.plan_step_index : null,
-        plan_total_steps: Number.isFinite(params.plan_total_steps) ? params.plan_total_steps : null,
-        prompted_at: params.prompted_at || null,
-        retries: 0,
-        attempt_count: 0,
-        attempt_id: 1,
-        buffered_at: null,
-        buffer: '',
+    this.expectations.set(callSid, {
+      ...normalized,
+      plan_id: params.plan_id || null,
+      plan_step_index: Number.isFinite(params.plan_step_index) ? params.plan_step_index : null,
+      plan_total_steps: Number.isFinite(params.plan_total_steps) ? params.plan_total_steps : null,
+      prompted_at: params.prompted_at || null,
+      soft_timeout_fired: false,
+      retries: 0,
+      attempt_count: 0,
+      attempt_id: 1,
+      buffered_at: null,
+      buffer: '',
         collected: [],
         last_masked: null
       });
@@ -2080,6 +2117,7 @@ function createDigitCollectionService(options = {}) {
 
       exp.collected.push(result.digits);
       exp.last_masked = masked;
+      exp.last_input_at = meta.timestamp || Date.now();
 
       if (result.accepted) {
         if (isRepeating(currentBuffer) || isAscending(currentBuffer)) {
@@ -2142,7 +2180,14 @@ function createDigitCollectionService(options = {}) {
       digitCollectionManager.expectations.set(callSid, exp);
     }
 
-    const timeoutMs = Math.max(5000, (exp.timeout_s || 10) * 1000);
+    const qualityScore = getCallQualityScore(callSid);
+    const timeoutMultiplier = Number.isFinite(qualityScore)
+      ? (qualityScore <= 2 ? 1.25 : qualityScore <= 3 ? 1.1 : 1)
+      : 1;
+    const timeoutMs = Math.max(5000, (exp.timeout_s || 10) * 1000 * timeoutMultiplier);
+    const softPromptMs = Number.isFinite(exp.soft_timeout_s)
+      ? Math.max(1000, exp.soft_timeout_s * 1000)
+      : Math.round(timeoutMs * 0.6);
     const promptAt = exp.prompted_at || Date.now();
     const promptDelayMs = Number.isFinite(exp.prompted_delay_ms)
       ? exp.prompted_delay_ms
@@ -2151,6 +2196,23 @@ function createDigitCollectionService(options = {}) {
     const elapsedSincePrompt = Date.now() - promptAt;
     const remainingPromptDelayMs = Math.max(0, normalizedPromptDelayMs - elapsedSincePrompt);
     const waitMs = remainingPromptDelayMs + timeoutMs;
+    const softWaitMs = remainingPromptDelayMs + softPromptMs;
+
+    if (!exp.soft_timeout_fired && softWaitMs + 200 < waitMs) {
+      const softTimer = setTimeout(() => {
+        const current = digitCollectionManager.expectations.get(callSid);
+        if (!current) return;
+        if (current.soft_timeout_fired) return;
+        current.soft_timeout_fired = true;
+        digitCollectionManager.expectations.set(callSid, current);
+        const softPrompt = buildSoftTimeoutPrompt(current);
+        if (queuePendingDigitAction) {
+          queuePendingDigitAction(callSid, { type: 'reprompt', text: softPrompt, scheduleTimeout: false, soft: true });
+        }
+        webhookService.addLiveEvent(callSid, '🕒 Still waiting for digits', { force: false });
+      }, softWaitMs);
+      digitTimeouts.set(`${callSid}:soft`, softTimer);
+    }
 
     const timer = setTimeout(async () => {
       const current = digitCollectionManager.expectations.get(callSid);
@@ -2237,7 +2299,9 @@ function createDigitCollectionService(options = {}) {
       current.retries = (current.retries || 0) + 1;
       digitCollectionManager.expectations.set(callSid, current);
 
-      if (current.retries > current.max_retries) {
+      const qualityRetryBonus = Number.isFinite(qualityScore) && qualityScore <= 2 ? 1 : 0;
+      const maxRetries = current.max_retries + qualityRetryBonus;
+      if (current.retries > maxRetries) {
         digitCollectionManager.expectations.delete(callSid);
         clearDigitTimeout(callSid);
         clearDigitFallbackState(callSid);
@@ -3481,6 +3545,32 @@ function createDigitCollectionService(options = {}) {
       webhookService.addLiveEvent(callSid, `⚠️ ${stepPrefix}${liveLabel} invalid${hint}: ${liveMasked}`, { force: true });
     }
 
+    if (expectation?.plan_id && expectation?.plan_step_index) {
+      const plan = digitCollectionPlans.get(callSid);
+      if (plan?.id === expectation.plan_id) {
+        if (!plan.step_stats) plan.step_stats = {};
+        const stepKey = String(expectation.plan_step_index);
+        const stepStats = plan.step_stats[stepKey] || {
+          attempts: 0,
+          failures: 0,
+          last_reason: null,
+          first_at: null,
+          last_at: null
+        };
+        stepStats.attempts += 1;
+        if (!collection.accepted) {
+          stepStats.failures += 1;
+          stepStats.last_reason = collection.reason || 'invalid';
+        } else {
+          stepStats.last_reason = 'accepted';
+        }
+        if (!stepStats.first_at) stepStats.first_at = new Date().toISOString();
+        stepStats.last_at = new Date().toISOString();
+        plan.step_stats[stepKey] = stepStats;
+        digitCollectionPlans.set(callSid, plan);
+      }
+    }
+
     if (!collection.accepted && collection.reason === 'incomplete' && resolvedSource === 'dtmf') {
       void emitAuditEvent(callSid, 'DigitCaptureFailed', {
         profile: collection.profile,
@@ -3712,6 +3802,15 @@ function createDigitCollectionService(options = {}) {
           }
           plan.active = false;
           updatePlanState(callSid, plan, PLAN_STATES.COMPLETE, { step_index: expectation.plan_step_index });
+          if (plan.step_stats) {
+            try {
+              await db.updateCallState(callSid, 'digit_plan_step_stats', {
+                plan_id: plan.id,
+                group_id: plan.group_id || null,
+                step_stats: plan.step_stats
+              });
+            } catch (_) {}
+          }
           digitCollectionPlans.delete(callSid);
           setCaptureActive(callSid, false);
           webhookService.addLiveEvent(callSid, '✅ Digit collection plan completed', { force: true });
@@ -3836,6 +3935,7 @@ function createDigitCollectionService(options = {}) {
         emitReply(fallbackMsg);
       } else {
         const affect = recordCallerAffect(callSid, collection.reason || 'invalid');
+        const qualityScore = getCallQualityScore(callSid);
         const policy = buildRetryPolicy({
           reason: collection.reason || 'invalid',
           attempt: attemptCount || collection.retries || 1,
@@ -3843,8 +3943,22 @@ function createDigitCollectionService(options = {}) {
           expectation,
           affect,
           session: getSessionState(callSid),
-          health: getSystemHealth(callSid)
+          health: getSystemHealth(callSid),
+          qualityScore
         });
+        const pacingDelay = attemptCount >= 2 ? 250 : 0;
+        if (pacingDelay > 0) {
+          policy.delayMs = Math.max(policy.delayMs || 0, pacingDelay);
+        }
+        if (affect?.patience === 'low') {
+          policy.delayMs = Math.max(policy.delayMs || 0, 350);
+        }
+        if (Number.isFinite(qualityScore) && qualityScore <= 2) {
+          policy.delayMs = Math.max(policy.delayMs || 0, 400);
+          if (policy.prompt && !/connection/i.test(policy.prompt)) {
+            policy.prompt = `I may be losing you. ${policy.prompt}`;
+          }
+        }
         const adaptiveReason = isAdaptiveRepromptReason(collection.reason);
         let prompt = adaptiveReason
           ? buildAdaptiveReprompt(expectation || {}, collection.reason, attemptCount || collection.retries || 1)

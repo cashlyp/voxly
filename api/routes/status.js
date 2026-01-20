@@ -27,7 +27,7 @@ class EnhancedWebhookService {
     this.liveConsoleEditTimers = new Map();
     const debounce = Number(config.liveConsole?.editDebounceMs);
     this.liveConsoleDebounceMs = Number.isFinite(debounce) && debounce >= 0 ? debounce : 700;
-    this.liveConsoleMaxEvents = 5;
+    this.liveConsoleMaxEvents = 4;
     this.liveConsoleMaxPreviewChars = 200;
     this.waveformFrames = [
       '▁▂▁▂',
@@ -1417,6 +1417,21 @@ class EnhancedWebhookService {
     return `📶 ${this.signalCarrier} ${bars} ${badge}`;
   }
 
+  formatEventTimeline(events = []) {
+    const cleaned = events
+      .map((event) => String(event || '').trim())
+      .filter(Boolean);
+    const deduped = [];
+    for (const item of cleaned) {
+      if (!deduped.length || deduped[deduped.length - 1] !== item) {
+        deduped.push(item);
+      }
+    }
+    const recent = deduped.slice(-this.liveConsoleMaxEvents);
+    if (!recent.length) return ['• —'];
+    return recent.map((line) => `• ${line}`);
+  }
+
   getPhaseAccent(phaseKey) {
     const map = {
       waiting: '🟡',
@@ -1493,6 +1508,13 @@ class EnhancedWebhookService {
     if (metrics.packetLossPct > 1) score -= 1;
     if (metrics.asrConfidence < 0.6) score -= 1;
     return Math.max(0, Math.min(5, score));
+  }
+
+  getCallQualityScore(callSid) {
+    if (!callSid) return null;
+    const entry = this.liveConsoleByCallSid.get(callSid);
+    if (!entry) return null;
+    return this.getQualityScore(entry);
   }
 
   formatLatencyLine(entry) {
@@ -1736,8 +1758,7 @@ class EnhancedWebhookService {
 
   buildLiveConsoleMessage(entry) {
     const elapsed = this.formatElapsed(entry.createdAt, entry.endedAt);
-    const events = entry.lastEvents.slice(-this.liveConsoleMaxEvents);
-    while (events.length < this.liveConsoleMaxEvents) events.unshift('—');
+    const timeline = this.formatEventTimeline(entry.lastEvents);
     const phaseKey = entry.phaseKey || '';
     const frames = this.getWaveformFramesForPhase(phaseKey);
     let phaseLine = entry.phase;
@@ -1748,19 +1769,23 @@ class EnhancedWebhookService {
     const phaseAccent = this.getPhaseAccent(phaseKey);
     const phaseDisplay = `${phaseAccent} ${phaseLine}`;
     const sentimentLine = entry.sentimentFlag ? `Mood: ${entry.sentimentFlag}` : null;
-    const recentBlock = events.length ? events.map((e) => `• ${e}`).join('\n') : '• (no events yet)';
+    const recentBlock = timeline.join('\n');
     const signalLine = this.buildSignalLine(entry);
     const latencyLine = this.formatLatencyLine(entry);
     const healthLine = this.formatHealthLine(entry);
+    const updatedLine = entry.lastEditAt ? `🕒 Updated ${entry.lastEditAt.toLocaleTimeString()}` : null;
 
     if (entry.compact) {
       return [
         signalLine,
         `🎧 Live Call • ${entry.status}`,
+        updatedLine,
         `👤 ${entry.victimName} | 📞 ${entry.phoneNumber}`,
         entry.script && entry.script !== '—' ? `🧩 ${entry.script}` : null,
         `⏱ ${elapsed} | Phase: ${phaseDisplay}`,
         `${latencyLine} | ${healthLine}`,
+        'Highlights',
+        recentBlock,
         'Preview',
         `🧑 ${entry.previewTurns.user || '—'}`,
         `🤖 ${entry.previewTurns.agent || '—'}`
@@ -1770,6 +1795,7 @@ class EnhancedWebhookService {
     return [
       signalLine,
       `🎧 Live Call • ${entry.status}`,
+      updatedLine,
       `👤 ${entry.victimName} | 📞 ${entry.phoneNumber}`,
       entry.script && entry.script !== '—' ? `🧩 ${entry.script}` : null,
       `⏱ ${elapsed} | Phase: ${phaseDisplay}`,
@@ -1777,7 +1803,7 @@ class EnhancedWebhookService {
       healthLine,
       sentimentLine,
       '',
-      'Recent',
+      'Highlights',
       recentBlock,
       '',
       'Preview',

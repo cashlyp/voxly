@@ -1499,6 +1499,63 @@ function buildDigitSummary(digitEvents = []) {
   };
 }
 
+function parseDigitEventMetadata(event = {}) {
+  if (!event || event.metadata == null) return {};
+  if (typeof event.metadata === 'object') return event.metadata;
+  try {
+    return JSON.parse(event.metadata);
+  } catch (_) {
+    return {};
+  }
+}
+
+function buildDigitFunnelStats(digitEvents = []) {
+  if (!Array.isArray(digitEvents) || digitEvents.length === 0) {
+    return null;
+  }
+  const steps = new Map();
+  for (const event of digitEvents) {
+    const meta = parseDigitEventMetadata(event);
+    const stepKey = meta.plan_step_index
+      ? String(meta.plan_step_index)
+      : (event.profile || 'generic');
+    const step = steps.get(stepKey) || {
+      step: stepKey,
+      label: meta.step_label || (DIGIT_PROFILE_LABELS[event.profile] || event.profile || 'digits'),
+      plan_id: meta.plan_id || null,
+      attempts: 0,
+      accepted: 0,
+      failed: 0,
+      reasons: {}
+    };
+    step.attempts += 1;
+    if (event.accepted) {
+      step.accepted += 1;
+    } else {
+      step.failed += 1;
+      const reason = event.reason || 'invalid';
+      step.reasons[reason] = (step.reasons[reason] || 0) + 1;
+    }
+    steps.set(stepKey, step);
+  }
+  const list = Array.from(steps.values());
+  const topFailures = {};
+  for (const step of list) {
+    let topReason = null;
+    let topCount = 0;
+    for (const [reason, count] of Object.entries(step.reasons || {})) {
+      if (count > topCount) {
+        topReason = reason;
+        topCount = count;
+      }
+    }
+    if (topReason) {
+      topFailures[step.step] = { reason: topReason, count: topCount };
+    }
+  }
+  return { steps: list, topFailures };
+}
+
 function shouldCloseConversation(text = '') {
   const lower = String(text || '').toLowerCase();
   if (!lower) return false;
@@ -3087,6 +3144,7 @@ async function handleCallEnd(callSid, callStartTime) {
     const summary = generateCallSummary(transcripts, duration);
     const digitEvents = await db.getCallDigits(callSid).catch(() => []);
     const digitSummary = buildDigitSummary(digitEvents);
+    const digitFunnel = buildDigitFunnelStats(digitEvents);
     
     // Get personality adaptation data
     const callSession = activeCalls.get(callSid);
@@ -3117,6 +3175,9 @@ async function handleCallEnd(callSid, callStartTime) {
       total_interactions: transcripts.length,
       personality_adaptations: adaptationAnalysis.personalityChanges || 0
     });
+    if (digitFunnel) {
+      await db.updateCallState(callSid, 'digit_funnel_summary', digitFunnel).catch(() => {});
+    }
 
     const callDetails = await db.getCall(callSid);
     
@@ -5501,6 +5562,114 @@ app.post('/email/preview', async (req, res) => {
         res.json({ success: result.ok, ...result });
     } catch (error) {
         res.status(400).json({ success: false, error: error.message });
+    }
+});
+
+function extractEmailTemplateVariables(text = '') {
+    if (!text) return [];
+    const matches = text.match(/{{\s*([\w.-]+)\s*}}/g) || [];
+    const vars = new Set();
+    matches.forEach((match) => {
+        const cleaned = match.replace(/{{|}}/g, '').trim();
+        if (cleaned) vars.add(cleaned);
+    });
+    return Array.from(vars);
+}
+
+function buildRequiredVars(subject, html, text) {
+    const required = new Set();
+    extractEmailTemplateVariables(subject).forEach((v) => required.add(v));
+    extractEmailTemplateVariables(html).forEach((v) => required.add(v));
+    extractEmailTemplateVariables(text).forEach((v) => required.add(v));
+    return Array.from(required);
+}
+
+app.get('/email/templates', async (req, res) => {
+    try {
+        const limit = Number(req.query?.limit) || 50;
+        const templates = await db.listEmailTemplates(limit);
+        res.json({ success: true, templates });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.get('/email/templates/:id', async (req, res) => {
+    try {
+        const templateId = req.params.id;
+        const template = await db.getEmailTemplate(templateId);
+        if (!template) {
+            return res.status(404).json({ success: false, error: 'Template not found' });
+        }
+        res.json({ success: true, template });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/email/templates', async (req, res) => {
+    try {
+        const payload = req.body || {};
+        const templateId = String(payload.template_id || '').trim();
+        if (!templateId) {
+            return res.status(400).json({ success: false, error: 'template_id is required' });
+        }
+        const subject = payload.subject || '';
+        const html = payload.html || '';
+        const text = payload.text || '';
+        if (!subject) {
+            return res.status(400).json({ success: false, error: 'subject is required' });
+        }
+        if (!html && !text) {
+            return res.status(400).json({ success: false, error: 'html or text is required' });
+        }
+        const requiredVars = buildRequiredVars(subject, html, text);
+        await db.createEmailTemplate({
+            template_id: templateId,
+            subject,
+            html,
+            text,
+            required_vars: JSON.stringify(requiredVars)
+        });
+        const template = await db.getEmailTemplate(templateId);
+        res.json({ success: true, template });
+    } catch (error) {
+        res.status(400).json({ success: false, error: error.message });
+    }
+});
+
+app.put('/email/templates/:id', async (req, res) => {
+    try {
+        const templateId = req.params.id;
+        const existing = await db.getEmailTemplate(templateId);
+        if (!existing) {
+            return res.status(404).json({ success: false, error: 'Template not found' });
+        }
+        const payload = req.body || {};
+        const subject = payload.subject !== undefined ? payload.subject : existing.subject;
+        const html = payload.html !== undefined ? payload.html : existing.html;
+        const text = payload.text !== undefined ? payload.text : existing.text;
+        const requiredVars = buildRequiredVars(subject || '', html || '', text || '');
+        await db.updateEmailTemplate(templateId, {
+            subject: payload.subject,
+            html: payload.html,
+            text: payload.text,
+            required_vars: JSON.stringify(requiredVars)
+        });
+        const template = await db.getEmailTemplate(templateId);
+        res.json({ success: true, template });
+    } catch (error) {
+        res.status(400).json({ success: false, error: error.message });
+    }
+});
+
+app.delete('/email/templates/:id', async (req, res) => {
+    try {
+        const templateId = req.params.id;
+        await db.deleteEmailTemplate(templateId);
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
