@@ -66,11 +66,13 @@ class TranscriptionService extends EventEmitter {
       this.dgConnection.on(LiveTranscriptionEvents.Error, (error) => {
         console.error('STT -> deepgram error');
         console.error(error);
+        this.emit('error', error);
       });
 
       this.dgConnection.on(LiveTranscriptionEvents.Warning, (warning) => {
         console.error('STT -> deepgram warning');
         console.error(warning);
+        this.emit('warning', warning);
       });
 
       this.dgConnection.on(LiveTranscriptionEvents.Metadata, (metadata) => {
@@ -80,6 +82,7 @@ class TranscriptionService extends EventEmitter {
 
       this.dgConnection.on(LiveTranscriptionEvents.Close, () => {
         console.log('STT -> Deepgram connection closed'.yellow);
+        this.emit('close');
       });
     });
   }

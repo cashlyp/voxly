@@ -11,6 +11,8 @@ class StreamService extends EventEmitter {
     const interval = Number(options.audioTickIntervalMs);
     this.audioTickIntervalMs = Number.isFinite(interval) && interval > 0 ? interval : 160;
     this.audioTickTimer = null;
+    const maxBuffered = Number(options.maxBufferedChunks);
+    this.maxBufferedChunks = Number.isFinite(maxBuffered) && maxBuffered > 0 ? maxBuffered : 64;
   }
 
   setStreamSid (streamSid) {
@@ -21,7 +23,25 @@ class StreamService extends EventEmitter {
     // Escape hatch for intro message, which doesn't have an index
     if(index === null) {
       this.sendAudio(audio);
-    } else if(index === this.expectedAudioIndex) {
+      return;
+    }
+
+    const normalizedIndex = Number(index);
+    if (!Number.isFinite(normalizedIndex)) {
+      this.sendAudio(audio);
+      return;
+    }
+
+    if (normalizedIndex < this.expectedAudioIndex) {
+      return;
+    }
+
+    if (Object.keys(this.audioBuffer).length >= this.maxBufferedChunks) {
+      this.audioBuffer = {};
+      this.expectedAudioIndex = normalizedIndex;
+    }
+
+    if(normalizedIndex === this.expectedAudioIndex) {
       this.sendAudio(audio);
       this.expectedAudioIndex++;
 
@@ -31,7 +51,7 @@ class StreamService extends EventEmitter {
         this.expectedAudioIndex++;
       }
     } else {
-      this.audioBuffer[index] = audio;
+      this.audioBuffer[normalizedIndex] = audio;
     }
   }
 

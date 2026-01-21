@@ -3,6 +3,7 @@
 function createTwilioGatherHandler(deps = {}) {
   const {
     warnOnInvalidTwilioSignature = () => {},
+    requireTwilioSignature,
     getDigitService,
     digitService: staticDigitService,
     callConfigurations,
@@ -29,10 +30,17 @@ function createTwilioGatherHandler(deps = {}) {
 
   return async function twilioGatherHandler(req, res) {
     try {
-      warnOnInvalidTwilioSignature(req, '/webhook/twilio-gather');
+      if (typeof requireTwilioSignature === 'function') {
+        const ok = requireTwilioSignature(req, res, '/webhook/twilio-gather');
+        if (!ok) return;
+      } else {
+        warnOnInvalidTwilioSignature(req, '/webhook/twilio-gather');
+      }
       const digitService = getService();
       const { CallSid, Digits } = req.body || {};
       const callSid = req.query?.callSid || CallSid;
+      const from = req.body?.From || req.body?.from || null;
+      const to = req.body?.To || req.body?.to || null;
       if (!callSid) {
         return res.status(400).send('Missing CallSid');
       }
@@ -144,7 +152,7 @@ function createTwilioGatherHandler(deps = {}) {
         return;
       }
       const respondWithStream = () => {
-        const twiml = buildTwilioStreamTwiml(host);
+        const twiml = buildTwilioStreamTwiml(host, { callSid, from, to });
         res.type('text/xml');
         res.end(twiml);
       };

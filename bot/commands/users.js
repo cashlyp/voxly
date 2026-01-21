@@ -1,5 +1,78 @@
+const { InlineKeyboard } = require('grammy');
 const { getUser, getUserList, addUser, promoteUser, removeUser, isAdmin } = require('../db/db');
+const { buildCallbackData } = require('../utils/actions');
 const { guardAgainstCommandInterrupt, OperationCancelledError } = require('../utils/sessionState');
+const { renderMenu } = require('../utils/ui');
+
+async function ensureAdminAccess(ctx) {
+  const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
+  if (!user) {
+    await ctx.reply('❌ You are not authorized to use this bot.');
+    return false;
+  }
+
+  const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
+  if (!adminStatus) {
+    await ctx.reply('❌ This command is for administrators only.');
+    return false;
+  }
+
+  return true;
+}
+
+function buildUsersKeyboard(ctx) {
+  return new InlineKeyboard()
+    .text('📋 List Users', buildCallbackData(ctx, 'USERS_LIST'))
+    .row()
+    .text('➕ Add User', buildCallbackData(ctx, 'ADDUSER'))
+    .text('⬆️ Promote User', buildCallbackData(ctx, 'PROMOTE'))
+    .row()
+    .text('❌ Remove User', buildCallbackData(ctx, 'REMOVE'));
+}
+
+async function renderUsersMenu(ctx, note = '') {
+  const message = note
+    ? `👥 User Management\n${note}`
+    : '👥 User Management\nChoose an action below.';
+  await renderMenu(ctx, message, buildUsersKeyboard(ctx));
+}
+
+async function sendUsersList(ctx) {
+  try {
+    const users = await new Promise((resolve) => {
+      getUserList((err, result) => {
+        if (err) {
+          console.error('Database error in getUserList:', err);
+          resolve([]);
+        } else {
+          resolve(result || []);
+        }
+      });
+    });
+
+    if (!users || users.length === 0) {
+      await ctx.reply('📋 No users found in the system.');
+      return;
+    }
+
+    let message = `📋 USERS LIST (${users.length}):\n\n`;
+
+    users.forEach((item, index) => {
+      const roleIcon = item.role === 'ADMIN' ? '🛡️' : '👤';
+      const username = item.username || 'no_username';
+      const joinDate = new Date(item.timestamp).toLocaleDateString();
+      message += `${index + 1}. ${roleIcon} @${username}\n`;
+      message += `   ID: ${item.telegram_id}\n`;
+      message += `   Role: ${item.role}\n`;
+      message += `   Joined: ${joinDate}\n\n`;
+    });
+
+    await ctx.reply(message);
+  } catch (error) {
+    console.error('Users list error:', error);
+    await ctx.reply('❌ Error fetching users list. Please try again.');
+  }
+}
 
 // ------------------------- Add User Flow -------------------------
 async function addUserFlow(conversation, ctx) {
@@ -60,26 +133,6 @@ async function addUserFlow(conversation, ctx) {
   }
 }
 
-function registerAddUserCommand(bot) {
-  bot.command(['adduser', 'authorize'], async (ctx) => {
-    try {
-      const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
-      if (!user) {
-        return ctx.reply('❌ You are not authorized to use this bot.');
-      }
-
-      const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
-      if (!adminStatus) {
-        return ctx.reply('❌ This command is for administrators only.');
-      }
-
-      await ctx.conversation.enter('adduser-conversation');
-    } catch (error) {
-      console.error('Add user command error:', error);
-      await ctx.reply('❌ An error occurred. Please try again.');
-    }
-  });
-}
 
 // ------------------------- Promote User Flow -------------------------
 async function promoteFlow(conversation, ctx) {
@@ -123,26 +176,6 @@ async function promoteFlow(conversation, ctx) {
   }
 }
 
-function registerPromoteCommand(bot) {
-  bot.command('promote', async (ctx) => {
-    try {
-      const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
-      if (!user) {
-        return ctx.reply('❌ You are not authorized to use this bot.');
-      }
-
-      const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
-      if (!adminStatus) {
-        return ctx.reply('❌ This command is for administrators only.');
-      }
-
-      await ctx.conversation.enter('promote-conversation');
-    } catch (error) {
-      console.error('Promote command error:', error);
-      await ctx.reply('❌ An error occurred. Please try again.');
-    }
-  });
-}
 
 // ------------------------- Remove User Flow -------------------------
 async function removeUserFlow(conversation, ctx) {
@@ -186,83 +219,26 @@ async function removeUserFlow(conversation, ctx) {
   }
 }
 
-function registerRemoveUserCommand(bot) {
-  bot.command('removeuser', async (ctx) => {
-    try {
-      const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
-      if (!user) {
-        return ctx.reply('❌ You are not authorized to use this bot.');
-      }
-
-      const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
-      if (!adminStatus) {
-        return ctx.reply('❌ This command is for administrators only.');
-      }
-
-      await ctx.conversation.enter('remove-conversation');
-    } catch (error) {
-      console.error('Remove user command error:', error);
-      await ctx.reply('❌ An error occurred. Please try again.');
-    }
-  });
-}
 
 // ------------------------- Users List Command -------------------------
 function registerUserListCommand(bot) {
   bot.command('users', async (ctx) => {
     try {
-      const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
-      if (!user) {
-        return ctx.reply('❌ You are not authorized to use this bot.');
-      }
-
-      const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
-      if (!adminStatus) {
-        return ctx.reply('❌ This command is for administrators only.');
-      }
-
-      const users = await new Promise((resolve) => {
-        getUserList((err, result) => {
-          if (err) {
-            console.error('Database error in getUserList:', err);
-            resolve([]);
-          } else {
-            resolve(result || []);
-          }
-        });
-      });
-
-      if (!users || users.length === 0) {
-        await ctx.reply('📋 No users found in the system.');
-        return;
-      }
-
-      let message = `📋 USERS LIST (${users.length}):\n\n`;
-
-      users.forEach((item, index) => {
-        const roleIcon = item.role === 'ADMIN' ? '🛡️' : '👤';
-        const username = item.username || 'no_username';
-        const joinDate = new Date(item.timestamp).toLocaleDateString();
-        message += `${index + 1}. ${roleIcon} @${username}\n`;
-        message += `   ID: ${item.telegram_id}\n`;
-        message += `   Role: ${item.role}\n`;
-        message += `   Joined: ${joinDate}\n\n`;
-      });
-
-      await ctx.reply(message);
+      const allowed = await ensureAdminAccess(ctx);
+      if (!allowed) return;
+      await renderUsersMenu(ctx);
     } catch (error) {
       console.error('Users command error:', error);
-      await ctx.reply('❌ Error fetching users list. Please try again.');
+      await ctx.reply('❌ Error opening user management. Please try again.');
     }
   });
 }
 
 module.exports = {
   addUserFlow,
-  registerAddUserCommand,
   promoteFlow,
-  registerPromoteCommand,
   removeUserFlow,
-  registerRemoveUserCommand,
   registerUserListCommand,
+  renderUsersMenu,
+  sendUsersList,
 };

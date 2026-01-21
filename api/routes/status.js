@@ -1400,7 +1400,7 @@ class EnhancedWebhookService {
     const rawLevel = this.getRawSignalLevel(entry);
     const strength = this.getSmoothedSignalLevel(entry, rawLevel);
     const bars = this.renderSignalBars(Number.isFinite(strength) ? strength : 0, this.signalBarsMax);
-    return `${this.signalCarrierName} ${bars}  ${this.signalNetworkLabel}`;
+    return `📶 ${this.signalCarrierName} ${bars}  ${this.signalNetworkLabel}`;
   }
 
   formatEventTimeline(events = []) {

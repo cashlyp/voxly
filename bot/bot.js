@@ -329,12 +329,11 @@ const {
 } = require('./commands/provider');
 const {
     addUserFlow,
-    registerAddUserCommand,
     promoteFlow,
-    registerPromoteCommand,
     removeUserFlow,
-    registerRemoveUserCommand,
-    registerUserListCommand
+    registerUserListCommand,
+    renderUsersMenu,
+    sendUsersList
 } = require('./commands/users');
 const { registerHelpCommand, handleHelp } = require('./commands/help');
 const { registerMenuCommand, handleMenu } = require('./commands/menu');
@@ -374,9 +373,6 @@ bot.use(wrapConversation(personaFlow, "persona-conversation"));
 
 // Register command handlers
 registerCallCommand(bot);
-registerAddUserCommand(bot);
-registerPromoteCommand(bot);
-registerRemoveUserCommand(bot);
 registerSmsCommands(bot);
 registerEmailCommands(bot);
 registerScriptsCommand(bot);
@@ -915,14 +911,9 @@ bot.command('start', async (ctx) => {
                 .text('📧 Mailer', buildCallbackData(ctx, 'BULK_EMAIL'))
             .row()
                 .text('👥 Users', buildCallbackData(ctx, 'USERS'))
-                .text('➕ Add', buildCallbackData(ctx, 'ADDUSER'))
-            .row()
-                .text('⬆️ Promote', buildCallbackData(ctx, 'PROMOTE'))
-                .text('❌ Remove', buildCallbackData(ctx, 'REMOVE'))
-            .row()
                 .text('🧰 Scripts', buildCallbackData(ctx, 'SCRIPTS'))
-                .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER_STATUS'))
             .row()
+                .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER_STATUS'))
                 .text('🔍 Status', buildCallbackData(ctx, 'STATUS'));
         }
 
@@ -1235,10 +1226,21 @@ bot.on('callback_query:data', async (ctx) => {
                 
             case 'USERS':
                 try {
-                    await executeUsersCommand(ctx);
+                    await renderUsersMenu(ctx);
                     finishMetric('ok');
                 } catch (usersError) {
                     console.error('Users callback error:', usersError);
+                    await ctx.reply('❌ Error displaying users list. Please try again.');
+                    finishMetric('error', { error: usersError?.message || String(usersError) });
+                }
+                break;
+
+            case 'USERS_LIST':
+                try {
+                    await sendUsersList(ctx);
+                    finishMetric('ok');
+                } catch (usersError) {
+                    console.error('Users list callback error:', usersError);
                     await ctx.reply('❌ Error displaying users list. Please try again.');
                     finishMetric('error', { error: usersError?.message || String(usersError) });
                 }
@@ -1372,49 +1374,6 @@ bot.on('callback_query:data', async (ctx) => {
         finishMetric('error', { error: error?.message || String(error) });
     }
 });
-
-// Command execution helpers for inline buttons
-async function executeUsersCommand(ctx) {
-    try {
-        const { getUserList } = require('./db/db');
-        
-        const users = await new Promise((resolve, reject) => {
-            getUserList((err, result) => {
-                if (err) {
-                    console.error('Database error in getUserList:', err);
-                    reject(err);
-                } else {
-                    resolve(result);
-                }
-            });
-        });
-
-        if (!users || users.length === 0) {
-            await ctx.reply('📋 No users found in the system.');
-            return;
-        }
-
-        // Create user list without problematic markdown - use plain text
-        let message = `📋 USERS LIST (${users.length}):\n\n`;
-        
-        users.forEach((user, index) => {
-            const roleIcon = user.role === 'ADMIN' ? '🛡️' : '👤';
-            const username = user.username || 'no_username';
-            const joinDate = new Date(user.timestamp).toLocaleDateString();
-            message += `${index + 1}. ${roleIcon} @${username}\n`;
-            message += `   ID: ${user.telegram_id}\n`;
-            message += `   Role: ${user.role}\n`;
-            message += `   Joined: ${joinDate}\n\n`;
-        });
-
-        // Send without parse_mode to avoid markdown parsing errors
-        await ctx.reply(message);
-
-    } catch (error) {
-        console.error('executeUsersCommand error:', error);
-        await ctx.reply('❌ Error fetching users list. Please try again.');
-    }
-}
 
 async function executeCallsCommand(ctx) {
     try {
@@ -1551,10 +1510,7 @@ const TELEGRAM_COMMANDS = [
     { command: 'scripts', description: 'Manage call & SMS scripts (admin only)' },
     { command: 'persona', description: 'Manage personas (admin only)' },
     { command: 'provider', description: 'Manage call provider (admin only)' },
-    { command: 'adduser', description: 'Add user (admin only)' },
-    { command: 'promote', description: 'Promote to ADMIN (admin only)' },
-    { command: 'removeuser', description: 'Remove a USER (admin only)' },
-    { command: 'users', description: 'List authorized users (admin only)' },
+    { command: 'users', description: 'Manage users (admin only)' },
     { command: 'status', description: 'System status (admin only)' }
 ];
 

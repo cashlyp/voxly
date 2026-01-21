@@ -30,6 +30,9 @@ const { WaveFile } = require('wavefile');
 const twilio = require('twilio');
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
+const DEFAULT_INBOUND_PROMPT = 'You are an intelligent AI assistant capable of adapting to different business contexts and customer needs. Be professional, helpful, and responsive to customer communication styles. You must add a \'•\' symbol every 5 to 10 words at natural pauses where your response can be split for text to speech.';
+const DEFAULT_INBOUND_FIRST_MESSAGE = 'Hello! How can I assist you today?';
+
 const liveConsoleAudioTickMs = Number.isFinite(Number(config.liveConsole?.audioTickMs))
   ? Number(config.liveConsole?.audioTickMs)
   : 160;
@@ -60,6 +63,8 @@ let digitService;
 const functionEngine = new DynamicFunctionEngine();
 let smsService = new EnhancedSmsService();
 let emailService;
+const sttFallbackCalls = new Set();
+const streamTimeoutCalls = new Set();
 
 function stableStringify(value) {
   if (value === null || typeof value !== 'object') {
@@ -92,6 +97,193 @@ function buildHmacPayload(req, timestamp) {
   const path = req.originalUrl || req.url || '/';
   const body = normalizeBodyForSignature(req);
   return `${timestamp}.${method}.${path}.${body}`;
+}
+
+function normalizePhoneDigits(value) {
+  return String(value || '').replace(/\D/g, '');
+}
+
+function resolveInboundRoute(toNumber) {
+  const routes = config.inbound?.routes || {};
+  if (!toNumber || !routes || typeof routes !== 'object') return null;
+  const normalizedTo = normalizePhoneDigits(toNumber);
+  if (!normalizedTo) return routes[toNumber] || null;
+
+  if (routes[toNumber]) return routes[toNumber];
+  if (routes[normalizedTo]) return routes[normalizedTo];
+  if (routes[`+${normalizedTo}`]) return routes[`+${normalizedTo}`];
+
+  for (const [key, value] of Object.entries(routes)) {
+    if (normalizePhoneDigits(key) === normalizedTo) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function buildInboundDefaults(route = {}) {
+  const prompt = route.prompt
+    || config.inbound?.defaultPrompt
+    || DEFAULT_INBOUND_PROMPT;
+  const firstMessage = route.first_message
+    || route.firstMessage
+    || config.inbound?.defaultFirstMessage
+    || DEFAULT_INBOUND_FIRST_MESSAGE;
+  return { prompt, firstMessage };
+}
+
+function buildInboundCallConfig(callSid, payload = {}) {
+  const route = resolveInboundRoute(payload.To || payload.to || payload.called || payload.Called) || {};
+  const { prompt, firstMessage } = buildInboundDefaults(route);
+  const functionSystem = functionEngine.generateAdaptiveFunctionSystem(prompt, firstMessage);
+  const createdAt = new Date().toISOString();
+  const callConfig = {
+    prompt,
+    first_message: firstMessage,
+    created_at: createdAt,
+    user_chat_id: config.telegram?.adminChatId || route.user_chat_id || null,
+    customer_name: route.customer_name || null,
+    provider: 'twilio',
+    provider_metadata: null,
+    business_context: route.business_context || functionSystem.context,
+    function_count: functionSystem.functions.length,
+    purpose: route.purpose || null,
+    business_id: route.business_id || null,
+    script: route.script || null,
+    script_id: route.script_id || null,
+    emotion: route.emotion || null,
+    urgency: route.urgency || null,
+    technical_level: route.technical_level || null,
+    voice_model: route.voice_model || null,
+    collection_profile: route.collection_profile || null,
+    collection_expected_length: route.collection_expected_length || null,
+    collection_timeout_s: route.collection_timeout_s || null,
+    collection_max_retries: route.collection_max_retries || null,
+    collection_mask_for_gpt: route.collection_mask_for_gpt,
+    collection_speak_confirmation: route.collection_speak_confirmation,
+    flow_state: 'normal',
+    flow_state_updated_at: createdAt,
+    call_mode: 'normal',
+    digit_capture_active: false,
+    inbound: true
+  };
+  return { callConfig, functionSystem };
+}
+
+function ensureCallSetup(callSid, payload = {}) {
+  let callConfig = callConfigurations.get(callSid);
+  let functionSystem = callFunctionSystems.get(callSid);
+  if (callConfig && functionSystem) {
+    return { callConfig, functionSystem, created: false };
+  }
+
+  if (!callConfig) {
+    const created = buildInboundCallConfig(callSid, payload);
+    callConfig = created.callConfig;
+    functionSystem = functionSystem || created.functionSystem;
+  } else if (!functionSystem) {
+    const { prompt, first_message } = callConfig;
+    const promptValue = prompt || DEFAULT_INBOUND_PROMPT;
+    const firstValue = first_message || DEFAULT_INBOUND_FIRST_MESSAGE;
+    functionSystem = functionEngine.generateAdaptiveFunctionSystem(promptValue, firstValue);
+  }
+
+  callConfigurations.set(callSid, callConfig);
+  callFunctionSystems.set(callSid, functionSystem);
+  return { callConfig, functionSystem, created: true };
+}
+
+async function ensureCallRecord(callSid, payload = {}, source = 'unknown') {
+  if (!db || !callSid) return null;
+  const setup = ensureCallSetup(callSid, payload);
+  const existing = await db.getCall(callSid).catch(() => null);
+  if (existing) return existing;
+
+  const { callConfig, functionSystem } = setup;
+  const from = payload.From || payload.from || payload.Caller || payload.caller || null;
+  const to = payload.To || payload.to || payload.Called || payload.called || null;
+
+  try {
+    await db.createCall({
+      call_sid: callSid,
+      phone_number: from || null,
+      prompt: callConfig.prompt,
+      first_message: callConfig.first_message,
+      user_chat_id: callConfig.user_chat_id || null,
+      business_context: JSON.stringify(functionSystem?.context || {}),
+      generated_functions: JSON.stringify(
+        (functionSystem?.functions || [])
+          .map((f) => f.function?.name || f.function?.function?.name || f.name)
+          .filter(Boolean)
+      )
+    });
+    await db.updateCallState(callSid, 'call_created', {
+      inbound: true,
+      source,
+      from: from || null,
+      to: to || null,
+      business_id: callConfig.business_id || null,
+      purpose: callConfig.purpose || null,
+      voice_model: callConfig.voice_model || null
+    });
+    return await db.getCall(callSid);
+  } catch (error) {
+    console.error('Failed to create inbound call record:', error);
+    return null;
+  }
+}
+
+function buildStreamAuthToken(callSid, timestamp) {
+  const secret = config.streamAuth?.secret;
+  if (!secret) return null;
+  const payload = `${callSid}.${timestamp}`;
+  return crypto.createHmac('sha256', secret).update(payload).digest('hex');
+}
+
+function resolveStreamAuthParams(req) {
+  if (req?.query && Object.keys(req.query).length) {
+    return req.query;
+  }
+  const url = req?.url || '';
+  const queryIndex = url.indexOf('?');
+  if (queryIndex === -1) return {};
+  const params = new URLSearchParams(url.slice(queryIndex + 1));
+  const result = {};
+  for (const [key, value] of params.entries()) {
+    result[key] = value;
+  }
+  return result;
+}
+
+function verifyStreamAuth(callSid, req) {
+  const secret = config.streamAuth?.secret;
+  if (!secret) return { ok: true, skipped: true, reason: 'missing_secret' };
+  const params = resolveStreamAuthParams(req);
+  const token = params.token || params.signature;
+  const timestamp = Number(params.ts || params.timestamp);
+  if (!token || !Number.isFinite(timestamp)) {
+    return { ok: false, reason: 'missing_token' };
+  }
+  const maxSkewMs = Number(config.streamAuth?.maxSkewMs || 300000);
+  const now = Date.now();
+  if (Math.abs(now - timestamp) > maxSkewMs) {
+    return { ok: false, reason: 'timestamp_out_of_range' };
+  }
+  const expected = buildStreamAuthToken(callSid, String(timestamp));
+  if (!expected) return { ok: false, reason: 'missing_secret' };
+  try {
+    const expectedBuf = Buffer.from(expected, 'hex');
+    const providedBuf = Buffer.from(String(token), 'hex');
+    if (expectedBuf.length !== providedBuf.length) {
+      return { ok: false, reason: 'invalid_signature' };
+    }
+    if (!crypto.timingSafeEqual(expectedBuf, providedBuf)) {
+      return { ok: false, reason: 'invalid_signature' };
+    }
+  } catch (error) {
+    return { ok: false, reason: 'invalid_signature' };
+  }
+  return { ok: true };
 }
 
 function clearCallEndLock(callSid) {
@@ -418,6 +610,106 @@ function scheduleSilenceTimer(callSid, timeoutMs = 30000) {
     }
   }, timeoutMs);
   silenceTimers.set(callSid, timer);
+}
+
+async function handleStreamTimeout(callSid, host) {
+  if (!callSid || streamTimeoutCalls.has(callSid)) return;
+  streamTimeoutCalls.add(callSid);
+  try {
+    const callConfig = callConfigurations.get(callSid);
+    const expectation = digitService?.getExpectation?.(callSid);
+    if (expectation && config.twilio?.gatherFallback) {
+      const prompt = expectation.prompt || (digitService?.buildDigitPrompt ? digitService.buildDigitPrompt(expectation) : '');
+      const sent = await digitService.sendTwilioGather(callSid, expectation, { prompt }, host);
+      if (sent) {
+        await db.updateCallState(callSid, 'stream_fallback_gather', {
+          at: new Date().toISOString()
+        }).catch(() => {});
+        return;
+      }
+    }
+
+    if (config.twilio?.accountSid && config.twilio?.authToken) {
+      const client = twilio(config.twilio.accountSid, config.twilio.authToken);
+      const response = new VoiceResponse();
+      response.say('We are having trouble connecting the call. Please try again later.');
+      response.hangup();
+      await client.calls(callSid).update({ twiml: response.toString() });
+    }
+
+    await db.updateCallState(callSid, 'stream_timeout', {
+      at: new Date().toISOString(),
+      provider: callConfig?.provider || currentProvider
+    }).catch(() => {});
+  } catch (error) {
+    console.error('Stream timeout handler error:', error);
+  }
+}
+
+async function activateDtmfFallback(callSid, callConfig, gptService, interactionCount = 0, reason = 'stt_failure') {
+  if (!callSid || sttFallbackCalls.has(callSid)) return false;
+  if (!digitService) return false;
+  const provider = callConfig?.provider || currentProvider;
+  if (provider !== 'twilio') return false;
+  sttFallbackCalls.add(callSid);
+
+  const configToUse = callConfig || callConfigurations.get(callSid);
+  if (!configToUse) return false;
+
+  configToUse.digit_intent = { mode: 'dtmf', reason, confidence: 1 };
+  configToUse.digit_capture_active = true;
+  configToUse.call_mode = 'dtmf_capture';
+  configToUse.flow_state = 'capture_pending';
+  configToUse.flow_state_reason = reason;
+  configToUse.flow_state_updated_at = new Date().toISOString();
+  callConfigurations.set(callSid, configToUse);
+
+  await db.updateCallState(callSid, 'stt_fallback', {
+    reason,
+    at: new Date().toISOString()
+  }).catch(() => {});
+
+  try {
+    await applyInitialDigitIntent(callSid, configToUse, gptService, interactionCount);
+  } catch (error) {
+    console.error('Failed to apply digit intent during STT fallback:', error);
+  }
+
+  const expectation = digitService.getExpectation(callSid);
+  if (expectation && config.twilio?.gatherFallback) {
+    const prompt = expectation.prompt || digitService.buildDigitPrompt(expectation);
+    try {
+      const sent = await digitService.sendTwilioGather(callSid, expectation, { prompt });
+      if (sent) {
+        webhookService.addLiveEvent(callSid, '📟 Switching to keypad capture', { force: true });
+        return true;
+      }
+    } catch (error) {
+      console.error('Twilio gather fallback error:', error);
+    }
+  }
+
+  const fallbackPrompt = expectation
+    ? digitService.buildDigitPrompt(expectation)
+    : 'Please enter the digits using your keypad.';
+  if (gptService) {
+    const personalityInfo = gptService?.personalityEngine?.getCurrentPersonality?.();
+    gptService.emit('gptreply', {
+      partialResponseIndex: null,
+      partialResponse: fallbackPrompt,
+      personalityInfo,
+      adaptationHistory: gptService?.personalityChanges?.slice(-3) || []
+    }, interactionCount);
+  }
+  if (expectation) {
+    digitService.markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', {
+      allowCallEnd: true,
+      prompt_text: fallbackPrompt,
+      reset_buffer: true
+    });
+    digitService.scheduleDigitTimeout(callSid, gptService, interactionCount + 1);
+  }
+  return true;
 }
 
 function getTranscriptAudioEntry(callSid) {
@@ -843,11 +1135,24 @@ function resolveHost(req) {
     || '';
 }
 
-function buildTwilioStreamTwiml(hostname) {
+function buildTwilioStreamTwiml(hostname, options = {}) {
   const response = new VoiceResponse();
   const connect = response.connect();
   const host = hostname || config.server.hostname;
-  connect.stream({ url: `wss://${host}/connection`, track: TWILIO_STREAM_TRACK });
+  const params = new URLSearchParams();
+  if (options.from) params.set('from', String(options.from));
+  if (options.to) params.set('to', String(options.to));
+  if (options.callSid && config.streamAuth?.secret) {
+    const timestamp = String(Date.now());
+    const token = buildStreamAuthToken(options.callSid, timestamp);
+    if (token) {
+      params.set('token', token);
+      params.set('ts', timestamp);
+    }
+  }
+  const query = params.toString();
+  const url = `wss://${host}/connection${query ? `?${query}` : ''}`;
+  connect.stream({ url, track: TWILIO_STREAM_TRACK });
   return response.toString();
 }
 
@@ -919,7 +1224,8 @@ function validateTwilioRequest(req) {
   if (!signature || !authToken || !url) {
     return false;
   }
-  return twilio.validateRequest(authToken, signature, url, req.body);
+  const params = String(req.method || '').toUpperCase() === 'GET' ? (req.query || {}) : (req.body || {});
+  return twilio.validateRequest(authToken, signature, url, params);
 }
 
 function warnOnInvalidTwilioSignature(req, label = '') {
@@ -929,6 +1235,20 @@ function warnOnInvalidTwilioSignature(req, label = '') {
     console.warn(`⚠️ Twilio signature invalid for ${path}`);
   }
   return valid;
+}
+
+function requireValidTwilioSignature(req, res, label = '') {
+  const mode = String(config.twilio?.webhookValidation || 'warn').toLowerCase();
+  if (mode === 'off') return true;
+  const valid = validateTwilioRequest(req);
+  if (valid) return true;
+  const path = label || req.originalUrl || req.path || 'unknown';
+  console.warn(`⚠️ Twilio signature invalid for ${path}`);
+  if (mode === 'strict') {
+    res.status(403).send('Forbidden');
+    return false;
+  }
+  return true;
 }
 
 function selectWsProtocol(protocols) {
@@ -2000,6 +2320,20 @@ app.ws('/connection', (ws, req) => {
     let marks = [];
     let interactionCount = 0;
     let isInitialized = false;
+
+    const handleSttFailure = async (tag, error) => {
+      if (!callSid) return;
+      console.error(`STT failure (${tag}) for ${callSid}`, error?.message || error || '');
+      const activeSession = activeCalls.get(callSid);
+      await activateDtmfFallback(callSid, callConfig, gptService, activeSession?.interactionCount || interactionCount, tag);
+    };
+
+    transcriptionService.on('error', (error) => {
+      handleSttFailure('stt_error', error);
+    });
+    transcriptionService.on('close', () => {
+      handleSttFailure('stt_closed');
+    });
   
     ws.on('message', async function message(data) {
       try {
@@ -2010,6 +2344,21 @@ app.ws('/connection', (ws, req) => {
           streamSid = msg.start.streamSid;
           callSid = msg.start.callSid;
           callStartTime = new Date();
+          if (!callSid) {
+            console.warn('WebSocket start missing CallSid');
+            ws.close();
+            return;
+          }
+          const authResult = verifyStreamAuth(callSid, req);
+          if (!authResult.ok) {
+            console.warn(`Stream auth failed for ${callSid} (${authResult.reason})`);
+            db.updateCallState(callSid, 'stream_auth_failed', {
+              reason: authResult.reason,
+              at: new Date().toISOString()
+            }).catch(() => {});
+            ws.close();
+            return;
+          }
           if (digitService?.isFallbackActive?.(callSid)) {
             digitService.clearDigitFallbackState(callSid);
           }
@@ -2021,6 +2370,21 @@ app.ws('/connection', (ws, req) => {
           console.log(`Adaptive call started - SID: ${callSid}`);
           
           streamService.setStreamSid(streamSid);
+
+          const streamParams = resolveStreamAuthParams(req);
+          const customParams = msg.start?.customParameters || {};
+          const fromValue = streamParams.from || streamParams.From || customParams.from || customParams.From;
+          const toValue = streamParams.to || streamParams.To || customParams.to || customParams.To;
+          const setup = ensureCallSetup(callSid, {
+            From: fromValue,
+            To: toValue
+          });
+          callConfig = setup.callConfig || callConfigurations.get(callSid);
+          functionSystem = setup.functionSystem || callFunctionSystems.get(callSid);
+          await ensureCallRecord(callSid, {
+            From: fromValue,
+            To: toValue
+          }, 'ws_start');
 
           // Update database with enhanced tracking
           try {
@@ -2037,13 +2401,18 @@ app.ws('/connection', (ws, req) => {
             if (call && call.user_chat_id) {
               await db.createEnhancedWebhookNotification(callSid, 'call_stream_started', call.user_chat_id);
             }
+            if (callConfig?.inbound) {
+              const chatId = call?.user_chat_id || callConfig?.user_chat_id || config.telegram?.adminChatId;
+              if (chatId) {
+                webhookService.sendCallStatusUpdate(callSid, 'answered', chatId, {
+                  status_source: 'stream'
+                }).catch((err) => console.error('Inbound answered update error:', err));
+              }
+            }
           } catch (dbError) {
             console.error('Database error on call start:', dbError);
           }
-
           // Get call configuration and function system
-          callConfig = callConfigurations.get(callSid);
-          functionSystem = callFunctionSystems.get(callSid);
           const resolvedVoiceModel = resolveVoiceModel(callConfig);
           if (resolvedVoiceModel) {
             ttsService.voiceModel = resolvedVoiceModel;
@@ -2653,6 +3022,8 @@ app.ws('/connection', (ws, req) => {
       clearNormalFlowState(callSid);
       clearCallEndLock(callSid);
       clearSilenceTimer(callSid);
+      sttFallbackCalls.delete(callSid);
+      streamTimeoutCalls.delete(callSid);
     });
 
   } catch (err) {
@@ -2682,6 +3053,20 @@ app.ws('/vonage/stream', async (ws, req) => {
     const transcriptionService = new TranscriptionService({
       encoding: 'mulaw',
       sampleRate: 8000
+    });
+
+    const handleSttFailure = async (tag, error) => {
+      if (!callSid) return;
+      console.error(`STT failure (${tag}) for ${callSid}`, error?.message || error || '');
+      const session = activeCalls.get(callSid);
+      await activateDtmfFallback(callSid, callConfig, gptService, session?.interactionCount || interactionCount, tag);
+    };
+
+    transcriptionService.on('error', (error) => {
+      handleSttFailure('stt_error', error);
+    });
+    transcriptionService.on('close', () => {
+      handleSttFailure('stt_closed');
     });
 
     let gptService;
@@ -2913,6 +3298,8 @@ app.ws('/vonage/stream', async (ws, req) => {
       clearNormalFlowState(callSid);
       clearCallEndLock(callSid);
       clearSilenceTimer(callSid);
+      sttFallbackCalls.delete(callSid);
+      streamTimeoutCalls.delete(callSid);
     });
 
     // Send first message once stream is ready
@@ -2971,6 +3358,20 @@ app.ws('/aws/stream', (ws, req) => {
     const transcriptionService = new TranscriptionService({
       encoding: encoding,
       sampleRate: sampleRate
+    });
+
+    const handleSttFailure = async (tag, error) => {
+      if (!callSid) return;
+      console.error(`STT failure (${tag}) for ${callSid}`, error?.message || error || '');
+      const session = activeCalls.get(callSid);
+      await activateDtmfFallback(callSid, session?.callConfig || callConfig, session?.gptService, session?.interactionCount || interactionCount, tag);
+    };
+
+    transcriptionService.on('error', (error) => {
+      handleSttFailure('stt_error', error);
+    });
+    transcriptionService.on('close', () => {
+      handleSttFailure('stt_closed');
     });
 
     const sessionPromise = ensureAwsSession(callSid);
@@ -3099,6 +3500,8 @@ app.ws('/aws/stream', (ws, req) => {
       clearNormalFlowState(callSid);
       clearCallEndLock(callSid);
       clearSilenceTimer(callSid);
+      sttFallbackCalls.delete(callSid);
+      streamTimeoutCalls.delete(callSid);
     });
 
     recordCallStatus(callSid, 'in-progress', 'call_in_progress').catch(() => {});
@@ -3121,6 +3524,8 @@ async function handleCallEnd(callSid, callStartTime) {
     clearGptQueue(callSid);
     clearNormalFlowState(callSid);
     clearSpeechTicks(callSid);
+    sttFallbackCalls.delete(callSid);
+    streamTimeoutCalls.delete(callSid);
     const terminalStatuses = new Set(['completed', 'no-answer', 'no_answer', 'busy', 'failed', 'canceled']);
     const normalizeStatus = (value) => String(value || '').toLowerCase().replace(/_/g, '-');
     const initialCallDetails = await db.getCall(callSid);
@@ -3275,7 +3680,9 @@ function generateCallSummary(transcripts, duration) {
 
 function handleTwilioIncoming(req, res) {
   try {
-    warnOnInvalidTwilioSignature(req, '/incoming');
+    if (!requireValidTwilioSignature(req, res, '/incoming')) {
+      return;
+    }
     const host = resolveHost(req);
     if (!host) {
       return res.status(500).send('Server hostname not configured');
@@ -3283,9 +3690,18 @@ function handleTwilioIncoming(req, res) {
     console.log(`Incoming call webhook (${req.method}) from ${req.body?.From || 'unknown'} to ${req.body?.To || 'unknown'} host=${host}`);
     const callSid = req.body?.CallSid;
     if (callSid) {
+      ensureCallRecord(callSid, req.body, 'incoming_webhook').then((callRecord) => {
+        const chatId = callRecord?.user_chat_id || config.telegram?.adminChatId;
+        if (chatId) {
+          webhookService.sendCallStatusUpdate(callSid, 'ringing', chatId, {
+            status_source: 'inbound'
+          }).catch((err) => console.error('Inbound ringing update error:', err));
+        }
+      }).catch((err) => console.error('Inbound call record error:', err));
       const timeout = setTimeout(() => {
         if (!activeCalls.has(callSid)) {
           console.warn(`WebSocket not established for CallSid ${callSid} within 5s of /incoming. Check WSS reachability to ${host}.`);
+          void handleStreamTimeout(callSid, host);
         }
         pendingStreams.delete(callSid);
       }, 5000);
@@ -3293,9 +3709,22 @@ function handleTwilioIncoming(req, res) {
     }
     const response = new VoiceResponse();
     const connect = response.connect();
+    const streamParams = new URLSearchParams();
+    if (req.body?.From) streamParams.set('from', String(req.body.From));
+    if (req.body?.To) streamParams.set('to', String(req.body.To));
+    if (callSid && config.streamAuth?.secret) {
+      const timestamp = String(Date.now());
+      const token = buildStreamAuthToken(callSid, timestamp);
+      if (token) {
+        streamParams.set('token', token);
+        streamParams.set('ts', timestamp);
+      }
+    }
+    const streamQuery = streamParams.toString();
+    const streamUrl = `wss://${host}/connection${streamQuery ? `?${streamQuery}` : ''}`;
     // Request both audio + DTMF events from Twilio Media Streams
     connect.stream({
-      url: `wss://${host}/connection`,
+      url: streamUrl,
       track: TWILIO_STREAM_TRACK,
       statusCallback: `https://${host}/webhook/twilio-stream`,
       statusCallbackMethod: 'POST',
@@ -4185,10 +4614,13 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
     .filter((value) => Number.isFinite(value));
   const durationValue = durationCandidates.length ? Math.max(...durationCandidates) : 0;
 
-  const call = await db.getCall(CallSid);
+  let call = await db.getCall(CallSid);
   if (!call) {
     console.warn(`Webhook received for unknown call: ${CallSid}`);
-    return { ok: false, error: 'call_not_found', callSid: CallSid };
+    call = await ensureCallRecord(CallSid, payload, 'status_webhook');
+    if (!call) {
+      return { ok: false, error: 'call_not_found', callSid: CallSid };
+    }
   }
 
   let notificationType = null;
@@ -4374,7 +4806,9 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
 
 app.post('/webhook/call-status', async (req, res) => {
   try {
-    warnOnInvalidTwilioSignature(req, '/webhook/call-status');
+    if (!requireValidTwilioSignature(req, res, '/webhook/call-status')) {
+      return;
+    }
     await processCallStatusWebhookPayload(req.body, { source: 'provider' });
   } catch (error) {
     console.error('Error processing fixed call status webhook:', error);
@@ -4396,6 +4830,9 @@ app.post('/webhook/call-status', async (req, res) => {
 // Twilio Media Stream status callback
 app.post('/webhook/twilio-stream', (req, res) => {
   try {
+    if (!requireValidTwilioSignature(req, res, '/webhook/twilio-stream')) {
+      return;
+    }
     const payload = req.body || {};
     const callSid = payload.CallSid || payload.callSid || 'unknown';
     const streamSid = payload.StreamSid || payload.streamSid || 'unknown';
@@ -5376,7 +5813,9 @@ app.get('/api/calls/search', async (req, res) => {
 // SMS webhook endpoints
 app.post('/webhook/sms', async (req, res) => {
     try {
-        warnOnInvalidTwilioSignature(req, '/webhook/sms');
+        if (!requireValidTwilioSignature(req, res, '/webhook/sms')) {
+          return;
+        }
         const { From, Body, MessageSid, SmsStatus } = req.body;
 
         console.log(`SMS webhook: ${From} -> ${maskSmsBodyForLog(Body)}`);
@@ -5414,7 +5853,9 @@ app.post('/webhook/sms', async (req, res) => {
 
 app.post('/webhook/sms-status', async (req, res) => {
   try {
-    warnOnInvalidTwilioSignature(req, '/webhook/sms-status');
+    if (!requireValidTwilioSignature(req, res, '/webhook/sms-status')) {
+      return;
+    }
         const { MessageSid, MessageStatus, ErrorCode, ErrorMessage } = req.body;
 
         console.log(`SMS status update: ${MessageSid} -> ${MessageStatus}`);
@@ -5491,6 +5932,7 @@ app.get('/webhook/email-unsubscribe', async (req, res) => {
 
 const twilioGatherHandler = createTwilioGatherHandler({
   warnOnInvalidTwilioSignature,
+  requireTwilioSignature: requireValidTwilioSignature,
   getDigitService: () => digitService,
   callConfigurations,
   config,
@@ -6250,6 +6692,9 @@ app.get('/api/sms/scripts/:scriptName?', async (req, res) => {
 // SMS webhook delivery status notifications (enhanced)
 app.post('/webhook/sms-delivery', async (req, res) => {
     try {
+        if (!requireValidTwilioSignature(req, res, '/webhook/sms-delivery')) {
+          return;
+        }
         const { MessageSid, MessageStatus, ErrorCode, ErrorMessage, To, From } = req.body;
 
         console.log(`📱 SMS Delivery Status: ${MessageSid} -> ${MessageStatus}`);

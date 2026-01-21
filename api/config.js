@@ -63,6 +63,11 @@ const twilioMachineDetectionTimeout = Number.isFinite(Number(twilioMachineDetect
   ? Number(twilioMachineDetectionTimeoutRaw)
   : undefined;
 const twilioTtsMaxWaitMs = Number(readEnv('TWILIO_TTS_MAX_WAIT_MS') || '1200');
+const twilioWebhookValidationRaw = (readEnv('TWILIO_WEBHOOK_VALIDATION') || (isProduction ? 'strict' : 'warn')).toLowerCase();
+const twilioWebhookValidationModes = new Set(['strict', 'warn', 'off']);
+const twilioWebhookValidation = twilioWebhookValidationModes.has(twilioWebhookValidationRaw)
+  ? twilioWebhookValidationRaw
+  : (isProduction ? 'strict' : 'warn');
 
 const callProvider = ensure('CALL_PROVIDER', 'twilio').toLowerCase();
 const awsRegion = ensure('AWS_REGION', 'us-east-1');
@@ -83,6 +88,27 @@ if (!apiHmacSecret) {
   }
   console.warn(`${message} HMAC auth will be disabled.`);
 }
+const streamAuthSecret = readEnv('STREAM_AUTH_SECRET') || apiHmacSecret;
+const streamAuthMaxSkewMs = Number(readEnv('STREAM_AUTH_MAX_SKEW_MS') || apiHmacMaxSkewMs || '300000');
+
+function parseJsonObject(rawValue, label) {
+  if (!rawValue) return {};
+  try {
+    const parsed = JSON.parse(rawValue);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('JSON must be an object');
+    }
+    return parsed;
+  } catch (error) {
+    const tag = label ? ` (${label})` : '';
+    console.warn(`Unable to parse JSON config${tag}: ${error.message}`);
+    return {};
+  }
+}
+
+const inboundDefaultPrompt = readEnv('INBOUND_PROMPT');
+const inboundDefaultFirstMessage = readEnv('INBOUND_FIRST_MESSAGE');
+const inboundRoutes = parseJsonObject(readEnv('INBOUND_NUMBER_ROUTES'), 'INBOUND_NUMBER_ROUTES');
 
 function loadPrivateKey(rawValue) {
   if (!rawValue) {
@@ -113,6 +139,7 @@ const liveConsoleUserLevelThreshold = Number(readEnv('LIVE_CONSOLE_USER_LEVEL_TH
 const liveConsoleUserHoldMs = Number(readEnv('LIVE_CONSOLE_USER_HOLD_MS') || '450');
 const liveConsoleCarrier = readEnv('LIVE_CONSOLE_CARRIER') || 'VOICEDNUT';
 const liveConsoleNetworkLabel = readEnv('LIVE_CONSOLE_NETWORK_LABEL') || 'LTE';
+const telegramAdminChatId = readEnv('TELEGRAM_ADMIN_CHAT_ID') || readEnv('ADMIN_TELEGRAM_ID');
 const emailProvider = (readEnv('EMAIL_PROVIDER') || 'sendgrid').toLowerCase();
 const emailDefaultFrom = readEnv('EMAIL_DEFAULT_FROM') || '';
 const emailVerifiedDomains = (readEnv('EMAIL_VERIFIED_DOMAINS') || '')
@@ -151,7 +178,8 @@ module.exports = {
     gatherFallback: twilioGatherFallback,
     machineDetection: twilioMachineDetection,
     machineDetectionTimeout: twilioMachineDetectionTimeout,
-    ttsMaxWaitMs: Number.isFinite(twilioTtsMaxWaitMs) ? twilioTtsMaxWaitMs : 1200
+    ttsMaxWaitMs: Number.isFinite(twilioTtsMaxWaitMs) ? twilioTtsMaxWaitMs : 1200,
+    webhookValidation: twilioWebhookValidation
   },
   aws: {
     region: awsRegion,
@@ -197,6 +225,7 @@ module.exports = {
   },
   telegram: {
     botToken: ensure('TELEGRAM_BOT_TOKEN', process.env.BOT_TOKEN),
+    adminChatId: telegramAdminChatId
   },
   openRouter: {
     apiKey: ensure('OPENROUTER_API_KEY'),
@@ -283,4 +312,13 @@ module.exports = {
     hmacSecret: apiHmacSecret,
     maxSkewMs: apiHmacMaxSkewMs,
   },
+  streamAuth: {
+    secret: streamAuthSecret,
+    maxSkewMs: streamAuthMaxSkewMs,
+  },
+  inbound: {
+    defaultPrompt: inboundDefaultPrompt,
+    defaultFirstMessage: inboundDefaultFirstMessage,
+    routes: inboundRoutes
+  }
 };

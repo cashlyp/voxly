@@ -39,7 +39,8 @@ const MENU_ACTIONS = new Set([
   'SCRIPTS',
   'PROVIDER_STATUS',
   'STATUS',
-  'USERS'
+  'USERS',
+  'USERS_LIST'
 ]);
 const menuActionStats = {};
 let menuActionCount = 0;

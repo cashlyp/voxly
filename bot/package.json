@@ -4,8 +4,8 @@
   "description": "AI-powered voice calling bot with Mini App interface",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js",
-    "dev": "nodemon bot.js",
+    "start": "node .",
+    "dev": "nodemon .",
     "setup": "node setup-env.js",
     "test": "echo \"No tests configured\""
   },

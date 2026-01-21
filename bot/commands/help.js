@@ -62,10 +62,7 @@ async function handleHelp(ctx) {
 
         if (isOwner) {
             const adminList = [
-                '🛡️ /adduser — add a trusted operator',
-                '⭐ /promote — elevate a teammate to admin',
-                '❌ /removeuser — cut access cleanly',
-                '👥 /users — list all authorized personnel',
+                '👥 /users — manage authorized personnel',
                 '📣 /smssender — bulk SMS center',
                 '📦 /mailer — bulk email center',
                 '🧪 /status — deep system status',
@@ -119,7 +116,6 @@ async function handleHelp(ctx) {
                 if (isOwner) {
                     keyboard.row()
                         .text('👥 Users', buildCallbackData(ctx, 'USERS'))
-                        .text('➕ Add', buildCallbackData(ctx, 'ADDUSER'))
                         .row()
                         .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER_STATUS'));
                 }

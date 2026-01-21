@@ -2,12 +2,11 @@
   "name": "api",
   "version": "1.1.0",
   "description": "",
-  "main": "index.js",
+  "main": "app.js",
   "scripts": {
-    "test": "jest",
-    "db:migrate": "node scripts/db-migrate.js",
-    "dev": "npm run db:migrate && nodemon app.js",
-    "start": "npm run db:migrate && node app.js",
+    "test": "echo No tests configured",
+    "dev": "nodemon .",
+    "start": "node .",
     "setup": "node setup-env.js"
   },
   "keywords": [],

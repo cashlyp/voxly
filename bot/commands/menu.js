@@ -33,14 +33,9 @@ async function handleMenu(ctx) {
                 .text('📧 Mailer', buildCallbackData(ctx, 'BULK_EMAIL'))
                 .row()
                 .text('👥 Users', buildCallbackData(ctx, 'USERS'))
-                .text('➕ Add', buildCallbackData(ctx, 'ADDUSER'))
-                .row()
-                .text('⬆️ Promote', buildCallbackData(ctx, 'PROMOTE'))
-                .text('❌ Remove', buildCallbackData(ctx, 'REMOVE'))
-                .row()
                 .text('🧰 Scripts', buildCallbackData(ctx, 'SCRIPTS'))
-                .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER_STATUS'))
                 .row()
+                .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER_STATUS'))
                 .text('🔍 Status', buildCallbackData(ctx, 'STATUS'));
         } else if (!access.user) {
             const adminUsername = (config.admin.username || '').replace(/^@/, '');
