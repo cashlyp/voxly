@@ -78,6 +78,9 @@ class EnhancedWebhookService {
     this.pendingTerminalTimers = new Map();
     this.terminalQuietMs = 8000;
     this.pendingTranscriptNotifs = new Map();
+    this.retryBaseMs = Number(config.webhook?.retryBaseMs) || 5000;
+    this.retryMaxMs = Number(config.webhook?.retryMaxMs) || 60000;
+    this.retryMaxAttempts = Number(config.webhook?.retryMaxAttempts) || 5;
     this.pendingTranscriptTimers = new Map();
     this.transcriptRetryMs = 3000;
     this.transcriptMaxWaitMs = 10 * 60 * 1000;
@@ -326,6 +329,20 @@ class EnhancedWebhookService {
     console.log('Enhanced webhook service stopped');
   }
 
+  getRetryDelayMs(retryCount) {
+    const attempt = Math.max(0, Number(retryCount) || 0);
+    const base = this.retryBaseMs;
+    const max = this.retryMaxMs;
+    const rawDelay = base * Math.pow(2, attempt);
+    const jitter = Math.floor(Math.random() * Math.min(1000, base));
+    return Math.min(rawDelay + jitter, max);
+  }
+
+  computeNextAttemptAt(retryCount) {
+    const delay = this.getRetryDelayMs(retryCount);
+    return new Date(Date.now() + delay).toISOString();
+  }
+
   // Track call progression and prevent out-of-order status updates
   shouldSendStatus(call_sid, newStatus) {
     const currentStatusInfo = this.activeCallStatus.get(call_sid);
@@ -393,7 +410,7 @@ class EnhancedWebhookService {
     }
 
     try {
-      const notifications = await this.db.getEnhancedPendingWebhookNotifications(50);
+      const notifications = await this.db.getEnhancedPendingWebhookNotifications(50, this.retryMaxAttempts);
       
       if (notifications.length === 0) return;
 
@@ -961,14 +978,22 @@ class EnhancedWebhookService {
 
     } catch (error) {
       console.error(`❌ Failed to send notification ${id}:`, error.message);
-      await this.db.updateEnhancedWebhookNotification(id, 'failed', error.message, null);
+      const retryCount = Number(notification.retry_count) || 0;
+      const shouldRetry = retryCount + 1 < this.retryMaxAttempts;
+      const status = shouldRetry ? 'retrying' : 'failed';
+      const nextAttemptAt = shouldRetry ? this.computeNextAttemptAt(retryCount) : null;
+      await this.db.updateEnhancedWebhookNotification(id, status, error.message, null, {
+        nextAttemptAt
+      });
       
-      // For critical failures, try to send error notification to user
-      if (['call_failed', 'call_transcript'].includes(notification_type)) {
-        try {
-          await this.sendTelegramMessage(telegram_chat_id, `❌ Error processing ${notification_type.replace('_', ' ')}`);
-        } catch (errorNotificationError) {
-          console.error('Failed to send error notification:', errorNotificationError);
+      if (!shouldRetry) {
+        // For critical failures, try to send error notification to user
+        if (['call_failed', 'call_transcript'].includes(notification_type)) {
+          try {
+            await this.sendTelegramMessage(telegram_chat_id, `❌ Error processing ${notification_type.replace('_', ' ')}`);
+          } catch (errorNotificationError) {
+            console.error('Failed to send error notification:', errorNotificationError);
+          }
         }
       }
     }
@@ -1214,7 +1239,8 @@ class EnhancedWebhookService {
     return {
       victimName: label,
       phoneNumber: phoneNumber || 'Unknown',
-      script: state?.script || details?.script || '—'
+      script: state?.script || details?.script || '—',
+      inbound: state?.inbound === true
     };
   }
 
@@ -1238,6 +1264,7 @@ class EnhancedWebhookService {
       lastEvents: [],
       previewTurns: { user: '—', agent: '—' },
       victimName: meta.victimName || 'Unknown',
+      inbound: meta.inbound === true,
       phoneNumber: meta.phoneNumber || 'Unknown',
       script: meta.script || '—',
       waveformIndex: 0,
@@ -1263,10 +1290,10 @@ class EnhancedWebhookService {
     return entry;
   }
 
-  getConsoleStatusLabel(status) {
+  getConsoleStatusLabel(status, inbound = false) {
     const map = {
       initiated: '📡 Initiated',
-      ringing: '🔔 Ringing…',
+      ringing: inbound ? '🔔 Incoming…' : '🔔 Ringing…',
       answered: '📞 Picked up',
       'in-progress': '☎️ In progress',
       completed: '🟢 Completed',
@@ -1564,11 +1591,11 @@ class EnhancedWebhookService {
     const entry = this.liveConsoleByCallSid.get(callSid);
     if (!entry) return;
 
-    entry.status = this.getConsoleStatusLabel(status);
+    entry.status = this.getConsoleStatusLabel(status, entry.inbound);
     if (statusSource) {
       entry.statusSource = statusSource;
     }
-    const statusEvent = this.statusEventText(status, entry.victimName);
+    const statusEvent = this.statusEventText(status, entry.victimName, entry.inbound);
     if (['answered', 'in-progress'].includes(status) && !entry.pickedUpAt) {
       entry.pickedUpAt = new Date();
       entry.phase = this.getConsolePhaseLabel('listening');
@@ -1839,11 +1866,11 @@ class EnhancedWebhookService {
     return String(text || '').replace(/\s+/g, ' ').trim();
   }
 
-  statusEventText(status, victimName) {
+  statusEventText(status, victimName, inbound = false) {
     const name = victimName || 'victim';
     const map = {
       initiated: `📡 Connecting to ${name}…`,
-      ringing: `🔔 Ringing ${name}…`,
+      ringing: inbound ? `🔔 Incoming call from ${name}…` : `🔔 Ringing ${name}…`,
       answered: `📞 ${name} picked up`,
       'in-progress': `☎️ Connected`,
       completed: `🟢 Call ended`,

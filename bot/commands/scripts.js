@@ -755,6 +755,25 @@ async function fetchCallScriptById(id) {
   return data.script;
 }
 
+async function fetchInboundDefaultScript() {
+  const data = await scriptsApiRequest({ method: 'get', url: '/api/inbound/default-script' });
+  return data || {};
+}
+
+async function setInboundDefaultScript(scriptId) {
+  const data = await scriptsApiRequest({
+    method: 'put',
+    url: '/api/inbound/default-script',
+    data: { script_id: scriptId }
+  });
+  return data;
+}
+
+async function clearInboundDefaultScript() {
+  const data = await scriptsApiRequest({ method: 'delete', url: '/api/inbound/default-script' });
+  return data;
+}
+
 async function createCallScript(payload) {
   const data = await scriptsApiRequest({ method: 'post', url: '/api/call-scripts', data: payload });
   return data.script;
@@ -1410,6 +1429,111 @@ async function listCallScriptsFlow(conversation, ctx, ensureActive) {
   }
 }
 
+async function inboundDefaultScriptMenu(conversation, ctx, ensureActive) {
+  const safeEnsureActive = typeof ensureActive === 'function'
+    ? ensureActive
+    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  let open = true;
+  while (open) {
+    let current = null;
+    try {
+      current = await fetchInboundDefaultScript();
+      safeEnsureActive();
+    } catch (error) {
+      console.error('Failed to fetch inbound default script:', error);
+      await ctx.reply(formatScriptsApiError(error, 'Failed to load inbound default script'));
+      return;
+    }
+
+    const currentLabel = current?.mode === 'script' && current?.script
+      ? `📥 Current inbound default: ${current.script.name} (ID ${current.script_id})`
+      : '📥 Current inbound default: Built-in default';
+    const previewLine = current?.mode === 'script' && current?.script?.first_message
+      ? `🗨️ First message: ${current.script.first_message.slice(0, 140)}${current.script.first_message.length > 140 ? '…' : ''}`
+      : null;
+
+    const action = await askOptionWithButtons(
+      conversation,
+      ctx,
+      `${currentLabel}${previewLine ? `\n${previewLine}` : ''}\n\nChoose an action.`,
+      [
+        { id: 'set', label: '✅ Set default' },
+        { id: 'clear', label: '↩️ Revert to built-in' },
+        { id: 'back', label: '⬅️ Back' }
+      ],
+      { prefix: 'inbound-default', columns: 1, ensureActive: safeEnsureActive }
+    );
+
+    switch (action.id) {
+      case 'set': {
+        let scripts;
+        try {
+          scripts = await fetchCallScripts();
+          safeEnsureActive();
+        } catch (error) {
+          console.error('Failed to fetch call scripts:', error);
+          await ctx.reply(formatScriptsApiError(error, 'Failed to load call scripts'));
+          break;
+        }
+
+        if (!scripts.length) {
+          await ctx.reply('ℹ️ No call scripts available. Create one first.');
+          break;
+        }
+
+        const options = scripts.map((script) => ({
+          id: script.id.toString(),
+          label: `📄 ${script.name}`
+        }));
+        options.push({ id: 'back', label: '⬅️ Back' });
+
+        const selection = await askOptionWithButtons(
+          conversation,
+          ctx,
+          'Select a script to use as the inbound default.',
+          options,
+          { prefix: 'inbound-default-select', columns: 1, ensureActive: safeEnsureActive }
+        );
+
+        if (!selection || !selection.id || selection.id === 'back') {
+          break;
+        }
+
+        const scriptId = Number(selection.id);
+        if (Number.isNaN(scriptId)) {
+          await ctx.reply('❌ Invalid script selection.');
+          break;
+        }
+
+        try {
+          const result = await setInboundDefaultScript(scriptId);
+          safeEnsureActive();
+          await ctx.reply(`✅ Inbound default set to ${result?.script?.name || 'selected script'}.`);
+        } catch (error) {
+          console.error('Failed to set inbound default script:', error);
+          await ctx.reply(formatScriptsApiError(error, 'Failed to set inbound default script'));
+        }
+        break;
+      }
+      case 'clear':
+        try {
+          await clearInboundDefaultScript();
+          safeEnsureActive();
+          await ctx.reply('✅ Inbound default reverted to built-in settings.');
+        } catch (error) {
+          console.error('Failed to clear inbound default script:', error);
+          await ctx.reply(formatScriptsApiError(error, 'Failed to clear inbound default script'));
+        }
+        break;
+      case 'back':
+        open = false;
+        break;
+      default:
+        break;
+    }
+  }
+}
+
 async function callScriptsMenu(conversation, ctx, ensureActive) {
   const safeEnsureActive = typeof ensureActive === 'function'
     ? ensureActive
@@ -1423,6 +1547,7 @@ async function callScriptsMenu(conversation, ctx, ensureActive) {
       [
         { id: 'list', label: '📄 List scripts' },
         { id: 'create', label: '➕ Create script' },
+        { id: 'incoming', label: '📥 Incoming default' },
         { id: 'back', label: '⬅️ Back' }
       ],
       { prefix: 'call-script-main', columns: 1, ensureActive: safeEnsureActive }
@@ -1434,6 +1559,9 @@ async function callScriptsMenu(conversation, ctx, ensureActive) {
         break;
       case 'create':
         await createCallScriptFlow(conversation, ctx, safeEnsureActive);
+        break;
+      case 'incoming':
+        await inboundDefaultScriptMenu(conversation, ctx, safeEnsureActive);
         break;
       case 'back':
         open = false;

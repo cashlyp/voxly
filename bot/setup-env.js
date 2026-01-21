@@ -21,15 +21,9 @@ const SECTIONS = [
     ],
   },
   {
-    comments: ['# Bot admin API token (must match API ADMIN_API_TOKEN)'],
+    comments: ['# API secret (must match API_SECRET on server)'],
     fields: [
-      { key: 'ADMIN_API_TOKEN', prompt: 'Admin API Token', defaultValue: 'change-me' },
-    ],
-  },
-  {
-    comments: ['# API request signing (must match API_HMAC_SECRET)'],
-    fields: [
-      { key: 'API_HMAC_SECRET', prompt: 'API HMAC Secret', defaultValue: 'change-me' },
+      { key: 'API_SECRET', prompt: 'API Secret', defaultValue: 'change-me' },
     ],
   },
 ];

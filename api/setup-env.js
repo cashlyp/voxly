@@ -14,15 +14,9 @@ const SECTIONS = [
     ],
   },
   {
-    comments: ['# Admin API token for secure provider switching'],
+    comments: ['# API secret (shared for admin + HMAC signing)'],
     fields: [
-      { key: 'ADMIN_API_TOKEN', prompt: 'Admin API token (used by bot for provider switching)', defaultValue: 'change-me' },
-    ],
-  },
-  {
-    comments: ['# API request signing (shared with bot)'],
-    fields: [
-      { key: 'API_HMAC_SECRET', prompt: 'API HMAC Secret', defaultValue: 'change-me' },
+      { key: 'API_SECRET', prompt: 'API Secret', defaultValue: 'change-me' },
       { key: 'API_HMAC_MAX_SKEW_MS', prompt: 'API HMAC max skew (ms)', defaultValue: '300000' },
     ],
   },

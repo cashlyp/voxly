@@ -71,7 +71,8 @@ const twilioWebhookValidation = twilioWebhookValidationModes.has(twilioWebhookVa
 
 const callProvider = ensure('CALL_PROVIDER', 'twilio').toLowerCase();
 const awsRegion = ensure('AWS_REGION', 'us-east-1');
-const adminApiToken = readEnv('ADMIN_API_TOKEN');
+const apiSecret = readEnv('API_SECRET');
+const adminApiToken = apiSecret || readEnv('ADMIN_API_TOKEN');
 const complianceModeRaw = (readEnv('CONFIG_COMPLIANCE_MODE') || 'safe').toLowerCase();
 const allowedComplianceModes = new Set(['safe', 'dev_insecure']);
 const complianceMode = allowedComplianceModes.has(complianceModeRaw) ? complianceModeRaw : 'safe';
@@ -79,10 +80,10 @@ if (!allowedComplianceModes.has(complianceModeRaw) && !isProduction) {
   console.warn(`Invalid CONFIG_COMPLIANCE_MODE "${complianceModeRaw}". Falling back to "safe".`);
 }
 const dtmfEncryptionKey = readEnv('DTMF_ENCRYPTION_KEY');
-const apiHmacSecret = readEnv('API_HMAC_SECRET');
+const apiHmacSecret = apiSecret || readEnv('API_HMAC_SECRET');
 const apiHmacMaxSkewMs = Number(readEnv('API_HMAC_MAX_SKEW_MS') || '300000');
 if (!apiHmacSecret) {
-  const message = 'Missing required environment variable "API_HMAC_SECRET".';
+  const message = 'Missing required environment variable "API_SECRET" (or legacy API_HMAC_SECRET).';
   if (isProduction) {
     throw new Error(message);
   }
@@ -109,6 +110,12 @@ function parseJsonObject(rawValue, label) {
 const inboundDefaultPrompt = readEnv('INBOUND_PROMPT');
 const inboundDefaultFirstMessage = readEnv('INBOUND_FIRST_MESSAGE');
 const inboundRoutes = parseJsonObject(readEnv('INBOUND_NUMBER_ROUTES'), 'INBOUND_NUMBER_ROUTES');
+const inboundPreConnectMessage = readEnv('INBOUND_PRECONNECT_MESSAGE');
+const inboundPreConnectPauseSeconds = Number(readEnv('INBOUND_PRECONNECT_PAUSE_S') || '1');
+const inboundFirstMediaTimeoutMs = Number(readEnv('INBOUND_STREAM_FIRST_MEDIA_TIMEOUT_MS') || '8000');
+const webhookRetryBaseMs = Number(readEnv('WEBHOOK_RETRY_BASE_MS') || '5000');
+const webhookRetryMaxMs = Number(readEnv('WEBHOOK_RETRY_MAX_MS') || '60000');
+const webhookRetryMaxAttempts = Number(readEnv('WEBHOOK_RETRY_MAX_ATTEMPTS') || '5');
 
 function loadPrivateKey(rawValue) {
   if (!rawValue) {
@@ -319,6 +326,14 @@ module.exports = {
   inbound: {
     defaultPrompt: inboundDefaultPrompt,
     defaultFirstMessage: inboundDefaultFirstMessage,
-    routes: inboundRoutes
+    routes: inboundRoutes,
+    preConnectMessage: inboundPreConnectMessage,
+    preConnectPauseSeconds: inboundPreConnectPauseSeconds,
+    firstMediaTimeoutMs: inboundFirstMediaTimeoutMs
+  },
+  webhook: {
+    retryBaseMs: webhookRetryBaseMs,
+    retryMaxMs: webhookRetryMaxMs,
+    retryMaxAttempts: webhookRetryMaxAttempts
   }
 };

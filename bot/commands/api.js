@@ -159,12 +159,16 @@ async function handleStatusCommand(ctx) {
         await ctx.reply('🔍 Checking system status...');
 
         const startTime = Date.now();
+        const healthHeaders = {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        };
+        if (config.admin?.apiToken) {
+            healthHeaders['x-admin-token'] = config.admin.apiToken;
+        }
         const response = await httpClient.get(null, `${config.apiUrl}/health`, {
             timeout: 15000,
-            headers: {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json'
-            }
+            headers: healthHeaders
         });
         const responseTime = Date.now() - startTime;
 
@@ -226,6 +230,20 @@ async function handleStatusCommand(ctx) {
             message += `${buildLine('🧠', 'Adaptation Engine', '✅ Active')}\n`;
             message += `${buildLine('🧩', 'Function Scripts', health.adaptation_engine.available_scripts || 0)}\n`;
             message += `${buildLine('⚙️', 'Active Systems', health.adaptation_engine.active_function_systems || 0)}\n`;
+        }
+
+        if (health.inbound_defaults || health.inbound_env_defaults) {
+            message += `\n*📥 Inbound Defaults:*\n`;
+            const inbound = health.inbound_defaults || {};
+            if (inbound.mode === 'script') {
+                message += `${buildLine('📄', 'Default Script', `${escapeMarkdown(inbound.name || 'Unnamed')} (${escapeMarkdown(String(inbound.script_id || ''))})`)}\n`;
+            } else {
+                message += `${buildLine('📄', 'Default Script', 'Built-in')}\n`;
+            }
+            const envDefaults = health.inbound_env_defaults || {};
+            const envPrompt = envDefaults.prompt ? 'set' : 'unset';
+            const envFirst = envDefaults.first_message ? 'set' : 'unset';
+            message += `${buildLine('⚙️', 'Env Defaults', `prompt: ${envPrompt}, first_message: ${envFirst}`)}\n`;
         }
 
         if (health.enhanced_features) {

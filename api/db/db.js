@@ -139,6 +139,8 @@ class EnhancedDatabase {
                 error_message TEXT,
                 retry_count INTEGER DEFAULT 0,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_attempt_at DATETIME,
+                next_attempt_at DATETIME,
                 sent_at DATETIME,
                 delivery_time_ms INTEGER,
                 telegram_message_id INTEGER,
@@ -167,6 +169,13 @@ class EnhancedDatabase {
                 status TEXT NOT NULL,
                 details TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            // Application settings
+            `CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
 
             // Call performance metrics
@@ -209,6 +218,7 @@ class EnhancedDatabase {
 
         await this.ensureCallColumns(['digit_summary', 'digit_count', 'last_otp', 'last_otp_masked']);
         await this.ensureTemplateColumns(['requires_otp', 'default_profile', 'expected_length', 'allow_terminator', 'terminator_char']);
+        await this.ensureNotificationColumns(['last_attempt_at', 'next_attempt_at']);
 
         // Create comprehensive indexes for optimal performance
         const indexes = [
@@ -245,6 +255,7 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_notifications_created_at ON webhook_notifications(created_at)',
             'CREATE INDEX IF NOT EXISTS idx_notifications_chat_id ON webhook_notifications(telegram_chat_id)',
             'CREATE INDEX IF NOT EXISTS idx_notifications_priority ON webhook_notifications(priority)',
+            'CREATE INDEX IF NOT EXISTS idx_notifications_next_attempt ON webhook_notifications(next_attempt_at)',
             
             // Metrics indexes
             'CREATE INDEX IF NOT EXISTS idx_metrics_date ON notification_metrics(date)',
@@ -393,6 +404,39 @@ class EnhancedDatabase {
             });
             stmt.finalize();
         });
+    }
+
+    async ensureNotificationColumns(columns = []) {
+        if (!columns.length) return;
+        const existing = await new Promise((resolve, reject) => {
+            this.db.all('PRAGMA table_info(webhook_notifications)', (err, rows) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(rows || []);
+                }
+            });
+        });
+        const existingNames = new Set(existing.map((row) => row.name));
+        const addColumn = (name, definition) => new Promise((resolve, reject) => {
+            this.db.run(`ALTER TABLE webhook_notifications ADD COLUMN ${name} ${definition}`, (err) => {
+                if (err) {
+                    if (String(err.message || '').includes('duplicate')) resolve();
+                    else reject(err);
+                } else {
+                    resolve();
+                }
+            });
+        });
+
+        for (const column of columns) {
+            if (existingNames.has(column)) continue;
+            if (column === 'last_attempt_at') {
+                await addColumn('last_attempt_at', 'DATETIME');
+            } else if (column === 'next_attempt_at') {
+                await addColumn('next_attempt_at', 'DATETIME');
+            }
+        }
     }
 
     // Enhanced status update with comprehensive tracking
@@ -756,6 +800,35 @@ class EnhancedDatabase {
         });
     }
 
+    async getSetting(key) {
+        return new Promise((resolve, reject) => {
+            this.db.get('SELECT value FROM app_settings WHERE key = ?', [key], (err, row) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(row?.value ?? null);
+                }
+            });
+        });
+    }
+
+    async setSetting(key, value) {
+        return new Promise((resolve, reject) => {
+            const stmt = this.db.prepare(`
+                INSERT OR REPLACE INTO app_settings (key, value, updated_at)
+                VALUES (?, ?, datetime('now'))
+            `);
+            stmt.run([key, value], function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.changes);
+                }
+            });
+            stmt.finalize();
+        });
+    }
+
     // Enhanced webhook notification creation with priority
     async createEnhancedWebhookNotification(call_sid, notification_type, telegram_chat_id, priority = 'normal') {
         return new Promise((resolve, reject) => {
@@ -781,9 +854,11 @@ class EnhancedDatabase {
     }
 
     // Enhanced webhook notification update with delivery metrics
-    async updateEnhancedWebhookNotification(id, status, error_message = null, telegram_message_id = null) {
+    async updateEnhancedWebhookNotification(id, status, error_message = null, telegram_message_id = null, options = {}) {
         return new Promise((resolve, reject) => {
             const sent_at = status === 'sent' ? new Date().toISOString() : null;
+            const last_attempt_at = options.lastAttemptAt || new Date().toISOString();
+            const next_attempt_at = options.nextAttemptAt || null;
             
             // Calculate delivery time if we're marking as sent
             if (status === 'sent') {
@@ -802,11 +877,12 @@ class EnhancedDatabase {
                     const stmt = this.db.prepare(`
                         UPDATE webhook_notifications 
                         SET status = ?, error_message = ?, sent_at = ?, 
-                            telegram_message_id = ?, delivery_time_ms = ?
+                            telegram_message_id = ?, delivery_time_ms = ?, 
+                            last_attempt_at = ?, next_attempt_at = ?
                         WHERE id = ?
                     `);
                     
-                    stmt.run([status, error_message, sent_at, telegram_message_id, delivery_time_ms, id], function(err) {
+                    stmt.run([status, error_message, sent_at, telegram_message_id, delivery_time_ms, last_attempt_at, null, id], function(err) {
                         if (err) {
                             reject(err);
                         } else {
@@ -818,11 +894,12 @@ class EnhancedDatabase {
             } else {
                 const stmt = this.db.prepare(`
                     UPDATE webhook_notifications 
-                    SET status = ?, error_message = ?, retry_count = retry_count + 1
+                    SET status = ?, error_message = ?, retry_count = retry_count + 1,
+                        last_attempt_at = ?, next_attempt_at = ?
                     WHERE id = ?
                 `);
                 
-                stmt.run([status, error_message, id], function(err) {
+                stmt.run([status, error_message, last_attempt_at, next_attempt_at, id], function(err) {
                     if (err) {
                         reject(err);
                     } else {
@@ -840,7 +917,7 @@ class EnhancedDatabase {
     }
 
     // Enhanced pending notifications with priority and retry logic
-    async getEnhancedPendingWebhookNotifications(limit = 50) {
+    async getEnhancedPendingWebhookNotifications(limit = 50, maxRetries = 3) {
         return new Promise((resolve, reject) => {
             const sql = `
                 SELECT 
@@ -854,7 +931,8 @@ class EnhancedDatabase {
                 FROM webhook_notifications wn
                 JOIN calls c ON wn.call_sid = c.call_sid
                 WHERE wn.status IN ('pending', 'retrying')
-                    AND wn.retry_count < 3
+                    AND wn.retry_count < ?
+                    AND (wn.next_attempt_at IS NULL OR wn.next_attempt_at <= datetime('now'))
                 ORDER BY 
                     CASE wn.priority
                         WHEN 'urgent' THEN 1
@@ -873,7 +951,7 @@ class EnhancedDatabase {
                 LIMIT ?
             `;
             
-            this.db.all(sql, [limit], (err, rows) => {
+            this.db.all(sql, [maxRetries, limit], (err, rows) => {
                 if (err) {
                     reject(err);
                 } else {
