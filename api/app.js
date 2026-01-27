@@ -80,11 +80,17 @@ const streamStopSeen = new Set(); // callSid:streamSid (dedupe stops)
 const streamRetryState = new Map(); // callSid -> { attempts, nextDelayMs }
 const streamAuthBypass = new Map(); // callSid -> { reason, at }
 const streamStatusDedupe = new Map(); // callSid:streamSid:event -> ts
+const callStatusDedupe = new Map(); // callSid:status:sequence:timestamp -> ts
+const callLifecycle = new Map(); // callSid -> { status, updatedAt }
 const streamLastMediaAt = new Map(); // callSid -> timestamp
 const sttLastFrameAt = new Map(); // callSid -> timestamp
 const streamWatchdogState = new Map(); // callSid -> { noMediaNotifiedAt, noMediaEscalatedAt, sttNotifiedAt }
 const providerHealth = new Map();
 let callJobProcessing = false;
+const callLifecycleCleanupTimers = new Map();
+
+const CALL_STATUS_DEDUPE_MS = 3000;
+const CALL_STATUS_DEDUPE_MAX = 5000;
 
 function stableStringify(value) {
   if (value === null || typeof value !== 'object') {
@@ -107,6 +113,80 @@ function purgeStreamStatusDedupe(callSid) {
       streamStatusDedupe.delete(key);
     }
   }
+}
+
+function pruneDedupeMap(map, maxSize) {
+  if (map.size <= maxSize) return;
+  const entries = [...map.entries()].sort((a, b) => a[1] - b[1]);
+  const overflow = entries.length - maxSize;
+  for (let i = 0; i < overflow; i += 1) {
+    map.delete(entries[i][0]);
+  }
+}
+
+function buildCallStatusDedupeKey(payload = {}) {
+  const callSid = payload.CallSid || payload.callSid || 'unknown';
+  const status = normalizeCallStatus(payload.CallStatus || payload.callStatus || 'unknown');
+  const sequence = payload.SequenceNumber || payload.sequenceNumber || payload.Sequence || payload.sequence || '';
+  const timestamp = payload.Timestamp || payload.timestamp || payload.EventTimestamp || payload.eventTimestamp || '';
+  return `${callSid}:${status}:${sequence}:${timestamp}`;
+}
+
+function shouldProcessCallStatusPayload(payload = {}, options = {}) {
+  if (options.skipDedupe) return true;
+  const callSid = payload.CallSid || payload.callSid;
+  if (!callSid) return true;
+  const key = buildCallStatusDedupeKey(payload);
+  const now = Date.now();
+  const lastSeen = callStatusDedupe.get(key);
+  if (lastSeen && now - lastSeen < CALL_STATUS_DEDUPE_MS) {
+    return false;
+  }
+  callStatusDedupe.set(key, now);
+  pruneDedupeMap(callStatusDedupe, CALL_STATUS_DEDUPE_MAX);
+  return true;
+}
+
+function purgeCallStatusDedupe(callSid) {
+  if (!callSid) return;
+  const prefix = `${callSid}:`;
+  for (const key of callStatusDedupe.keys()) {
+    if (key.startsWith(prefix)) {
+      callStatusDedupe.delete(key);
+    }
+  }
+}
+
+function recordCallLifecycle(callSid, status, meta = {}) {
+  if (!callSid || !status) return false;
+  const normalized = normalizeCallStatus(status);
+  const prev = callLifecycle.get(callSid)?.status;
+  if (prev === normalized) return false;
+  const updatedAt = new Date().toISOString();
+  callLifecycle.set(callSid, { status: normalized, updatedAt });
+  db?.updateCallState?.(callSid, `status_${normalized}`, {
+    status: normalized,
+    prev_status: prev || null,
+    source: meta.source || null,
+    raw_status: meta.raw_status || meta.rawStatus || null,
+    answered_by: meta.answered_by || meta.answeredBy || null,
+    duration: meta.duration || null,
+    at: updatedAt
+  }).catch(() => {});
+  return true;
+}
+
+function scheduleCallLifecycleCleanup(callSid, delayMs = 10 * 60 * 1000) {
+  if (!callSid) return;
+  if (callLifecycleCleanupTimers.has(callSid)) {
+    clearTimeout(callLifecycleCleanupTimers.get(callSid));
+  }
+  const timer = setTimeout(() => {
+    callLifecycleCleanupTimers.delete(callSid);
+    purgeCallStatusDedupe(callSid);
+    callLifecycle.delete(callSid);
+  }, delayMs);
+  callLifecycleCleanupTimers.set(callSid, timer);
 }
 
 function normalizeBodyForSignature(req) {
@@ -1615,6 +1695,15 @@ function buildTwilioStreamTwiml(hostname, options = {}) {
   return response.toString();
 }
 
+function buildInboundHoldTwiml(hostname) {
+  const response = new VoiceResponse();
+  const host = hostname || config.server.hostname;
+  const pauseSeconds = 10;
+  response.pause({ length: pauseSeconds });
+  response.redirect({ method: 'POST' }, `https://${host}/incoming?wait=1`);
+  return response.toString();
+}
+
 function shouldBypassHmac(req) {
   const path = req.path || '';
   if (!path) return false;
@@ -2579,11 +2668,26 @@ async function endCallForProvider(callSid) {
   throw new Error(`Unsupported provider ${provider}`);
 }
 
-if (webhookService?.setCallTerminator) {
-  webhookService.setCallTerminator(async (callSid) => {
-    await endCallForProvider(callSid);
-  });
+async function connectInboundCall(callSid, hostOverride = null) {
+  const callConfig = callConfigurations.get(callSid);
+  const provider = callConfig?.provider || currentProvider;
+  if (provider !== 'twilio') {
+    throw new Error('Inbound answer is only supported for Twilio');
+  }
+  const host = hostOverride || config.server?.hostname;
+  if (!host) {
+    throw new Error('Server hostname not configured');
+  }
+  const accountSid = config.twilio.accountSid;
+  const authToken = config.twilio.authToken;
+  if (!accountSid || !authToken) {
+    throw new Error('Twilio credentials not configured');
+  }
+  const client = twilio(accountSid, authToken);
+  const url = `https://${host}/incoming?answer=1`;
+  await client.calls(callSid).update({ url, method: 'POST' });
 }
+
 
 function estimateSpeechDurationMs(text = '') {
   const words = String(text || '').trim().split(/\s+/).filter(Boolean).length;
@@ -2703,6 +2807,16 @@ async function recordCallStatus(callSid, status, notificationType, extra = {}) {
   });
   const finalStatus = applyStatus ? normalizedStatus : normalizeCallStatus(previousStatus || normalizedStatus);
   await db.updateCallStatus(callSid, finalStatus, extra);
+  if (applyStatus) {
+    recordCallLifecycle(callSid, finalStatus, {
+      source: 'internal',
+      raw_status: status,
+      duration: extra?.duration
+    });
+    if (isTerminalStatusKey(finalStatus)) {
+      scheduleCallLifecycleCleanup(callSid);
+    }
+  }
   if (call?.user_chat_id && notificationType && applyStatus) {
     await db.createEnhancedWebhookNotification(callSid, notificationType, call.user_chat_id);
   }
@@ -4274,6 +4388,13 @@ async function handleCallEnd(callSid, callStartTime) {
     streamAuthBypass.delete(callSid);
     streamRetryState.delete(callSid);
     purgeStreamStatusDedupe(callSid);
+    purgeCallStatusDedupe(callSid);
+    callLifecycle.delete(callSid);
+    const lifecycleTimer = callLifecycleCleanupTimers.get(callSid);
+    if (lifecycleTimer) {
+      clearTimeout(lifecycleTimer);
+      callLifecycleCleanupTimers.delete(callSid);
+    }
     const terminalStatuses = new Set(['completed', 'no-answer', 'no_answer', 'busy', 'failed', 'canceled']);
     const normalizeStatus = (value) => String(value || '').toLowerCase().replace(/_/g, '-');
     const initialCallDetails = await db.getCall(callSid);
@@ -4531,6 +4652,22 @@ async function handleTwilioIncoming(req, res) {
             status_source: 'inbound'
           }).catch((err) => console.error('Inbound ringing update error:', err));
         }
+
+        const gateStatus = webhookService.getInboundGate?.(callSid)?.status || 'pending';
+        const answerOverride = ['1', 'true', 'yes'].includes(String(req.query?.answer || '').toLowerCase());
+        if (gateStatus === 'declined') {
+          const declinedResponse = new VoiceResponse();
+          declinedResponse.hangup();
+          res.type('text/xml');
+          res.end(declinedResponse.toString());
+          return;
+        }
+        if (!answerOverride && gateStatus !== 'answered') {
+          const holdTwiml = buildInboundHoldTwiml(host);
+          res.type('text/xml');
+          res.end(holdTwiml);
+          return;
+        }
       }
       const timeoutMs = 30000;
       const timeout = setTimeout(async () => {
@@ -4629,63 +4766,13 @@ app.post('/webhook/telegram', async (req, res) => {
     if (prefix === 'lc') {
       action = parts[1];
       callSid = parts[2];
-    } else if (prefix === 'recap' || prefix === 'retry' || prefix === 'inb') {
+    } else if (prefix === 'recap' || prefix === 'retry') {
       action = parts[1];
       callSid = parts[2];
     } else {
       callSid = parts[1];
     }
-    if (!prefix || !callSid || ((prefix === 'lc' || prefix === 'inb') && !action)) {
-      webhookService.answerCallbackQuery(cb.id, 'Unsupported action').catch(() => {});
-      return;
-    }
-
-    if (prefix === 'inb') {
-      const chatId = cb.message?.chat?.id;
-      const gate = webhookService.getInboundGate(callSid);
-      if (!gate) {
-        webhookService.answerCallbackQuery(cb.id, 'Prompt expired').catch(() => {});
-        return;
-      }
-      if (gate.status === 'answered' || gate.status === 'declined') {
-        webhookService.answerCallbackQuery(cb.id, 'Already handled').catch(() => {});
-        return;
-      }
-      if (action === 'answer') {
-        webhookService.clearInboundGateTimer?.(callSid);
-        webhookService.setInboundGate(callSid, 'answered', {
-          chatId,
-          messageId: gate.messageId || cb.message?.message_id
-        });
-        await webhookService.resolveInboundPrompt(callSid, 'answered');
-        await webhookService.openInboundConsole(callSid, chatId);
-        webhookService.answerCallbackQuery(cb.id, 'Live console opened').catch(() => {});
-        return;
-      }
-      if (action === 'decline') {
-        webhookService.clearInboundGateTimer?.(callSid);
-        webhookService.setInboundGate(callSid, 'declined', {
-          chatId,
-          messageId: gate.messageId || cb.message?.message_id
-        });
-        await webhookService.resolveInboundPrompt(callSid, 'declined');
-        webhookService.answerCallbackQuery(cb.id, 'Call declined').catch(() => {});
-        try {
-          await db.updateCallState(callSid, 'admin_declined', {
-            at: new Date().toISOString(),
-            by: chatId
-          });
-        } catch (stateError) {
-          console.error('Failed to log admin decline:', stateError);
-        }
-        try {
-          await endCallForProvider(callSid);
-        } catch (endError) {
-          console.error('Failed to decline call:', endError);
-          await webhookService.sendTelegramMessage(chatId, `❌ Failed to decline call: ${endError.message || endError}`);
-        }
-        return;
-      }
+    if (!prefix || !callSid || (prefix === 'lc' && !action)) {
       webhookService.answerCallbackQuery(cb.id, 'Unsupported action').catch(() => {});
       return;
     }
@@ -4807,6 +4894,61 @@ app.post('/webhook/telegram', async (req, res) => {
       }
       await webhookService.sendTelegramMessage(chatId, '🎧 Recording is being prepared. You will receive it here if available.');
       return;
+    }
+
+    if (action === 'answer' || action === 'decline') {
+      if (!callRecord) {
+        webhookService.answerCallbackQuery(cb.id, 'Call not found').catch(() => {});
+        return;
+      }
+      const adminChatId = config.telegram?.adminChatId;
+      if (adminChatId && chatId && String(adminChatId) !== String(chatId)) {
+        webhookService.answerCallbackQuery(cb.id, 'Not authorized').catch(() => {});
+        return;
+      }
+      const gate = webhookService.getInboundGate(callSid);
+      if (gate?.status === 'answered' || gate?.status === 'declined' || gate?.status === 'expired') {
+        webhookService.answerCallbackQuery(cb.id, 'Already handled').catch(() => {});
+        return;
+      }
+      if (action === 'answer') {
+        webhookService.setInboundGate(callSid, 'answered', { chatId });
+        webhookService.setConsoleCompact(callSid, false);
+        webhookService.addLiveEvent(callSid, '✅ Admin answered', { force: true });
+        try {
+          await db.updateCallState(callSid, 'admin_answered', { at: new Date().toISOString(), by: chatId });
+        } catch (stateError) {
+          console.error('Failed to log admin answer:', stateError);
+        }
+        try {
+          await connectInboundCall(callSid);
+          webhookService.answerCallbackQuery(cb.id, 'Answering call…').catch(() => {});
+        } catch (answerError) {
+          console.error('Failed to answer call:', answerError);
+          webhookService.answerCallbackQuery(cb.id, 'Failed to answer').catch(() => {});
+          await webhookService.sendTelegramMessage(chatId, `❌ Failed to answer call: ${answerError.message || answerError}`);
+        }
+        return;
+      }
+      if (action === 'decline') {
+        webhookService.setInboundGate(callSid, 'declined', { chatId });
+        webhookService.addLiveEvent(callSid, '❌ Declined by admin', { force: true });
+        try {
+          await db.updateCallState(callSid, 'admin_declined', { at: new Date().toISOString(), by: chatId });
+        } catch (stateError) {
+          console.error('Failed to log admin decline:', stateError);
+        }
+        try {
+          await endCallForProvider(callSid);
+          webhookService.setLiveCallPhase(callSid, 'ended').catch(() => {});
+          webhookService.answerCallbackQuery(cb.id, 'Call declined').catch(() => {});
+        } catch (endError) {
+          console.error('Failed to decline call:', endError);
+          webhookService.answerCallbackQuery(cb.id, 'Failed to decline').catch(() => {});
+          await webhookService.sendTelegramMessage(chatId, `❌ Failed to decline call: ${endError.message || endError}`);
+        }
+        return;
+      }
     }
 
     if (action === 'privacy') {
@@ -5148,7 +5290,7 @@ app.post('/admin/replay/call-status', requireAdminToken, async (req, res) => {
       return res.status(400).json({ success: false, error: 'call_sid is required when using sample' });
     }
     const resolvedPayload = sample ? (buildSampleCallStatusPayload(sample, callSid) || payload) : payload;
-    const result = await processCallStatusWebhookPayload(resolvedPayload, { source: 'replay' });
+    const result = await processCallStatusWebhookPayload(resolvedPayload, { source: 'replay', skipDedupe: true });
     if (!result?.ok) {
       return res.status(404).json({ success: false, error: result?.error || 'call_not_found' });
     }
@@ -5836,6 +5978,10 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
   }
 
   const source = options.source || 'provider';
+  if (!shouldProcessCallStatusPayload(payload, options)) {
+    console.log(`⏭️ Duplicate status webhook ignored for ${CallSid}`);
+    return { ok: true, callSid: CallSid, deduped: true };
+  }
 
   console.log(`Fixed Webhook: Call ${CallSid} status: ${CallStatus}`.blue);
   console.log(`Debug Info:`);
@@ -5990,6 +6136,17 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
   }
 
   await db.updateCallStatus(CallSid, finalStatus, updateData);
+  if (applyStatus) {
+    recordCallLifecycle(CallSid, finalStatus, {
+      source,
+      raw_status: CallStatus,
+      answered_by: AnsweredBy,
+      duration: updateData.duration
+    });
+    if (isTerminalStatusKey(finalStatus)) {
+      scheduleCallLifecycleCleanup(CallSid);
+    }
+  }
 
   if (call.user_chat_id && finalNotificationType && !options.skipNotifications) {
     try {
@@ -6213,19 +6370,7 @@ app.get('/api/calls/:callSid/status', async (req, res) => {
     }
 
     // Get recent call states for detailed progress tracking
-    const recentStates = await new Promise((resolve, reject) => {
-      db.db.all(
-        `SELECT state, data, timestamp FROM call_states 
-         WHERE call_sid = ? 
-         ORDER BY timestamp DESC 
-         LIMIT 10`,
-        [callSid],
-        (err, rows) => {
-          if (err) reject(err);
-          else resolve(rows || []);
-        }
-      );
-    });
+    const recentStates = await db.getCallStates(callSid, { limit: 15 });
 
     // Get enhanced webhook notification status
     const notificationStatus = await new Promise((resolve, reject) => {

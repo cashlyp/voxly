@@ -130,26 +130,52 @@ function createTwilioGatherHandler(deps = {}) {
           return false;
         }
       };
+      const resolveMaxRetries = (exp = {}, callConfig = {}) => {
+        const candidates = [
+          exp.max_retries,
+          exp.collection_max_retries,
+          exp.maxRetries,
+          callConfig.collection_max_retries,
+          callConfig.collectionMaxRetries
+        ].map((value) => Number(value)).filter((value) => Number.isFinite(value));
+        if (!candidates.length) return 2;
+        return Math.max(0, Math.min(6, candidates[0]));
+      };
+      const triggerPressOneFallback = async (exp, reason = 'retry') => {
+        if (!exp || exp.fallback_prompted) return false;
+        exp.fallback_prompted = true;
+        exp.fallback_mode = 'press1';
+        exp.min_digits = 1;
+        exp.max_digits = 1;
+        exp.timeout_s = Math.min(Number(exp.timeout_s || 6), 8);
+        if (digitService?.expectations?.set) {
+          digitService.expectations.set(callSid, exp);
+        }
+        const fallbackPrompt = exp.fallback_prompt || 'If you still need help, press 1 now.';
+        webhookService?.addLiveEvent?.(callSid, `📟 Fallback prompt (${reason})`, { force: true });
+        return await respondWithGather(exp, fallbackPrompt, '', { resetBuffer: true });
+      };
       const queryPlanId = req.query?.planId ? String(req.query.planId) : null;
       const queryStepIndex = Number.isFinite(Number(req.query?.stepIndex))
         ? Number(req.query.stepIndex)
         : null;
       const currentExpectation = digitService?.getExpectation?.(callSid);
-      if (
-        currentExpectation
-        && (queryPlanId || queryStepIndex)
-        && (
-          (queryPlanId && currentExpectation.plan_id && queryPlanId !== String(currentExpectation.plan_id))
-          || (Number.isFinite(queryStepIndex) && currentExpectation.plan_step_index && queryStepIndex !== Number(currentExpectation.plan_step_index))
-        )
-      ) {
-        const prompt = currentExpectation.prompt || digitService.buildDigitPrompt(currentExpectation);
-        console.warn(`Stale gather callback ignored for ${callSid} (step ${queryStepIndex})`);
-        if (await respondWithGather(currentExpectation, prompt)) {
+      if (currentExpectation && (queryPlanId || queryStepIndex)) {
+        const missingPlan = queryPlanId && !currentExpectation.plan_id;
+        const missingStep = Number.isFinite(queryStepIndex) && !Number.isFinite(currentExpectation.plan_step_index);
+        const mismatchedPlan = queryPlanId && currentExpectation.plan_id && queryPlanId !== String(currentExpectation.plan_id);
+        const mismatchedStep = Number.isFinite(queryStepIndex)
+          && Number.isFinite(currentExpectation.plan_step_index)
+          && queryStepIndex !== Number(currentExpectation.plan_step_index);
+        if (missingPlan || missingStep || mismatchedPlan || mismatchedStep) {
+          const prompt = currentExpectation.prompt || digitService.buildDigitPrompt(currentExpectation);
+          console.warn(`Stale gather ignored for ${callSid} (plan=${queryPlanId || 'n/a'} step=${queryStepIndex ?? 'n/a'})`);
+          if (await respondWithGather(currentExpectation, prompt)) {
+            return;
+          }
+          respondWithStream();
           return;
         }
-        respondWithStream();
-        return;
       }
       const respondWithStream = () => {
         const twiml = buildTwilioStreamTwiml(host, { callSid, from, to });
@@ -207,6 +233,35 @@ function createTwilioGatherHandler(deps = {}) {
       }
       if (digits) {
         const expectation = digitService.getExpectation(callSid);
+        if (expectation?.fallback_mode === 'press1') {
+          const accepted = digits === '1';
+          webhookService?.addLiveEvent?.(callSid, accepted ? '✅ Fallback confirmed' : '❌ Fallback rejected', { force: true });
+          if (digitService?.clearDigitFallbackState) {
+            digitService.clearDigitFallbackState(callSid);
+          }
+          if (digitService?.clearDigitPlan) {
+            digitService.clearDigitPlan(callSid);
+          }
+          if (digitService?.setCaptureActive) {
+            digitService.setCaptureActive(callSid, false, { reason: 'fallback_press1' });
+          } else {
+            callConfig.digit_capture_active = false;
+            if (callConfig.call_mode === 'dtmf_capture') {
+              callConfig.call_mode = 'normal';
+            }
+            callConfig.flow_state = 'normal';
+            callConfig.flow_state_reason = 'fallback_press1';
+            callConfig.flow_state_updated_at = new Date().toISOString();
+            callConfigurations.set(callSid, callConfig);
+          }
+          if (accepted) {
+            respondWithStream();
+            return;
+          }
+          const failureMessage = expectation?.timeout_failure_message || callEndMessages.no_response;
+          await respondWithHangup(failureMessage);
+          return;
+        }
         const plan = digitService?.getPlan ? digitService.getPlan(callSid) : null;
         const hadPlan = !!expectation?.plan_id;
         const planEndOnSuccess = plan ? plan.end_call_on_success !== false : true;
@@ -279,6 +334,15 @@ function createTwilioGatherHandler(deps = {}) {
         }
 
         const attemptCount = collection.attempt_count || expectation?.attempt_count || collection.retries || 1;
+        const maxRetries = resolveMaxRetries(expectation, callConfig);
+        if (Number.isFinite(maxRetries) && attemptCount >= maxRetries) {
+          if (await triggerPressOneFallback(expectation, 'max_retries')) {
+            return;
+          }
+          const failureMessage = expectation?.failure_message || callEndMessages.failure || callEndMessages.no_response;
+          await respondWithHangup(failureMessage);
+          return;
+        }
         let reprompt = digitService?.buildAdaptiveReprompt
           ? digitService.buildAdaptiveReprompt(expectation || {}, collection.reason, attemptCount)
           : '';
@@ -343,7 +407,11 @@ function createTwilioGatherHandler(deps = {}) {
       expectation.retries = (expectation.retries || 0) + 1;
       digitService.expectations.set(callSid, expectation);
 
-      if (expectation.retries > expectation.max_retries) {
+      const maxRetries = resolveMaxRetries(expectation, callConfig);
+      if (Number.isFinite(maxRetries) && expectation.retries >= maxRetries) {
+        if (await triggerPressOneFallback(expectation, 'timeout')) {
+          return;
+        }
         const timeoutMessage = expectation.timeout_failure_message || callEndMessages.no_response;
         clearPendingDigitReprompts?.(callSid);
         digitService.clearDigitFallbackState(callSid);

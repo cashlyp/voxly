@@ -69,9 +69,6 @@ class EnhancedWebhookService {
     this.liveConsoleByCallSid = new Map();
     this.liveConsoleEditTimers = new Map();
     this.inboundGate = new Map(); // callSid -> { status, chatId, messageId }
-    this.inboundGateTimers = new Map(); // callSid -> timeout
-    this.inboundPromptTimeoutMs = Number(config.inbound?.promptTimeoutMs) || 30000;
-    this.callTerminator = null;
     const debounce = Number(config.liveConsole?.editDebounceMs);
     this.liveConsoleDebounceMs = Number.isFinite(debounce) && debounce >= 0 ? debounce : 700;
     this.liveConsoleMaxEvents = 4;
@@ -182,97 +179,6 @@ class EnhancedWebhookService {
     if (data.messageId) next.messageId = data.messageId;
     this.inboundGate.set(callSid, next);
     return next;
-  }
-
-  clearInboundGateTimer(callSid) {
-    const timer = this.inboundGateTimers.get(callSid);
-    if (timer) {
-      clearTimeout(timer);
-      this.inboundGateTimers.delete(callSid);
-    }
-  }
-
-  setCallTerminator(fn) {
-    this.callTerminator = typeof fn === 'function' ? fn : null;
-  }
-
-  async sendInboundPrompt(callSid, chatId, callMeta) {
-    if (!callSid || !chatId) return null;
-    const existing = this.inboundGate.get(callSid);
-    if (existing) return existing;
-    const name = callMeta?.victimName && callMeta.victimName !== 'Unknown' ? callMeta.victimName : null;
-    const fromMasked = maskPhoneLast4(callMeta?.phoneNumber);
-    const routeLabel = callMeta?.routeLabel ? `Route: ${callMeta.routeLabel}` : null;
-    const flag = callMeta?.callerFlag;
-    const flagLine = flag ? `Flag: ${flag}` : null;
-    const riskLine = flag === 'blocked' || flag === 'spam'
-      ? 'Risk: High'
-      : flag === 'allowed'
-        ? 'Risk: Low'
-        : 'Risk: Unknown';
-    const text = [
-      '📞 Incoming call',
-      name ? `From: ${name} • ${fromMasked}` : `From: ${fromMasked}`,
-      routeLabel,
-      flagLine,
-      riskLine,
-      'Tap Answer to open the live console.'
-    ].filter(Boolean).join('\n');
-    const replyMarkup = {
-      inline_keyboard: [[
-        { text: '✅ Answer', callback_data: `inb:answer:${callSid}` },
-        { text: '❌ Decline', callback_data: `inb:decline:${callSid}` }
-      ]]
-    };
-    const response = await this.sendTelegramMessage(chatId, text, false, { replyMarkup });
-    const messageId = response?.result?.message_id || null;
-    const gate = this.setInboundGate(callSid, 'pending', { chatId, messageId });
-    this.clearInboundGateTimer(callSid);
-    if (this.inboundPromptTimeoutMs > 0) {
-      const timer = setTimeout(async () => {
-        const latestGate = this.inboundGate.get(callSid);
-        if (!latestGate || latestGate.status !== 'pending') return;
-        this.setInboundGate(callSid, 'declined', { chatId: latestGate.chatId, messageId: latestGate.messageId });
-        await this.resolveInboundPrompt(callSid, 'timeout');
-        try {
-          await this.db?.updateCallState?.(callSid, 'admin_declined_timeout', {
-            at: new Date().toISOString(),
-            by: latestGate.chatId
-          });
-        } catch (stateError) {
-          console.error('Failed to log auto-decline:', stateError);
-        }
-        if (this.callTerminator) {
-          try {
-            await this.callTerminator(callSid, { reason: 'admin_timeout', chatId: latestGate.chatId });
-          } catch (endError) {
-            console.error('Failed to auto-decline call:', endError);
-          }
-        }
-      }, this.inboundPromptTimeoutMs);
-      this.inboundGateTimers.set(callSid, timer);
-    }
-    return gate;
-  }
-
-  async resolveInboundPrompt(callSid, statusLabel) {
-    const gate = this.inboundGate.get(callSid);
-    if (!gate?.chatId || !gate?.messageId) return;
-    let label = '⚠️ Incoming call update';
-    if (statusLabel === 'answered') {
-      label = '✅ Answered incoming call';
-    } else if (statusLabel === 'declined') {
-      label = '❌ Declined incoming call';
-    } else if (statusLabel === 'timeout') {
-      label = '⌛ No response — call declined';
-    } else if (statusLabel === 'expired') {
-      label = '⏹️ Call ended before response';
-    }
-    try {
-      await this.editTelegramMessage(gate.chatId, gate.messageId, label, false, { inline_keyboard: [] });
-    } catch (error) {
-      console.error('Failed to update inbound prompt:', error?.message || error);
-    }
   }
 
   async openInboundConsole(callSid, chatId) {
@@ -511,8 +417,6 @@ class EnhancedWebhookService {
     this.lastSentimentAt.clear();
     this.mediaSeen.clear();
     this.inboundGate.clear();
-    this.inboundGateTimers.forEach((timer) => clearTimeout(timer));
-    this.inboundGateTimers.clear();
     console.log('Enhanced webhook service stopped');
   }
 
@@ -690,41 +594,48 @@ class EnhancedWebhookService {
         statusInfo,
         additionalData
       });
-      const statusSource = correctedStatus !== effectiveStatus
+      let statusSource = correctedStatus !== effectiveStatus
         ? 'inferred'
         : (additionalData.status_source || 'provider');
       const voicemailDetected = additionalData.voicemail_detected === true
         || this.isVoicemailAnswer(additionalData.answered_by);
 
-      let consolePromise = null;
+      let adjustedStatus = correctedStatus;
       if (callMeta?.inbound) {
         const gate = this.getInboundGate(call_sid);
+        const gateStatus = gate?.status || 'pending';
+        const pending = gateStatus === 'pending';
+        if (pending && ['answered', 'in-progress'].includes(correctedStatus)) {
+          adjustedStatus = 'ringing';
+          statusSource = 'inferred';
+        }
+        if (pending && ['completed', 'canceled'].includes(correctedStatus)) {
+          adjustedStatus = 'no-answer';
+          statusSource = 'inferred';
+        }
+        if (gateStatus === 'declined' && ['completed', 'failed', 'canceled'].includes(correctedStatus)) {
+          adjustedStatus = 'canceled';
+          statusSource = 'inferred';
+        }
         if (!gate) {
-          await this.sendInboundPrompt(call_sid, telegram_chat_id, callMeta);
+          this.setInboundGate(call_sid, 'pending', { chatId: telegram_chat_id });
         }
         const latestGate = this.getInboundGate(call_sid);
-        if (latestGate?.status === 'pending' && this.isTerminalStatus(correctedStatus)) {
-          this.clearInboundGateTimer(call_sid);
-          this.setInboundGate(call_sid, 'expired', { chatId: telegram_chat_id, messageId: latestGate?.messageId });
-          await this.resolveInboundPrompt(call_sid, 'expired');
+        if (latestGate?.status === 'pending' && this.isTerminalStatus(adjustedStatus)) {
+          this.setInboundGate(call_sid, 'expired', { chatId: telegram_chat_id });
         }
-        if (latestGate?.status === 'answered') {
-          consolePromise = this.ensureLiveConsole(call_sid, telegram_chat_id, callMeta);
-        } else {
-          consolePromise = Promise.resolve(null);
-        }
-      } else {
-        consolePromise = this.ensureLiveConsole(call_sid, telegram_chat_id, callMeta);
       }
 
-      if (this.isTerminalStatus(correctedStatus) && !additionalData.deferred && this.shouldDeferTerminalStatus(call_sid)) {
-        this.scheduleDeferredTerminalStatus(call_sid, correctedStatus, telegram_chat_id, additionalData);
-        console.log(`⏳ Deferring terminal status ${correctedStatus} for call ${call_sid} (recent activity)`);
+      const consolePromise = this.ensureLiveConsole(call_sid, telegram_chat_id, callMeta);
+
+      if (this.isTerminalStatus(adjustedStatus) && !additionalData.deferred && this.shouldDeferTerminalStatus(call_sid)) {
+        this.scheduleDeferredTerminalStatus(call_sid, adjustedStatus, telegram_chat_id, additionalData);
+        console.log(`⏳ Deferring terminal status ${adjustedStatus} for call ${call_sid} (recent activity)`);
         return true;
       }
 
       // Check if we should send this status
-      if (!this.shouldSendStatus(call_sid, correctedStatus)) {
+      if (!this.shouldSendStatus(call_sid, adjustedStatus)) {
         return true; // Return success to mark notification as processed
       }
 
@@ -733,7 +644,7 @@ class EnhancedWebhookService {
       let emoji = '';
       let parseMode = null;
 
-      switch (correctedStatus) {
+      switch (adjustedStatus) {
         case 'queued':
         case 'initiated':
           emoji = '📞';
@@ -905,22 +816,22 @@ class EnhancedWebhookService {
 
       const fullMessage = message;
       const shouldSendBubble = ['completed', 'failed', 'busy', 'no-answer', 'no_answer', 'canceled', 'voicemail'];
-      const shouldOfferRetry = ['failed', 'busy', 'no-answer', 'voicemail'].includes(correctedStatus);
+      const shouldOfferRetry = ['failed', 'busy', 'no-answer', 'voicemail'].includes(adjustedStatus);
 
-      if (shouldSendBubble.includes(correctedStatus)) {
+      if (shouldSendBubble.includes(adjustedStatus)) {
         const replyMarkup = shouldOfferRetry ? this.buildRetryActions(call_sid) : null;
         await this.sendTelegramMessage(telegram_chat_id, fullMessage, false, { replyMarkup, parseMode });
-        console.log(`✅ Sent enhanced status update: ${correctedStatus} for call ${call_sid}`);
-        if (this.isTerminalStatus(correctedStatus)) {
+        console.log(`✅ Sent enhanced status update: ${adjustedStatus} for call ${call_sid}`);
+        if (this.isTerminalStatus(adjustedStatus)) {
           this.terminalStatusSent.set(call_sid, true);
         }
       } else {
-        console.log(`⏭️ Console-only status ${correctedStatus} for call ${call_sid}`);
+        console.log(`⏭️ Console-only status ${adjustedStatus} for call ${call_sid}`);
       }
       await consolePromise;
-      await this.updateLiveConsoleStatus(call_sid, correctedStatus, telegram_chat_id, statusSource);
+      await this.updateLiveConsoleStatus(call_sid, adjustedStatus, telegram_chat_id, statusSource);
 
-      if (this.isTerminalStatus(correctedStatus)) {
+      if (this.isTerminalStatus(adjustedStatus)) {
         await this.flushPendingTranscript(call_sid);
       }
 
@@ -930,7 +841,7 @@ class EnhancedWebhookService {
       }
 
       // Schedule cleanup for terminal states
-      if (['completed', 'failed', 'no-answer', 'busy', 'canceled', 'voicemail'].includes(correctedStatus)) {
+      if (['completed', 'failed', 'no-answer', 'busy', 'canceled', 'voicemail'].includes(adjustedStatus)) {
         setTimeout(() => {
           this.cleanupCallData(call_sid);
         }, 5 * 60 * 1000); // Cleanup after 5 minutes
@@ -1508,6 +1419,7 @@ class EnhancedWebhookService {
       pickedUpAt: null,
       endedAt: null,
       status: initialStatus,
+      statusKey: meta.inbound ? 'ringing' : 'initiated',
       statusSource: 'provider',
       phase: this.getConsolePhaseLabel('waiting'),
       phaseKey: 'waiting',
@@ -1535,6 +1447,10 @@ class EnhancedWebhookService {
       maxEvents: meta.inbound === true ? 3 : null,
       redactPreview: meta.inbound === true
     };
+
+    if (meta.inbound && !this.getInboundGate(callSid)) {
+      this.setInboundGate(callSid, 'pending', { chatId });
+    }
 
     const text = this.buildLiveConsoleMessage(entry);
     const initialMarkup = this.consoleButtons(callSid, entry);
@@ -1846,6 +1762,18 @@ class EnhancedWebhookService {
     const compactLabel = entry?.compact ? '🧭 Full view' : '🧭 Compact view';
     const privacyLabel = entry?.redactPreview ? '🔓 Reveal' : '🔒 Hide';
     if (entry?.inbound) {
+      const gateStatus = this.getInboundGate(callSid)?.status || 'pending';
+      const isTerminal = this.isTerminalStatus(entry?.statusKey);
+      if (gateStatus !== 'answered' && !isTerminal) {
+        return {
+          inline_keyboard: [
+            [
+              { text: '✅ Answer', callback_data: `lc:answer:${callSid}` },
+              { text: '❌ Decline', callback_data: `lc:decline:${callSid}` }
+            ]
+          ]
+        };
+      }
       if (!entry.actionsExpanded) {
         return {
           inline_keyboard: [
@@ -1899,6 +1827,7 @@ class EnhancedWebhookService {
     if (!entry) return;
 
     entry.status = this.getConsoleStatusLabel(status, entry.inbound);
+    entry.statusKey = status;
     if (statusSource) {
       entry.statusSource = statusSource;
     }
@@ -2521,11 +2450,6 @@ class EnhancedWebhookService {
     this.mediaSeen.delete(callSid);
     this.callActivityAt.delete(callSid);
     this.inboundGate.delete(callSid);
-    const gateTimer = this.inboundGateTimers.get(callSid);
-    if (gateTimer) {
-      clearTimeout(gateTimer);
-      this.inboundGateTimers.delete(callSid);
-    }
     this.pendingTerminalStatus.delete(callSid);
     const pendingTimer = this.pendingTerminalTimers.get(callSid);
     if (pendingTimer) {
