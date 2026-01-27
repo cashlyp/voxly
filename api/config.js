@@ -113,6 +113,22 @@ const inboundRoutes = parseJsonObject(readEnv('INBOUND_NUMBER_ROUTES'), 'INBOUND
 const inboundPreConnectMessage = readEnv('INBOUND_PRECONNECT_MESSAGE');
 const inboundPreConnectPauseSeconds = Number(readEnv('INBOUND_PRECONNECT_PAUSE_S') || '1');
 const inboundFirstMediaTimeoutMs = Number(readEnv('INBOUND_STREAM_FIRST_MEDIA_TIMEOUT_MS') || '8000');
+const inboundRateLimitWindowMs = Number(readEnv('INBOUND_RATE_LIMIT_WINDOW_S') || '60') * 1000;
+const inboundRateLimitMax = Number(readEnv('INBOUND_RATE_LIMIT_MAX') || '0');
+const inboundRateLimitSmsEnabled = String(readEnv('INBOUND_RATE_LIMIT_SMS') || 'false').toLowerCase() === 'true';
+const inboundRateLimitCallbackEnabled = String(readEnv('INBOUND_RATE_LIMIT_CALLBACK') || 'false').toLowerCase() === 'true';
+const inboundCallbackDelayMinutes = Number(readEnv('INBOUND_CALLBACK_DELAY_MIN') || '15');
+const providerFailoverEnabled = String(readEnv('PROVIDER_FAILOVER_ENABLED') || 'true').toLowerCase() === 'true';
+const providerFailoverThreshold = Number(readEnv('PROVIDER_ERROR_THRESHOLD') || '3');
+const providerFailoverWindowMs = Number(readEnv('PROVIDER_ERROR_WINDOW_S') || '120') * 1000;
+const providerFailoverCooldownMs = Number(readEnv('PROVIDER_COOLDOWN_S') || '300') * 1000;
+const callJobIntervalMs = Number(readEnv('CALL_JOB_PROCESSOR_INTERVAL_MS') || '5000');
+const callJobRetryBaseMs = Number(readEnv('CALL_JOB_RETRY_BASE_MS') || '5000');
+const callJobRetryMaxMs = Number(readEnv('CALL_JOB_RETRY_MAX_MS') || '60000');
+const callJobMaxAttempts = Number(readEnv('CALL_JOB_MAX_ATTEMPTS') || '3');
+const callSloFirstMediaMs = Number(readEnv('CALL_SLO_FIRST_MEDIA_MS') || '4000');
+const callSloAnswerDelayMs = Number(readEnv('CALL_SLO_ANSWER_DELAY_MS') || '12000');
+const callSloSttFailures = Number(readEnv('CALL_SLO_STT_FAILURES') || '3');
 const webhookRetryBaseMs = Number(readEnv('WEBHOOK_RETRY_BASE_MS') || '5000');
 const webhookRetryMaxMs = Number(readEnv('WEBHOOK_RETRY_MAX_MS') || '60000');
 const webhookRetryMaxAttempts = Number(readEnv('WEBHOOK_RETRY_MAX_ATTEMPTS') || '5');
@@ -329,7 +345,29 @@ module.exports = {
     routes: inboundRoutes,
     preConnectMessage: inboundPreConnectMessage,
     preConnectPauseSeconds: inboundPreConnectPauseSeconds,
-    firstMediaTimeoutMs: inboundFirstMediaTimeoutMs
+    firstMediaTimeoutMs: inboundFirstMediaTimeoutMs,
+    rateLimitWindowMs: inboundRateLimitWindowMs,
+    rateLimitMax: inboundRateLimitMax,
+    rateLimitSmsEnabled: inboundRateLimitSmsEnabled,
+    rateLimitCallbackEnabled: inboundRateLimitCallbackEnabled,
+    callbackDelayMinutes: inboundCallbackDelayMinutes
+  },
+  providerFailover: {
+    enabled: providerFailoverEnabled,
+    errorThreshold: providerFailoverThreshold,
+    errorWindowMs: providerFailoverWindowMs,
+    cooldownMs: providerFailoverCooldownMs
+  },
+  callJobs: {
+    intervalMs: callJobIntervalMs,
+    retryBaseMs: callJobRetryBaseMs,
+    retryMaxMs: callJobRetryMaxMs,
+    maxAttempts: callJobMaxAttempts
+  },
+  callSlo: {
+    firstMediaMs: callSloFirstMediaMs,
+    answerDelayMs: callSloAnswerDelayMs,
+    sttFailureThreshold: callSloSttFailures
   },
   webhook: {
     retryBaseMs: webhookRetryBaseMs,

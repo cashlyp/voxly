@@ -12,6 +12,33 @@ if (!console.__emojiWrapped) {
   console.__emojiWrapped = true;
 }
 
+function normalizePhoneDigits(value) {
+  return String(value || '').replace(/\D/g, '');
+}
+
+function normalizePhoneForFlag(value) {
+  const digits = normalizePhoneDigits(value);
+  if (!digits) return null;
+  return `+${digits}`;
+}
+
+function resolveInboundRouteLabel(toNumber, routes = {}) {
+  if (!toNumber || !routes || typeof routes !== 'object') return null;
+  const normalized = normalizePhoneDigits(toNumber);
+  if (!normalized) return null;
+  let route = routes[toNumber] || routes[normalized] || routes[`+${normalized}`];
+  if (!route) {
+    for (const [key, value] of Object.entries(routes)) {
+      if (normalizePhoneDigits(key) === normalized) {
+        route = value;
+        break;
+      }
+    }
+  }
+  if (!route || typeof route !== 'object') return null;
+  return route.label || route.name || route.route_label || route.script || null;
+}
+
 class EnhancedWebhookService {
   constructor() {
     this.isRunning = false;
@@ -558,6 +585,23 @@ class EnhancedWebhookService {
           if (callTiming.ringing) {
             const ringDuration = ((new Date() - callTiming.ringing) / 1000).toFixed(0);
             message = this.buildStatusBubble('answered', victimName, { ringDuration });
+            if (!callTiming.answerDelayLogged) {
+              const delayMs = Math.max(0, new Date() - callTiming.ringing);
+              const threshold = Number(config.callSlo?.answerDelayMs);
+              const thresholdMs = Number.isFinite(threshold) && threshold > 0 ? threshold : null;
+              this.db?.addCallMetric?.(call_sid, 'answer_delay_ms', delayMs, {
+                threshold_ms: thresholdMs
+              }).catch(() => {});
+              if (thresholdMs && delayMs > thresholdMs) {
+                this.db?.logServiceHealth?.('call_slo', 'degraded', {
+                  call_sid,
+                  metric: 'answer_delay_ms',
+                  value: delayMs,
+                  threshold_ms: thresholdMs
+                }).catch(() => {});
+              }
+              callTiming.answerDelayLogged = true;
+            }
           }
           break;
 
@@ -1233,14 +1277,28 @@ class EnhancedWebhookService {
     }
 
     const phoneNumber = details?.phone_number || state?.phone_number || '';
+    const toNumber = state?.to || state?.to_number || state?.called || state?.To || '';
     const victimName = state?.customer_name || state?.victim_name || details?.customer_name || details?.victim_name || '';
     const label = victimName || this.formatContactLabel(phoneNumber);
+    const inbound = state?.inbound === true;
+    let callerFlag = null;
+    if (inbound && this.db?.getCallerFlag && phoneNumber) {
+      const normalizedPhone = normalizePhoneForFlag(phoneNumber) || phoneNumber;
+      callerFlag = await this.db.getCallerFlag(normalizedPhone).catch(() => null);
+    }
+    const routeLabel = inbound
+      ? (state?.route_label || resolveInboundRouteLabel(toNumber, config.inbound?.routes || {}))
+      : null;
 
     return {
       victimName: label,
       phoneNumber: phoneNumber || 'Unknown',
+      toNumber: toNumber || 'Unknown',
       script: state?.script || details?.script || '—',
-      inbound: state?.inbound === true
+      routeLabel: routeLabel || null,
+      inbound,
+      callerFlag: callerFlag?.status || null,
+      callerNote: callerFlag?.note || null
     };
   }
 
@@ -1250,6 +1308,9 @@ class EnhancedWebhookService {
     if (!chatId) return null;
 
     const meta = callMeta || await this.getCallMeta(callSid);
+    const initialStatus = meta.inbound
+      ? `📥 Incoming call from ${meta.victimName || 'caller'}…`
+      : `📡 Connecting to ${meta.victimName || 'victim'}…`;
     const entry = {
       chatId,
       messageId: null,
@@ -1257,7 +1318,7 @@ class EnhancedWebhookService {
       lastEditAt: null,
       pickedUpAt: null,
       endedAt: null,
-      status: `📡 Connecting to ${meta.victimName || 'victim'}…`,
+      status: initialStatus,
       statusSource: 'provider',
       phase: this.getConsolePhaseLabel('waiting'),
       phaseKey: 'waiting',
@@ -1266,7 +1327,11 @@ class EnhancedWebhookService {
       victimName: meta.victimName || 'Unknown',
       inbound: meta.inbound === true,
       phoneNumber: meta.phoneNumber || 'Unknown',
+      toNumber: meta.toNumber || 'Unknown',
       script: meta.script || '—',
+      routeLabel: meta.routeLabel || null,
+      callerFlag: meta.callerFlag || null,
+      callerNote: meta.callerNote || null,
       waveformIndex: 0,
       waveformLevel: 0,
       signalLevel: null,
@@ -1276,7 +1341,8 @@ class EnhancedWebhookService {
       latencyMs: null,
       lastWaveformLevel: null,
       sentimentFlag: '',
-      compact: false
+      compact: false,
+      redactPreview: meta.inbound === true
     };
 
     const text = this.buildLiveConsoleMessage(entry);
@@ -1291,9 +1357,21 @@ class EnhancedWebhookService {
   }
 
   getConsoleStatusLabel(status, inbound = false) {
-    const map = {
+    const inboundMap = {
+      initiated: '📲 Incoming',
+      ringing: '🔔 Incoming…',
+      answered: '📞 Connected',
+      'in-progress': '☎️ Live',
+      completed: '🟢 Ended',
+      voicemail: '📮 Voicemail',
+      'no-answer': '📵 Missed',
+      busy: '🚫 Busy',
+      failed: '❌ Failed',
+      canceled: '⚠️ Canceled'
+    };
+    const outboundMap = {
       initiated: '📡 Initiated',
-      ringing: inbound ? '🔔 Incoming…' : '🔔 Ringing…',
+      ringing: '🔔 Ringing…',
       answered: '📞 Picked up',
       'in-progress': '☎️ In progress',
       completed: '🟢 Completed',
@@ -1303,6 +1381,7 @@ class EnhancedWebhookService {
       failed: '❌ Failed',
       canceled: '⚠️ Canceled'
     };
+    const map = inbound ? inboundMap : outboundMap;
     return map[status] || `📱 ${status}`;
   }
 
@@ -1573,6 +1652,31 @@ class EnhancedWebhookService {
       };
     }
     const compactLabel = entry?.compact ? '🧭 Full view' : '🧭 Compact view';
+    const privacyLabel = entry?.redactPreview ? '🔓 Reveal' : '🔒 Hide';
+    if (entry?.inbound) {
+      return {
+        inline_keyboard: [
+          [
+            { text: '⏺️ Record', callback_data: `lc:rec:${callSid}` },
+            { text: '⏹ End', callback_data: `lc:end:${callSid}` },
+            { text: '🔀 Transfer', callback_data: `lc:xfer:${callSid}` }
+          ],
+          [
+            { text: '📩 SMS', callback_data: `lc:sms:${callSid}` },
+            { text: '⏲ Callback', callback_data: `lc:callback:${callSid}` },
+            { text: '⚠️ Spam', callback_data: `lc:spam:${callSid}` }
+          ],
+          [
+            { text: '✅ Allow', callback_data: `lc:allow:${callSid}` },
+            { text: '🚫 Block', callback_data: `lc:block:${callSid}` },
+            { text: privacyLabel, callback_data: `lc:privacy:${callSid}` }
+          ],
+          [
+            { text: compactLabel, callback_data: `lc:compact:${callSid}` }
+          ]
+        ]
+      };
+    }
     return {
       inline_keyboard: [
         [
@@ -1630,6 +1734,23 @@ class EnhancedWebhookService {
     const entry = this.liveConsoleByCallSid.get(callSid);
     if (!entry) return false;
     entry.compact = !!compact;
+    this.queueLiveConsoleUpdate(callSid, { force: true });
+    return true;
+  }
+
+  togglePreviewRedaction(callSid) {
+    const entry = this.liveConsoleByCallSid.get(callSid);
+    if (!entry) return null;
+    entry.redactPreview = !entry.redactPreview;
+    this.queueLiveConsoleUpdate(callSid, { force: true });
+    return entry.redactPreview;
+  }
+
+  setCallerFlag(callSid, status, note = null) {
+    const entry = this.liveConsoleByCallSid.get(callSid);
+    if (!entry) return false;
+    entry.callerFlag = status || null;
+    entry.callerNote = note || null;
     this.queueLiveConsoleUpdate(callSid, { force: true });
     return true;
   }
@@ -1769,6 +1890,39 @@ class EnhancedWebhookService {
     }
   }
 
+  redactPreviewText(text) {
+    if (!text) return text;
+    let redacted = String(text);
+    redacted = redacted.replace(/\b\d{4,}\b/g, '••••');
+    redacted = redacted.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '••@••');
+    return redacted;
+  }
+
+  applyPreviewRedaction(entry, text) {
+    if (entry?.redactPreview) {
+      return this.redactPreviewText(text);
+    }
+    return text;
+  }
+
+  formatCallerFlagLine(entry) {
+    const flag = entry?.callerFlag;
+    if (!flag) return null;
+    if (flag === 'blocked') return '🚫 Caller blocked';
+    if (flag === 'allowed') return '✅ Caller allowlisted';
+    if (flag === 'spam') return '⚠️ Marked spam';
+    return `📛 Caller flag: ${flag}`;
+  }
+
+  formatInboundTimingLine(entry, phaseDisplay) {
+    const waitElapsed = this.formatElapsed(entry.createdAt, entry.pickedUpAt || entry.endedAt);
+    if (entry.pickedUpAt) {
+      const talkElapsed = this.formatElapsed(entry.pickedUpAt, entry.endedAt);
+      return `⏱ Answered in ${waitElapsed} | Talk ${talkElapsed} | Phase: ${phaseDisplay}`;
+    }
+    return `⏱ Waiting ${waitElapsed} | Phase: ${phaseDisplay}`;
+  }
+
   buildLiveConsoleMessage(entry) {
     const elapsed = this.formatElapsed(entry.createdAt, entry.endedAt);
     const timeline = this.formatEventTimeline(entry.lastEvents);
@@ -1787,29 +1941,97 @@ class EnhancedWebhookService {
     const latencyLine = this.formatLatencyLine(entry);
     const healthLine = this.formatHealthLine(entry);
     const updatedLine = entry.lastEditAt ? `🕒 Updated ${entry.lastEditAt.toLocaleTimeString()}` : null;
+    const headerLine = entry.inbound ? `📥 Incoming Call • ${entry.status}` : `🎧 Live Call • ${entry.status}`;
+    const flagLine = entry.inbound ? this.formatCallerFlagLine(entry) : null;
+    const previewUser = this.applyPreviewRedaction(entry, entry.previewTurns.user || '—');
+    const previewAgent = this.applyPreviewRedaction(entry, entry.previewTurns.agent || '—');
+    const fromLine = entry.inbound
+      ? (entry.victimName && entry.victimName !== 'Unknown'
+        ? `📲 From: ${entry.victimName} | 📞 ${entry.phoneNumber}`
+        : `📲 From: ${entry.phoneNumber}`)
+      : `👤 ${entry.victimName} | 📞 ${entry.phoneNumber}`;
 
     if (entry.compact) {
+      if (entry.inbound) {
+        const routeLine = entry.routeLabel
+          ? `🧭 Route: ${entry.routeLabel}`
+          : (entry.script && entry.script !== '—' ? `🧩 Script: ${entry.script}` : null);
+        const scriptLine = entry.routeLabel && entry.script && entry.script !== '—' && entry.script !== entry.routeLabel
+          ? `🧩 Script: ${entry.script}`
+          : null;
+        const toLine = entry.toNumber && entry.toNumber !== 'Unknown' ? `📍 To: ${entry.toNumber}` : null;
+        const timingLine = this.formatInboundTimingLine(entry, phaseDisplay);
+        return [
+          signalLine,
+          headerLine,
+          updatedLine,
+          fromLine,
+          toLine,
+          routeLine,
+          scriptLine,
+          timingLine,
+          `${latencyLine} | ${healthLine}`,
+          flagLine,
+          'Highlights',
+          recentBlock,
+          'Preview',
+          `🧑 ${previewUser}`,
+          `🤖 ${previewAgent}`
+        ].filter(Boolean).join('\n');
+      }
       return [
         signalLine,
-        `🎧 Live Call • ${entry.status}`,
+        headerLine,
         updatedLine,
-        `👤 ${entry.victimName} | 📞 ${entry.phoneNumber}`,
+        fromLine,
         entry.script && entry.script !== '—' ? `🧩 ${entry.script}` : null,
         `⏱ ${elapsed} | Phase: ${phaseDisplay}`,
         `${latencyLine} | ${healthLine}`,
         'Highlights',
         recentBlock,
         'Preview',
-        `🧑 ${entry.previewTurns.user || '—'}`,
-        `🤖 ${entry.previewTurns.agent || '—'}`
+        `🧑 ${previewUser}`,
+        `🤖 ${previewAgent}`
+      ].filter(Boolean).join('\n');
+    }
+
+    if (entry.inbound) {
+      const routeLine = entry.routeLabel
+        ? `🧭 Route: ${entry.routeLabel}`
+        : (entry.script && entry.script !== '—' ? `🧩 Script: ${entry.script}` : null);
+      const scriptLine = entry.routeLabel && entry.script && entry.script !== '—' && entry.script !== entry.routeLabel
+        ? `🧩 Script: ${entry.script}`
+        : null;
+      const toLine = entry.toNumber && entry.toNumber !== 'Unknown' ? `📍 To: ${entry.toNumber}` : null;
+      const timingLine = this.formatInboundTimingLine(entry, phaseDisplay);
+      return [
+        signalLine,
+        headerLine,
+        updatedLine,
+        fromLine,
+        toLine,
+        routeLine,
+        scriptLine,
+        timingLine,
+        latencyLine,
+        healthLine,
+        flagLine,
+        sentimentLine,
+        '',
+        'Highlights',
+        recentBlock,
+        '',
+        'Preview',
+        `🧑 ${previewUser}`,
+        `🤖 ${previewAgent}`
       ].filter(Boolean).join('\n');
     }
 
     return [
       signalLine,
-      `🎧 Live Call • ${entry.status}`,
+      headerLine,
       updatedLine,
-      `👤 ${entry.victimName} | 📞 ${entry.phoneNumber}`,
+      fromLine,
       entry.script && entry.script !== '—' ? `🧩 ${entry.script}` : null,
       `⏱ ${elapsed} | Phase: ${phaseDisplay}`,
       latencyLine,
@@ -1820,8 +2042,8 @@ class EnhancedWebhookService {
       recentBlock,
       '',
       'Preview',
-      `🧑 ${entry.previewTurns.user || '—'}`,
-      `🤖 ${entry.previewTurns.agent || '—'}`
+      `🧑 ${previewUser}`,
+      `🤖 ${previewAgent}`
     ].filter(Boolean).join('\n');
   }
 

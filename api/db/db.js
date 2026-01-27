@@ -96,6 +96,16 @@ class EnhancedDatabase {
                 FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
             )`,
 
+            // Caller flags for inbound allow/block/spam decisions
+            `CREATE TABLE IF NOT EXISTS caller_flags (
+                phone_number TEXT PRIMARY KEY,
+                status TEXT NOT NULL CHECK(status IN ('blocked', 'allowed', 'spam')),
+                note TEXT,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_by TEXT,
+                source TEXT
+            )`,
+
             // Digit capture events (DTMF, spoken, gather)
             `CREATE TABLE IF NOT EXISTS call_digits (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -189,6 +199,21 @@ class EnhancedDatabase {
                 FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
             )`,
 
+            // Durable call job queue (outbound retries, callbacks)
+            `CREATE TABLE IF NOT EXISTS call_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_type TEXT NOT NULL,
+                payload TEXT,
+                status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'completed', 'failed')),
+                run_at DATETIME NOT NULL,
+                attempts INTEGER DEFAULT 0,
+                last_error TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                locked_at DATETIME,
+                completed_at DATETIME
+            )`,
+
             // Enhanced user sessions tracking - FIXED: Added UNIQUE constraint
             `CREATE TABLE IF NOT EXISTS user_sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -243,6 +268,7 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_states_call_sid ON call_states(call_sid)',
             'CREATE INDEX IF NOT EXISTS idx_states_timestamp ON call_states(timestamp)',
             'CREATE INDEX IF NOT EXISTS idx_states_state ON call_states(state)',
+            'CREATE INDEX IF NOT EXISTS idx_caller_flags_status ON caller_flags(status)',
             'CREATE INDEX IF NOT EXISTS idx_call_digits_call_sid ON call_digits(call_sid)',
             'CREATE INDEX IF NOT EXISTS idx_call_digits_profile ON call_digits(profile)',
             'CREATE INDEX IF NOT EXISTS idx_call_digits_created_at ON call_digits(created_at)',
@@ -262,6 +288,8 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_metrics_type ON notification_metrics(notification_type)',
             'CREATE INDEX IF NOT EXISTS idx_call_metrics_call_sid ON call_metrics(call_sid)',
             'CREATE INDEX IF NOT EXISTS idx_call_metrics_type ON call_metrics(metric_type)',
+            'CREATE INDEX IF NOT EXISTS idx_call_jobs_status ON call_jobs(status)',
+            'CREATE INDEX IF NOT EXISTS idx_call_jobs_run_at ON call_jobs(run_at)',
             
             // Health indexes
             'CREATE INDEX IF NOT EXISTS idx_health_service ON service_health_logs(service_name)',
@@ -528,6 +556,83 @@ class EnhancedDatabase {
                     } catch (parseError) {
                         resolve(null);
                     }
+                }
+            });
+        });
+    }
+
+    async getCallerFlag(phone_number) {
+        if (!phone_number) return null;
+        return new Promise((resolve, reject) => {
+            const sql = `
+                SELECT phone_number, status, note, updated_at, updated_by, source
+                FROM caller_flags
+                WHERE phone_number = ?
+                LIMIT 1
+            `;
+            this.db.get(sql, [phone_number], (err, row) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(row || null);
+                }
+            });
+        });
+    }
+
+    async setCallerFlag(phone_number, status, meta = {}) {
+        if (!phone_number || !status) return null;
+        const note = meta.note || null;
+        const updatedBy = meta.updated_by || meta.updatedBy || null;
+        const source = meta.source || null;
+        const updatedAt = new Date().toISOString();
+        return new Promise((resolve, reject) => {
+            const sql = `
+                INSERT INTO caller_flags (phone_number, status, note, updated_at, updated_by, source)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(phone_number) DO UPDATE SET
+                    status = excluded.status,
+                    note = excluded.note,
+                    updated_at = excluded.updated_at,
+                    updated_by = excluded.updated_by,
+                    source = excluded.source
+            `;
+            this.db.run(sql, [phone_number, status, note, updatedAt, updatedBy, source], function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve({ phone_number, status, note, updated_at: updatedAt, updated_by: updatedBy, source });
+                }
+            });
+        });
+    }
+
+    async clearCallerFlag(phone_number) {
+        if (!phone_number) return 0;
+        return new Promise((resolve, reject) => {
+            this.db.run('DELETE FROM caller_flags WHERE phone_number = ?', [phone_number], function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.changes);
+                }
+            });
+        });
+    }
+
+    async listCallerFlags(filters = {}) {
+        const status = filters.status || null;
+        const limit = Number.isFinite(Number(filters.limit)) ? Math.max(1, Math.min(500, Number(filters.limit))) : 100;
+        const sql = status
+            ? `SELECT phone_number, status, note, updated_at, updated_by, source FROM caller_flags WHERE status = ? ORDER BY updated_at DESC LIMIT ?`
+            : `SELECT phone_number, status, note, updated_at, updated_by, source FROM caller_flags ORDER BY updated_at DESC LIMIT ?`;
+        const params = status ? [status, limit] : [limit];
+        return new Promise((resolve, reject) => {
+            this.db.all(sql, params, (err, rows) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(rows || []);
                 }
             });
         });
@@ -1064,6 +1169,102 @@ class EnhancedDatabase {
                 }
             });
             stmt.finalize();
+        });
+    }
+
+    async createCallJob(job_type, payload = {}, run_at = null) {
+        const scheduled = run_at || new Date().toISOString();
+        return new Promise((resolve, reject) => {
+            const stmt = this.db.prepare(`
+                INSERT INTO call_jobs (job_type, payload, run_at)
+                VALUES (?, ?, ?)
+            `);
+            stmt.run([job_type, JSON.stringify(payload || {}), scheduled], function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.lastID);
+                }
+            });
+            stmt.finalize();
+        });
+    }
+
+    async claimDueCallJobs(limit = 10) {
+        const now = new Date().toISOString();
+        const rows = await new Promise((resolve, reject) => {
+            const sql = `
+                SELECT * FROM call_jobs
+                WHERE status = 'pending' AND run_at <= ?
+                ORDER BY run_at ASC
+                LIMIT ?
+            `;
+            this.db.all(sql, [now, limit], (err, result) => {
+                if (err) reject(err);
+                else resolve(result || []);
+            });
+        });
+
+        const claimed = [];
+        for (const row of rows) {
+            const updated = await new Promise((resolve, reject) => {
+                const sql = `
+                    UPDATE call_jobs
+                    SET status = 'running', attempts = attempts + 1, locked_at = ?, updated_at = ?
+                    WHERE id = ? AND status = 'pending'
+                `;
+                this.db.run(sql, [now, now, row.id], function(err) {
+                    if (err) reject(err);
+                    else resolve(this.changes);
+                });
+            });
+            if (updated) {
+                claimed.push({ ...row, attempts: (row.attempts || 0) + 1 });
+            }
+        }
+        return claimed;
+    }
+
+    async rescheduleCallJob(job_id, run_at, error = null) {
+        const updatedAt = new Date().toISOString();
+        return new Promise((resolve, reject) => {
+            const sql = `
+                UPDATE call_jobs
+                SET status = 'pending',
+                    run_at = ?,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE id = ?
+            `;
+            this.db.run(sql, [run_at, error, updatedAt, job_id], function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.changes);
+                }
+            });
+        });
+    }
+
+    async completeCallJob(job_id, status = 'completed', error = null) {
+        const updatedAt = new Date().toISOString();
+        const completedAt = (status === 'completed' || status === 'failed') ? updatedAt : null;
+        return new Promise((resolve, reject) => {
+            const sql = `
+                UPDATE call_jobs
+                SET status = ?,
+                    last_error = ?,
+                    updated_at = ?,
+                    completed_at = COALESCE(?, completed_at)
+                WHERE id = ?
+            `;
+            this.db.run(sql, [status, error, updatedAt, completedAt, job_id], function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.changes);
+                }
+            });
         });
     }
 
@@ -2352,6 +2553,23 @@ class EnhancedDatabase {
                console.log(`🧹 Cleaned ${cleaned} old records from ${table.name}`);
            }
        }
+
+       const jobsCleaned = await new Promise((resolve, reject) => {
+           const sql = `
+               DELETE FROM call_jobs
+               WHERE status IN ('completed', 'failed')
+                 AND updated_at < datetime('now', '-${daysToKeep} days')
+           `;
+           this.db.run(sql, function(err) {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(this.changes);
+               }
+           });
+       });
+       cleanupResults.call_jobs = jobsCleaned;
+       totalCleaned += jobsCleaned;
        
        // Clean up old successful webhook notifications (keep for 7 days)
        const webhooksCleaned = await new Promise((resolve, reject) => {
