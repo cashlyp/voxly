@@ -136,6 +136,9 @@ const miniappRateLimitMax = Number(readEnv('MINIAPP_RATE_LIMIT_MAX') || '120');
 const miniappBrandName = readEnv('MINIAPP_BRAND_NAME') || 'VOICEDNUT';
 const miniappThemeRaw = parseJsonObject(readEnv('MINIAPP_THEME_JSON'), 'MINIAPP_THEME_JSON');
 const miniappTheme = miniappThemeRaw && Object.keys(miniappThemeRaw).length ? miniappThemeRaw : null;
+const miniappJwtSecret = readEnv('MINIAPP_JWT_SECRET') || apiSecret;
+const miniappJwtTtlSeconds = Number(readEnv('MINIAPP_JWT_TTL_S') || '900');
+const miniappInitDataMaxAgeS = Number(readEnv('MINIAPP_INITDATA_MAX_AGE_S') || '120');
 const providerFailoverEnabled = String(readEnv('PROVIDER_FAILOVER_ENABLED') || 'true').toLowerCase() === 'true';
 const providerFailoverThreshold = Number(readEnv('PROVIDER_ERROR_THRESHOLD') || '3');
 const providerFailoverWindowMs = Number(readEnv('PROVIDER_ERROR_WINDOW_S') || '120') * 1000;
@@ -279,6 +282,9 @@ module.exports = {
     allowedOrigins: miniappAllowedOrigins.length ? miniappAllowedOrigins : corsOrigins,
     sessionTtlMs: miniappSessionTtlMs,
     refreshTtlMs: miniappRefreshTtlMs,
+    jwtSecret: miniappJwtSecret,
+    jwtTtlSeconds: miniappJwtTtlSeconds,
+    initDataMaxAgeS: miniappInitDataMaxAgeS,
     rateLimit: {
       windowMs: miniappRateLimitWindowMs,
       max: miniappRateLimitMax,

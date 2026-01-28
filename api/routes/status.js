@@ -2057,6 +2057,10 @@ class EnhancedWebhookService {
       entry.previewTurns.agent = cleaned;
     }
     this.queueLiveConsoleUpdate(callSid);
+    this.emitMiniappEvent('transcript.partial', callSid, {
+      speaker,
+      message: cleaned
+    });
   }
 
   queueLiveConsoleUpdate(callSid, options = {}) {

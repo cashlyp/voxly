@@ -14,11 +14,31 @@ bot/.env
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
 bot/logs
+logs
 
 # Build artifacts
 **/dist
 **/build
+**/dist-ssr
+
+# Local overrides/secrets
+*.local
+*.pem
+.env*.local
+.vercel
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
 
 #
 # Local databases or data files

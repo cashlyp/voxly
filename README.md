@@ -103,6 +103,89 @@ npm run setup --prefix bot
 - Use `/start` to begin
 - Use `/call` to make your first AI call
 
+## 📱 Mini App (Telegram WebApp Admin Console)
+
+The Mini App is the primary admin/authorized-user UI for VOICEDNUT. It provides
+live inbound/outbound call status, answer/decline actions, call logs, and per-call
+console timelines. It authenticates with Telegram Mini Apps initData and uses the
+`/webapp/*` API namespace.
+
+### Requirements
+- Node.js 18+ (or 20+) and npm
+- Telegram bot token configured in the API (`config.telegram.botToken` or `TELEGRAM_BOT_TOKEN`)
+- Admin chat ID(s) set in the API (`TELEGRAM_ADMIN_CHAT_ID(S)`)
+- HTTPS URL for Telegram clients
+
+### Quick start
+```bash
+cd miniapp
+npm install
+npm run dev
+```
+
+Open the dev URL in Telegram (Mini App URL) or a browser:
+- Dev URL: `http://localhost:5173/`
+
+> Note: Telegram requires HTTPS. Use a tunnel (ngrok, Cloudflared, etc.) for device testing.
+
+### Configure API base URL
+By default the UI calls the API on `window.location.origin` (same host).
+Override the API base with a build-time env:
+```
+VITE_API_BASE=https://api.example.com
+```
+
+### API endpoints used
+- `POST /webapp/auth` (initData auth, returns short-lived JWT)
+- `GET /webapp/me`
+- `GET /webapp/sse` (SSE live updates)
+- `GET /webapp/calls?limit&cursor&status&q`
+- `GET /webapp/calls/:callSid`
+- `GET /webapp/calls/:callSid/events?after=`
+- `GET /webapp/inbound/queue`
+- `POST /webapp/inbound/:callSid/answer`
+- `POST /webapp/inbound/:callSid/decline`
+- `GET /webapp/scripts`
+- `POST /webapp/scripts`
+- `PUT /webapp/scripts/:id`
+- `DELETE /webapp/scripts/:id`
+- `GET /webapp/users` (admin allowlist)
+- `POST /webapp/users`
+- `POST /webapp/users/:id/promote`
+- `DELETE /webapp/users/:id`
+- `GET /webapp/settings`
+- `POST /webapp/settings/provider`
+
+### Auth + security notes
+- initData is verified on auth using the bot token; expired initData is rejected (default 120s).
+- Only configured admin/viewer users are authorized.
+- JWTs are short-lived (default 10-15 minutes); no secrets in client.
+
+### Build
+```bash
+npm run build
+```
+Output goes to `miniapp/dist/`. Host it anywhere that can reach your API and
+serve over HTTPS.
+
+### Environment checklist (prod)
+API (`api/.env`):
+```
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_ADMIN_CHAT_ID=... (or TELEGRAM_ADMIN_CHAT_IDS=...)
+MINIAPP_PUBLIC_URL=https://<miniapp-domain>
+MINIAPP_ALLOWED_ORIGINS=https://<miniapp-domain>
+MINIAPP_JWT_SECRET=... (or reuse API_SECRET)
+MINIAPP_INITDATA_MAX_AGE_S=120
+MINIAPP_JWT_TTL_S=900
+CORS_ORIGINS=https://<miniapp-domain>
+```
+
+Bot (`bot/.env`):
+```
+MINIAPP_URL=https://<miniapp-domain>
+```
+
 ## 🔐 Access gating & verification
 
 - Guests can open `/start`, `/menu`, `/help`, and `/guide` to see what the bot offers; actions such as `/call`, `/sms`, `/email`, and `/calllog` remain locked until an admin approves them.
@@ -150,7 +233,7 @@ BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
 ADMIN_TELEGRAM_ID=123456789
 ADMIN_TELEGRAM_USERNAME=your_username
 API_URL=http://localhost:3000
-MINI_APP_URL=https://voicednut-mini.vercel.app
+MINIAPP_URL=https://voicednut-mini.vercel.app
 WEB_APP_SECRET=super-secret-shared-key
 WEB_APP_PORT=8080
 ```
@@ -283,6 +366,10 @@ voice-call-bot/
 │   │   └── ...
 │   ├── db/               # Bot database
 │   └── utils/            # Utility functions
+│
+├── miniapp/              # Telegram Mini App (Vite + React)
+│   ├── src/              # Mini App UI
+│   └── dist/             # Build output
 │
 └── README.md             # This documentation
 ```

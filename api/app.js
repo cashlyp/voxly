@@ -64,7 +64,7 @@ if (!console.__emojiWrapped) {
 
 const HMAC_HEADER_TIMESTAMP = 'x-api-timestamp';
 const HMAC_HEADER_SIGNATURE = 'x-api-signature';
-const HMAC_BYPASS_PATH_PREFIXES = ['/webhook/', '/incoming', '/aws/transcripts', '/connection', '/vonage/stream', '/aws/stream', '/miniapp'];
+const HMAC_BYPASS_PATH_PREFIXES = ['/webhook/', '/incoming', '/aws/transcripts', '/connection', '/vonage/stream', '/aws/stream', '/miniapp', '/webapp'];
 
 let db;
 let digitService;
@@ -102,6 +102,10 @@ const MINIAPP_ACCESS_CACHE_TTL_MS = 30000;
 const MINIAPP_ACCESS_ADMIN_KEY = 'miniapp_admin_ids';
 const MINIAPP_ACCESS_VIEWER_KEY = 'miniapp_viewer_ids';
 const miniappAccessCache = { admins: [], viewers: [], loadedAt: 0 };
+const WEBAPP_JWT_TTL_S = Number(config.miniapp?.jwtTtlSeconds || 900);
+const WEBAPP_INITDATA_MAX_AGE_S = Number(config.miniapp?.initDataMaxAgeS || 120);
+const WEBAPP_JWT_ISSUER = 'voicdnut-webapp';
+let backgroundWorkersStarted = false;
 
 const CALL_STATUS_DEDUPE_MS = 3000;
 const CALL_STATUS_DEDUPE_MAX = 5000;
@@ -435,15 +439,148 @@ function requireMiniappAdmin(req, res, next) {
   return next();
 }
 
-function emitMiniappEvent(type, callSid, data = {}) {
-  if (!type || !callSid) return null;
-  const event = {
-    sequence: ++miniappSequence,
-    type,
-    call_sid: callSid,
-    data,
-    ts: new Date().toISOString()
-  };
+function base64UrlEncode(input) {
+  return Buffer.from(input)
+    .toString('base64')
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+}
+
+function base64UrlDecode(input) {
+  if (!input) return '';
+  const normalized = String(input).replace(/-/g, '+').replace(/_/g, '/');
+  const padded = normalized.padEnd(normalized.length + (4 - (normalized.length % 4 || 4)), '=');
+  return Buffer.from(padded, 'base64').toString('utf8');
+}
+
+function getWebappJwtSecret() {
+  const secret = config.miniapp?.jwtSecret;
+  if (!secret) {
+    console.warn('Miniapp JWT secret is missing. Set MINIAPP_JWT_SECRET.');
+  }
+  return secret;
+}
+
+function signWebappJwt(payload = {}) {
+  const secret = getWebappJwtSecret();
+  if (!secret) return null;
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const encodedHeader = base64UrlEncode(JSON.stringify(header));
+  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+  const data = `${encodedHeader}.${encodedPayload}`;
+  const signature = crypto.createHmac('sha256', secret).update(data).digest('base64');
+  const encodedSignature = signature.replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  return `${data}.${encodedSignature}`;
+}
+
+function verifyWebappJwt(token) {
+  const secret = getWebappJwtSecret();
+  if (!secret) return { ok: false, error: 'missing_secret' };
+  const parts = String(token || '').split('.');
+  if (parts.length !== 3) return { ok: false, error: 'invalid_token' };
+  const [encodedHeader, encodedPayload, encodedSignature] = parts;
+  const data = `${encodedHeader}.${encodedPayload}`;
+  const expected = crypto.createHmac('sha256', secret).update(data).digest('base64');
+  const expectedNormalized = expected.replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  const expectedBuf = Buffer.from(expectedNormalized);
+  const actualBuf = Buffer.from(encodedSignature);
+  if (expectedBuf.length !== actualBuf.length || !crypto.timingSafeEqual(expectedBuf, actualBuf)) {
+    return { ok: false, error: 'invalid_signature' };
+  }
+  try {
+    const payloadRaw = base64UrlDecode(encodedPayload);
+    const payload = JSON.parse(payloadRaw);
+    const now = Math.floor(Date.now() / 1000);
+    if (payload.iss && payload.iss !== WEBAPP_JWT_ISSUER) {
+      return { ok: false, error: 'invalid_issuer' };
+    }
+    if (payload.exp && now >= payload.exp) {
+      return { ok: false, error: 'token_expired' };
+    }
+    return { ok: true, payload };
+  } catch (error) {
+    return { ok: false, error: 'invalid_payload' };
+  }
+}
+
+function resolveWebappToken(req) {
+  const header = req.headers.authorization || '';
+  if (header.startsWith('Bearer ')) {
+    return header.slice('Bearer '.length).trim();
+  }
+  const direct = req.headers['x-webapp-token'];
+  if (direct) return String(direct);
+  const queryToken = req.query?.token || req.query?.session;
+  if (queryToken) return String(queryToken);
+  return null;
+}
+
+function requireWebappInitData(req, res, next) {
+  const raw = resolveMiniappInitData(req);
+  if (!raw) {
+    return res.status(401).json({ ok: false, error: 'missing_initdata' });
+  }
+  const verified = verifyTelegramInitData(raw, WEBAPP_INITDATA_MAX_AGE_S);
+  if (!verified.ok) {
+    return res.status(401).json({ ok: false, error: verified.reason || 'invalid_initdata' });
+  }
+  req.miniappInitData = raw;
+  req.miniappInitUser = verified.user;
+  req.miniappInitParams = verified.params;
+  return next();
+}
+
+async function requireWebappJwt(req, res, next) {
+  try {
+    const token = resolveWebappToken(req);
+    if (!token) {
+      return res.status(401).json({ ok: false, error: 'missing_token' });
+    }
+    const verification = verifyWebappJwt(token);
+    if (!verification.ok) {
+      return res.status(401).json({ ok: false, error: verification.error || 'invalid_token' });
+    }
+    const payload = verification.payload || {};
+    const userId = payload.sub || payload.user_id || payload.userId;
+    if (!userId) {
+      return res.status(401).json({ ok: false, error: 'missing_user' });
+    }
+    const roles = await resolveMiniappRoles(userId);
+    if (!roles.length) {
+      return res.status(403).json({ ok: false, error: 'not_authorized' });
+    }
+    req.webappSession = {
+      token,
+      user: {
+        id: String(userId),
+        username: payload.username || null,
+        first_name: payload.first_name || null,
+        last_name: payload.last_name || null
+      },
+      roles
+    };
+    return next();
+  } catch (error) {
+    console.error('Webapp auth error:', error);
+    return res.status(500).json({ ok: false, error: 'auth_error' });
+  }
+}
+
+function requireWebappAdmin(req, res, next) {
+  const session = req.webappSession;
+  if (!session?.user?.id) {
+    return res.status(401).json({ ok: false, error: 'missing_user' });
+  }
+  const roles = session.roles || [];
+  if (!roles.includes('admin')) {
+    return res.status(403).json({ ok: false, error: 'not_authorized' });
+  }
+  return next();
+}
+
+function pushMiniappEvent(event) {
+  if (!event) return;
   miniappEventBuffer.push(event);
   if (miniappEventBuffer.length > MINIAPP_EVENT_BUFFER_MAX) {
     miniappEventBuffer.splice(0, miniappEventBuffer.length - MINIAPP_EVENT_BUFFER_MAX);
@@ -456,6 +593,59 @@ function emitMiniappEvent(type, callSid, data = {}) {
       // ignore broken clients
     }
   }
+}
+
+function emitMiniappEvent(type, callSid, data = {}) {
+  if (!type || !callSid) return null;
+  const ts = new Date().toISOString();
+  const event = {
+    sequence: ++miniappSequence,
+    type,
+    call_sid: callSid,
+    data,
+    ts
+  };
+  pushMiniappEvent(event);
+
+  if (type === 'call.status') {
+    pushMiniappEvent({
+      sequence: ++miniappSequence,
+      type: 'call.updated',
+      call_sid: callSid,
+      data,
+      ts
+    });
+    if (isTerminalStatusKey(data?.status)) {
+      pushMiniappEvent({
+        sequence: ++miniappSequence,
+        type: 'call.ended',
+        call_sid: callSid,
+        data,
+        ts
+      });
+    }
+  }
+
+  if (type === 'call.inbound_gate' && data?.status === 'pending') {
+    pushMiniappEvent({
+      sequence: ++miniappSequence,
+      type: 'inbound.ringing',
+      call_sid: callSid,
+      data,
+      ts
+    });
+  }
+
+  if (type === 'call.phase') {
+    pushMiniappEvent({
+      sequence: ++miniappSequence,
+      type: 'stream.health',
+      call_sid: callSid,
+      data,
+      ts
+    });
+  }
+
   return event;
 }
 
@@ -1820,16 +2010,6 @@ function estimateAudioDurationMsFromBase64(base64 = '') {
   return Math.round((buffer.length / 8000) * 1000);
 }
 
-function estimateSpeechDurationMs(text = '') {
-  const words = String(text || '')
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean).length;
-  if (!words) return 0;
-  const wordsPerMinute = 150;
-  return Math.ceil((words / wordsPerMinute) * 60000);
-}
-
 function isGroupedGatherPlan(plan, callConfig = {}) {
   if (!plan) return false;
   const provider = callConfig?.provider || currentProvider;
@@ -2154,6 +2334,20 @@ const miniappLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+const webappLimiter = rateLimit({
+  windowMs: config.miniapp?.rateLimit?.windowMs || 60000,
+  max: config.miniapp?.rateLimit?.max || 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const webappAuthLimiter = rateLimit({
+  windowMs: config.miniapp?.rateLimit?.windowMs || 60000,
+  max: Math.min(30, config.miniapp?.rateLimit?.max || 120),
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 function miniappSecurityHeaders(req, res, next) {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'no-referrer');
@@ -2173,6 +2367,27 @@ function miniappRequestLogger(req, res, next) {
     const userId = req.miniappInitUser?.id || req.miniappSession?.user?.id || null;
     const entry = {
       type: 'miniapp.request',
+      request_id: requestId,
+      method: req.method,
+      path: req.originalUrl.split('?')[0],
+      status: res.statusCode,
+      duration_ms: Date.now() - start,
+      user_id: userId ? String(userId) : null
+    };
+    console.log(JSON.stringify(entry));
+  });
+  return next();
+}
+
+function webappRequestLogger(req, res, next) {
+  const requestId = req.headers['x-request-id'] || uuidv4();
+  req.requestId = requestId;
+  res.setHeader('x-request-id', requestId);
+  const start = Date.now();
+  res.on('finish', () => {
+    const userId = req.webappSession?.user?.id || req.miniappInitUser?.id || null;
+    const entry = {
+      type: 'webapp.request',
       request_id: requestId,
       method: req.method,
       path: req.originalUrl.split('?')[0],
@@ -2206,6 +2421,7 @@ app.use((req, res, next) => {
 });
 
 app.use('/miniapp', miniappLimiter, miniappSecurityHeaders, requireMiniappOrigin, requireMiniappInitData, miniappRequestLogger);
+app.use('/webapp', webappLimiter, miniappSecurityHeaders, requireMiniappOrigin, webappRequestLogger);
 
 const PORT = config.server?.port || 3000;
 
@@ -3097,6 +3313,46 @@ function estimateSpeechDurationMs(text = '') {
   return Math.max(1600, Math.min(12000, estimated));
 }
 
+function startBackgroundWorkers() {
+  if (backgroundWorkersStarted) return;
+  backgroundWorkersStarted = true;
+
+  setInterval(() => {
+    smsService.processScheduledMessages().catch(error => {
+      console.error('❌ Scheduled SMS processing error:', error);
+    });
+  }, 60000); // Check every minute
+
+  setInterval(() => {
+    processCallJobs().catch(error => {
+      console.error('❌ Call job processor error:', error);
+    });
+  }, config.callJobs?.intervalMs || 5000);
+
+  processCallJobs().catch(error => {
+    console.error('❌ Initial call job processor error:', error);
+  });
+
+  setInterval(() => {
+    runStreamWatchdog().catch(error => {
+      console.error('❌ Stream watchdog error:', error);
+    });
+  }, STREAM_WATCHDOG_INTERVAL_MS);
+
+  setInterval(() => {
+    if (!emailService) {
+      return;
+    }
+    emailService.processQueue({ limit: 10 }).catch(error => {
+      console.error('❌ Email queue processing error:', error);
+    });
+  }, config.email?.queueIntervalMs || 5000);
+
+  setInterval(() => {
+    smsService.cleanupOldConversations(24); // Keep conversations for 24 hours
+  }, 60 * 60 * 1000);
+}
+
 async function speakAndEndCall(callSid, message, reason = 'completed') {
   if (!callSid || callEndLocks.has(callSid)) {
     return;
@@ -3341,7 +3597,8 @@ async function ensureAwsSession(callSid) {
   return session;
 }
 
-async function startServer() {
+async function startServer(options = {}) {
+  const { listen = true } = options;
   try {
     console.log('🚀 Initializing Adaptive AI Call System...');
     warnIfMachineDetectionDisabled('startup');
@@ -3351,6 +3608,21 @@ async function startServer() {
     db = new Database();
     await db.initialize();
     console.log('✅ Enhanced database initialized successfully');
+    if (db?.addTranscript) {
+      const originalAddTranscript = db.addTranscript.bind(db);
+      db.addTranscript = async (payload) => {
+        const result = await originalAddTranscript(payload);
+        if (payload?.call_sid) {
+          emitMiniappEvent('transcript.final', payload.call_sid, {
+            speaker: payload.speaker || null,
+            message: payload.message || null,
+            interaction_count: payload.interaction_count || null,
+            timestamp: new Date().toISOString()
+          });
+        }
+        return result;
+      };
+    }
     if (smsService?.setDb) {
       smsService.setDb(db);
     }
@@ -3384,13 +3656,17 @@ async function startServer() {
     // Initialize function engine
     console.log('✅ Dynamic Function Engine ready');
 
+    startBackgroundWorkers();
+
     // Start HTTP server
-    app.listen(PORT, () => {
-      console.log(`✅ Enhanced Adaptive API server running on port ${PORT}`);
-      console.log(`🎭 System ready - Personality Engine & Dynamic Functions active`);
-      console.log(`📡 Enhanced webhook notifications enabled`);
-      console.log(`📞 Twilio Media Stream track mode: ${TWILIO_STREAM_TRACK}`);
-    });
+    if (listen) {
+      app.listen(PORT, () => {
+        console.log(`✅ Enhanced Adaptive API server running on port ${PORT}`);
+        console.log(`🎭 System ready - Personality Engine & Dynamic Functions active`);
+        console.log(`📡 Enhanced webhook notifications enabled`);
+        console.log(`📞 Twilio Media Stream track mode: ${TWILIO_STREAM_TRACK}`);
+      });
+    }
 
   } catch (error) {
     console.error('❌ Failed to start server:', error);
@@ -6761,6 +7037,60 @@ async function handleInboundAdminDecision(callSid, action, adminId) {
   return { ok: false, error: 'invalid_action' };
 }
 
+function truncatePrompt(value, limit = 800) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}...`;
+}
+
+async function applyScriptInjection(callSid, scriptId, userId) {
+  if (!callSid || !scriptId) return { ok: false, error: 'missing_script' };
+  if (!db) return { ok: false, error: 'db_unavailable' };
+  const script = await db.getCallTemplateById(scriptId);
+  if (!script) return { ok: false, error: 'script_not_found' };
+  const callConfig = callConfigurations.get(callSid);
+  if (!callConfig) return { ok: false, error: 'call_not_active' };
+  callConfig.script = script.name || callConfig.script;
+  callConfig.script_id = script.id || callConfig.script_id;
+  if (script.prompt) {
+    callConfig.prompt = script.prompt;
+  }
+  if (script.first_message) {
+    callConfig.first_message = script.first_message;
+  }
+  callConfigurations.set(callSid, callConfig);
+
+  const session = activeCalls.get(callSid);
+  if (session?.gptService) {
+    const promptPreview = truncatePrompt(script.prompt || '');
+    const intentLine = `Injected script: ${script.name || 'custom'}. ${promptPreview}`;
+    session.gptService.setCallIntent(intentLine);
+  }
+
+  await db.updateCallState(callSid, 'script_injected', {
+    script_id: script.id,
+    script_name: script.name || null,
+    user_id: userId || null,
+    at: new Date().toISOString()
+  }).catch(() => {});
+
+  emitMiniappEvent('call.updated', callSid, {
+    script_id: script.id,
+    script_name: script.name || null,
+    source: 'script_injected'
+  });
+
+  await db.logMiniappAudit({
+    user_id: String(userId || ''),
+    action: 'webapp.script.inject',
+    call_sid: callSid,
+    metadata: { script_id: script.id }
+  }).catch(() => {});
+
+  return { ok: true, script };
+}
+
 // Mini App endpoints (Telegram initData auth)
 app.post('/miniapp/bootstrap', async (req, res) => {
   try {
@@ -7093,6 +7423,525 @@ app.post('/miniapp/calls/:callSid/decline', requireMiniappSession, requireMiniap
     console.error('Miniapp decline error:', error);
     return res.status(500).json({ ok: false, error: 'decline_failed' });
   }
+});
+
+// WebApp endpoints (Telegram initData -> short-lived JWT)
+app.post('/webapp/auth', webappAuthLimiter, requireWebappInitData, async (req, res) => {
+  try {
+    const user = req.miniappInitUser;
+    if (!user?.id) {
+      return res.status(401).json({ ok: false, error: 'missing_user' });
+    }
+    const roles = await resolveMiniappRoles(user.id);
+    if (!roles.length) {
+      return res.status(403).json({ ok: false, error: 'not_authorized' });
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const payload = {
+      sub: String(user.id),
+      username: user.username || null,
+      first_name: user.first_name || null,
+      last_name: user.last_name || null,
+      roles,
+      iat: now,
+      exp: now + WEBAPP_JWT_TTL_S,
+      iss: WEBAPP_JWT_ISSUER
+    };
+    const token = signWebappJwt(payload);
+    if (!token) {
+      return res.status(500).json({ ok: false, error: 'token_unavailable' });
+    }
+    db?.logMiniappAudit?.({
+      user_id: String(user.id),
+      action: 'webapp.auth',
+      metadata: { roles },
+      ip: req.ip,
+      user_agent: req.headers['user-agent']
+    }).catch(() => {});
+    return res.json({
+      ok: true,
+      token,
+      expires_at: new Date((now + WEBAPP_JWT_TTL_S) * 1000).toISOString(),
+      user: {
+        id: user.id,
+        username: user.username || null,
+        first_name: user.first_name || null,
+        last_name: user.last_name || null
+      },
+      roles
+    });
+  } catch (error) {
+    console.error('Webapp auth error:', error);
+    return res.status(500).json({ ok: false, error: 'auth_failed' });
+  }
+});
+
+app.get('/webapp/me', requireWebappJwt, async (req, res) => {
+  const session = req.webappSession;
+  return res.json({
+    ok: true,
+    user: session?.user || null,
+    roles: session?.roles || []
+  });
+});
+
+app.get('/webapp/calls', requireWebappJwt, async (req, res) => {
+  try {
+    const limit = Math.min(100, Math.max(1, Number(req.query?.limit || 25)));
+    const cursor = Math.max(0, Number(req.query?.cursor || 0));
+    const status = req.query?.status || null;
+    const query = req.query?.q || req.query?.query || null;
+    const calls = await db.getRecentCalls({
+      limit,
+      offset: cursor,
+      status,
+      query
+    });
+    const normalized = calls.map(normalizeCallRecordForApi);
+    return res.json({
+      ok: true,
+      calls: normalized,
+      next_cursor: normalized.length === limit ? cursor + limit : null
+    });
+  } catch (error) {
+    console.error('Webapp calls error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_fetch_calls' });
+  }
+});
+
+app.get('/webapp/calls/:callSid', requireWebappJwt, async (req, res) => {
+  try {
+    const call = await db.getCall(req.params.callSid);
+    if (!call) {
+      return res.status(404).json({ ok: false, error: 'call_not_found' });
+    }
+    const gate = webhookService.getInboundGate(req.params.callSid);
+    const liveSnapshot = webhookService.getLiveConsoleSnapshot?.(req.params.callSid) || null;
+    return res.json({
+      ok: true,
+      call: normalizeCallRecordForApi(call),
+      inbound_gate: gate
+        ? {
+          status: gate.status,
+          decision_by: gate.chatId || null,
+          decision_at: gate.updatedAt || null
+        }
+        : null,
+      live: liveSnapshot
+    });
+  } catch (error) {
+    console.error('Webapp call detail error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_fetch_call' });
+  }
+});
+
+app.get('/webapp/calls/:callSid/events', requireWebappJwt, async (req, res) => {
+  try {
+    const after = Number(req.query?.after || 0);
+    const limit = Math.min(200, Math.max(1, Number(req.query?.limit || 100)));
+    const events = await db.getCallStatesAfter(req.params.callSid, after, limit);
+    const latest = events.length ? events[events.length - 1].sequence_number : after;
+    return res.json({
+      ok: true,
+      events,
+      latest_sequence: latest
+    });
+  } catch (error) {
+    console.error('Webapp call events error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_fetch_events' });
+  }
+});
+
+app.post('/webapp/calls/:callSid/script', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const scriptId = Number(req.body?.script_id || req.body?.scriptId);
+    if (!Number.isFinite(scriptId)) {
+      return res.status(400).json({ ok: false, error: 'invalid_script_id' });
+    }
+    const result = await applyScriptInjection(req.params.callSid, scriptId, req.webappSession?.user?.id);
+    if (!result.ok) {
+      return res.status(400).json({ ok: false, error: result.error });
+    }
+    return res.json({ ok: true, script: result.script });
+  } catch (error) {
+    console.error('Webapp script inject error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_inject_script' });
+  }
+});
+
+app.post('/webapp/calls/:callSid/stream/retry', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const { callSid } = req.params;
+    const host = req.headers.host || config.server?.hostname;
+    if (!host) {
+      return res.status(400).json({ ok: false, error: 'missing_host' });
+    }
+    const scheduled = await scheduleStreamReconnect(callSid, host, 'manual');
+    if (!scheduled) {
+      return res.status(400).json({ ok: false, error: 'retry_unavailable' });
+    }
+    await db?.updateCallState?.(callSid, 'stream_retry_manual', {
+      at: new Date().toISOString(),
+      user_id: req.webappSession?.user?.id || null
+    }).catch(() => {});
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error('Webapp stream retry error:', error);
+    return res.status(500).json({ ok: false, error: 'retry_failed' });
+  }
+});
+
+app.post('/webapp/calls/:callSid/stream/fallback', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const { callSid } = req.params;
+    const callConfig = callConfigurations.get(callSid);
+    const session = activeCalls.get(callSid);
+    const ok = await activateDtmfFallback(callSid, callConfig, session?.gptService, session?.interactionCount || 0, 'manual_fallback');
+    if (!ok) {
+      return res.status(400).json({ ok: false, error: 'fallback_unavailable' });
+    }
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error('Webapp stream fallback error:', error);
+    return res.status(500).json({ ok: false, error: 'fallback_failed' });
+  }
+});
+
+app.post('/webapp/calls/:callSid/end', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const { callSid } = req.params;
+    await endCallForProvider(callSid);
+    await db?.updateCallState?.(callSid, 'admin_end_call', {
+      at: new Date().toISOString(),
+      user_id: req.webappSession?.user?.id || null
+    }).catch(() => {});
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error('Webapp end call error:', error);
+    return res.status(500).json({ ok: false, error: 'end_failed' });
+  }
+});
+
+app.get('/webapp/inbound/queue', requireWebappJwt, async (req, res) => {
+  try {
+    const liveCalls = getMiniappLiveSnapshot();
+    const inbound = liveCalls.filter((call) => call?.inbound);
+    const queue = inbound.map((call) => {
+      const gate = webhookService.getInboundGate(call.call_sid);
+      const decision = gate?.status === 'expired' ? 'missed' : gate?.status || 'pending';
+      return {
+        ...call,
+        decision,
+        decision_by: gate?.chatId || null,
+        decision_at: gate?.updatedAt || null
+      };
+    }).filter((call) => {
+      const status = String(call.status || '').toLowerCase();
+      const decision = String(call.decision || 'pending').toLowerCase();
+      if (decision !== 'pending') return false;
+      return ['ringing', 'queued', 'initiated', 'in-progress'].includes(status) || !status;
+    });
+    return res.json({ ok: true, calls: queue });
+  } catch (error) {
+    console.error('Webapp inbound queue error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_fetch_queue' });
+  }
+});
+
+app.post('/webapp/inbound/:callSid/answer', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const { callSid } = req.params;
+    const result = await handleInboundAdminDecision(callSid, 'answer', req.webappSession?.user?.id);
+    if (!result.ok) {
+      return res.status(result.error === 'already_handled' ? 409 : 400).json({ ok: false, error: result.error, status: result.status || null });
+    }
+    return res.json({ ok: true, status: result.status });
+  } catch (error) {
+    console.error('Webapp answer error:', error);
+    return res.status(500).json({ ok: false, error: 'answer_failed' });
+  }
+});
+
+app.post('/webapp/inbound/:callSid/decline', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const { callSid } = req.params;
+    const result = await handleInboundAdminDecision(callSid, 'decline', req.webappSession?.user?.id);
+    if (!result.ok) {
+      return res.status(result.error === 'already_handled' ? 409 : 400).json({ ok: false, error: result.error, status: result.status || null });
+    }
+    return res.json({ ok: true, status: result.status });
+  } catch (error) {
+    console.error('Webapp decline error:', error);
+    return res.status(500).json({ ok: false, error: 'decline_failed' });
+  }
+});
+
+app.get('/webapp/scripts', requireWebappJwt, async (req, res) => {
+  try {
+    const scripts = await db.getCallTemplates();
+    return res.json({ ok: true, scripts });
+  } catch (error) {
+    console.error('Webapp scripts list error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_fetch_scripts' });
+  }
+});
+
+app.post('/webapp/scripts', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const payload = req.body || {};
+    if (!payload?.name) {
+      return res.status(400).json({ ok: false, error: 'missing_name' });
+    }
+    const id = await db.createCallTemplate(payload);
+    const script = await db.getCallTemplateById(id);
+    await db.logMiniappAudit({
+      user_id: String(req.webappSession?.user?.id || ''),
+      action: 'webapp.script.create',
+      metadata: { id, name: payload.name },
+      ip: req.ip,
+      user_agent: req.headers['user-agent']
+    }).catch(() => {});
+    return res.json({ ok: true, script });
+  } catch (error) {
+    console.error('Webapp script create error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_create_script' });
+  }
+});
+
+app.put('/webapp/scripts/:id', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ ok: false, error: 'invalid_id' });
+    }
+    const changes = await db.updateCallTemplate(id, req.body || {});
+    if (!changes) {
+      return res.status(404).json({ ok: false, error: 'script_not_found' });
+    }
+    const script = await db.getCallTemplateById(id);
+    await db.logMiniappAudit({
+      user_id: String(req.webappSession?.user?.id || ''),
+      action: 'webapp.script.update',
+      metadata: { id },
+      ip: req.ip,
+      user_agent: req.headers['user-agent']
+    }).catch(() => {});
+    return res.json({ ok: true, script });
+  } catch (error) {
+    console.error('Webapp script update error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_update_script' });
+  }
+});
+
+app.delete('/webapp/scripts/:id', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ ok: false, error: 'invalid_id' });
+    }
+    const changes = await db.deleteCallTemplate(id);
+    if (!changes) {
+      return res.status(404).json({ ok: false, error: 'script_not_found' });
+    }
+    await db.logMiniappAudit({
+      user_id: String(req.webappSession?.user?.id || ''),
+      action: 'webapp.script.delete',
+      metadata: { id },
+      ip: req.ip,
+      user_agent: req.headers['user-agent']
+    }).catch(() => {});
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error('Webapp script delete error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_delete_script' });
+  }
+});
+
+app.get('/webapp/users', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const access = await getMiniappAccessLists();
+    return res.json({
+      ok: true,
+      admins: access.admins,
+      viewers: access.viewers
+    });
+  } catch (error) {
+    console.error('Webapp users error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_fetch_users' });
+  }
+});
+
+app.post('/webapp/users', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const userId = String(req.body?.user_id || req.body?.id || '').replace(/[^\d]/g, '');
+    if (!userId) {
+      return res.status(400).json({ ok: false, error: 'missing_user_id' });
+    }
+    const role = String(req.body?.role || 'viewer').toLowerCase();
+    const access = await getMiniappAccessLists();
+    const admins = new Set(access.admins.map(String));
+    const viewers = new Set(access.viewers.map(String));
+    if (role === 'admin') {
+      admins.add(userId);
+    } else {
+      viewers.add(userId);
+    }
+    await db.setSetting(MINIAPP_ACCESS_ADMIN_KEY, JSON.stringify(Array.from(admins)));
+    await db.setSetting(MINIAPP_ACCESS_VIEWER_KEY, JSON.stringify(Array.from(viewers)));
+    await loadMiniappAccessCache(true);
+    await db.logMiniappAudit({
+      user_id: String(req.webappSession?.user?.id || ''),
+      action: 'webapp.user.add',
+      metadata: { user_id: userId, role },
+      ip: req.ip,
+      user_agent: req.headers['user-agent']
+    }).catch(() => {});
+    const updated = await getMiniappAccessLists();
+    return res.json({ ok: true, admins: updated.admins, viewers: updated.viewers });
+  } catch (error) {
+    console.error('Webapp user add error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_add_user' });
+  }
+});
+
+app.post('/webapp/users/:id/promote', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const userId = String(req.params.id || '').replace(/[^\d]/g, '');
+    if (!userId) {
+      return res.status(400).json({ ok: false, error: 'missing_user_id' });
+    }
+    const access = await getMiniappAccessLists();
+    const admins = new Set(access.admins.map(String));
+    const viewers = new Set(access.viewers.map(String));
+    admins.add(userId);
+    await db.setSetting(MINIAPP_ACCESS_ADMIN_KEY, JSON.stringify(Array.from(admins)));
+    await db.setSetting(MINIAPP_ACCESS_VIEWER_KEY, JSON.stringify(Array.from(viewers)));
+    await loadMiniappAccessCache(true);
+    await db.logMiniappAudit({
+      user_id: String(req.webappSession?.user?.id || ''),
+      action: 'webapp.user.promote',
+      metadata: { user_id: userId },
+      ip: req.ip,
+      user_agent: req.headers['user-agent']
+    }).catch(() => {});
+    const updated = await getMiniappAccessLists();
+    return res.json({ ok: true, admins: updated.admins, viewers: updated.viewers });
+  } catch (error) {
+    console.error('Webapp user promote error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_promote_user' });
+  }
+});
+
+app.delete('/webapp/users/:id', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const userId = String(req.params.id || '').replace(/[^\d]/g, '');
+    if (!userId) {
+      return res.status(400).json({ ok: false, error: 'missing_user_id' });
+    }
+    const access = await getMiniappAccessLists();
+    const currentAdmin = String(req.webappSession?.user?.id || '');
+    const admins = access.admins.filter((id) => String(id) !== userId);
+    const viewers = access.viewers.filter((id) => String(id) !== userId);
+    if (currentAdmin && String(currentAdmin) === userId && !access.envAdmins.includes(userId)) {
+      admins.push(userId);
+    }
+    await db.setSetting(MINIAPP_ACCESS_ADMIN_KEY, JSON.stringify(admins));
+    await db.setSetting(MINIAPP_ACCESS_VIEWER_KEY, JSON.stringify(viewers));
+    await loadMiniappAccessCache(true);
+    await db.logMiniappAudit({
+      user_id: String(req.webappSession?.user?.id || ''),
+      action: 'webapp.user.remove',
+      metadata: { user_id: userId },
+      ip: req.ip,
+      user_agent: req.headers['user-agent']
+    }).catch(() => {});
+    const updated = await getMiniappAccessLists();
+    return res.json({ ok: true, admins: updated.admins, viewers: updated.viewers });
+  } catch (error) {
+    console.error('Webapp user remove error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_remove_user' });
+  }
+});
+
+app.get('/webapp/settings', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const readiness = getProviderReadiness();
+    return res.json({
+      ok: true,
+      provider: {
+        current: currentProvider,
+        stored: storedProvider,
+        supported: SUPPORTED_PROVIDERS,
+        readiness
+      },
+      webhook_health: {
+        last_sequence: miniappSequence
+      },
+      retention: config.dataRetention || null
+    });
+  } catch (error) {
+    console.error('Webapp settings error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_fetch_settings' });
+  }
+});
+
+app.post('/webapp/settings/provider', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const { provider } = req.body || {};
+    if (!provider || !SUPPORTED_PROVIDERS.includes(provider)) {
+      return res.status(400).json({ ok: false, error: 'unsupported_provider' });
+    }
+    const readiness = getProviderReadiness();
+    if (!readiness[provider]) {
+      return res.status(400).json({ ok: false, error: 'provider_not_configured' });
+    }
+    const normalized = provider.toLowerCase();
+    const changed = normalized !== currentProvider;
+    currentProvider = normalized;
+    storedProvider = normalized;
+    await db.logMiniappAudit({
+      user_id: String(req.webappSession?.user?.id || ''),
+      action: 'webapp.provider.switch',
+      metadata: { provider: normalized, changed },
+      ip: req.ip,
+      user_agent: req.headers['user-agent']
+    }).catch(() => {});
+    return res.json({ ok: true, provider: currentProvider, changed });
+  } catch (error) {
+    console.error('Webapp provider switch error:', error);
+    return res.status(500).json({ ok: false, error: 'provider_switch_failed' });
+  }
+});
+
+app.get('/webapp/sse', requireWebappJwt, (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  const token = resolveWebappToken(req);
+  const userId = req.webappSession?.user?.id || null;
+  const client = { res, token, userId };
+  miniappClients.add(client);
+
+  const since = Number(req.query?.since || 0);
+  if (Number.isFinite(since) && since > 0) {
+    const pending = miniappEventBuffer.filter((evt) => evt.sequence > since);
+    for (const evt of pending) {
+      res.write(`data: ${JSON.stringify(evt)}\n\n`);
+    }
+  }
+
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(`: ping ${Date.now()}\n\n`);
+    } catch (_) {}
+  }, 20000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    miniappClients.delete(client);
+  });
 });
 
 
@@ -9523,47 +10372,11 @@ app.post('/api/sms/cleanup-conversations', async (req, res) => {
     }
 });
 
-// Start scheduled message processor
-setInterval(() => {
-    smsService.processScheduledMessages().catch(error => {
-        console.error('❌ Scheduled SMS processing error:', error);
-    });
-}, 60000); // Check every minute
+if (require.main === module) {
+  startServer();
+}
 
-// Start call job processor (durable queue)
-setInterval(() => {
-    processCallJobs().catch(error => {
-        console.error('❌ Call job processor error:', error);
-    });
-}, config.callJobs?.intervalMs || 5000);
-
-processCallJobs().catch(error => {
-    console.error('❌ Initial call job processor error:', error);
-});
-
-// Stream watchdog to recover stalled calls
-setInterval(() => {
-    runStreamWatchdog().catch(error => {
-        console.error('❌ Stream watchdog error:', error);
-    });
-}, STREAM_WATCHDOG_INTERVAL_MS);
-
-// Start email queue processor
-setInterval(() => {
-    if (!emailService) {
-        return;
-    }
-    emailService.processQueue({ limit: 10 }).catch(error => {
-        console.error('❌ Email queue processing error:', error);
-    });
-}, config.email?.queueIntervalMs || 5000);
-
-// Cleanup old conversations every hour
-setInterval(() => {
-    smsService.cleanupOldConversations(24); // Keep conversations for 24 hours
-}, 60 * 60 * 1000);
-
-startServer();
+module.exports = { app, startServer };
 
 // Enhanced graceful shutdown with comprehensive cleanup
 process.on('SIGINT', async () => {

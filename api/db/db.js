@@ -639,6 +639,44 @@ class EnhancedDatabase {
         });
     }
 
+    async getCallStatesAfter(call_sid, after = 0, limit = 100) {
+        if (!call_sid) return [];
+        const safeAfter = Number.isFinite(Number(after)) ? Number(after) : 0;
+        const safeLimit = Math.max(1, Math.min(Number(limit) || 100, 200));
+        return new Promise((resolve, reject) => {
+            const sql = `
+                SELECT state, data, timestamp, sequence_number
+                FROM call_states
+                WHERE call_sid = ? AND sequence_number > ?
+                ORDER BY sequence_number ASC
+                LIMIT ?
+            `;
+            this.db.all(sql, [call_sid, safeAfter, safeLimit], (err, rows) => {
+                if (err) {
+                    reject(err);
+                    return;
+                }
+                const parsed = (rows || []).map((row) => {
+                    let data = row.data;
+                    if (typeof data === 'string' && data) {
+                        try {
+                            data = JSON.parse(data);
+                        } catch (_) {
+                            // leave as string
+                        }
+                    }
+                    return {
+                        state: row.state,
+                        data,
+                        timestamp: row.timestamp,
+                        sequence_number: row.sequence_number
+                    };
+                });
+                resolve(parsed);
+            });
+        });
+    }
+
     async getCallerFlag(phone_number) {
         if (!phone_number) return null;
         return new Promise((resolve, reject) => {
