@@ -71,8 +71,9 @@ export function Settings() {
   };
 
   return (
-    <List>
-      <Section header="Provider status">
+    <div className="wallet-page">
+      <List className="wallet-list">
+      <Section header="Provider status" className="wallet-section">
         {!settings ? (
           <Placeholder header="Loading settings" description="Fetching provider status." />
         ) : (
@@ -103,7 +104,7 @@ export function Settings() {
         )}
       </Section>
 
-      <Section header="Webhook health">
+      <Section header="Webhook health" className="wallet-section">
         <Cell
           subtitle="Latest event sequence"
           after={<Chip mode="mono">{settings?.webhook_health?.last_sequence ?? '-'}</Chip>}
@@ -112,7 +113,7 @@ export function Settings() {
         </Cell>
       </Section>
 
-      <Section header="Audit log" footer="Latest admin actions">
+      <Section header="Audit log" footer="Latest admin actions" className="wallet-section">
         {auditLogs.length === 0 ? (
           <Placeholder header="No audit entries" description="Admin actions will appear here." />
         ) : (
@@ -139,6 +140,7 @@ export function Settings() {
           </div>
         )}
       </Section>
-    </List>
+      </List>
+    </div>
   );
 }

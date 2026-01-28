@@ -9,6 +9,7 @@ import {
   Select,
 } from '@telegram-apps/telegram-ui';
 import { apiFetch, createIdempotencyKey } from '../lib/api';
+import { confirmAction } from '../lib/ux';
 
 type UsersResponse = {
   ok: boolean;
@@ -63,7 +64,13 @@ export function Users() {
   };
 
   const handleRemove = async (userId: string) => {
-    if (!window.confirm('Remove user from allowlist?')) return;
+    const confirmed = await confirmAction({
+      title: 'Remove user?',
+      message: 'This user will lose access immediately.',
+      confirmText: 'Remove',
+      destructive: true,
+    });
+    if (!confirmed) return;
     setLoading(true);
     try {
       await apiFetch(`/webapp/users/${userId}`, {
@@ -77,8 +84,9 @@ export function Users() {
   };
 
   return (
-    <List>
-      <Section header="Allowlisted users">
+    <div className="wallet-page">
+      <List className="wallet-list">
+      <Section header="Allowlisted users" className="wallet-section">
         <Input
           header="Telegram user id"
           placeholder="123456789"
@@ -100,7 +108,7 @@ export function Users() {
         </div>
       </Section>
 
-      <Section header="Admins">
+      <Section header="Admins" className="wallet-section">
         {admins.map((id) => (
           <Cell
             key={id}
@@ -116,7 +124,7 @@ export function Users() {
         ))}
       </Section>
 
-      <Section header="Viewers">
+      <Section header="Viewers" className="wallet-section">
         {viewers.map((id) => (
           <Cell
             key={id}
@@ -132,6 +140,7 @@ export function Users() {
           </Cell>
         ))}
       </Section>
-    </List>
+      </List>
+    </div>
   );
 }

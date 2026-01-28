@@ -12,6 +12,7 @@ import {
 import { connectEventStream, type WebappEvent } from '../lib/realtime';
 import { ensureAuth } from '../lib/auth';
 import { apiFetch, createIdempotencyKey } from '../lib/api';
+import { confirmAction, hapticImpact, hapticSuccess, hapticError } from '../lib/ux';
 import { useCalls } from '../state/calls';
 import { useUser } from '../state/user';
 
@@ -160,20 +161,44 @@ export function CallConsole({ callSid }: { callSid: string }) {
   const timeline = callEventsById[callSid] || [];
 
   const handleInboundAction = async (action: 'answer' | 'decline') => {
+    if (action === 'decline') {
+      const confirmed = await confirmAction({
+        title: 'Decline this call?',
+        message: 'The caller will be rejected immediately.',
+        confirmText: 'Decline',
+        destructive: true,
+      });
+      if (!confirmed) return;
+    }
     setActionBusy(action);
+    hapticImpact();
     try {
       await apiFetch(`/webapp/inbound/${callSid}/${action}`, {
         method: 'POST',
         idempotencyKey: createIdempotencyKey(),
       });
+      hapticSuccess();
       await fetchCall(callSid);
+    } catch (error) {
+      hapticError();
+      throw error;
     } finally {
       setActionBusy(null);
     }
   };
 
   const handleStreamAction = async (action: 'retry' | 'fallback' | 'end') => {
+    if (action === 'end') {
+      const confirmed = await confirmAction({
+        title: 'End this call?',
+        message: 'This will immediately stop the live call.',
+        confirmText: 'End call',
+        destructive: true,
+      });
+      if (!confirmed) return;
+    }
     setActionBusy(action);
+    hapticImpact();
     try {
       const idempotencyKey = createIdempotencyKey();
       if (action === 'end') {
@@ -181,7 +206,11 @@ export function CallConsole({ callSid }: { callSid: string }) {
       } else {
         await apiFetch(`/webapp/calls/${callSid}/stream/${action}`, { method: 'POST', idempotencyKey });
       }
+      hapticSuccess();
       await fetchCall(callSid);
+    } catch (error) {
+      hapticError();
+      throw error;
     } finally {
       setActionBusy(null);
     }
@@ -202,8 +231,9 @@ export function CallConsole({ callSid }: { callSid: string }) {
   };
 
   return (
-    <List>
-      <Section header="Live call console" footer={callSid}>
+    <div className="wallet-page">
+      <List className="wallet-list">
+        <Section header="Live call console" footer={callSid} className="wallet-section">
         <Cell subtitle="Status" after={<Chip mode="mono">{statusLine}</Chip>}>
           Call status
         </Cell>
@@ -226,7 +256,7 @@ export function CallConsole({ callSid }: { callSid: string }) {
       </Section>
 
       {isAdmin && (
-        <Section header="Actions">
+        <Section header="Actions" className="wallet-section">
           {activeCall?.inbound_gate?.status === 'pending' && (
             <InlineButtons mode="bezeled">
               <InlineButtons.Item
@@ -286,7 +316,7 @@ export function CallConsole({ callSid }: { callSid: string }) {
         </Section>
       )}
 
-      <Section header="Timeline">
+      <Section header="Timeline" className="wallet-section">
         {timeline.length === 0 ? (
           <Placeholder header="No events yet" description="Waiting for new events." />
         ) : (
@@ -301,7 +331,7 @@ export function CallConsole({ callSid }: { callSid: string }) {
         )}
       </Section>
 
-      <Section header="Transcript">
+      <Section header="Transcript" className="wallet-section">
         {transcript.length === 0 ? (
           <Placeholder header="Waiting for transcript" description="Live transcript will appear here." />
         ) : (
@@ -317,7 +347,7 @@ export function CallConsole({ callSid }: { callSid: string }) {
         )}
       </Section>
 
-      <Section header="Live events">
+      <Section header="Live events" className="wallet-section">
         {liveEvents.length === 0 ? (
           <Placeholder header="No realtime updates" description="Waiting for realtime events." />
         ) : (
@@ -328,6 +358,7 @@ export function CallConsole({ callSid }: { callSid: string }) {
           ))
         )}
       </Section>
-    </List>
+      </List>
+    </div>
   );
 }

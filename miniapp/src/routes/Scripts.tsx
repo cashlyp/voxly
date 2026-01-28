@@ -10,6 +10,7 @@ import {
 } from '@telegram-apps/telegram-ui';
 import { apiFetch, createIdempotencyKey } from '../lib/api';
 import { useUser } from '../state/user';
+import { confirmAction } from '../lib/ux';
 
 type Script = {
   id: number;
@@ -80,7 +81,13 @@ export function Scripts() {
 
   const handleDelete = async () => {
     if (!isAdmin || !selected?.id) return;
-    if (!window.confirm('Delete this script?')) return;
+    const confirmed = await confirmAction({
+      title: 'Delete this script?',
+      message: 'This cannot be undone.',
+      confirmText: 'Delete',
+      destructive: true,
+    });
+    if (!confirmed) return;
     setSaving(true);
     try {
       await apiFetch(`/webapp/scripts/${selected.id}`, {
@@ -96,8 +103,9 @@ export function Scripts() {
   };
 
   return (
-    <List>
-      <Section header="Script library">
+    <div className="wallet-page">
+      <List className="wallet-list">
+      <Section header="Script library" className="wallet-section">
         {scripts.map((script) => (
           <Cell
             key={script.id}
@@ -127,7 +135,7 @@ export function Scripts() {
         )}
       </Section>
 
-      <Section header={hasSelection ? 'Edit script' : 'Create script'}>
+      <Section header={hasSelection ? 'Edit script' : 'Create script'} className="wallet-section">
         <Input
           header="Name"
           value={draft.name || ''}
@@ -166,6 +174,7 @@ export function Scripts() {
           )}
         </div>
       </Section>
-    </List>
+      </List>
+    </div>
   );
 }

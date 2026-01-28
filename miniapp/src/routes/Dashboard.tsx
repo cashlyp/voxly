@@ -1,13 +1,5 @@
 import { useEffect, useMemo } from 'react';
-import {
-  Badge,
-  Button,
-  Cell,
-  Chip,
-  List,
-  Placeholder,
-  Section,
-} from '@telegram-apps/telegram-ui';
+import { Button } from '@telegram-apps/telegram-ui';
 import { useCalls } from '../state/calls';
 import { navigate } from '../lib/router';
 
@@ -26,69 +18,122 @@ export function Dashboard() {
     return { total, active, completed };
   }, [calls]);
 
+  const heroStatus = stats.active > 0 ? 'Live' : 'Idle';
+
   return (
-    <List>
-      <Section header="Quick stats">
-        <Cell
-          subtitle="Total (recent)"
-          after={<Badge type="number" mode="primary">{stats.total}</Badge>}
-        >
-          Total calls
-        </Cell>
-        <Cell
-          subtitle="Active (ringing / answered)"
-          after={<Badge type="number" mode="secondary">{stats.active}</Badge>}
-        >
-          Active calls
-        </Cell>
-        <Cell
-          subtitle="Completed"
-          after={<Badge type="number" mode="gray">{stats.completed}</Badge>}
-        >
-          Completed calls
-        </Cell>
-      </Section>
+    <div className="wallet-page">
+      <div className="hero-card">
+        <div className="hero-header">
+          <div>
+            <div className="hero-label">Active calls</div>
+            <div className="hero-subtitle">Today {stats.total} total</div>
+          </div>
+          <div className={`hero-status ${heroStatus === 'Live' ? 'live' : 'idle'}`}>
+            {heroStatus}
+          </div>
+        </div>
+        <div className="hero-value">{stats.active}</div>
+        <div className="hero-meta">
+          <span className="hero-pill">{stats.completed} completed</span>
+          <span className="hero-pill ghost">{inboundQueue.length} waiting</span>
+        </div>
+      </div>
 
-      <Section header="Inbound queue">
+      <div className="pill-row">
+        <button className="pill-card" type="button" onClick={() => navigate('/calls')}>
+          <span className="pill-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path d="M7 17a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h4.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+              <path d="M15 7h4v10h-4z" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+              <path d="M11 12h4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+            </svg>
+          </span>
+          Live Console
+        </button>
+        <button className="pill-card" type="button" onClick={() => navigate('/inbox')}>
+          <span className="pill-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path d="M4 7h16l-2.4 9.6a2 2 0 0 1-2 1.4H8.4a2 2 0 0 1-2-1.4L4 7z" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+              <path d="M9 12h6" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+            </svg>
+          </span>
+          Inbox
+        </button>
+        <button className="pill-card" type="button" onClick={() => navigate('/calls')}>
+          <span className="pill-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path d="M6 5h12v14H6z" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+              <path d="M9 9h6M9 13h6M9 17h4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+            </svg>
+          </span>
+          Call Logs
+        </button>
+      </div>
+
+      <div className="banner-card">
+        <div className="banner-content">
+          <div className="banner-title">Tip: Keep your console open</div>
+          <div className="banner-subtitle">Answer in the Mini App to connect incoming calls instantly.</div>
+        </div>
+        <div className="banner-dots">
+          <span className="dot active" />
+          <span className="dot" />
+          <span className="dot" />
+        </div>
+      </div>
+
+      <div className="card-section">
+        <div className="card-header">
+          <span>Inbound queue</span>
+          <Button size="s" mode="bezeled" onClick={() => navigate('/inbox')}>
+            View all
+          </Button>
+        </div>
         {inboundQueue.length === 0 ? (
-          <Placeholder
-            header="No inbound calls"
-            description="You're all caught up."
-            action={(
-              <Button size="s" mode="bezeled" onClick={() => navigate('/inbox')}>
-                Open inbox
-              </Button>
-            )}
-          />
+          <div className="empty-card">
+            <div className="empty-title">No inbound calls</div>
+            <div className="empty-subtitle">You are all caught up.</div>
+          </div>
         ) : (
-          inboundQueue.slice(0, 3).map((call) => (
-            <Cell
-              key={call.call_sid}
-              subtitle={call.route_label || call.script || 'Inbound'}
-              description={call.from || 'Unknown caller'}
-              after={<Chip mode="mono">{call.decision || 'pending'}</Chip>}
-            >
-              Inbound call
-            </Cell>
-          ))
+          <div className="card-list">
+            {inboundQueue.slice(0, 3).map((call) => (
+              <div key={call.call_sid} className="card-item">
+                <div className="card-item-main">
+                  <div className="card-item-title">Inbound call</div>
+                  <div className="card-item-subtitle">{call.route_label || call.script || 'Inbound route'}</div>
+                  <div className="card-item-meta">{call.from || 'Unknown caller'}</div>
+                </div>
+                <span className="tag">{call.decision || 'pending'}</span>
+              </div>
+            ))}
+          </div>
         )}
-      </Section>
+      </div>
 
-      <Section
-        header="Recent activity"
-        footer={loading && calls.length === 0 ? 'Loading calls...' : undefined}
-      >
-        {calls.slice(0, 5).map((call) => (
-          <Cell
-            key={call.call_sid}
-            subtitle={call.status || 'unknown'}
-            description={call.created_at || '-'}
-            after={<Chip mode="outline">{call.status || 'unknown'}</Chip>}
-          >
-            {call.phone_number || call.call_sid}
-          </Cell>
-        ))}
-      </Section>
-    </List>
+      <div className="card-section">
+        <div className="card-header">
+          <span>Recent calls</span>
+          <span className="card-header-muted">
+            {loading && calls.length === 0 ? 'Loading calls...' : `Showing ${calls.slice(0, 5).length}`}
+          </span>
+        </div>
+        <div className="card-list">
+          {calls.slice(0, 5).map((call) => (
+            <button
+              key={call.call_sid}
+              type="button"
+              className="card-item card-item-button"
+              onClick={() => navigate(`/calls/${call.call_sid}`)}
+            >
+              <div className="card-item-main">
+                <div className="card-item-title">{call.phone_number || call.call_sid}</div>
+                <div className="card-item-subtitle">{call.created_at || '-'}</div>
+              </div>
+              <span className="tag outline">{call.status || 'unknown'}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
   );
 }

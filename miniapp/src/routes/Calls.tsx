@@ -51,8 +51,9 @@ export function Calls() {
   };
 
   return (
-    <List>
-      <Section header="Filters">
+    <div className="wallet-page">
+      <List className="wallet-list">
+      <Section header="Filters" className="wallet-section">
         <Input
           header="Search"
           placeholder="Last 4 or label"
@@ -97,6 +98,7 @@ export function Calls() {
       <Section
         header="Call log"
         footer={`Showing ${calls.length} calls${cursor ? ` from ${cursor + 1}` : ''}${statusFilter ? ` | ${statusFilter}` : ''}${search ? ` | "${search}"` : ''}`}
+        className="wallet-section"
       >
         {loading && calls.length === 0 ? (
           <Cell subtitle="Loading calls...">Please wait</Cell>
@@ -114,12 +116,13 @@ export function Calls() {
         )}
       </Section>
 
-      <Section>
+      <Section className="wallet-section">
         <InlineButtons mode="gray">
           <InlineButtons.Item text="Prev" disabled={cursor === 0} onClick={handlePrev} />
           <InlineButtons.Item text="Next" disabled={nextCursor === null} onClick={handleNext} />
         </InlineButtons>
       </Section>
-    </List>
+      </List>
+    </div>
   );
 }
