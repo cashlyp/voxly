@@ -128,6 +128,7 @@ class EnhancedWebhookService {
     this.transcriptRetryMs = 3000;
     this.transcriptMaxWaitMs = 10 * 60 * 1000;
     this.terminalStatusSent = new Map();
+    this.miniappEventSink = null;
   }
 
   normalizeStatus(value) {
@@ -167,6 +168,19 @@ class EnhancedWebhookService {
     return this.inboundGate.get(callSid) || null;
   }
 
+  setMiniappEventSink(fn) {
+    this.miniappEventSink = typeof fn === 'function' ? fn : null;
+  }
+
+  emitMiniappEvent(type, callSid, payload = {}) {
+    if (!this.miniappEventSink || !callSid) return;
+    try {
+      this.miniappEventSink(type, callSid, payload);
+    } catch (error) {
+      console.error('Miniapp event sink error:', error);
+    }
+  }
+
   setInboundGate(callSid, status, data = {}) {
     if (!callSid) return null;
     const existing = this.inboundGate.get(callSid) || {};
@@ -178,6 +192,11 @@ class EnhancedWebhookService {
     if (data.chatId) next.chatId = data.chatId;
     if (data.messageId) next.messageId = data.messageId;
     this.inboundGate.set(callSid, next);
+    this.emitMiniappEvent('call.inbound_gate', callSid, {
+      status,
+      chat_id: next.chatId || null,
+      updated_at: next.updatedAt
+    });
     return next;
   }
 
@@ -1460,6 +1479,7 @@ class EnhancedWebhookService {
     entry.lastMessageText = text;
     entry.lastMarkup = JSON.stringify(initialMarkup || {});
     this.liveConsoleByCallSid.set(callSid, entry);
+    this.emitMiniappEvent('call.console.opened', callSid, this.getLiveConsoleSnapshot(callSid));
     return entry;
   }
 
@@ -1759,6 +1779,13 @@ class EnhancedWebhookService {
         inline_keyboard: [[{ text: `⏳ ${entry.actionLock}`, callback_data: 'noop' }]]
       };
     }
+    const miniappUrlBase = config.miniapp?.publicUrl;
+    const miniappUrl = miniappUrlBase
+      ? (() => {
+          const joiner = miniappUrlBase.includes('?') ? '&' : '?';
+          return `${miniappUrlBase}${joiner}call=${encodeURIComponent(callSid)}`;
+        })()
+      : null;
     const compactLabel = entry?.compact ? '🧭 Full view' : '🧭 Compact view';
     const privacyLabel = entry?.redactPreview ? '🔓 Reveal' : '🔒 Hide';
     if (entry?.inbound) {
@@ -1770,7 +1797,8 @@ class EnhancedWebhookService {
             [
               { text: '✅ Answer', callback_data: `lc:answer:${callSid}` },
               { text: '❌ Decline', callback_data: `lc:decline:${callSid}` }
-            ]
+            ],
+            ...(miniappUrl ? [[{ text: '🖥️ Mini App', url: miniappUrl }]] : [])
           ]
         };
       }
@@ -1780,7 +1808,8 @@ class EnhancedWebhookService {
             [
               { text: '⚙️ Actions', callback_data: `lc:actions:${callSid}` },
               { text: compactLabel, callback_data: `lc:compact:${callSid}` }
-            ]
+            ],
+            ...(miniappUrl ? [[{ text: '🖥️ Mini App', url: miniappUrl }]] : [])
           ]
         };
       }
@@ -1804,7 +1833,8 @@ class EnhancedWebhookService {
           [
             { text: '🔽 Hide actions', callback_data: `lc:actions:${callSid}` },
             { text: compactLabel, callback_data: `lc:compact:${callSid}` }
-          ]
+          ],
+          ...(miniappUrl ? [[{ text: '🖥️ Mini App', url: miniappUrl }]] : [])
         ]
       };
     }
@@ -1817,7 +1847,8 @@ class EnhancedWebhookService {
         ],
         [
           { text: compactLabel, callback_data: `lc:compact:${callSid}` }
-        ]
+        ],
+        ...(miniappUrl ? [[{ text: '🖥️ Mini App', url: miniappUrl }]] : [])
       ]
     };
   }
@@ -1852,6 +1883,11 @@ class EnhancedWebhookService {
     }
 
     this.queueLiveConsoleUpdate(callSid, { force: ['completed', 'failed', 'no-answer', 'busy', 'canceled', 'voicemail'].includes(status) });
+    this.emitMiniappEvent('call.status', callSid, {
+      status: entry.statusKey,
+      label: entry.status,
+      source: statusSource || entry.statusSource || null
+    });
   }
 
   toggleConsoleCompact(callSid) {
@@ -1936,6 +1972,16 @@ class EnhancedWebhookService {
       this.addLiveEvent(callSid, phaseEvent, { force: !!options.force });
     }
     this.queueLiveConsoleUpdate(callSid, { force: !!options.force });
+    this.emitMiniappEvent('call.phase', callSid, {
+      phase: phaseKey,
+      label: phase,
+      metrics: {
+        latencyMs: entry.latencyMs,
+        jitterMs: entry.jitterMs,
+        packetLossPct: entry.packetLossPct,
+        asrConfidence: entry.asrConfidence
+      }
+    });
     return true;
   }
 
@@ -1963,6 +2009,36 @@ class EnhancedWebhookService {
       entry.lastEvents.splice(0, entry.lastEvents.length - maxEvents);
     }
     this.queueLiveConsoleUpdate(callSid, { force: !!options.force });
+    this.emitMiniappEvent('call.console.event', callSid, { line });
+  }
+
+  getLiveConsoleSnapshot(callSid) {
+    const entry = this.liveConsoleByCallSid.get(callSid);
+    if (!entry) return null;
+    return {
+      call_sid: entry.callSid,
+      inbound: entry.inbound === true,
+      status: entry.statusKey || null,
+      status_label: entry.status || null,
+      phase: entry.phaseKey || null,
+      phase_label: entry.phase || null,
+      from: entry.phoneNumber || null,
+      to: entry.toNumber || null,
+      name: entry.victimName || null,
+      script: entry.script || null,
+      route_label: entry.routeLabel || null,
+      caller_flag: entry.callerFlag || null,
+      caller_note: entry.callerNote || null,
+      updated_at: entry.lastEditAt ? entry.lastEditAt.toISOString() : null,
+      last_events: entry.lastEvents.slice(-3),
+      preview: entry.previewTurns || { user: '—', agent: '—' }
+    };
+  }
+
+  listLiveConsoles() {
+    return Array.from(this.liveConsoleByCallSid.keys())
+      .map((callSid) => this.getLiveConsoleSnapshot(callSid))
+      .filter(Boolean);
   }
 
   recordTranscriptTurn(callSid, speaker, text) {

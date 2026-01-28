@@ -28,6 +28,8 @@ const { v4: uuidv4 } = require('uuid');
 const apiPackage = require('./package.json');
 const { WaveFile } = require('wavefile');
 
+const isProduction = process.env.NODE_ENV === 'production';
+
 const twilio = require('twilio');
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
@@ -62,7 +64,7 @@ if (!console.__emojiWrapped) {
 
 const HMAC_HEADER_TIMESTAMP = 'x-api-timestamp';
 const HMAC_HEADER_SIGNATURE = 'x-api-signature';
-const HMAC_BYPASS_PATH_PREFIXES = ['/webhook/', '/incoming', '/aws/transcripts', '/connection', '/vonage/stream', '/aws/stream'];
+const HMAC_BYPASS_PATH_PREFIXES = ['/webhook/', '/incoming', '/aws/transcripts', '/connection', '/vonage/stream', '/aws/stream', '/miniapp'];
 
 let db;
 let digitService;
@@ -88,6 +90,18 @@ const streamWatchdogState = new Map(); // callSid -> { noMediaNotifiedAt, noMedi
 const providerHealth = new Map();
 let callJobProcessing = false;
 const callLifecycleCleanupTimers = new Map();
+const miniappClients = new Set(); // { res, token, userId }
+const miniappEventBuffer = [];
+let miniappSequence = 0;
+
+const MINIAPP_SESSION_TTL_MS = Number(config.miniapp?.sessionTtlMs || 60 * 60 * 1000);
+const MINIAPP_REFRESH_TTL_MS = Number(config.miniapp?.refreshTtlMs || 7 * 24 * 60 * 60 * 1000);
+const MINIAPP_EVENT_BUFFER_MAX = 500;
+const MINIAPP_INITDATA_MAX_AGE_S = 24 * 60 * 60;
+const MINIAPP_ACCESS_CACHE_TTL_MS = 30000;
+const MINIAPP_ACCESS_ADMIN_KEY = 'miniapp_admin_ids';
+const MINIAPP_ACCESS_VIEWER_KEY = 'miniapp_viewer_ids';
+const miniappAccessCache = { admins: [], viewers: [], loadedAt: 0 };
 
 const CALL_STATUS_DEDUPE_MS = 3000;
 const CALL_STATUS_DEDUPE_MAX = 5000;
@@ -103,6 +117,346 @@ function stableStringify(value) {
   const keys = Object.keys(value).filter((key) => value[key] !== undefined).sort();
   const entries = keys.map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`);
   return `{${entries.join(',')}}`;
+}
+
+function parseTelegramInitData(raw = '') {
+  const params = new URLSearchParams(raw);
+  const hash = params.get('hash');
+  if (hash) {
+    params.delete('hash');
+  }
+  const entries = [];
+  params.forEach((value, key) => {
+    entries.push([key, value]);
+  });
+  entries.sort((a, b) => a[0].localeCompare(b[0]));
+  const dataCheckString = entries.map(([key, value]) => `${key}=${value}`).join('\n');
+  return { hash, dataCheckString, params };
+}
+
+function decodeBase64(value) {
+  if (!value) return '';
+  try {
+    return Buffer.from(String(value), 'base64').toString('utf8');
+  } catch {
+    return '';
+  }
+}
+
+function resolveMiniappInitData(req) {
+  const header = req.headers['x-telegram-init-data']
+    || req.headers['x-telegram-initdata']
+    || req.headers['x-telegram-init'];
+  if (header) return String(header);
+  const auth = String(req.headers.authorization || '');
+  if (auth.toLowerCase().startsWith('tma ')) {
+    return auth.slice(4).trim();
+  }
+  if (req.query?.init_b64) {
+    const decoded = decodeBase64(req.query.init_b64);
+    if (decoded) return decoded;
+  }
+  if (req.query?.init) return String(req.query.init);
+  if (req.body?.initData) return String(req.body.initData);
+  return '';
+}
+
+function verifyTelegramInitData(raw, maxAgeSeconds = MINIAPP_INITDATA_MAX_AGE_S) {
+  const botToken = config.telegram?.botToken || process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN;
+  if (!botToken) {
+    return { ok: false, reason: 'missing_bot_token' };
+  }
+  const { hash, dataCheckString, params } = parseTelegramInitData(raw);
+  if (!hash) {
+    return { ok: false, reason: 'missing_hash' };
+  }
+  const secret = crypto.createHmac('sha256', botToken).update('WebAppData').digest();
+  const computed = crypto.createHmac('sha256', secret).update(dataCheckString).digest('hex');
+  const computedBuf = Buffer.from(computed, 'hex');
+  const hashBuf = Buffer.from(hash, 'hex');
+  if (computedBuf.length !== hashBuf.length) {
+    return { ok: false, reason: 'invalid_hash' };
+  }
+  if (!crypto.timingSafeEqual(computedBuf, hashBuf)) {
+    return { ok: false, reason: 'invalid_hash' };
+  }
+  const authDateRaw = params.get('auth_date');
+  const authDate = Number(authDateRaw);
+  if (Number.isFinite(authDate) && maxAgeSeconds > 0) {
+    const ageSeconds = Math.floor(Date.now() / 1000) - authDate;
+    if (ageSeconds > maxAgeSeconds) {
+      return { ok: false, reason: 'expired_init_data' };
+    }
+  }
+  let user = null;
+  const userRaw = params.get('user');
+  if (userRaw) {
+    try {
+      user = JSON.parse(userRaw);
+    } catch {
+      user = null;
+    }
+  }
+  return { ok: true, user, params };
+}
+
+function requireMiniappInitData(req, res, next) {
+  const raw = resolveMiniappInitData(req);
+  if (!raw) {
+    return res.status(401).json({ ok: false, error: 'missing_initdata' });
+  }
+  const verified = verifyTelegramInitData(raw);
+  if (!verified.ok) {
+    return res.status(401).json({ ok: false, error: verified.reason || 'invalid_initdata' });
+  }
+  req.miniappInitData = raw;
+  req.miniappInitUser = verified.user;
+  req.miniappInitParams = verified.params;
+  return next();
+}
+
+function parseAccessList(rawValue) {
+  if (!rawValue) return [];
+  if (Array.isArray(rawValue)) {
+    return rawValue
+      .map((value) => String(value).trim())
+      .map((value) => value.replace(/[^\d]/g, ''))
+      .filter((value) => value.length >= 5);
+  }
+  const raw = String(rawValue).trim();
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return parsed
+        .map((value) => String(value).trim())
+        .map((value) => value.replace(/[^\d]/g, ''))
+        .filter((value) => value.length >= 5);
+    }
+  } catch (_) {
+    // fall through
+  }
+  return raw
+    .split(',')
+    .map((value) => value.trim())
+    .map((value) => value.replace(/[^\d]/g, ''))
+    .filter((value) => value.length >= 5);
+}
+
+function mergeAccessLists(base = [], extra = []) {
+  const merged = new Set();
+  base.forEach((value) => merged.add(String(value)));
+  extra.forEach((value) => merged.add(String(value)));
+  return Array.from(merged);
+}
+
+async function loadMiniappAccessCache(force = false) {
+  const now = Date.now();
+  if (!force && now - miniappAccessCache.loadedAt < MINIAPP_ACCESS_CACHE_TTL_MS) {
+    return miniappAccessCache;
+  }
+  try {
+    const [adminsRaw, viewersRaw] = await Promise.all([
+      db.getSetting(MINIAPP_ACCESS_ADMIN_KEY).catch(() => null),
+      db.getSetting(MINIAPP_ACCESS_VIEWER_KEY).catch(() => null),
+    ]);
+    miniappAccessCache.admins = parseAccessList(adminsRaw);
+    miniappAccessCache.viewers = parseAccessList(viewersRaw);
+    miniappAccessCache.loadedAt = now;
+  } catch (error) {
+    console.error('Failed to load miniapp access cache:', error);
+  }
+  return miniappAccessCache;
+}
+
+async function getMiniappAccessLists() {
+  const envAdmins = config.telegram?.adminChatIds || [];
+  const envViewers = config.telegram?.viewerChatIds || [];
+  if (!db) {
+    return {
+      envAdmins,
+      envViewers,
+      customAdmins: [],
+      customViewers: [],
+      admins: envAdmins,
+      viewers: envViewers
+    };
+  }
+  const cache = await loadMiniappAccessCache();
+  const admins = mergeAccessLists(envAdmins, cache.admins);
+  const viewers = mergeAccessLists(envViewers, cache.viewers);
+  return {
+    envAdmins,
+    envViewers,
+    customAdmins: cache.admins,
+    customViewers: cache.viewers,
+    admins,
+    viewers
+  };
+}
+
+async function resolveMiniappRoles(userId) {
+  const { admins, viewers } = await getMiniappAccessLists();
+  if (!admins.length && !viewers.length && !isProduction) return ['admin'];
+  if (admins.map(String).includes(String(userId))) return ['admin'];
+  if (viewers.map(String).includes(String(userId))) return ['viewer'];
+  return [];
+}
+
+async function isMiniappUserAllowed(userId) {
+  const roles = await resolveMiniappRoles(userId);
+  return roles.length > 0;
+}
+
+function resolveMiniappOrigin(req) {
+  const origin = req.headers.origin || '';
+  return String(origin || '').trim();
+}
+
+function isMiniappOriginAllowed(origin) {
+  if (!origin) {
+    const allowlist = config.miniapp?.allowedOrigins || [];
+    return !isProduction || !allowlist.length;
+  }
+  if (!origin.startsWith('https://')) {
+    return !isProduction;
+  }
+  const allowlist = config.miniapp?.allowedOrigins || [];
+  if (!allowlist.length) {
+    return true;
+  }
+  return allowlist.includes(origin);
+}
+
+function requireMiniappOrigin(req, res, next) {
+  const origin = resolveMiniappOrigin(req);
+  if (!isMiniappOriginAllowed(origin)) {
+    return res.status(403).json({ ok: false, error: 'origin_not_allowed' });
+  }
+  return next();
+}
+
+async function createMiniappSession(user = null, req = null) {
+  const token = crypto.randomBytes(24).toString('hex');
+  const refreshToken = crypto.randomBytes(32).toString('hex');
+  const now = Date.now();
+  const roles = await resolveMiniappRoles(user?.id);
+  const session = {
+    session_token: token,
+    refresh_token: refreshToken,
+    user_id: String(user?.id || ''),
+    username: user?.username || null,
+    first_name: user?.first_name || null,
+    last_name: user?.last_name || null,
+    roles,
+    expires_at: new Date(now + MINIAPP_SESSION_TTL_MS).toISOString(),
+    refresh_expires_at: new Date(now + MINIAPP_REFRESH_TTL_MS).toISOString(),
+    ip: req?.ip || null,
+    user_agent: req?.headers?.['user-agent'] || null
+  };
+  await db.createMiniappSession(session);
+  return { ...session, token };
+}
+
+function resolveMiniappToken(req) {
+  const header = req.headers.authorization || '';
+  if (header.startsWith('Bearer ')) {
+    return header.slice('Bearer '.length).trim();
+  }
+  const direct = req.headers['x-miniapp-token'];
+  if (direct) return String(direct);
+  const queryToken = req.query?.token || req.query?.session;
+  if (queryToken) return String(queryToken);
+  return null;
+}
+
+function resolveMiniappRefreshToken(req) {
+  const header = req.headers.authorization || '';
+  if (header.startsWith('Bearer ')) {
+    return header.slice('Bearer '.length).trim();
+  }
+  const direct = req.headers['x-miniapp-refresh'];
+  if (direct) return String(direct);
+  const bodyToken = req.body?.refresh_token;
+  if (bodyToken) return String(bodyToken);
+  return null;
+}
+
+async function requireMiniappSession(req, res, next) {
+  try {
+    const token = resolveMiniappToken(req);
+    if (!token) {
+      return res.status(401).json({ ok: false, error: 'missing_session' });
+    }
+    const session = await db.getMiniappSessionByToken(token);
+    if (!session) {
+      return res.status(401).json({ ok: false, error: 'invalid_session' });
+    }
+    const expiresAt = session.expires_at ? Date.parse(session.expires_at) : null;
+    if (expiresAt && Date.now() > expiresAt) {
+      await db.revokeMiniappSession(token).catch(() => {});
+      return res.status(401).json({ ok: false, error: 'session_expired' });
+    }
+    const roles = await resolveMiniappRoles(session.user_id);
+    if (!roles.length) {
+      await db.revokeMiniappSession(token).catch(() => {});
+      return res.status(403).json({ ok: false, error: 'not_authorized' });
+    }
+    if (req.miniappInitUser?.id && String(req.miniappInitUser.id) !== String(session.user_id)) {
+      return res.status(403).json({ ok: false, error: 'user_mismatch' });
+    }
+    req.miniappSession = {
+      token,
+      user: {
+        id: session.user_id,
+        username: session.username,
+        first_name: session.first_name,
+        last_name: session.last_name
+      },
+      roles
+    };
+    db.updateMiniappSessionLastSeen(token, req.ip, req.headers['user-agent']).catch(() => {});
+    return next();
+  } catch (error) {
+    console.error('Miniapp session error:', error);
+    return res.status(500).json({ ok: false, error: 'session_error' });
+  }
+}
+
+function requireMiniappAdmin(req, res, next) {
+  const session = req.miniappSession;
+  if (!session?.user?.id) {
+    return res.status(401).json({ ok: false, error: 'missing_user' });
+  }
+  const roles = session.roles || [];
+  if (!roles.includes('admin')) {
+    return res.status(403).json({ ok: false, error: 'not_authorized' });
+  }
+  return next();
+}
+
+function emitMiniappEvent(type, callSid, data = {}) {
+  if (!type || !callSid) return null;
+  const event = {
+    sequence: ++miniappSequence,
+    type,
+    call_sid: callSid,
+    data,
+    ts: new Date().toISOString()
+  };
+  miniappEventBuffer.push(event);
+  if (miniappEventBuffer.length > MINIAPP_EVENT_BUFFER_MAX) {
+    miniappEventBuffer.splice(0, miniappEventBuffer.length - MINIAPP_EVENT_BUFFER_MAX);
+  }
+  const payload = `data: ${JSON.stringify(event)}\n\n`;
+  for (const client of miniappClients) {
+    try {
+      client.res.write(payload);
+    } catch {
+      // ignore broken clients
+    }
+  }
+  return event;
 }
 
 function purgeStreamStatusDedupe(callSid) {
@@ -173,6 +527,11 @@ function recordCallLifecycle(callSid, status, meta = {}) {
     duration: meta.duration || null,
     at: updatedAt
   }).catch(() => {});
+  emitMiniappEvent('call.status', callSid, {
+    status: normalized,
+    prev_status: prev || null,
+    source: meta.source || null
+  });
   return true;
 }
 
@@ -417,7 +776,8 @@ async function ensureCallRecord(callSid, payload = {}, source = 'unknown') {
         (functionSystem?.functions || [])
           .map((f) => f.function?.name || f.function?.function?.name || f.name)
           .filter(Boolean)
-      )
+      ),
+      direction: 'inbound'
     });
     await db.updateCallState(callSid, 'call_created', {
       inbound: true,
@@ -1787,6 +2147,44 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+const miniappLimiter = rateLimit({
+  windowMs: config.miniapp?.rateLimit?.windowMs || 60000,
+  max: config.miniapp?.rateLimit?.max || 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+function miniappSecurityHeaders(req, res, next) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-site');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Embedder-Policy', 'unsafe-none');
+  return next();
+}
+
+function miniappRequestLogger(req, res, next) {
+  const requestId = req.headers['x-request-id'] || uuidv4();
+  req.requestId = requestId;
+  res.setHeader('x-request-id', requestId);
+  const start = Date.now();
+  res.on('finish', () => {
+    const userId = req.miniappInitUser?.id || req.miniappSession?.user?.id || null;
+    const entry = {
+      type: 'miniapp.request',
+      request_id: requestId,
+      method: req.method,
+      path: req.originalUrl.split('?')[0],
+      status: res.statusCode,
+      duration_ms: Date.now() - start,
+      user_id: userId ? String(userId) : null
+    };
+    console.log(JSON.stringify(entry));
+  });
+  return next();
+}
+
 app.use((req, res, next) => {
   if (shouldBypassHmac(req)) {
     return next();
@@ -1806,6 +2204,8 @@ app.use((req, res, next) => {
   }
   return apiLimiter(req, res, next);
 });
+
+app.use('/miniapp', miniappLimiter, miniappSecurityHeaders, requireMiniappOrigin, requireMiniappInitData, miniappRequestLogger);
 
 const PORT = config.server?.port || 3000;
 
@@ -2960,6 +3360,7 @@ async function startServer() {
     // Start webhook service after database is ready
     console.log('Starting enhanced webhook service...');
     webhookService.start(db);
+    webhookService.setMiniappEventSink(emitMiniappEvent);
     console.log('✅ Enhanced webhook service started');
 
     digitService = createDigitCollectionService({
@@ -5833,7 +6234,8 @@ async function placeOutboundCall(payload, hostOverride = null) {
       first_message: first_message,
       user_chat_id: user_chat_id,
       business_context: JSON.stringify(functionSystem.context),
-      generated_functions: JSON.stringify(functionSystem.functions.map(f => f.function.name))
+      generated_functions: JSON.stringify(functionSystem.functions.map(f => f.function.name)),
+      direction: 'outbound'
     });
     await db.updateCallState(callId, 'call_created', {
       customer_name: customer_name || null,
@@ -6271,6 +6673,426 @@ app.post('/webhook/twilio-stream', (req, res) => {
     console.error('Twilio stream status webhook error:', err);
   }
   res.status(200).send('OK');
+});
+
+
+function getMiniappLiveSnapshot() {
+  if (!webhookService?.listLiveConsoles) return [];
+  return webhookService.listLiveConsoles();
+}
+
+function escapeCsvValue(value) {
+  if (value === null || value === undefined) return '';
+  const str = String(value);
+  if (/[",\n]/.test(str)) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+function callsToCsv(calls = []) {
+  const headers = [
+    'call_sid',
+    'status',
+    'direction',
+    'phone_number',
+    'created_at',
+    'duration',
+    'answered_by',
+    'error_code',
+    'error_message'
+  ];
+  const lines = [headers.join(',')];
+  for (const call of calls) {
+    const row = headers.map((key) => escapeCsvValue(call?.[key]));
+    lines.push(row.join(','));
+  }
+  return lines.join('\n');
+}
+
+function normalizeDateFilter(value, isEnd = false) {
+  if (!value) return null;
+  const raw = String(value).trim();
+  if (!raw) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    return `${raw} ${isEnd ? '23:59:59' : '00:00:00'}`;
+  }
+  return raw;
+}
+
+async function handleInboundAdminDecision(callSid, action, adminId) {
+  if (!callSid) {
+    return { ok: false, error: 'missing_call_sid' };
+  }
+  const callRecord = await db.getCall(callSid).catch(() => null);
+  if (!callRecord) {
+    return { ok: false, error: 'call_not_found' };
+  }
+  const gate = webhookService.getInboundGate(callSid);
+  if (gate?.status === 'answered' || gate?.status === 'declined' || gate?.status === 'expired') {
+    return { ok: false, error: 'already_handled', status: gate?.status };
+  }
+  if (action === 'answer') {
+    webhookService.setInboundGate(callSid, 'answered', { chatId: adminId });
+    webhookService.setConsoleCompact(callSid, false);
+    webhookService.addLiveEvent(callSid, '✅ Admin answered', { force: true });
+    await db.updateCallState(callSid, 'admin_answered', { at: new Date().toISOString(), by: adminId }).catch(() => {});
+    await connectInboundCall(callSid);
+    await db.logMiniappAudit({
+      user_id: String(adminId || ''),
+      action: 'inbound.answer',
+      call_sid: callSid
+    }).catch(() => {});
+    return { ok: true, status: 'answered' };
+  }
+  if (action === 'decline') {
+    webhookService.setInboundGate(callSid, 'declined', { chatId: adminId });
+    webhookService.addLiveEvent(callSid, '❌ Declined by admin', { force: true });
+    await db.updateCallState(callSid, 'admin_declined', { at: new Date().toISOString(), by: adminId }).catch(() => {});
+    await endCallForProvider(callSid);
+    await webhookService.setLiveCallPhase(callSid, 'ended').catch(() => {});
+    await db.logMiniappAudit({
+      user_id: String(adminId || ''),
+      action: 'inbound.decline',
+      call_sid: callSid
+    }).catch(() => {});
+    return { ok: true, status: 'declined' };
+  }
+  return { ok: false, error: 'invalid_action' };
+}
+
+// Mini App endpoints (Telegram initData auth)
+app.post('/miniapp/bootstrap', async (req, res) => {
+  try {
+    const user = req.miniappInitUser;
+    if (!user?.id) {
+      return res.status(401).json({ ok: false, error: 'missing_user' });
+    }
+    if (!(await isMiniappUserAllowed(user.id))) {
+      return res.status(403).json({ ok: false, error: 'not_authorized' });
+    }
+    const session = await createMiniappSession(user, req);
+    await db.logMiniappAudit({
+      user_id: String(user.id),
+      action: 'miniapp.login',
+      metadata: { username: user.username || null },
+      ip: req.ip,
+      user_agent: req.headers['user-agent']
+    }).catch(() => {});
+    return res.json({
+      ok: true,
+      session_token: session.token,
+      refresh_token: session.refresh_token,
+      session_expires_at: session.expires_at,
+      refresh_expires_at: session.refresh_expires_at,
+      user: {
+        id: user.id,
+        username: user.username || null,
+        first_name: user.first_name || null,
+        last_name: user.last_name || null
+      },
+      roles: session.roles,
+      branding: {
+        name: config.miniapp?.brandName || 'VOICEDNUT'
+      },
+      theme: config.miniapp?.theme || null,
+      features: {
+        live_console: true,
+        calllog: true
+      }
+    });
+  } catch (error) {
+    console.error('Miniapp bootstrap error:', error);
+    return res.status(500).json({ ok: false, error: 'bootstrap_failed' });
+  }
+});
+
+app.post('/miniapp/refresh', async (req, res) => {
+  try {
+    const refreshToken = resolveMiniappRefreshToken(req);
+    if (!refreshToken) {
+      return res.status(401).json({ ok: false, error: 'missing_refresh' });
+    }
+    const session = await db.getMiniappSessionByRefresh(refreshToken);
+    if (!session) {
+      return res.status(401).json({ ok: false, error: 'invalid_refresh' });
+    }
+    const refreshExpiresAt = session.refresh_expires_at ? Date.parse(session.refresh_expires_at) : null;
+    if (refreshExpiresAt && Date.now() > refreshExpiresAt) {
+      await db.revokeMiniappSession(session.session_token).catch(() => {});
+      return res.status(401).json({ ok: false, error: 'refresh_expired' });
+    }
+    if (!(await isMiniappUserAllowed(session.user_id))) {
+      await db.revokeMiniappSession(session.session_token).catch(() => {});
+      return res.status(403).json({ ok: false, error: 'not_authorized' });
+    }
+    const newSessionToken = crypto.randomBytes(24).toString('hex');
+    const newRefreshToken = crypto.randomBytes(32).toString('hex');
+    const now = Date.now();
+    const expiresAt = new Date(now + MINIAPP_SESSION_TTL_MS).toISOString();
+    const refreshExpiresAtNew = new Date(now + MINIAPP_REFRESH_TTL_MS).toISOString();
+    await db.rotateMiniappSession(refreshToken, {
+      session_token: newSessionToken,
+      refresh_token: newRefreshToken,
+      expires_at: expiresAt,
+      refresh_expires_at: refreshExpiresAtNew,
+      ip: req.ip,
+      user_agent: req.headers['user-agent']
+    });
+    await db.logMiniappAudit({
+      user_id: String(session.user_id),
+      action: 'miniapp.refresh',
+      metadata: { rotated: true },
+      ip: req.ip,
+      user_agent: req.headers['user-agent']
+    }).catch(() => {});
+    return res.json({
+      ok: true,
+      session_token: newSessionToken,
+      refresh_token: newRefreshToken,
+      session_expires_at: expiresAt,
+      refresh_expires_at: refreshExpiresAtNew,
+      roles: session.roles || []
+    });
+  } catch (error) {
+    console.error('Miniapp refresh error:', error);
+    return res.status(500).json({ ok: false, error: 'refresh_failed' });
+  }
+});
+
+app.get('/miniapp/access', requireMiniappSession, requireMiniappAdmin, async (req, res) => {
+  try {
+    const access = await getMiniappAccessLists();
+    return res.json({
+      ok: true,
+      admins: access.admins,
+      viewers: access.viewers,
+      env_admins: access.envAdmins,
+      env_viewers: access.envViewers,
+      custom_admins: access.customAdmins,
+      custom_viewers: access.customViewers
+    });
+  } catch (error) {
+    console.error('Miniapp access read error:', error);
+    return res.status(500).json({ ok: false, error: 'access_read_failed' });
+  }
+});
+
+app.post('/miniapp/access', requireMiniappSession, requireMiniappAdmin, async (req, res) => {
+  try {
+    const adminsInput = req.body?.admins ?? req.body?.admin_ids ?? req.body?.adminIds ?? '';
+    const viewersInput = req.body?.viewers ?? req.body?.viewer_ids ?? req.body?.viewerIds ?? '';
+    const admins = parseAccessList(adminsInput);
+    const viewers = parseAccessList(viewersInput);
+    const access = await getMiniappAccessLists();
+    const currentAdmin = String(req.miniappSession?.user?.id || '');
+    if (currentAdmin && !access.envAdmins.includes(currentAdmin) && !admins.includes(currentAdmin)) {
+      admins.push(currentAdmin);
+    }
+    await db.setSetting(MINIAPP_ACCESS_ADMIN_KEY, JSON.stringify(admins));
+    await db.setSetting(MINIAPP_ACCESS_VIEWER_KEY, JSON.stringify(viewers));
+    await loadMiniappAccessCache(true);
+    const updated = await getMiniappAccessLists();
+    await db.logMiniappAudit({
+      user_id: currentAdmin,
+      action: 'miniapp.access.update',
+      metadata: {
+        admins_count: updated.admins.length,
+        viewers_count: updated.viewers.length
+      },
+      ip: req.ip,
+      user_agent: req.headers['user-agent']
+    }).catch(() => {});
+    return res.json({
+      ok: true,
+      admins: updated.admins,
+      viewers: updated.viewers,
+      env_admins: updated.envAdmins,
+      env_viewers: updated.envViewers,
+      custom_admins: updated.customAdmins,
+      custom_viewers: updated.customViewers
+    });
+  } catch (error) {
+    console.error('Miniapp access update error:', error);
+    return res.status(500).json({ ok: false, error: 'access_update_failed' });
+  }
+});
+
+app.get('/miniapp/stream', requireMiniappSession, (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  const token = resolveMiniappToken(req);
+  const userId = req.miniappSession?.user?.id || null;
+  const client = { res, token, userId };
+  miniappClients.add(client);
+
+  const since = Number(req.query?.since || 0);
+  if (Number.isFinite(since) && since > 0) {
+    const pending = miniappEventBuffer.filter((evt) => evt.sequence > since);
+    for (const evt of pending) {
+      res.write(`data: ${JSON.stringify(evt)}\n\n`);
+    }
+  }
+
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(`: ping ${Date.now()}\n\n`);
+    } catch (_) {}
+  }, 20000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    miniappClients.delete(client);
+  });
+});
+
+app.get('/miniapp/resync', requireMiniappSession, (req, res) => {
+  const after = Number(req.query?.after || 0);
+  const limit = Math.min(200, Math.max(1, Number(req.query?.limit || 100)));
+  const events = miniappEventBuffer
+    .filter((evt) => evt.sequence > after)
+    .slice(-limit);
+  const liveCalls = getMiniappLiveSnapshot();
+  res.json({
+    ok: true,
+    events,
+    live_calls: liveCalls,
+    latest_sequence: miniappSequence
+  });
+});
+
+app.get('/miniapp/calls/active', requireMiniappSession, (req, res) => {
+  res.json({
+    ok: true,
+    calls: getMiniappLiveSnapshot(),
+    latest_sequence: miniappSequence
+  });
+});
+
+app.get('/miniapp/calls/recent', requireMiniappSession, async (req, res) => {
+  try {
+    const limit = Math.min(50, Math.max(1, Number(req.query?.limit || 10)));
+    const offset = Math.max(0, Number(req.query?.offset || 0));
+    const status = req.query?.status || null;
+    const direction = req.query?.direction || null;
+    const query = req.query?.q || req.query?.query || null;
+    const start = normalizeDateFilter(req.query?.start || null, false);
+    const end = normalizeDateFilter(req.query?.end || null, true);
+    const calls = await db.getRecentCalls({
+      limit,
+      offset,
+      status,
+      direction,
+      query,
+      start,
+      end
+    });
+    res.json({
+      ok: true,
+      calls: calls.map(normalizeCallRecordForApi),
+    });
+  } catch (error) {
+    console.error('Miniapp recent calls error:', error);
+    res.status(500).json({ ok: false, error: 'failed_to_fetch_calls' });
+  }
+});
+
+app.get('/miniapp/calls/export', requireMiniappSession, requireMiniappAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(5000, Math.max(1, Number(req.query?.limit || 1000)));
+    const offset = Math.max(0, Number(req.query?.offset || 0));
+    const status = req.query?.status || null;
+    const direction = req.query?.direction || null;
+    const query = req.query?.q || req.query?.query || null;
+    const start = normalizeDateFilter(req.query?.start || null, false);
+    const end = normalizeDateFilter(req.query?.end || null, true);
+    const calls = await db.getRecentCalls({
+      limit,
+      offset,
+      status,
+      direction,
+      query,
+      start,
+      end
+    });
+    const csv = callsToCsv(calls.map(normalizeCallRecordForApi));
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename=\"voxly_calls.csv\"');
+    res.send(csv);
+    await db.logMiniappAudit({
+      user_id: String(req.miniappSession?.user?.id || ''),
+      action: 'miniapp.export',
+      metadata: { limit, offset, status, direction, query, start, end },
+      ip: req.ip,
+      user_agent: req.headers['user-agent']
+    }).catch(() => {});
+  } catch (error) {
+    console.error('Miniapp export error:', error);
+    res.status(500).json({ ok: false, error: 'export_failed' });
+  }
+});
+
+app.get('/miniapp/calls/:callSid', requireMiniappSession, async (req, res) => {
+  try {
+    const call = await db.getCall(req.params.callSid);
+    if (!call) {
+      return res.status(404).json({ ok: false, error: 'call_not_found' });
+    }
+    res.json({ ok: true, call: normalizeCallRecordForApi(call) });
+  } catch (error) {
+    console.error('Miniapp call detail error:', error);
+    res.status(500).json({ ok: false, error: 'failed_to_fetch_call' });
+  }
+});
+
+app.get('/miniapp/calls/:callSid/status', requireMiniappSession, async (req, res) => {
+  try {
+    const { callSid } = req.params;
+    const call = await db.getCall(callSid);
+    if (!call) {
+      return res.status(404).json({ ok: false, error: 'call_not_found' });
+    }
+    const recentStates = await db.getCallStates(callSid, { limit: 20 });
+    res.json({
+      ok: true,
+      call: normalizeCallRecordForApi(call),
+      recent_states: recentStates,
+    });
+  } catch (error) {
+    console.error('Miniapp call status error:', error);
+    res.status(500).json({ ok: false, error: 'failed_to_fetch_status' });
+  }
+});
+
+app.post('/miniapp/calls/:callSid/answer', requireMiniappSession, requireMiniappAdmin, async (req, res) => {
+  try {
+    const { callSid } = req.params;
+    const result = await handleInboundAdminDecision(callSid, 'answer', req.miniappSession?.user?.id);
+    if (!result.ok) {
+      return res.status(result.error === 'already_handled' ? 409 : 400).json({ ok: false, error: result.error, status: result.status || null });
+    }
+    return res.json({ ok: true, status: result.status });
+  } catch (error) {
+    console.error('Miniapp answer error:', error);
+    return res.status(500).json({ ok: false, error: 'answer_failed' });
+  }
+});
+
+app.post('/miniapp/calls/:callSid/decline', requireMiniappSession, requireMiniappAdmin, async (req, res) => {
+  try {
+    const { callSid } = req.params;
+    const result = await handleInboundAdminDecision(callSid, 'decline', req.miniappSession?.user?.id);
+    if (!result.ok) {
+      return res.status(result.error === 'already_handled' ? 409 : 400).json({ ok: false, error: result.error, status: result.status || null });
+    }
+    return res.json({ ok: true, status: result.status });
+  } catch (error) {
+    console.error('Miniapp decline error:', error);
+    return res.status(500).json({ ok: false, error: 'decline_failed' });
+  }
 });
 
 

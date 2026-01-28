@@ -42,6 +42,7 @@ class EnhancedDatabase {
                 user_chat_id TEXT,
                 status TEXT DEFAULT 'initiated',
                 twilio_status TEXT,
+                direction TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 started_at DATETIME,
                 ended_at DATETIME,
@@ -225,6 +226,35 @@ class EnhancedDatabase {
                 failed_calls INTEGER DEFAULT 0,
                 total_duration INTEGER DEFAULT 0,
                 last_activity DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            // Mini app sessions (admin console auth)
+            `CREATE TABLE IF NOT EXISTS miniapp_sessions (
+                session_token TEXT PRIMARY KEY,
+                refresh_token TEXT UNIQUE NOT NULL,
+                user_id TEXT NOT NULL,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                roles TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                expires_at DATETIME NOT NULL,
+                refresh_expires_at DATETIME NOT NULL,
+                last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                ip TEXT,
+                user_agent TEXT
+            )`,
+
+            // Mini app audit trail
+            `CREATE TABLE IF NOT EXISTS miniapp_audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                call_sid TEXT,
+                metadata TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                ip TEXT,
+                user_agent TEXT
             )`
         ];
 
@@ -241,7 +271,7 @@ class EnhancedDatabase {
             });
         }
 
-        await this.ensureCallColumns(['digit_summary', 'digit_count', 'last_otp', 'last_otp_masked']);
+        await this.ensureCallColumns(['digit_summary', 'digit_count', 'last_otp', 'last_otp_masked', 'direction']);
         await this.ensureTemplateColumns(['requires_otp', 'default_profile', 'expected_length', 'allow_terminator', 'terminator_char']);
         await this.ensureNotificationColumns(['last_attempt_at', 'next_attempt_at']);
 
@@ -253,6 +283,7 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_calls_status ON calls(status)',
             'CREATE INDEX IF NOT EXISTS idx_calls_created_at ON calls(created_at)',
             'CREATE INDEX IF NOT EXISTS idx_calls_twilio_status ON calls(twilio_status)',
+            'CREATE INDEX IF NOT EXISTS idx_calls_direction ON calls(direction)',
             'CREATE INDEX IF NOT EXISTS idx_calls_phone_number ON calls(phone_number)',
             
             // Transcript indexes for both table names
@@ -299,7 +330,13 @@ class EnhancedDatabase {
             // Session indexes
             'CREATE INDEX IF NOT EXISTS idx_sessions_chat_id ON user_sessions(telegram_chat_id)',
             'CREATE INDEX IF NOT EXISTS idx_sessions_start ON user_sessions(session_start)',
-            'CREATE INDEX IF NOT EXISTS idx_sessions_activity ON user_sessions(last_activity)'
+            'CREATE INDEX IF NOT EXISTS idx_sessions_activity ON user_sessions(last_activity)',
+            'CREATE INDEX IF NOT EXISTS idx_miniapp_sessions_user ON miniapp_sessions(user_id)',
+            'CREATE INDEX IF NOT EXISTS idx_miniapp_sessions_expires ON miniapp_sessions(expires_at)',
+            'CREATE INDEX IF NOT EXISTS idx_miniapp_sessions_refresh_expires ON miniapp_sessions(refresh_expires_at)',
+            'CREATE INDEX IF NOT EXISTS idx_miniapp_audit_created ON miniapp_audit_logs(created_at)',
+            'CREATE INDEX IF NOT EXISTS idx_miniapp_audit_call ON miniapp_audit_logs(call_sid)',
+            'CREATE INDEX IF NOT EXISTS idx_miniapp_audit_action ON miniapp_audit_logs(action)'
         ];
 
         for (const index of indexes) {
@@ -357,6 +394,8 @@ class EnhancedDatabase {
                 await addColumn('last_otp', 'TEXT');
             } else if (column === 'last_otp_masked') {
                 await addColumn('last_otp_masked', 'TEXT');
+            } else if (column === 'direction') {
+                await addColumn('direction', 'TEXT');
             }
         }
     }
@@ -403,16 +442,17 @@ class EnhancedDatabase {
             first_message, 
             user_chat_id, 
             business_context = null,
-            generated_functions = null 
+            generated_functions = null,
+            direction = null
         } = callData;
         
         return new Promise((resolve, reject) => {
             const stmt = this.db.prepare(`
                 INSERT INTO calls (
                     call_sid, phone_number, prompt, first_message, 
-                    user_chat_id, status, business_context, generated_functions
+                    user_chat_id, status, business_context, generated_functions, direction
                 )
-                VALUES (?, ?, ?, ?, ?, 'initiated', ?, ?)
+                VALUES (?, ?, ?, ?, ?, 'initiated', ?, ?, ?)
             `);
             
             stmt.run([
@@ -422,7 +462,8 @@ class EnhancedDatabase {
                 first_message, 
                 user_chat_id, 
                 business_context,
-                generated_functions
+                generated_functions,
+                direction
             ], function(err) {
                 if (err) {
                     reject(err);
@@ -904,7 +945,77 @@ class EnhancedDatabase {
     }
 
     // NEW: Get recent calls with transcripts count (REQUIRED FOR API ENDPOINTS)
-    async getRecentCalls(limit = 10, offset = 0) {
+    async getRecentCalls(limitOrOptions = 10, offset = 0) {
+        let limit = 10;
+        let actualOffset = 0;
+        let status = null;
+        let direction = null;
+        let search = null;
+        let start = null;
+        let end = null;
+
+        if (typeof limitOrOptions === 'object' && limitOrOptions !== null) {
+            limit = Number(limitOrOptions.limit ?? 10);
+            actualOffset = Number(limitOrOptions.offset ?? 0);
+            status = limitOrOptions.status ?? null;
+            direction = limitOrOptions.direction ?? null;
+            search = limitOrOptions.query ?? null;
+            start = limitOrOptions.start ?? null;
+            end = limitOrOptions.end ?? null;
+        } else {
+            limit = Number(limitOrOptions ?? 10);
+            actualOffset = Number(offset ?? 0);
+        }
+
+        const where = [];
+        const params = [];
+
+        if (status) {
+            const statuses = String(status)
+                .split(',')
+                .map((value) => value.trim().toLowerCase())
+                .filter(Boolean);
+            if (statuses.length === 1) {
+                where.push('LOWER(c.status) = ?');
+                params.push(statuses[0]);
+            } else if (statuses.length > 1) {
+                where.push(`LOWER(c.status) IN (${statuses.map(() => '?').join(',')})`);
+                params.push(...statuses);
+            }
+        }
+
+        if (direction) {
+            const directions = String(direction)
+                .split(',')
+                .map((value) => value.trim().toLowerCase())
+                .filter(Boolean);
+            if (directions.length === 1) {
+                where.push('LOWER(c.direction) = ?');
+                params.push(directions[0]);
+            } else if (directions.length > 1) {
+                where.push(`LOWER(c.direction) IN (${directions.map(() => '?').join(',')})`);
+                params.push(...directions);
+            }
+        }
+
+        if (search) {
+            const needle = `%${String(search).trim()}%`;
+            where.push('(c.phone_number LIKE ? OR c.call_sid LIKE ?)');
+            params.push(needle, needle);
+        }
+
+        if (start) {
+            where.push('c.created_at >= ?');
+            params.push(start);
+        }
+
+        if (end) {
+            where.push('c.created_at <= ?');
+            params.push(end);
+        }
+
+        const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
         return new Promise((resolve, reject) => {
             const query = `
                 SELECT 
@@ -912,12 +1023,14 @@ class EnhancedDatabase {
                     COUNT(t.id) as transcript_count
                 FROM calls c
                 LEFT JOIN transcripts t ON c.call_sid = t.call_sid
+                ${whereClause}
                 GROUP BY c.call_sid
                 ORDER BY c.created_at DESC
                 LIMIT ? OFFSET ?
             `;
-            
-            this.db.all(query, [limit, offset], (err, rows) => {
+
+            params.push(limit, actualOffset);
+            this.db.all(query, params, (err, rows) => {
                 if (err) {
                     console.error('Database error in getRecentCalls:', err);
                     reject(err);
@@ -939,6 +1052,202 @@ class EnhancedDatabase {
                     resolve(row?.count || 0);
                 }
             });
+        });
+    }
+
+    async createMiniappSession(session) {
+        const {
+            session_token,
+            refresh_token,
+            user_id,
+            username,
+            first_name,
+            last_name,
+            roles,
+            expires_at,
+            refresh_expires_at,
+            ip,
+            user_agent
+        } = session;
+
+        return new Promise((resolve, reject) => {
+            const stmt = this.db.prepare(`
+                INSERT INTO miniapp_sessions (
+                    session_token, refresh_token, user_id, username, first_name, last_name, roles,
+                    expires_at, refresh_expires_at, last_seen_at, ip, user_agent
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)
+            `);
+
+            stmt.run([
+                session_token,
+                refresh_token,
+                user_id,
+                username || null,
+                first_name || null,
+                last_name || null,
+                roles ? JSON.stringify(roles) : null,
+                expires_at,
+                refresh_expires_at,
+                ip || null,
+                user_agent || null
+            ], function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.changes);
+                }
+            });
+            stmt.finalize();
+        });
+    }
+
+    async getMiniappSessionByToken(sessionToken) {
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT * FROM miniapp_sessions WHERE session_token = ?`,
+                [sessionToken],
+                (err, row) => {
+                    if (err) {
+                        reject(err);
+                    } else if (!row) {
+                        resolve(null);
+                    } else {
+                        resolve({
+                            ...row,
+                            roles: row.roles ? JSON.parse(row.roles) : []
+                        });
+                    }
+                }
+            );
+        });
+    }
+
+    async getMiniappSessionByRefresh(refreshToken) {
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT * FROM miniapp_sessions WHERE refresh_token = ?`,
+                [refreshToken],
+                (err, row) => {
+                    if (err) {
+                        reject(err);
+                    } else if (!row) {
+                        resolve(null);
+                    } else {
+                        resolve({
+                            ...row,
+                            roles: row.roles ? JSON.parse(row.roles) : []
+                        });
+                    }
+                }
+            );
+        });
+    }
+
+    async rotateMiniappSession(refreshToken, session) {
+        const {
+            session_token,
+            refresh_token,
+            expires_at,
+            refresh_expires_at,
+            ip,
+            user_agent
+        } = session;
+
+        return new Promise((resolve, reject) => {
+            const stmt = this.db.prepare(`
+                UPDATE miniapp_sessions
+                SET session_token = ?,
+                    refresh_token = ?,
+                    expires_at = ?,
+                    refresh_expires_at = ?,
+                    last_seen_at = datetime('now'),
+                    ip = COALESCE(?, ip),
+                    user_agent = COALESCE(?, user_agent)
+                WHERE refresh_token = ?
+            `);
+
+            stmt.run([
+                session_token,
+                refresh_token,
+                expires_at,
+                refresh_expires_at,
+                ip || null,
+                user_agent || null,
+                refreshToken
+            ], function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.changes);
+                }
+            });
+            stmt.finalize();
+        });
+    }
+
+    async updateMiniappSessionLastSeen(sessionToken, ip, user_agent) {
+        return new Promise((resolve, reject) => {
+            const stmt = this.db.prepare(`
+                UPDATE miniapp_sessions
+                SET last_seen_at = datetime('now'),
+                    ip = COALESCE(?, ip),
+                    user_agent = COALESCE(?, user_agent)
+                WHERE session_token = ?
+            `);
+
+            stmt.run([ip || null, user_agent || null, sessionToken], function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.changes);
+                }
+            });
+            stmt.finalize();
+        });
+    }
+
+    async revokeMiniappSession(sessionToken) {
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `DELETE FROM miniapp_sessions WHERE session_token = ?`,
+                [sessionToken],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(this.changes);
+                    }
+                }
+            );
+        });
+    }
+
+    async logMiniappAudit(payload) {
+        const { user_id, action, call_sid, metadata, ip, user_agent } = payload;
+        return new Promise((resolve, reject) => {
+            const stmt = this.db.prepare(`
+                INSERT INTO miniapp_audit_logs (
+                    user_id, action, call_sid, metadata, ip, user_agent
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+            `);
+
+            stmt.run([
+                user_id,
+                action,
+                call_sid || null,
+                metadata ? JSON.stringify(metadata) : null,
+                ip || null,
+                user_agent || null
+            ], function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.lastID);
+                }
+            });
+            stmt.finalize();
         });
     }
 
@@ -2649,6 +2958,46 @@ class EnhancedDatabase {
        
        if (sessionsCleaned > 0) {
            console.log(`🧹 Cleaned ${sessionsCleaned} old user sessions`);
+       }
+
+       // Clean up expired miniapp sessions
+       const miniappSessionsCleaned = await new Promise((resolve, reject) => {
+           const sql = `DELETE FROM miniapp_sessions
+               WHERE refresh_expires_at < datetime('now')`;
+
+           this.db.run(sql, function(err) {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(this.changes);
+               }
+           });
+       });
+       cleanupResults.miniapp_sessions = miniappSessionsCleaned;
+       totalCleaned += miniappSessionsCleaned;
+
+       if (miniappSessionsCleaned > 0) {
+           console.log(`🧹 Cleaned ${miniappSessionsCleaned} expired miniapp sessions`);
+       }
+
+       // Clean up miniapp audit logs (keep 30 days)
+       const miniappAuditCleaned = await new Promise((resolve, reject) => {
+           const sql = `DELETE FROM miniapp_audit_logs
+               WHERE created_at < datetime('now', '-30 days')`;
+
+           this.db.run(sql, function(err) {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(this.changes);
+               }
+           });
+       });
+       cleanupResults.miniapp_audit_logs = miniappAuditCleaned;
+       totalCleaned += miniappAuditCleaned;
+
+       if (miniappAuditCleaned > 0) {
+           console.log(`🧹 Cleaned ${miniappAuditCleaned} old miniapp audit logs`);
        }
        
        // Log cleanup operation

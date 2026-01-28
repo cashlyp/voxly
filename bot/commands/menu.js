@@ -5,6 +5,17 @@ const { cancelActiveFlow, resetSession } = require('../utils/sessionState');
 const { escapeHtml, renderMenu } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 
+function addMiniappButton(kb) {
+    if (!config.miniappUrl) return kb;
+    kb.row();
+    if (typeof kb.webApp === 'function') {
+        kb.webApp('🖥️ Mini App', config.miniappUrl);
+    } else {
+        kb.url('🖥️ Mini App', config.miniappUrl);
+    }
+    return kb;
+}
+
 async function handleMenu(ctx) {
     try {
         await cancelActiveFlow(ctx, 'command:/menu');
@@ -25,6 +36,7 @@ async function handleMenu(ctx) {
 
         if (access.user) {
             kb.row().text('🏥 Health', buildCallbackData(ctx, 'HEALTH'));
+            addMiniappButton(kb);
         }
 
         if (isOwner) {

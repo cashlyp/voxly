@@ -350,6 +350,7 @@ const {
 const { registerHelpCommand, handleHelp } = require('./commands/help');
 const { registerMenuCommand, handleMenu } = require('./commands/menu');
 const { registerGuideCommand, handleGuide } = require('./commands/guide');
+const { registerMiniappCommand } = require('./commands/miniapp');
 const {
     registerApiCommands,
     handleStatusCommand,
@@ -395,6 +396,7 @@ registerUserListCommand(bot);
 registerPersonaCommand(bot);
 registerCalllogCommand(bot);
 registerCallerFlagsCommand(bot);
+registerMiniappCommand(bot);
 
 
 // Register non-conversation commands
@@ -1547,6 +1549,7 @@ const TELEGRAM_COMMANDS = [
     { command: 'start', description: 'Start or restart the bot' },
     { command: 'help', description: 'Show available commands' },
     { command: 'menu', description: 'Show quick action menu' },
+    { command: 'miniapp', description: 'Open the Mini App console' },
     { command: 'guide', description: 'Show detailed usage guide' },
     { command: 'health', description: 'Check bot and API health' },
     { command: 'call', description: 'Start outbound voice call' },
@@ -1574,6 +1577,7 @@ const TELEGRAM_COMMANDS_USER = [
     { command: 'start', description: 'Start or restart the bot' },
     { command: 'help', description: 'Show available commands' },
     { command: 'menu', description: 'Show quick action menu' },
+    { command: 'miniapp', description: 'Open the Mini App console' },
     { command: 'guide', description: 'Show detailed usage guide' },
     { command: 'health', description: 'Check bot and API health' },
     { command: 'call', description: 'Start outbound voice call' },

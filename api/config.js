@@ -46,6 +46,14 @@ function normalizeHostname(value) {
   return trimmed.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
 }
 
+function parseList(rawValue) {
+  if (!rawValue) return [];
+  return String(rawValue)
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
 const corsOriginsRaw = ensure('CORS_ORIGINS', process.env.WEB_APP_URL || '');
 const corsOrigins = corsOriginsRaw
   .split(',')
@@ -118,6 +126,16 @@ const inboundRateLimitMax = Number(readEnv('INBOUND_RATE_LIMIT_MAX') || '0');
 const inboundRateLimitSmsEnabled = String(readEnv('INBOUND_RATE_LIMIT_SMS') || 'false').toLowerCase() === 'true';
 const inboundRateLimitCallbackEnabled = String(readEnv('INBOUND_RATE_LIMIT_CALLBACK') || 'false').toLowerCase() === 'true';
 const inboundCallbackDelayMinutes = Number(readEnv('INBOUND_CALLBACK_DELAY_MIN') || '15');
+
+const miniappAllowedOrigins = parseList(readEnv('MINIAPP_ALLOWED_ORIGINS'));
+const miniappPublicUrl = readEnv('MINIAPP_PUBLIC_URL') || readEnv('MINIAPP_URL');
+const miniappSessionTtlMs = Number(readEnv('MINIAPP_SESSION_TTL_MS') || '3600000');
+const miniappRefreshTtlMs = Number(readEnv('MINIAPP_REFRESH_TTL_MS') || String(7 * 24 * 60 * 60 * 1000));
+const miniappRateLimitWindowMs = Number(readEnv('MINIAPP_RATE_LIMIT_WINDOW_MS') || '60000');
+const miniappRateLimitMax = Number(readEnv('MINIAPP_RATE_LIMIT_MAX') || '120');
+const miniappBrandName = readEnv('MINIAPP_BRAND_NAME') || 'VOICEDNUT';
+const miniappThemeRaw = parseJsonObject(readEnv('MINIAPP_THEME_JSON'), 'MINIAPP_THEME_JSON');
+const miniappTheme = miniappThemeRaw && Object.keys(miniappThemeRaw).length ? miniappThemeRaw : null;
 const providerFailoverEnabled = String(readEnv('PROVIDER_FAILOVER_ENABLED') || 'true').toLowerCase() === 'true';
 const providerFailoverThreshold = Number(readEnv('PROVIDER_ERROR_THRESHOLD') || '3');
 const providerFailoverWindowMs = Number(readEnv('PROVIDER_ERROR_WINDOW_S') || '120') * 1000;
@@ -163,6 +181,11 @@ const liveConsoleUserHoldMs = Number(readEnv('LIVE_CONSOLE_USER_HOLD_MS') || '45
 const liveConsoleCarrier = readEnv('LIVE_CONSOLE_CARRIER') || 'VOICEDNUT';
 const liveConsoleNetworkLabel = readEnv('LIVE_CONSOLE_NETWORK_LABEL') || 'LTE';
 const telegramAdminChatId = readEnv('TELEGRAM_ADMIN_CHAT_ID') || readEnv('ADMIN_TELEGRAM_ID');
+const telegramAdminChatIds = parseList(readEnv('TELEGRAM_ADMIN_CHAT_IDS'));
+const telegramViewerChatIds = parseList(readEnv('TELEGRAM_VIEWER_CHAT_IDS'));
+if (!telegramAdminChatIds.length && telegramAdminChatId) {
+  telegramAdminChatIds.push(telegramAdminChatId);
+}
 const emailProvider = (readEnv('EMAIL_PROVIDER') || 'sendgrid').toLowerCase();
 const emailDefaultFrom = readEnv('EMAIL_DEFAULT_FROM') || '';
 const emailVerifiedDomains = (readEnv('EMAIL_VERIFIED_DOMAINS') || '')
@@ -248,7 +271,21 @@ module.exports = {
   },
   telegram: {
     botToken: ensure('TELEGRAM_BOT_TOKEN', process.env.BOT_TOKEN),
-    adminChatId: telegramAdminChatId
+    adminChatId: telegramAdminChatId,
+    adminChatIds: telegramAdminChatIds,
+    viewerChatIds: telegramViewerChatIds
+  },
+  miniapp: {
+    allowedOrigins: miniappAllowedOrigins.length ? miniappAllowedOrigins : corsOrigins,
+    sessionTtlMs: miniappSessionTtlMs,
+    refreshTtlMs: miniappRefreshTtlMs,
+    rateLimit: {
+      windowMs: miniappRateLimitWindowMs,
+      max: miniappRateLimitMax,
+    },
+    brandName: miniappBrandName,
+    theme: miniappTheme,
+    publicUrl: miniappPublicUrl
   },
   openRouter: {
     apiKey: ensure('OPENROUTER_API_KEY'),

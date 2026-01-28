@@ -42,6 +42,7 @@ module.exports = {
   },
   apiUrl: process.env.API_URL,
   botToken: process.env.BOT_TOKEN,
+  miniappUrl: process.env.MINIAPP_URL || process.env.MINIAPP_PUBLIC_URL,
   scriptsApiUrl,
   defaultVoiceModel: process.env.DEFAULT_VOICE_MODEL || 'aura-asteria-en',
   defaultBusinessId: process.env.DEFAULT_BUSINESS_ID || 'general',
