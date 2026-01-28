@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - 'miniapp/**'
 
 jobs:
   deploy:
@@ -27,8 +29,12 @@ jobs:
             # Navigate to project root
             cd /home/ubuntu/voicednut
 
-            # Pull latest changes
-            git pull origin main
+            # Keep only api + bot checked out on EC2 (avoid deploying miniapp assets)
+            git fetch origin main
+            git sparse-checkout init --cone
+            git sparse-checkout set api bot
+            git checkout main
+            git pull --ff-only origin main
 
             # Kill PM2 daemon and delete all processes
             pm2 kill

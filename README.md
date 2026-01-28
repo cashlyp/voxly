@@ -35,7 +35,7 @@ A comprehensive Telegram bot system for making AI-powered voice calls using Twil
 ## 🔁 Provider Modes (Twilio, AWS Connect, Vonage)
 
 - Set the default voice backbone with `CALL_PROVIDER` in `api/.env` (`twilio`, `aws`, or `vonage`).
-- Admins can switch live traffic at any time via `/provider [twilio|aws|vonage|status]` in Telegram (requires `ADMIN_API_TOKEN`).
+- Admins can switch live traffic at any time via `/provider <name>|status` in Telegram (requires `ADMIN_API_TOKEN`).
 - Twilio mode keeps the original Media Streams flow; AWS mode routes through Connect/Kinesis per `aws-migration.md`; Vonage mode uses the Vonage Voice API and WebSocket streaming.
 - Each provider has matching SMS adapters (Twilio SMS, AWS Pinpoint, Vonage SMS) so outbound texts follow the active backbone.
 - When Twilio is selected but credentials are missing, the API now fails fast with a targeted message pointing to the relevant `.env` entries and the `npm run setup --prefix api` helper.
@@ -493,7 +493,7 @@ Available TTS voices:
 - API: `GET /health`
 - Bot: `/health` command
 - Admin: `/status` command
-- Admin: `/provider [twilio|aws|vonage|status]` to inspect or switch the active call backbone
+- Admin: `/provider <name>|status` to inspect or switch the active call backbone
 
 ### Logging
 

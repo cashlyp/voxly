@@ -37,6 +37,13 @@ export type LiveCall = {
   decision?: string;
   decision_by?: string | null;
   decision_at?: string | null;
+  priority?: string | null;
+  rule_summary?: {
+    decision?: string | null;
+    label?: string | null;
+    risk?: string | null;
+    recent_calls?: number | null;
+  } | null;
 };
 
 export type CallEvent = {

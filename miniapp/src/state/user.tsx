@@ -4,6 +4,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type PropsWithChildren,
 } from 'react';
@@ -14,14 +15,20 @@ import {
   getStoredRoles,
   getStoredUser,
   getTokenExpiry,
+  AuthError,
+  type AuthErrorKind,
   type WebappUser,
 } from '../lib/auth';
+import { trackEvent } from '../lib/telemetry';
 
 type UserState = {
   status: 'idle' | 'loading' | 'ready' | 'error';
   user: WebappUser | null;
   roles: string[];
   error?: string | null;
+  errorKind?: AuthErrorKind | null;
+  environment?: string | null;
+  tenantId?: string | null;
   refresh: () => Promise<void>;
   login: () => Promise<void>;
   logout: () => void;
@@ -34,32 +41,62 @@ export function UserProvider({ children }: PropsWithChildren) {
   const [user, setUser] = useState<WebappUser | null>(getStoredUser());
   const [roles, setRoles] = useState<string[]>(getStoredRoles());
   const [error, setError] = useState<string | null>(null);
+  const [errorKind, setErrorKind] = useState<AuthErrorKind | null>(null);
+  const [environment, setEnvironment] = useState<string | null>(null);
+  const [tenantId, setTenantId] = useState<string | null>(null);
+  const authStartRef = useRef<number | null>(Date.now());
 
   const refresh = useCallback(async () => {
     setStatus('loading');
     setError(null);
+    setErrorKind(null);
+    authStartRef.current = Date.now();
     try {
       const session = await ensureAuth();
       setUser(session.user);
       setRoles(session.roles || []);
+      setEnvironment(session.environment ?? null);
+      setTenantId(session.tenant_id ?? null);
       setStatus('ready');
+      if (authStartRef.current !== null) {
+        trackEvent('slo_auth_ready', { duration_ms: Math.round(Date.now() - authStartRef.current) });
+      }
     } catch (err) {
       setStatus('error');
-      setError(err instanceof Error ? err.message : 'Auth failed');
+      if (err instanceof AuthError) {
+        setError(err.message);
+        setErrorKind(err.kind);
+      } else {
+        setError(err instanceof Error ? err.message : 'Auth failed');
+        setErrorKind('unknown');
+      }
     }
   }, []);
 
   const login = useCallback(async () => {
     setStatus('loading');
     setError(null);
+    setErrorKind(null);
+    authStartRef.current = Date.now();
     try {
       const session = await authenticate();
       setUser(session.user);
       setRoles(session.roles || []);
+      setEnvironment(session.environment ?? null);
+      setTenantId(session.tenant_id ?? null);
       setStatus('ready');
+      if (authStartRef.current !== null) {
+        trackEvent('slo_auth_ready', { duration_ms: Math.round(Date.now() - authStartRef.current) });
+      }
     } catch (err) {
       setStatus('error');
-      setError(err instanceof Error ? err.message : 'Login failed');
+      if (err instanceof AuthError) {
+        setError(err.message);
+        setErrorKind(err.kind);
+      } else {
+        setError(err instanceof Error ? err.message : 'Login failed');
+        setErrorKind('unknown');
+      }
     }
   }, []);
 
@@ -68,6 +105,10 @@ export function UserProvider({ children }: PropsWithChildren) {
     setUser(null);
     setRoles([]);
     setStatus('idle');
+    setError(null);
+    setErrorKind(null);
+    setEnvironment(null);
+    setTenantId(null);
   }, []);
 
   useEffect(() => {
@@ -93,10 +134,13 @@ export function UserProvider({ children }: PropsWithChildren) {
     user,
     roles,
     error,
+    errorKind,
+    environment,
+    tenantId,
     refresh,
     login,
     logout,
-  }), [status, user, roles, error, refresh, login, logout]);
+  }), [status, user, roles, error, errorKind, environment, tenantId, refresh, login, logout]);
 
   return (
     <UserContext.Provider value={value}>

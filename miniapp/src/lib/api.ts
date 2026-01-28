@@ -46,6 +46,10 @@ const API_BASE = import.meta.env.VITE_API_BASE || '';
 const DEFAULT_TIMEOUT_MS = 8000;
 const DEFAULT_RETRIES = 2;
 
+export function getApiBase() {
+  return API_BASE;
+}
+
 function buildUrl(path: string) {
   if (path.startsWith('http://') || path.startsWith('https://')) return path;
   return `${API_BASE}${path}`;
@@ -133,8 +137,8 @@ export async function apiFetch<T>(
         const payload = await readJsonSafely(response);
         const error = new ApiError({
           status: response.status,
-          code: payload?.error || payload?.code || 'request_failed',
-          message: payload?.message || payload?.error || 'Request failed',
+          code: payload?.error || payload?.code || `http_${response.status}`,
+          message: payload?.message || payload?.error || response.statusText || `Request failed (${response.status})`,
           details: payload,
           retryable: shouldRetry(response.status),
         });
@@ -157,10 +161,28 @@ export async function apiFetch<T>(
       if (error instanceof ApiError) {
         throw error;
       }
+      if (isAbort) {
+        throw new ApiError({
+          status: 0,
+          code: 'timeout',
+          message: 'Request timed out',
+          details: error,
+          retryable: true,
+        });
+      }
+      if (error instanceof TypeError) {
+        throw new ApiError({
+          status: 0,
+          code: 'network_error',
+          message: 'Cannot reach API (network/CORS/DNS)',
+          details: error,
+          retryable: true,
+        });
+      }
       throw new ApiError({
         status: 0,
-        code: 'network_error',
-        message: 'Network error',
+        code: 'unknown_error',
+        message: 'Unexpected network failure',
         details: error,
         retryable: true,
       });

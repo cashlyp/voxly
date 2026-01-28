@@ -1,15 +1,25 @@
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Button } from '@telegram-apps/telegram-ui';
 import { useCalls } from '../state/calls';
 import { navigate } from '../lib/router';
+import { apiFetch } from '../lib/api';
+import { useUser } from '../state/user';
 
 export function Dashboard() {
   const { calls, inboundQueue, fetchCalls, fetchInboundQueue, loading } = useCalls();
+  const { roles } = useUser();
+  const isAdmin = roles.includes('admin');
+  const [callbackTasks, setCallbackTasks] = useState<{ id: number; run_at: string; number: string }[]>([]);
 
   useEffect(() => {
     fetchCalls({ limit: 10 });
     fetchInboundQueue();
-  }, [fetchCalls, fetchInboundQueue]);
+    if (isAdmin) {
+      apiFetch<{ ok: boolean; tasks: { id: number; run_at: string; number: string }[] }>('/webapp/callbacks?limit=3')
+        .then((response) => setCallbackTasks(response.tasks || []))
+        .catch(() => {});
+    }
+  }, [fetchCalls, fetchInboundQueue, isAdmin]);
 
   const stats = useMemo(() => {
     const total = calls.length;
@@ -134,6 +144,33 @@ export function Dashboard() {
           ))}
         </div>
       </div>
+
+      {isAdmin && (
+        <div className="card-section">
+        <div className="card-header">
+          <span>Callbacks</span>
+          <span className="card-header-muted">{callbackTasks.length ? `${callbackTasks.length} scheduled` : 'None'}</span>
+        </div>
+        {callbackTasks.length === 0 ? (
+          <div className="empty-card">
+            <div className="empty-title">No callbacks queued</div>
+            <div className="empty-subtitle">Callback tasks will show up here.</div>
+          </div>
+        ) : (
+          <div className="card-list">
+            {callbackTasks.map((task) => (
+              <div key={task.id} className="card-item">
+                <div className="card-item-main">
+                  <div className="card-item-title">{task.number}</div>
+                  <div className="card-item-subtitle">Run at {task.run_at}</div>
+                </div>
+                <span className="tag outline">callback</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+      )}
     </div>
   );
 }

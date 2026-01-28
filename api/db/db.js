@@ -1093,6 +1093,27 @@ class EnhancedDatabase {
         });
     }
 
+    async getRecentCallCountByNumber(number, hours = 24) {
+        if (!number) return 0;
+        const window = Math.max(1, Number(hours) || 24);
+        const sql = `
+            SELECT COUNT(*) as count
+            FROM calls
+            WHERE phone_number = ?
+              AND created_at >= datetime('now', '-${window} hours')
+        `;
+        return new Promise((resolve, reject) => {
+            this.db.get(sql, [number], (err, row) => {
+                if (err) {
+                    console.error('Database error in getRecentCallCountByNumber:', err);
+                    reject(err);
+                } else {
+                    resolve(row?.count || 0);
+                }
+            });
+        });
+    }
+
     async createMiniappSession(session) {
         const {
             session_token,
@@ -1599,6 +1620,36 @@ class EnhancedDatabase {
                 }
             });
             stmt.finalize();
+        });
+    }
+
+    async listCallJobs({ job_type = null, status = null, limit = 20 } = {}) {
+        const clauses = [];
+        const params = [];
+        if (job_type) {
+            clauses.push('job_type = ?');
+            params.push(job_type);
+        }
+        if (status) {
+            clauses.push('status = ?');
+            params.push(status);
+        }
+        const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+        const sql = `
+            SELECT * FROM call_jobs
+            ${where}
+            ORDER BY run_at ASC
+            LIMIT ?
+        `;
+        params.push(Math.min(100, Math.max(1, Number(limit) || 20)));
+        return new Promise((resolve, reject) => {
+            this.db.all(sql, params, (err, rows) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(rows || []);
+                }
+            });
         });
     }
 

@@ -108,21 +108,24 @@ async function handleHelp(ctx) {
             ? (() => {
                 const keyboard = new InlineKeyboard()
                     .text('📞 Call', buildCallbackData(ctx, 'CALL'))
-                    .text('📋 Menu', buildCallbackData(ctx, 'MENU'))
-                    .row()
                     .text('💬 SMS', buildCallbackData(ctx, 'SMS'))
-                    .text('📧 Email', buildCallbackData(ctx, 'EMAIL'))
                     .row()
-                    .text('📚 Guide', buildCallbackData(ctx, 'GUIDE'));
+                    .text('📧 Email', buildCallbackData(ctx, 'EMAIL'))
+                    .text('📋 Menu', buildCallbackData(ctx, 'MENU'));
 
                 if (config.miniappUrl && isAuthorized) {
+                    const buttonLabel = '🖥️ VOICEDNUT ✅ mini app';
                     keyboard.row();
                     if (typeof keyboard.webApp === 'function') {
-                        keyboard.webApp('🖥️ Mini App', config.miniappUrl);
+                        keyboard.webApp(buttonLabel, config.miniappUrl);
                     } else {
-                        keyboard.url('🖥️ Mini App', config.miniappUrl);
+                        keyboard.url(buttonLabel, config.miniappUrl);
                     }
                 }
+
+                keyboard.row()
+                    .text('📚 Guide', buildCallbackData(ctx, 'GUIDE'))
+                    .text('ℹ️ Help', buildCallbackData(ctx, 'HELP'));
 
                 if (isOwner) {
                     keyboard.row()

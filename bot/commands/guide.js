@@ -30,7 +30,7 @@ async function handleGuide(ctx) {
 
     const adminControls = [
         '📍 /provider status — see the active provider',
-        '🔁 /provider twilio|aws|vonage — switch on the fly',
+        '🔁 /provider <name> — switch providers on the fly',
         '👥 /users — manage seats'
     ];
 

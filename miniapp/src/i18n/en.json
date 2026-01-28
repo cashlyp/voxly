@@ -1,0 +1,15 @@
+{
+  "banner.offline.header": "You're offline",
+  "banner.offline.body": "Some data may be outdated. Reconnect to refresh.",
+  "banner.auth.unauthorized.header": "Not authorized",
+  "banner.auth.unauthorized.body": "Please reopen the Mini App from the bot to sign in.",
+  "banner.auth.initdata.header": "Session expired",
+  "banner.auth.initdata.body": "Telegram session expired. Close and reopen the Mini App.",
+  "banner.auth.server.header": "Server unavailable",
+  "banner.auth.server.body": "The server is unavailable. Try again soon.",
+  "banner.error.header": "Something went wrong",
+  "banner.error.body": "Reload the mini app to continue.",
+  "env.staging": "STAGING",
+  "env.production": "PRODUCTION",
+  "env.unknown": "ENV"
+}

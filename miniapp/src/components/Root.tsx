@@ -3,18 +3,22 @@ import { ErrorBoundary } from '@/components/ErrorBoundary.tsx';
 import { UserProvider } from '@/state/user.tsx';
 
 function ErrorBoundaryError({ error }: { error: unknown }) {
+  const message = error instanceof Error
+    ? error.message
+    : typeof error === 'string'
+      ? error
+      : 'Unexpected error';
   return (
-    <div>
-      <p>An unhandled error occurred:</p>
-      <blockquote>
-        <code>
-          {error instanceof Error
-            ? error.message
-            : typeof error === 'string'
-              ? error
-              : JSON.stringify(error)}
-        </code>
-      </blockquote>
+    <div className="panel">
+      <div className="empty-title">Something went wrong</div>
+      <div className="empty-subtitle">{message}</div>
+      <button
+        type="button"
+        className="pill-card"
+        onClick={() => window.location.reload()}
+      >
+        Reload
+      </button>
     </div>
   );
 }

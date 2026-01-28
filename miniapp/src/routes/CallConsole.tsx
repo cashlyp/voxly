@@ -15,6 +15,7 @@ import { apiFetch, createIdempotencyKey } from '../lib/api';
 import { confirmAction, hapticImpact, hapticSuccess, hapticError } from '../lib/ux';
 import { useCalls } from '../state/calls';
 import { useUser } from '../state/user';
+import { trackEvent } from '../lib/telemetry';
 
 type TranscriptEntry = {
   speaker: string;
@@ -30,13 +31,14 @@ export function CallConsole({ callSid }: { callSid: string }) {
   const [liveEvents, setLiveEvents] = useState<WebappEvent[]>([]);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [streamHealth, setStreamHealth] = useState<{ latencyMs?: number; jitterMs?: number; packetLossPct?: number; asrConfidence?: number } | null>(null);
-  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'open' | 'error' | 'stale'>('connecting');
+  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'open' | 'error' | 'stale' | 'reconnecting'>('connecting');
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [scripts, setScripts] = useState<{ id: number; name: string }[]>([]);
   const [selectedScript, setSelectedScript] = useState<number | null>(null);
   const lastSequenceRef = useRef(0);
   const lastSeenRef = useRef(Date.now());
   const reconnectTimerRef = useRef<number | null>(null);
+  const reconnectAttemptRef = useRef(0);
   const [streamEpoch, setStreamEpoch] = useState(0);
 
   useEffect(() => {
@@ -60,6 +62,17 @@ export function CallConsole({ callSid }: { callSid: string }) {
     let stream: { close: () => void } | null = null;
     let cancelled = false;
     const since = lastSequenceRef.current;
+    const scheduleReconnect = () => {
+      if (reconnectTimerRef.current) return;
+      const attempt = reconnectAttemptRef.current + 1;
+      reconnectAttemptRef.current = attempt;
+      const delay = Math.min(30000, 1000 * Math.pow(2, attempt - 1));
+      setConnectionStatus('reconnecting');
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = null;
+        setStreamEpoch((prev) => prev + 1);
+      }, delay);
+    };
     ensureAuth()
       .then((session) => {
         if (cancelled) return;
@@ -98,20 +111,18 @@ export function CallConsole({ callSid }: { callSid: string }) {
           },
           onError: () => {
             setConnectionStatus('error');
-            if (reconnectTimerRef.current) return;
-            reconnectTimerRef.current = window.setTimeout(() => {
-              reconnectTimerRef.current = null;
-              setStreamEpoch((prev) => prev + 1);
-            }, 3000);
+            scheduleReconnect();
           },
           onOpen: () => {
             lastSeenRef.current = Date.now();
             setConnectionStatus('open');
+            reconnectAttemptRef.current = 0;
           },
         });
       })
       .catch(() => {
         setConnectionStatus('error');
+        scheduleReconnect();
       });
     return () => {
       cancelled = true;
@@ -158,6 +169,16 @@ export function CallConsole({ callSid }: { callSid: string }) {
     return `${activeCall.status || 'unknown'} - ${activeCall.direction || 'n/a'}`;
   }, [activeCall]);
 
+  const ruleLabel = useMemo(() => {
+    const live = activeCall?.live as Record<string, unknown> | undefined;
+    return String(live?.route_label || live?.script || (activeCall as Record<string, unknown> | null)?.route_label || 'default');
+  }, [activeCall]);
+
+  const riskLabel = useMemo(() => {
+    const live = activeCall?.live as Record<string, unknown> | undefined;
+    return String(live?.risk_level || 'normal');
+  }, [activeCall]);
+
   const timeline = callEventsById[callSid] || [];
 
   const handleInboundAction = async (action: 'answer' | 'decline') => {
@@ -171,6 +192,7 @@ export function CallConsole({ callSid }: { callSid: string }) {
       if (!confirmed) return;
     }
     setActionBusy(action);
+    trackEvent(`console_${action}_clicked`, { call_sid: callSid });
     hapticImpact();
     try {
       await apiFetch(`/webapp/inbound/${callSid}/${action}`, {
@@ -178,9 +200,31 @@ export function CallConsole({ callSid }: { callSid: string }) {
         idempotencyKey: createIdempotencyKey(),
       });
       hapticSuccess();
+      trackEvent(`console_${action}_success`, { call_sid: callSid });
       await fetchCall(callSid);
     } catch (error) {
       hapticError();
+      trackEvent(`console_${action}_failed`, { call_sid: callSid });
+      throw error;
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
+  const handleCallback = async () => {
+    if (!isAdmin) return;
+    setActionBusy('callback');
+    trackEvent('console_callback_clicked', { call_sid: callSid });
+    try {
+      await apiFetch(`/webapp/inbound/${callSid}/callback`, {
+        method: 'POST',
+        body: { window_minutes: 30 },
+        idempotencyKey: createIdempotencyKey(),
+      });
+      trackEvent('console_callback_scheduled', { call_sid: callSid });
+      await fetchCall(callSid);
+    } catch (error) {
+      trackEvent('console_callback_failed', { call_sid: callSid });
       throw error;
     } finally {
       setActionBusy(null);
@@ -198,6 +242,7 @@ export function CallConsole({ callSid }: { callSid: string }) {
       if (!confirmed) return;
     }
     setActionBusy(action);
+    trackEvent(`console_stream_${action}_clicked`, { call_sid: callSid });
     hapticImpact();
     try {
       const idempotencyKey = createIdempotencyKey();
@@ -207,9 +252,11 @@ export function CallConsole({ callSid }: { callSid: string }) {
         await apiFetch(`/webapp/calls/${callSid}/stream/${action}`, { method: 'POST', idempotencyKey });
       }
       hapticSuccess();
+      trackEvent(`console_stream_${action}_success`, { call_sid: callSid });
       await fetchCall(callSid);
     } catch (error) {
       hapticError();
+      trackEvent(`console_stream_${action}_failed`, { call_sid: callSid });
       throw error;
     } finally {
       setActionBusy(null);
@@ -220,11 +267,13 @@ export function CallConsole({ callSid }: { callSid: string }) {
     if (!selectedScript) return;
     setActionBusy('script');
     try {
+      trackEvent('console_script_inject_clicked', { call_sid: callSid, script_id: selectedScript });
       await apiFetch(`/webapp/calls/${callSid}/script`, {
         method: 'POST',
         body: { script_id: selectedScript },
         idempotencyKey: createIdempotencyKey(),
       });
+      trackEvent('console_script_inject_success', { call_sid: callSid, script_id: selectedScript });
     } finally {
       setActionBusy(null);
     }
@@ -240,12 +289,22 @@ export function CallConsole({ callSid }: { callSid: string }) {
         <Cell subtitle="Realtime" after={<Chip mode="outline">{connectionStatus}</Chip>}>
           Connection
         </Cell>
+        {(connectionStatus === 'reconnecting' || connectionStatus === 'stale') && (
+          <Cell subtitle="Reconnecting to live updates...">
+            Reconnecting
+          </Cell>
+        )}
         {streamHealth && (
           <Cell
             subtitle={`latency ${streamHealth.latencyMs ?? '-'}ms • jitter ${streamHealth.jitterMs ?? '-'}ms`}
             description={`loss ${streamHealth.packetLossPct ?? '-'}% • asr ${streamHealth.asrConfidence ?? '-'}`}
           >
             Stream health
+          </Cell>
+        )}
+        {activeCall && (
+          <Cell subtitle={ruleLabel} after={<Chip mode="mono">{riskLabel}</Chip>}>
+            Rule summary
           </Cell>
         )}
         <div className="section-actions">
@@ -268,6 +327,11 @@ export function CallConsole({ callSid }: { callSid: string }) {
                 text="Decline"
                 disabled={!!actionBusy}
                 onClick={() => handleInboundAction('decline')}
+              />
+              <InlineButtons.Item
+                text="Callback"
+                disabled={!!actionBusy}
+                onClick={handleCallback}
               />
             </InlineButtons>
           )}

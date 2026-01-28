@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Button, Cell, Chip, List, Placeholder, Section } from '@telegram-apps/telegram-ui';
 import { apiFetch, createIdempotencyKey } from '../lib/api';
+import { AppBrand } from '../components/AppBrand';
 
 type SettingsResponse = {
   ok: boolean;
@@ -10,6 +11,22 @@ type SettingsResponse = {
     readiness: Record<string, boolean>;
   };
   webhook_health?: {
+    last_sequence?: number;
+  };
+};
+
+type PingResponse = {
+  ok: boolean;
+  server_time: string;
+  environment: string;
+  provider: {
+    current: string;
+    readiness: Record<string, boolean>;
+    degraded: boolean;
+    last_error_at?: string | null;
+    last_success_at?: string | null;
+  };
+  webhook: {
     last_sequence?: number;
   };
 };
@@ -25,6 +42,8 @@ type AuditLog = {
 
 export function Settings() {
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
+  const [ping, setPing] = useState<PingResponse | null>(null);
+  const [pingLatency, setPingLatency] = useState<number | null>(null);
   const [switching, setSwitching] = useState(false);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [auditCursor, setAuditCursor] = useState<number | null>(null);
@@ -51,10 +70,18 @@ export function Settings() {
     }
   }, []);
 
+  const loadPing = useCallback(async () => {
+    const start = Date.now();
+    const response = await apiFetch<PingResponse>('/webapp/ping');
+    setPingLatency(Date.now() - start);
+    setPing(response);
+  }, []);
+
   useEffect(() => {
     loadSettings();
     loadAudit(0, false);
-  }, [loadSettings, loadAudit]);
+    loadPing();
+  }, [loadSettings, loadAudit, loadPing]);
 
   const switchProvider = async (provider: string) => {
     setSwitching(true);
@@ -72,6 +99,9 @@ export function Settings() {
 
   return (
     <div className="wallet-page">
+      <div className="settings-brand-card">
+        <AppBrand subtitle="mini app" meta="Settings & health" />
+      </div>
       <List className="wallet-list">
       <Section header="Provider status" className="wallet-section">
         {!settings ? (
@@ -111,6 +141,31 @@ export function Settings() {
         >
           Webhook status
         </Cell>
+      </Section>
+
+      <Section header="API health" className="wallet-section">
+        {!ping ? (
+          <Placeholder header="Loading health" description="Fetching API latency and provider status." />
+        ) : (
+          <>
+            <Cell subtitle="Environment" after={<Chip mode="mono">{ping.environment}</Chip>}>
+              API env
+            </Cell>
+            <Cell subtitle="Latency" after={<Chip mode="mono">{pingLatency ? `${pingLatency}ms` : '-'}</Chip>}>
+              API latency
+            </Cell>
+            <Cell subtitle="Provider" after={<Chip mode="mono">{ping.provider.current}</Chip>}>
+              Current provider
+            </Cell>
+            <Cell
+              subtitle="Provider health"
+              after={<Chip mode={ping.provider.degraded ? 'outline' : 'mono'}>{ping.provider.degraded ? 'degraded' : 'healthy'}</Chip>}
+            >
+              Provider status
+            </Cell>
+            <Cell subtitle="Last error">{ping.provider.last_error_at || '-'}</Cell>
+          </>
+        )}
       </Section>
 
       <Section header="Audit log" footer="Latest admin actions" className="wallet-section">

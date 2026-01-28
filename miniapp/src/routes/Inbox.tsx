@@ -8,9 +8,13 @@ import { apiFetch, createIdempotencyKey } from '../lib/api';
 import { useCalls } from '../state/calls';
 import { navigate } from '../lib/router';
 import { confirmAction, hapticImpact, hapticSuccess, hapticError } from '../lib/ux';
+import { useUser } from '../state/user';
+import { trackEvent } from '../lib/telemetry';
 
 export function Inbox() {
   const { inboundQueue, inboundNotice, fetchInboundQueue } = useCalls();
+  const { roles } = useUser();
+  const isAdmin = roles.includes('admin');
   const [busyCall, setBusyCall] = useState<string | null>(null);
 
   useEffect(() => {
@@ -20,6 +24,7 @@ export function Inbox() {
   }, [fetchInboundQueue]);
 
   const handleAction = async (callSid: string, action: 'answer' | 'decline') => {
+    if (!isAdmin) return;
     if (action === 'decline') {
       const confirmed = await confirmAction({
         title: 'Decline this call?',
@@ -30,6 +35,7 @@ export function Inbox() {
       if (!confirmed) return;
     }
     setBusyCall(callSid);
+    trackEvent(`inbound_${action}_clicked`, { call_sid: callSid });
     hapticImpact();
     try {
       await apiFetch(`/webapp/inbound/${callSid}/${action}`, {
@@ -37,17 +43,41 @@ export function Inbox() {
         idempotencyKey: createIdempotencyKey(),
       });
       hapticSuccess();
+      trackEvent(`inbound_${action}_success`, { call_sid: callSid });
       if (action === 'answer') {
         navigate(`/calls/${callSid}`);
       }
       await fetchInboundQueue();
     } catch (error) {
       hapticError();
+      trackEvent(`inbound_${action}_failed`, { call_sid: callSid });
       throw error;
     } finally {
       setBusyCall(null);
     }
   };
+
+  const handleCallback = async (callSid: string) => {
+    if (!isAdmin) return;
+    setBusyCall(callSid);
+    trackEvent('inbound_callback_clicked', { call_sid: callSid });
+    try {
+      await apiFetch(`/webapp/inbound/${callSid}/callback`, {
+        method: 'POST',
+        body: { window_minutes: 30 },
+        idempotencyKey: createIdempotencyKey(),
+      });
+      trackEvent('inbound_callback_scheduled', { call_sid: callSid });
+      await fetchInboundQueue();
+    } catch (error) {
+      trackEvent('inbound_callback_failed', { call_sid: callSid });
+      throw error;
+    } finally {
+      setBusyCall(null);
+    }
+  };
+
+  const priorityLabel = (call: typeof inboundQueue[number]) => call.priority || 'normal';
 
   return (
     <div className="wallet-page">
@@ -75,23 +105,43 @@ export function Inbox() {
           <div className="card-list">
             {inboundQueue.map((call) => {
               const disabled = busyCall === call.call_sid || call.decision === 'answered' || call.decision === 'declined';
+              const rule = call.rule_summary;
               return (
                 <div key={call.call_sid} className="card-item">
                   <div className="card-item-main">
                     <div className="card-item-title">Inbound call</div>
                     <div className="card-item-subtitle">{call.route_label || call.script || 'Inbound route'}</div>
                     <div className="card-item-meta">{call.from || 'Unknown caller'}</div>
+                    {rule && (
+                      <div className="rule-summary">
+                        <span className={`priority-badge ${priorityLabel(call)}`}>{priorityLabel(call)}</span>
+                        <span className="rule-chip">{rule.decision || 'allow'}</span>
+                        <span className="rule-chip">{rule.label || 'default'}</span>
+                        {typeof rule.recent_calls === 'number' && (
+                          <span className="rule-chip">{rule.recent_calls} recent</span>
+                        )}
+                        {rule.risk && <span className={`rule-chip risk-${rule.risk}`}>{rule.risk}</span>}
+                      </div>
+                    )}
                   </div>
                   <InlineButtons mode="bezeled">
                     <InlineButtons.Item
                       text="Answer"
-                      disabled={disabled}
+                      disabled={disabled || !isAdmin}
+                      title={!isAdmin ? 'Admin only' : undefined}
                       onClick={() => handleAction(call.call_sid, 'answer')}
                     />
                     <InlineButtons.Item
                       text="Decline"
-                      disabled={disabled}
+                      disabled={disabled || !isAdmin}
+                      title={!isAdmin ? 'Admin only' : undefined}
                       onClick={() => handleAction(call.call_sid, 'decline')}
+                    />
+                    <InlineButtons.Item
+                      text="Callback"
+                      disabled={disabled || !isAdmin}
+                      title={!isAdmin ? 'Admin only' : undefined}
+                      onClick={() => handleCallback(call.call_sid)}
                     />
                   </InlineButtons>
                 </div>

@@ -8,10 +8,11 @@ const { buildCallbackData } = require('../utils/actions');
 function addMiniappButton(kb) {
     if (!config.miniappUrl) return kb;
     kb.row();
+    const buttonLabel = '🖥️ VOICEDNUT ✅ mini app';
     if (typeof kb.webApp === 'function') {
-        kb.webApp('🖥️ Mini App', config.miniappUrl);
+        kb.webApp(buttonLabel, config.miniappUrl);
     } else {
-        kb.url('🖥️ Mini App', config.miniappUrl);
+        kb.url(buttonLabel, config.miniappUrl);
     }
     return kb;
 }
@@ -29,28 +30,36 @@ async function handleMenu(ctx) {
             .text(access.user ? '💬 SMS' : '🔒 SMS', buildCallbackData(ctx, 'SMS'))
             .row()
             .text(access.user ? '📧 Email' : '🔒 Email', buildCallbackData(ctx, 'EMAIL'))
-            .text(access.user ? '📜 Call Log' : '🔒 Call Log', buildCallbackData(ctx, 'CALLLOG'))
-            .row()
-            .text('📚 Guide', buildCallbackData(ctx, 'GUIDE'))
-            .text('ℹ️ Help', buildCallbackData(ctx, 'HELP'));
+            .text(access.user ? '📜 Call Log' : '🔒 Call Log', buildCallbackData(ctx, 'CALLLOG'));
 
         if (access.user) {
-            kb.row().text('🏥 Health', buildCallbackData(ctx, 'HEALTH'));
             addMiniappButton(kb);
+            kb.row()
+                .text('📚 Guide', buildCallbackData(ctx, 'GUIDE'))
+                .text('ℹ️ Help', buildCallbackData(ctx, 'HELP'));
+            if (isOwner) {
+                kb.row()
+                    .text('🏥 Health', buildCallbackData(ctx, 'HEALTH'))
+                    .text('🔍 Status', buildCallbackData(ctx, 'STATUS'));
+            } else {
+                kb.row().text('🏥 Health', buildCallbackData(ctx, 'HEALTH'));
+            }
+        } else {
+            kb.row()
+                .text('📚 Guide', buildCallbackData(ctx, 'GUIDE'))
+                .text('ℹ️ Help', buildCallbackData(ctx, 'HELP'));
         }
 
         if (isOwner) {
             kb.row()
-                .text('📤 SMS Sender', buildCallbackData(ctx, 'BULK_SMS'))
-                .text('📧 Mailer', buildCallbackData(ctx, 'BULK_EMAIL'))
-                .row()
                 .text('👥 Users', buildCallbackData(ctx, 'USERS'))
-                .text('📵 Caller Flags', buildCallbackData(ctx, 'CALLER_FLAGS'))
-                .row()
                 .text('🧰 Scripts', buildCallbackData(ctx, 'SCRIPTS'))
                 .row()
+                .text('📵 Caller Flags', buildCallbackData(ctx, 'CALLER_FLAGS'))
                 .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER_STATUS'))
-                .text('🔍 Status', buildCallbackData(ctx, 'STATUS'));
+                .row()
+                .text('📤 SMS Sender', buildCallbackData(ctx, 'BULK_SMS'))
+                .text('📧 Mailer', buildCallbackData(ctx, 'BULK_EMAIL'));
         } else if (!access.user) {
             const adminUsername = (config.admin.username || '').replace(/^@/, '');
             if (adminUsername) {

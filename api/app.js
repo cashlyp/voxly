@@ -106,9 +106,12 @@ const MINIAPP_ACCESS_VIEWER_KEY = 'miniapp_viewer_ids';
 const miniappAccessCache = { admins: [], viewers: [], loadedAt: 0 };
 const WEBAPP_JWT_TTL_S = Number(config.miniapp?.jwtTtlSeconds || 900);
 const WEBAPP_INITDATA_MAX_AGE_S = Number(config.miniapp?.initDataMaxAgeS || 120);
+const WEBAPP_INITDATA_CLOCK_SKEW_S = 60;
 const WEBAPP_JWT_ISSUER = 'voicdnut-webapp';
 const WEBAPP_JWT_AUDIENCE = 'voicednut-miniapp';
 const WEBAPP_JWT_CLOCK_SKEW_S = 60;
+const WEBAPP_ENVIRONMENT = String(process.env.APP_ENV || process.env.NODE_ENV || 'production').toLowerCase();
+const WEBAPP_TENANT_ID = String(config.miniapp?.tenantId || process.env.TENANT_ID || 'default');
 let backgroundWorkersStarted = false;
 
 const CALL_STATUS_DEDUPE_MS = 3000;
@@ -238,8 +241,11 @@ function verifyTelegramInitData(raw, maxAgeSeconds = MINIAPP_INITDATA_MAX_AGE_S)
   const authDate = Number(authDateRaw);
   if (Number.isFinite(authDate) && maxAgeSeconds > 0) {
     const ageSeconds = Math.floor(Date.now() / 1000) - authDate;
-    if (ageSeconds > maxAgeSeconds) {
+    if (ageSeconds > maxAgeSeconds + WEBAPP_INITDATA_CLOCK_SKEW_S) {
       return { ok: false, reason: 'expired_init_data' };
+    }
+    if (ageSeconds < -WEBAPP_INITDATA_CLOCK_SKEW_S) {
+      return { ok: false, reason: 'invalid_auth_date' };
     }
   }
   let user = null;
@@ -325,14 +331,17 @@ async function loadMiniappAccessCache(force = false) {
 
 async function getMiniappAccessLists() {
   const envAdmins = config.telegram?.adminChatIds || [];
+  const envOperators = config.telegram?.operatorChatIds || [];
   const envViewers = config.telegram?.viewerChatIds || [];
   if (!db) {
     return {
       envAdmins,
+      envOperators,
       envViewers,
       customAdmins: [],
       customViewers: [],
       admins: envAdmins,
+      operators: envOperators,
       viewers: envViewers
     };
   }
@@ -341,18 +350,21 @@ async function getMiniappAccessLists() {
   const viewers = mergeAccessLists(envViewers, cache.viewers);
   return {
     envAdmins,
+    envOperators,
     envViewers,
     customAdmins: cache.admins,
     customViewers: cache.viewers,
     admins,
+    operators: envOperators,
     viewers
   };
 }
 
 async function resolveMiniappRoles(userId) {
-  const { admins, viewers } = await getMiniappAccessLists();
+  const { admins, operators, viewers } = await getMiniappAccessLists();
   if (!admins.length && !viewers.length && !isProduction) return ['admin'];
   if (admins.map(String).includes(String(userId))) return ['admin'];
+  if (operators.map(String).includes(String(userId))) return ['operator'];
   if (viewers.map(String).includes(String(userId))) return ['viewer'];
   return [];
 }
@@ -385,7 +397,11 @@ function isMiniappOriginAllowed(origin) {
 function requireMiniappOrigin(req, res, next) {
   const origin = resolveMiniappOrigin(req);
   if (!isMiniappOriginAllowed(origin)) {
-    return res.status(403).json({ ok: false, error: 'origin_not_allowed' });
+    return res.status(403).json({
+      ok: false,
+      error: 'origin_not_allowed',
+      message: webappErrorMessage('origin_not_allowed'),
+    });
   }
   return next();
 }
@@ -582,14 +598,41 @@ function resolveWebappToken(req) {
   return null;
 }
 
+function webappErrorMessage(code) {
+  const messages = {
+    missing_initdata: 'Telegram init data is missing. Open the Mini App from Telegram.',
+    missing_hash: 'Telegram init data hash is missing.',
+    invalid_hash: 'Telegram init data signature is invalid.',
+    expired_init_data: 'Telegram init data expired. Close and reopen the Mini App.',
+    invalid_auth_date: 'Telegram init data has an invalid timestamp.',
+    missing_bot_token: 'Server is missing the bot token for initData verification.',
+    invalid_initdata: 'Telegram init data is invalid.',
+    missing_user: 'Telegram user payload is missing.',
+    not_authorized: 'User is not authorized for this Mini App.',
+    missing_token: 'Auth token is missing.',
+    invalid_token: 'Auth token is invalid or expired.',
+    origin_not_allowed: 'Origin not allowed for this Mini App.',
+  };
+  return messages[code] || 'Request failed';
+}
+
 function requireWebappInitData(req, res, next) {
   const raw = resolveMiniappInitData(req);
   if (!raw) {
-    return res.status(401).json({ ok: false, error: 'missing_initdata' });
+    return res.status(401).json({
+      ok: false,
+      error: 'missing_initdata',
+      message: webappErrorMessage('missing_initdata'),
+    });
   }
   const verified = verifyTelegramInitData(raw, WEBAPP_INITDATA_MAX_AGE_S);
   if (!verified.ok) {
-    return res.status(401).json({ ok: false, error: verified.reason || 'invalid_initdata' });
+    const code = verified.reason || 'invalid_initdata';
+    return res.status(401).json({
+      ok: false,
+      error: code,
+      message: webappErrorMessage(code),
+    });
   }
   req.miniappInitData = raw;
   req.miniappInitUser = verified.user;
@@ -601,11 +644,20 @@ async function requireWebappJwt(req, res, next) {
   try {
     const token = resolveWebappToken(req);
     if (!token) {
-      return res.status(401).json({ ok: false, error: 'missing_token' });
+      return res.status(401).json({
+        ok: false,
+        error: 'missing_token',
+        message: webappErrorMessage('missing_token'),
+      });
     }
     const verification = verifyWebappJwt(token);
     if (!verification.ok) {
-      return res.status(401).json({ ok: false, error: verification.error || 'invalid_token' });
+      const code = verification.error || 'invalid_token';
+      return res.status(401).json({
+        ok: false,
+        error: code,
+        message: webappErrorMessage(code),
+      });
     }
     const payload = verification.payload || {};
     const userId = payload.sub || payload.user_id || payload.userId;
@@ -614,7 +666,11 @@ async function requireWebappJwt(req, res, next) {
     }
     const roles = await resolveMiniappRoles(userId);
     if (!roles.length) {
-      return res.status(403).json({ ok: false, error: 'not_authorized' });
+      return res.status(403).json({
+        ok: false,
+        error: 'not_authorized',
+        message: webappErrorMessage('not_authorized'),
+      });
     }
     req.webappSession = {
       token,
@@ -624,7 +680,8 @@ async function requireWebappJwt(req, res, next) {
         first_name: payload.first_name || null,
         last_name: payload.last_name || null
       },
-      roles
+      roles,
+      tenant_id: payload.tenant_id || WEBAPP_TENANT_ID
     };
     return next();
   } catch (error) {
@@ -2424,6 +2481,24 @@ function miniappSecurityHeaders(req, res, next) {
   return next();
 }
 
+function miniappCorsHeaders(req, res, next) {
+  const origin = resolveMiniappOrigin(req);
+  if (origin && isMiniappOriginAllowed(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      'Authorization, Content-Type, Idempotency-Key, X-Request-Id, X-Telegram-Init-Data, X-Telegram-Initdata, X-Telegram-Init',
+    );
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+    if (req.method === 'OPTIONS') {
+      return res.status(204).end();
+    }
+  }
+  return next();
+}
+
 function miniappRequestLogger(req, res, next) {
   const requestId = req.headers['x-request-id'] || uuidv4();
   req.requestId = requestId;
@@ -2477,6 +2552,31 @@ function logWebappAuthEvent(req, action, metadata = {}, userIdOverride = null) {
   }).catch(() => {});
 }
 
+function sanitizeTelemetryValue(value) {
+  if (value == null) return null;
+  if (typeof value === 'number') return value;
+  if (typeof value === 'string') {
+    if (value.length > 120) return value.slice(0, 120);
+    return value;
+  }
+  if (typeof value === 'boolean') return value;
+  return null;
+}
+
+function sanitizeTelemetryData(data = {}) {
+  const filtered = {};
+  const blockedKeys = ['phone', 'otp', 'token', 'secret', 'init', 'authorization', 'sid'];
+  Object.entries(data || {}).forEach(([key, value]) => {
+    const lower = key.toLowerCase();
+    if (blockedKeys.some((blocked) => lower.includes(blocked))) return;
+    const sanitized = sanitizeTelemetryValue(value);
+    if (sanitized !== null) {
+      filtered[key] = sanitized;
+    }
+  });
+  return filtered;
+}
+
 app.use((req, res, next) => {
   if (shouldBypassHmac(req)) {
     return next();
@@ -2497,8 +2597,8 @@ app.use((req, res, next) => {
   return apiLimiter(req, res, next);
 });
 
-app.use('/miniapp', miniappLimiter, miniappSecurityHeaders, requireMiniappOrigin, requireMiniappInitData, miniappRequestLogger);
-app.use('/webapp', webappLimiter, miniappSecurityHeaders, requireMiniappOrigin, webappRequestLogger);
+app.use('/miniapp', miniappLimiter, miniappSecurityHeaders, miniappCorsHeaders, requireMiniappOrigin, requireMiniappInitData, miniappRequestLogger);
+app.use('/webapp', webappLimiter, miniappSecurityHeaders, miniappCorsHeaders, requireMiniappOrigin, webappRequestLogger);
 
 const PORT = config.server?.port || 3000;
 
@@ -7459,12 +7559,20 @@ app.post('/webapp/auth', webappAuthLimiter, requireWebappInitData, async (req, r
     const user = req.miniappInitUser;
     if (!user?.id) {
       logWebappAuthEvent(req, 'webapp.auth.failed', { reason: 'missing_user' });
-      return res.status(401).json({ ok: false, error: 'missing_user' });
+      return res.status(401).json({
+        ok: false,
+        error: 'missing_user',
+        message: webappErrorMessage('missing_user'),
+      });
     }
     const roles = await resolveMiniappRoles(user.id);
     if (!roles.length) {
       logWebappAuthEvent(req, 'webapp.auth.failed', { reason: 'not_authorized' }, user.id);
-      return res.status(403).json({ ok: false, error: 'not_authorized' });
+      return res.status(403).json({
+        ok: false,
+        error: 'not_authorized',
+        message: webappErrorMessage('not_authorized'),
+      });
     }
     const now = Math.floor(Date.now() / 1000);
     const tokenId = createWebappTokenId();
@@ -7474,6 +7582,7 @@ app.post('/webapp/auth', webappAuthLimiter, requireWebappInitData, async (req, r
       first_name: user.first_name || null,
       last_name: user.last_name || null,
       roles,
+      tenant_id: WEBAPP_TENANT_ID,
       aud: WEBAPP_JWT_AUDIENCE,
       jti: tokenId,
       iat: now,
@@ -7483,7 +7592,11 @@ app.post('/webapp/auth', webappAuthLimiter, requireWebappInitData, async (req, r
     const token = signWebappJwt(payload);
     if (!token) {
       logWebappAuthEvent(req, 'webapp.auth.failed', { reason: 'token_unavailable' }, user.id);
-      return res.status(500).json({ ok: false, error: 'token_unavailable' });
+      return res.status(500).json({
+        ok: false,
+        error: 'token_unavailable',
+        message: 'Auth token unavailable. Check server configuration.',
+      });
     }
     logWebappAuthEvent(req, 'webapp.auth', { roles, token_id: tokenId }, user.id);
     return res.json({
@@ -7496,21 +7609,116 @@ app.post('/webapp/auth', webappAuthLimiter, requireWebappInitData, async (req, r
         first_name: user.first_name || null,
         last_name: user.last_name || null
       },
-      roles
+      roles,
+      environment: WEBAPP_ENVIRONMENT,
+      tenant_id: WEBAPP_TENANT_ID
     });
   } catch (error) {
     console.error('Webapp auth error:', error);
-    return res.status(500).json({ ok: false, error: 'auth_failed' });
+    return res.status(500).json({
+      ok: false,
+      error: 'auth_failed',
+      message: 'Authentication failed. Please try again.',
+    });
   }
 });
 
 app.get('/webapp/me', requireWebappJwt, async (req, res) => {
   const session = req.webappSession;
+  const roles = session?.roles || [];
+  const role = roles.includes('admin')
+    ? 'admin'
+    : roles.includes('operator')
+      ? 'operator'
+      : roles.includes('viewer')
+        ? 'viewer'
+        : 'unknown';
   return res.json({
     ok: true,
     user: session?.user || null,
-    roles: session?.roles || []
+    roles,
+    role,
+    environment: WEBAPP_ENVIRONMENT,
+    tenant_id: WEBAPP_TENANT_ID
   });
+});
+
+app.post('/webapp/telemetry', requireWebappJwt, async (req, res) => {
+  try {
+    const payload = req.body || {};
+    const events = Array.isArray(payload.events) ? payload.events.slice(0, 50) : [];
+    const cleanedEvents = events.map((event) => ({
+      name: String(event?.name || 'unknown'),
+      ts: String(event?.ts || new Date().toISOString()),
+      data: sanitizeTelemetryData(event?.data || {}),
+    }));
+    const entry = {
+      type: 'webapp.telemetry',
+      request_id: req.requestId || null,
+      user_id: String(req.webappSession?.user?.id || ''),
+      session_id: String(payload.session_id || 'unknown'),
+      route: String((payload.context && payload.context.route) || ''),
+      environment: WEBAPP_ENVIRONMENT,
+      tenant_id: WEBAPP_TENANT_ID,
+      events: cleanedEvents,
+    };
+    console.log(JSON.stringify(entry));
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error('Webapp telemetry error:', error);
+    return res.status(500).json({ ok: false, error: 'telemetry_failed' });
+  }
+});
+
+app.get('/webapp/ping', requireWebappJwt, async (req, res) => {
+  try {
+    const readiness = getProviderReadiness();
+    const health = getProviderHealthEntry(currentProvider);
+    return res.json({
+      ok: true,
+      server_time: new Date().toISOString(),
+      environment: WEBAPP_ENVIRONMENT,
+      tenant_id: WEBAPP_TENANT_ID,
+      provider: {
+        current: currentProvider,
+        readiness,
+        degraded: isProviderDegraded(currentProvider),
+        last_error_at: health?.lastErrorAt || null,
+        last_success_at: health?.lastSuccessAt || null,
+      },
+      webhook: {
+        last_sequence: miniappSequence,
+      },
+    });
+  } catch (error) {
+    console.error('Webapp ping error:', error);
+    return res.status(500).json({ ok: false, error: 'ping_failed' });
+  }
+});
+
+app.get('/webapp/callbacks', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    if (!db) return res.json({ ok: true, tasks: [] });
+    const limit = Math.min(50, Math.max(1, Number(req.query?.limit || 10)));
+    const jobs = await db.listCallJobs({ job_type: 'callback_call', status: 'pending', limit });
+    const tasks = (jobs || []).map((job) => {
+      let payload = {};
+      try {
+        payload = job.payload ? JSON.parse(job.payload) : {};
+      } catch {
+        payload = {};
+      }
+      return {
+        id: job.id,
+        run_at: job.run_at,
+        number: payload.number || payload.phone_number || 'Unknown',
+      };
+    });
+    return res.json({ ok: true, tasks });
+  } catch (error) {
+    console.error('Webapp callbacks error:', error);
+    return res.status(500).json({ ok: false, error: 'callbacks_failed' });
+  }
 });
 
 app.get('/webapp/calls', requireWebappJwt, async (req, res) => {
@@ -7662,16 +7870,39 @@ app.get('/webapp/inbound/queue', requireWebappJwt, async (req, res) => {
   try {
     const liveCalls = getMiniappLiveSnapshot();
     const inbound = liveCalls.filter((call) => call?.inbound);
-    const queue = inbound.map((call) => {
+    const queue = (await Promise.all(inbound.map(async (call) => {
       const gate = webhookService.getInboundGate(call.call_sid);
       const decision = gate?.status === 'expired' ? 'missed' : gate?.status || 'pending';
+      const number = call.from || call.phone_number || null;
+      let recentCalls = null;
+      if (db && number) {
+        try {
+          recentCalls = await db.getRecentCallCountByNumber(number, 72);
+        } catch {
+          recentCalls = null;
+        }
+      }
+      const lowerLabel = String(call.route_label || call.script || '').toLowerCase();
+      let priority = 'normal';
+      if (!number) priority = 'unknown';
+      if (lowerLabel.includes('vip') || lowerLabel.includes('priority')) priority = 'vip';
+      if (typeof recentCalls === 'number' && recentCalls >= 3) priority = 'repeat';
+      let risk = 'normal';
+      if (typeof recentCalls === 'number' && recentCalls >= 5) risk = 'high';
       return {
         ...call,
         decision,
         decision_by: gate?.chatId || null,
-        decision_at: gate?.updatedAt || null
+        decision_at: gate?.updatedAt || null,
+        priority,
+        rule_summary: {
+          decision: decision === 'pending' ? 'allow' : decision,
+          label: call.route_label || call.script || 'default',
+          risk,
+          recent_calls: recentCalls,
+        },
       };
-    }).filter((call) => {
+    }))).filter((call) => {
       const status = String(call.status || '').toLowerCase();
       const decision = String(call.decision || 'pending').toLowerCase();
       if (decision !== 'pending') return false;
@@ -7688,6 +7919,38 @@ app.get('/webapp/inbound/queue', requireWebappJwt, async (req, res) => {
   } catch (error) {
     console.error('Webapp inbound queue error:', error);
     return res.status(500).json({ ok: false, error: 'failed_to_fetch_queue' });
+  }
+});
+
+app.post('/webapp/inbound/:callSid/callback', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  const idempotency = applyIdempotency(req, res);
+  if (idempotency.handled) return;
+  try {
+    const { callSid } = req.params;
+    const windowMinutes = Math.max(5, Math.min(120, Number(req.body?.window_minutes || 30)));
+    const live = getMiniappLiveSnapshot().find((call) => call.call_sid === callSid);
+    const callRecord = live || (db ? await db.getCall(callSid) : null);
+    const number = callRecord?.from || callRecord?.phone_number || callRecord?.to || null;
+    const prompt = config.inbound?.defaultPrompt;
+    const firstMessage = config.inbound?.defaultFirstMessage;
+    if (!number || !prompt || !firstMessage) {
+      return res.status(400).json({ ok: false, error: 'missing_callback_payload', message: 'Missing number or default prompt/first message.' });
+    }
+    const runAt = new Date(Date.now() + windowMinutes * 60 * 1000).toISOString();
+    const payload = {
+      number,
+      prompt,
+      first_message: firstMessage,
+      route_label: callRecord?.route_label || null,
+      script: callRecord?.script || null,
+      callback_window_min: windowMinutes,
+      requested_by: String(req.webappSession?.user?.id || ''),
+    };
+    await scheduleCallJob('callback_call', payload, runAt);
+    return res.json({ ok: true, run_at: runAt });
+  } catch (error) {
+    console.error('Webapp callback schedule error:', error);
+    return res.status(500).json({ ok: false, error: 'callback_failed' });
   }
 });
 

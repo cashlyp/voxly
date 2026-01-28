@@ -10,12 +10,14 @@ import {
 } from '@telegram-apps/telegram-ui';
 import { useCalls } from '../state/calls';
 import { navigate } from '../lib/router';
+import { loadUiState, updateCallsFilters } from '../lib/uiState';
 
 export function Calls() {
   const { calls, fetchCalls, nextCursor, loading } = useCalls();
-  const [statusFilter, setStatusFilter] = useState('');
-  const [search, setSearch] = useState('');
-  const [cursor, setCursor] = useState(0);
+  const saved = loadUiState().callsFilters;
+  const [statusFilter, setStatusFilter] = useState(saved?.status || '');
+  const [search, setSearch] = useState(saved?.query || '');
+  const [cursor, setCursor] = useState(saved?.cursor || 0);
 
   const loadCalls = useCallback(async (nextCursorValue = 0) => {
     await fetchCalls({
@@ -29,6 +31,10 @@ export function Calls() {
   useEffect(() => {
     loadCalls(0);
   }, [loadCalls]);
+
+  useEffect(() => {
+    updateCallsFilters({ status: statusFilter, query: search, cursor });
+  }, [statusFilter, search, cursor]);
 
   const handleNext = () => {
     if (nextCursor !== null) {

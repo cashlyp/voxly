@@ -1,24 +1,28 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
-import { addToHomeScreen, backButton, miniApp, openLink, openTelegramLink } from '@tma.js/sdk-react';
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { addToHomeScreen, backButton, openLink, openTelegramLink, popup } from '@tma.js/sdk-react';
+import { settingsButton } from '@tma.js/sdk';
 import {
   Banner,
-  Button,
-  Cell,
-  List,
-  Modal,
-  Section,
   Tabbar,
 } from '@telegram-apps/telegram-ui';
 import { matchRoute, navigate, getHashPath, type RouteMatch } from '../lib/router';
+import { loadUiState, saveUiState } from '../lib/uiState';
+import { resolveRoleTier, canAccessRoute, type RoleTier } from '../lib/roles';
+import { trackEvent, setTelemetryContext } from '../lib/telemetry';
+import { t } from '../lib/i18n';
+import { apiFetch } from '../lib/api';
 import { useUser } from '../state/user';
-import { CallsProvider } from '../state/calls';
+import { CallsProvider, useCalls } from '../state/calls';
 import { Dashboard } from '../routes/Dashboard';
 import { Inbox } from '../routes/Inbox';
 import { Calls } from '../routes/Calls';
 import { CallConsole } from '../routes/CallConsole';
-import { Scripts } from '../routes/Scripts';
-import { Users } from '../routes/Users';
 import { Settings } from '../routes/Settings';
+import { SkeletonPanel } from '../components/Skeleton';
+import { AppBrand } from '../components/AppBrand';
+
+const Scripts = lazy(() => import('../routes/Scripts').then((module) => ({ default: module.Scripts })));
+const Users = lazy(() => import('../routes/Users').then((module) => ({ default: module.Users })));
 
 type TabItem = {
   label: string;
@@ -26,7 +30,7 @@ type TabItem = {
   icon: JSX.Element;
 };
 
-const tabItems: TabItem[] = [
+const baseTabs: TabItem[] = [
   {
     label: 'Dashboard',
     path: '/',
@@ -68,13 +72,41 @@ const tabItems: TabItem[] = [
   },
 ];
 
-const MenuIcon = ({ children }: { children: ReactNode }) => (
-  <span className="menu-icon" aria-hidden="true">
-    <svg viewBox="0 0 24 24">{children}</svg>
-  </span>
-);
+const adminTabs: TabItem[] = [
+  {
+    label: 'Scripts',
+    path: '/scripts',
+    icon: (
+      <svg className="tab-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M6 4h9l3 3v13H6z" fill="none" stroke="currentColor" strokeWidth="1.6" />
+        <path d="M9 12h6M9 16h4M9 8h3" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      </svg>
+    ),
+  },
+  {
+    label: 'Users',
+    path: '/users',
+    icon: (
+      <svg className="tab-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M7 18c0-2.2 2.2-4 5-4s5 1.8 5 4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+        <circle cx="12" cy="9" r="3.2" fill="none" stroke="currentColor" strokeWidth="1.6" />
+      </svg>
+    ),
+  },
+];
 
-function RouteRenderer({ route }: { route: RouteMatch }) {
+function AccessDenied({ message }: { message: string }) {
+  return (
+    <div className="panel">
+      {message}
+    </div>
+  );
+}
+
+function RouteRenderer({ route, role }: { route: RouteMatch; role: RoleTier }) {
+  if (!canAccessRoute(role, route.name)) {
+    return <AccessDenied message={t('banner.auth.unauthorized.body', 'Admin access required.')} />;
+  }
   const { roles } = useUser();
   const isAdmin = roles.includes('admin');
 
@@ -88,22 +120,49 @@ function RouteRenderer({ route }: { route: RouteMatch }) {
     case 'callConsole':
       return <CallConsole callSid={route.params.callSid} />;
     case 'scripts':
-      return <Scripts />;
+      return (
+        <Suspense fallback={<SkeletonPanel title="Loading scripts" />}>
+          <Scripts />
+        </Suspense>
+      );
     case 'users':
-      return isAdmin ? <Users /> : <div className="panel">Admin access required.</div>;
+      return (
+        <Suspense fallback={<SkeletonPanel title="Loading users" />}>
+          {isAdmin ? <Users /> : <AccessDenied message="Admin access required." />}
+        </Suspense>
+      );
     case 'settings':
-      return isAdmin ? <Settings /> : <div className="panel">Admin access required.</div>;
+      return isAdmin ? <Settings /> : <AccessDenied message="Admin access required." />;
     default:
-      return <div className="panel">Route not found.</div>;
+      return <AccessDenied message="Route not found." />;
   }
 }
 
+function CallsBootstrap({ activeCallSid }: { activeCallSid?: string | null }) {
+  const { fetchCalls, fetchInboundQueue, fetchCall } = useCalls();
+  const { status } = useUser();
+
+  useEffect(() => {
+    if (status !== 'ready') return;
+    fetchCalls({ limit: 10 }).catch(() => {});
+    fetchInboundQueue().catch(() => {});
+    if (activeCallSid) {
+      fetchCall(activeCallSid).catch(() => {});
+    }
+  }, [status, activeCallSid, fetchCalls, fetchInboundQueue, fetchCall]);
+
+  return null;
+}
+
 export function AppShell() {
-  const { status, user, roles, error, refresh } = useUser();
-  const isAdmin = roles.includes('admin');
+  const { status, user, roles, error, errorKind, environment, tenantId } = useUser();
+  const roleTier = useMemo(() => resolveRoleTier(roles), [roles]);
+  const isAdmin = roleTier === 'admin';
   const [isOnline, setIsOnline] = useState(() => (typeof navigator !== 'undefined' ? navigator.onLine : true));
   const [path, setPath] = useState(getHashPath());
-  const [menuOpen, setMenuOpen] = useState(false);
+  const menuBusyRef = useRef(false);
+  const restoredRef = useRef(false);
+  const [health, setHealth] = useState<{ degraded: boolean; lastErrorAt?: string | null } | null>(null);
 
   useEffect(() => {
     const handler = () => setPath(getHashPath());
@@ -112,8 +171,21 @@ export function AppShell() {
   }, []);
 
   const route = matchRoute(path);
-  const tabPaths = tabItems.map((item) => item.path);
+  const navItems = useMemo(() => {
+    if (roleTier === 'admin') {
+      return [...baseTabs.slice(0, 3), ...adminTabs, baseTabs[3]];
+    }
+    if (roleTier === 'operator') {
+      return baseTabs.filter((item) => ['/', '/inbox', '/calls'].includes(item.path));
+    }
+    if (roleTier === 'viewer') {
+      return baseTabs.filter((item) => ['/', '/calls'].includes(item.path));
+    }
+    return baseTabs.filter((item) => item.path === '/');
+  }, [roleTier]);
+  const tabPaths = navItems.map((item) => item.path);
   const showBack = !tabPaths.includes(route.path);
+  const activeCallSid = route.name === 'callConsole' ? route.params.callSid : null;
 
   useEffect(() => {
     const handleBack = () => {
@@ -148,13 +220,29 @@ export function AppShell() {
     };
   }, []);
 
+  useEffect(() => {
+    saveUiState({ path, activeCallSid });
+  }, [path, activeCallSid]);
+
+  useEffect(() => {
+    if (status !== 'ready' || restoredRef.current) return;
+    const saved = loadUiState();
+    if (saved.path && saved.path !== path) {
+      const savedRoute = matchRoute(saved.path);
+      if (canAccessRoute(roleTier, savedRoute.name)) {
+        navigate(saved.path);
+      }
+    }
+    restoredRef.current = true;
+  }, [status, path, roleTier]);
+
   const headerSubtitle = useMemo(() => {
     if (status === 'loading') return 'Authorizing...';
     if (status === 'error') return error || 'Auth failed';
     if (!user) return 'Not connected';
-    const roleLabel = isAdmin ? 'Admin' : 'Viewer';
+    const roleLabel = isAdmin ? 'Admin' : roleTier === 'operator' ? 'Operator' : 'Read-only';
     return `${roleLabel} • ${user.username || user.first_name || user.id}`;
-  }, [status, error, user, isAdmin]);
+  }, [status, error, user, isAdmin, roleTier]);
 
   const botUsername = import.meta.env.VITE_BOT_USERNAME || '';
   const botUrl = botUsername ? `https://t.me/${botUsername}` : '';
@@ -162,84 +250,212 @@ export function AppShell() {
   const privacyUrl = import.meta.env.VITE_PRIVACY_URL || '';
   const addToHomeSupported = addToHomeScreen?.isAvailable?.() ?? false;
 
-  const handleClose = () => {
-    if (miniApp.close?.ifAvailable) {
-      miniApp.close.ifAvailable();
-    } else {
-      miniApp.close();
-    }
-  };
-
-  const handleOpenBot = () => {
+  const handleOpenBot = useCallback(() => {
     if (!botUrl) return;
     if (openTelegramLink.ifAvailable) {
       openTelegramLink.ifAvailable(botUrl);
     } else {
       openLink(botUrl);
     }
-    setMenuOpen(false);
-  };
+  }, [botUrl]);
 
-  const handleOpenSettings = () => {
-    navigate('/settings');
-    setMenuOpen(false);
-  };
+  const handleOpenSettings = useCallback(() => navigate('/settings'), []);
 
-  const handleReload = () => {
-    setMenuOpen(false);
-    window.location.reload();
-  };
+  const handleReload = useCallback(() => window.location.reload(), []);
 
-  const handleOpenUrl = (url: string) => {
+  const handleOpenUrl = useCallback((url: string) => {
     if (!url) return;
     openLink(url);
-    setMenuOpen(false);
-  };
+  }, []);
 
-  const handleAddToHome = () => {
+  const handleAddToHome = useCallback(() => {
     if (addToHomeSupported) {
       addToHomeScreen();
-      setMenuOpen(false);
     }
-  };
+  }, [addToHomeSupported]);
+
+  const showLegalMenu = useCallback(async () => {
+    if (!popup.show?.isAvailable?.()) return;
+    const result = await popup.show({
+      title: 'Legal',
+      message: 'View policies',
+      buttons: [
+        { id: 'terms', type: 'default', text: 'Terms' },
+        { id: 'privacy', type: 'default', text: 'Privacy' },
+        { type: 'close' },
+      ],
+    });
+    if (result === 'terms') handleOpenUrl(termsUrl);
+    if (result === 'privacy') handleOpenUrl(privacyUrl);
+  }, [handleOpenUrl, privacyUrl, termsUrl]);
+
+  const showMoreMenu = useCallback(async () => {
+    if (!popup.show?.isAvailable?.()) return;
+    const buttons = [];
+    if (botUrl) {
+      buttons.push({ id: 'reload', type: 'default', text: 'Reload' });
+    }
+    if (addToHomeSupported) {
+      buttons.push({ id: 'add_home', type: 'default', text: 'Add to Home' });
+    }
+    buttons.push({ id: 'legal', type: 'default', text: 'Legal' });
+    const result = await popup.show({
+      title: 'More actions',
+      message: 'Extra options',
+      buttons,
+    });
+    if (result === 'reload') handleReload();
+    if (result === 'add_home') handleAddToHome();
+    if (result === 'legal') await showLegalMenu();
+  }, [addToHomeSupported, botUrl, handleAddToHome, handleReload, showLegalMenu]);
+
+  const showSettingsMenu = useCallback(async () => {
+    if (!popup.show?.isAvailable?.()) return;
+    if (menuBusyRef.current) return;
+    menuBusyRef.current = true;
+    try {
+      const buttons = [
+        { id: 'settings', type: 'default', text: 'Settings' },
+        botUrl
+          ? { id: 'bot', type: 'default', text: 'Open Bot' }
+          : { id: 'reload', type: 'default', text: 'Reload' },
+        { id: 'more', type: 'default', text: 'More' },
+      ];
+      const result = await popup.show({
+        title: 'Menu',
+        message: 'Choose an action',
+        buttons,
+      });
+      if (result === 'settings') handleOpenSettings();
+      if (result === 'bot') handleOpenBot();
+      if (result === 'reload') handleReload();
+      if (result === 'more') await showMoreMenu();
+    } finally {
+      menuBusyRef.current = false;
+    }
+  }, [botUrl, handleOpenBot, handleOpenSettings, handleReload, showMoreMenu]);
+
+  useEffect(() => {
+    if (!settingsButton?.show?.isAvailable?.()) return undefined;
+    settingsButton.mount?.ifAvailable?.();
+    settingsButton.show();
+    const off = settingsButton.onClick(() => {
+      void showSettingsMenu();
+    });
+    return () => {
+      off?.();
+      settingsButton.hide?.ifAvailable?.();
+    };
+  }, [showSettingsMenu]);
+
+  useEffect(() => {
+    if (status !== 'ready') return;
+    setTelemetryContext({ role: roleTier, environment: environment ?? null, tenant_id: tenantId ?? null });
+    trackEvent('console_opened');
+  }, [status, roleTier, environment, tenantId]);
+
+  useEffect(() => {
+    if (status !== 'ready') return;
+    let cancelled = false;
+    const fetchHealth = async () => {
+      try {
+        const response = await apiFetch<{ provider: { degraded: boolean; last_error_at?: string | null } }>('/webapp/ping');
+        if (!cancelled) {
+          setHealth({ degraded: response.provider.degraded, lastErrorAt: response.provider.last_error_at || null });
+        }
+      } catch {
+        if (!cancelled) setHealth(null);
+      }
+    };
+    fetchHealth();
+    const timer = window.setInterval(fetchHealth, 60000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [status]);
+
+  const authBanner = useMemo(() => {
+    if (status !== 'error' || !error) return null;
+    if (errorKind === 'offline') {
+      return {
+        header: t('banner.offline.header', "You're offline"),
+        body: t('banner.offline.body', 'Some data may be outdated. Reconnect to refresh.'),
+      };
+    }
+    if (errorKind === 'unauthorized') {
+      return {
+        header: t('banner.auth.unauthorized.header', 'Not authorized'),
+        body: t('banner.auth.unauthorized.body', 'Please reopen the Mini App from the bot to sign in.'),
+      };
+    }
+    if (errorKind === 'initdata') {
+      return {
+        header: t('banner.auth.initdata.header', 'Session expired'),
+        body: t('banner.auth.initdata.body', 'Close and reopen the Mini App.'),
+      };
+    }
+    if (errorKind === 'server') {
+      return {
+        header: t('banner.auth.server.header', 'Server unavailable'),
+        body: t('banner.auth.server.body', 'Try again soon.'),
+      };
+    }
+    return {
+      header: t('banner.error.header', 'Something went wrong'),
+      body: error,
+    };
+  }, [status, error, errorKind]);
+
+  const envLabel = environment ? environment.toLowerCase() : '';
 
   return (
     <CallsProvider>
       <div className="app-shell">
+        <CallsBootstrap activeCallSid={activeCallSid} />
         <header className="wallet-topbar">
-          <button type="button" className="close-button" onClick={handleClose} aria-label="Close mini app">
-            Close
-          </button>
-          <div className="brand">
-            <div className="brand-title">
-              VOICEDNUT
-              <span className="brand-badge" aria-hidden="true">
-                <span className="brand-check" />
-              </span>
-            </div>
-            <div className="brand-sub">mini app</div>
-            <div className="brand-meta">{headerSubtitle}</div>
-          </div>
-          <button type="button" className="menu-button" onClick={() => setMenuOpen(true)} aria-label="Open menu">
-            <span className="menu-dots" aria-hidden="true">...</span>
-          </button>
+          <AppBrand subtitle="mini app" meta={headerSubtitle} />
         </header>
 
-        {!isOnline && (
+        {environment && (
+          <div className={`env-ribbon env-${envLabel || 'unknown'}`}>
+            {t(`env.${envLabel}`, environment.toUpperCase())}
+          </div>
+        )}
+
+        {authBanner && (
           <Banner
             type="inline"
-            header="You're offline"
-            description="Some data may be outdated. Reconnect to refresh."
+            header={authBanner.header}
+            description={authBanner.body}
+            className="wallet-banner"
+          />
+        )}
+
+        {health?.degraded && roleTier === 'admin' && (
+          <Banner
+            type="inline"
+            header="Degraded service"
+            description={health.lastErrorAt ? `Provider errors detected. Last error at ${health.lastErrorAt}.` : 'Provider errors detected.'}
+            className="wallet-banner"
+          />
+        )}
+
+        {!isOnline && !authBanner && (
+          <Banner
+            type="inline"
+            header={t('banner.offline.header', "You're offline")}
+            description={t('banner.offline.body', 'Some data may be outdated. Reconnect to refresh.')}
             className="wallet-banner"
           />
         )}
 
         <main key={route.path} className="content" data-route={route.name}>
-          <RouteRenderer route={route} />
+          <RouteRenderer route={route} role={roleTier} />
         </main>
 
         <Tabbar className="vn-tabbar">
-          {tabItems.map((item) => {
+          {navItems.map((item) => {
             const isActive = route.path === item.path;
             return (
               <Tabbar.Item
@@ -254,101 +470,6 @@ export function AppShell() {
             );
           })}
         </Tabbar>
-
-        <Modal
-          open={menuOpen}
-          onOpenChange={setMenuOpen}
-          className="menu-sheet"
-          snapPoints={['62%']}
-        >
-          <Modal.Header after={<Modal.Close />}>
-            Menu
-          </Modal.Header>
-          <List className="wallet-list">
-            <Section className="wallet-section" header="Quick actions">
-              <Cell
-                before={(
-                  <MenuIcon>
-                    <path d="M12 8a4 4 0 1 1 0 8 4 4 0 0 1 0-8z" fill="none" stroke="currentColor" strokeWidth="1.6" />
-                    <path d="M4 12h2m12 0h2M6.5 6.5l1.4 1.4m8.2 8.2 1.4 1.4M17.5 6.5l-1.4 1.4M8.1 16.1l-1.6 1.6" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-                  </MenuIcon>
-                )}
-                onClick={handleOpenSettings}
-              >
-                Settings
-              </Cell>
-              {botUrl && (
-                <Cell
-                  before={(
-                    <MenuIcon>
-                      <path d="M6 8h12a3 3 0 0 1 3 3v4H3v-4a3 3 0 0 1 3-3z" fill="none" stroke="currentColor" strokeWidth="1.6" />
-                      <path d="M8.5 6.5h7a1.5 1.5 0 0 1 0 3h-7a1.5 1.5 0 0 1 0-3z" fill="none" stroke="currentColor" strokeWidth="1.6" />
-                      <path d="M9 12.5h.01M15 12.5h.01" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-                    </MenuIcon>
-                  )}
-                  onClick={handleOpenBot}
-                >
-                  Open Bot
-                </Cell>
-              )}
-              <Cell
-                before={(
-                  <MenuIcon>
-                    <path d="M20 12a8 8 0 1 1-2.3-5.7" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-                    <path d="M20 4v6h-6" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
-                  </MenuIcon>
-                )}
-                onClick={handleReload}
-              >
-                Reload
-              </Cell>
-              {addToHomeSupported && (
-                <Cell
-                  before={(
-                    <MenuIcon>
-                      <path d="M7 4h10a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z" fill="none" stroke="currentColor" strokeWidth="1.6" />
-                      <path d="M12 8v8M8 12h8" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-                    </MenuIcon>
-                  )}
-                  onClick={handleAddToHome}
-                >
-                  Add to Home Screen
-                </Cell>
-              )}
-            </Section>
-            <Section className="wallet-section" header="Legal">
-              <Cell
-                className={!termsUrl ? 'cell-disabled' : undefined}
-                before={(
-                  <MenuIcon>
-                    <path d="M12 7.5h.01M11 11h1v5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-                    <path d="M12 3.5a8.5 8.5 0 1 1 0 17 8.5 8.5 0 0 1 0-17z" fill="none" stroke="currentColor" strokeWidth="1.6" />
-                  </MenuIcon>
-                )}
-                onClick={() => handleOpenUrl(termsUrl)}
-              >
-                Terms of Use
-              </Cell>
-              <Cell
-                className={!privacyUrl ? 'cell-disabled' : undefined}
-                before={(
-                  <MenuIcon>
-                    <path d="M12 4l6 3v5c0 4-2.6 6.8-6 8-3.4-1.2-6-4-6-8V7l6-3z" fill="none" stroke="currentColor" strokeWidth="1.6" />
-                    <path d="M9.5 12.5l2 2 3-3" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
-                  </MenuIcon>
-                )}
-                onClick={() => handleOpenUrl(privacyUrl)}
-              >
-                Privacy Policy
-              </Cell>
-            </Section>
-            <Section className="wallet-section">
-              <Button size="s" mode="bezeled" onClick={refresh}>
-                Refresh data
-              </Button>
-            </Section>
-          </List>
-        </Modal>
       </div>
     </CallsProvider>
   );

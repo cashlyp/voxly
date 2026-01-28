@@ -1,6 +1,6 @@
 import { retrieveRawInitData } from '@tma.js/sdk-react';
 
-import { apiFetch, setAuthRefreshProvider, setAuthTokenProvider } from './api';
+import { ApiError, apiFetch, getApiBase, setAuthRefreshProvider, setAuthTokenProvider } from './api';
 
 export type WebappUser = {
   id: string | number;
@@ -14,6 +14,8 @@ export type AuthSession = {
   expiresAt: string;
   user: WebappUser;
   roles: string[];
+  environment?: string | null;
+  tenant_id?: string | null;
 };
 
 const STORAGE_KEY = 'voicednut.webapp.jwt';
@@ -22,6 +24,27 @@ const STORAGE_USER_KEY = 'voicednut.webapp.user';
 const STORAGE_ROLES_KEY = 'voicednut.webapp.roles';
 
 let cachedToken: string | null = null;
+
+type InitDataContext = {
+  initData: string;
+  user: WebappUser | null;
+};
+
+export type AuthErrorKind = 'offline' | 'unauthorized' | 'initdata' | 'server' | 'unknown';
+
+export class AuthError extends Error {
+  kind: AuthErrorKind;
+  status?: number;
+  code?: string;
+
+  constructor(message: string, kind: AuthErrorKind, status?: number, code?: string) {
+    super(message);
+    this.name = 'AuthError';
+    this.kind = kind;
+    this.status = status;
+    this.code = code;
+  }
+}
 
 function parseJwtPayload(token: string) {
   try {
@@ -112,41 +135,149 @@ export function getInitData() {
   return webapp?.initData || '';
 }
 
-export async function authenticate(initData?: string): Promise<AuthSession> {
-  const rawInitData = initData || getInitData();
-  const headers = rawInitData ? { Authorization: `tma ${rawInitData}` } : undefined;
-  const response = await apiFetch<{
-    ok: boolean;
-    token: string;
-    expires_at: string;
-    user: WebappUser;
-    roles: string[];
-  }>('/webapp/auth', {
-    method: 'POST',
-    headers,
-    auth: false,
-  });
-  const session: AuthSession = {
-    token: response.token,
-    expiresAt: response.expires_at,
+function getInitDataContext(): InitDataContext {
+  const webapp = (window as Window & {
+    Telegram?: { WebApp?: { initData?: string; initDataUnsafe?: { user?: WebappUser } } };
+  }).Telegram?.WebApp;
+  return {
+    initData: getInitData(),
+    user: webapp?.initDataUnsafe?.user || null,
+  };
+}
+
+function describeAuthError(error: unknown) {
+  if (error instanceof ApiError) {
+    const apiBase = getApiBase() || window.location.origin;
+    if (error.status === 0) {
+      if (error.code === 'timeout') {
+        return new AuthError(`Cannot reach API (timeout). Check ${apiBase}.`, 'offline', 0, error.code);
+      }
+      return new AuthError(`Cannot reach API (network/CORS/DNS). Check ${apiBase}.`, 'offline', 0, error.code);
+    }
+    const initDataErrors: Record<string, string> = {
+      missing_initdata: 'Telegram init data is missing. Open the Mini App from Telegram.',
+      missing_hash: 'Telegram init data hash is missing.',
+      invalid_hash: 'Telegram init data signature is invalid.',
+      expired_init_data: 'Telegram init data expired. Close and reopen the Mini App.',
+      invalid_auth_date: 'Telegram init data has an invalid timestamp.',
+      missing_bot_token: 'Server is missing the bot token for initData verification.',
+      invalid_initdata: 'Telegram init data is invalid.',
+      not_authorized: 'You are not authorized for this Mini App.',
+      origin_not_allowed: 'Origin not allowed. Add MINI_APP_URL to the API allowlist.',
+    };
+    const mapped = initDataErrors[error.code];
+    const reason = mapped || error.message || error.code || 'Auth failed';
+    const kind = ['missing_initdata', 'missing_hash', 'invalid_hash', 'expired_init_data', 'invalid_auth_date', 'invalid_initdata'].includes(error.code)
+      ? 'initdata'
+      : error.status === 401 || error.status === 403
+        ? 'unauthorized'
+        : error.status >= 500
+          ? 'server'
+          : 'unknown';
+    return new AuthError(`Auth failed (${error.status}): ${reason}`, kind, error.status, error.code);
+  }
+  if (error instanceof AuthError) {
+    return error;
+  }
+  return new AuthError(error instanceof Error ? error.message : 'Auth failed', 'unknown');
+}
+
+async function fetchSessionDetails(): Promise<Pick<AuthSession, 'user' | 'roles' | 'environment' | 'tenant_id'>> {
+  const response = await apiFetch<{ ok: boolean; user: WebappUser; roles: string[]; environment?: string | null; tenant_id?: string | null }>('/webapp/me');
+  return {
     user: response.user,
     roles: response.roles || [],
+    environment: response.environment ?? null,
+    tenant_id: response.tenant_id ?? null,
   };
-  setStoredToken(session.token, session.expiresAt, session.user, session.roles);
-  return session;
+}
+
+export async function authenticate(initData?: string): Promise<AuthSession> {
+  const context = getInitDataContext();
+  const rawInitData = initData || context.initData;
+  if (!rawInitData) {
+    throw new AuthError('Telegram init data is missing. Open the Mini App from Telegram.', 'initdata', 401, 'missing_initdata');
+  }
+  try {
+    const response = await apiFetch<{
+      ok: boolean;
+      token: string;
+      expires_at: string;
+      user: WebappUser;
+      roles: string[];
+      environment?: string | null;
+      tenant_id?: string | null;
+    }>('/webapp/auth', {
+      method: 'POST',
+      headers: {
+        Authorization: `tma ${rawInitData}`,
+        'X-Telegram-Init-Data': rawInitData,
+      },
+      body: { initData: rawInitData },
+      auth: false,
+    });
+    const session: AuthSession = {
+      token: response.token,
+      expiresAt: response.expires_at,
+      user: response.user,
+      roles: response.roles || [],
+      environment: response.environment ?? null,
+      tenant_id: response.tenant_id ?? null,
+    };
+    setStoredToken(session.token, session.expiresAt, session.user, session.roles);
+
+    const details = await fetchSessionDetails();
+    const merged = {
+      ...session,
+      user: details.user || session.user || context.user || { id: '' },
+      roles: details.roles || [],
+      environment: details.environment ?? session.environment ?? null,
+      tenant_id: details.tenant_id ?? session.tenant_id ?? null,
+    };
+    setStoredToken(merged.token, merged.expiresAt, merged.user, merged.roles);
+    return merged;
+  } catch (error) {
+    const described = describeAuthError(error);
+    if (described instanceof AuthError) {
+      throw described;
+    }
+    throw new AuthError(String(described || 'Auth failed'), 'unknown');
+  }
 }
 
 export async function ensureAuth(
   initData?: string,
-  options: { minValiditySeconds?: number; forceRefresh?: boolean } = {},
+  options: { minValiditySeconds?: number; forceRefresh?: boolean; verify?: boolean } = {},
 ): Promise<AuthSession> {
   const minValiditySeconds = options.minValiditySeconds ?? 60;
+  const verify = options.verify ?? true;
   if (!options.forceRefresh && isTokenValid(minValiditySeconds)) {
+    if (verify) {
+      try {
+        const details = await fetchSessionDetails();
+        const session = {
+          token: getStoredToken() || '',
+          expiresAt: getTokenExpiry() || '',
+          user: details.user || getStoredUser() || { id: '' },
+          roles: details.roles || [],
+          environment: details.environment ?? null,
+          tenant_id: details.tenant_id ?? null,
+        };
+        setStoredToken(session.token, session.expiresAt, session.user, session.roles);
+        return session;
+      } catch (error) {
+        const described = describeAuthError(error);
+        if (described instanceof AuthError) throw described;
+        throw new AuthError('Auth failed', 'unknown');
+      }
+    }
     return {
       token: getStoredToken() || '',
       expiresAt: getTokenExpiry() || '',
       user: getStoredUser() || { id: '' },
       roles: getStoredRoles(),
+      environment: null,
+      tenant_id: null,
     };
   }
   return authenticate(initData);
@@ -154,5 +285,5 @@ export async function ensureAuth(
 
 setAuthTokenProvider(() => getStoredToken());
 setAuthRefreshProvider(async () => {
-  await ensureAuth(undefined, { forceRefresh: true });
+  await ensureAuth(undefined, { forceRefresh: true, verify: false });
 });

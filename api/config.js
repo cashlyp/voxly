@@ -187,6 +187,7 @@ const liveConsoleCarrier = readEnv('LIVE_CONSOLE_CARRIER') || 'VOICEDNUT';
 const liveConsoleNetworkLabel = readEnv('LIVE_CONSOLE_NETWORK_LABEL') || 'LTE';
 const telegramAdminChatId = readEnv('TELEGRAM_ADMIN_CHAT_ID') || readEnv('ADMIN_TELEGRAM_ID');
 const telegramAdminChatIds = parseList(readEnv('TELEGRAM_ADMIN_CHAT_IDS'));
+const telegramOperatorChatIds = parseList(readEnv('TELEGRAM_OPERATOR_CHAT_IDS'));
 const telegramViewerChatIds = parseList(readEnv('TELEGRAM_VIEWER_CHAT_IDS'));
 if (!telegramAdminChatIds.length && telegramAdminChatId) {
   telegramAdminChatIds.push(telegramAdminChatId);
@@ -278,6 +279,7 @@ module.exports = {
     botToken: ensure('TELEGRAM_BOT_TOKEN', process.env.BOT_TOKEN),
     adminChatId: telegramAdminChatId,
     adminChatIds: telegramAdminChatIds,
+    operatorChatIds: telegramOperatorChatIds,
     viewerChatIds: telegramViewerChatIds
   },
   miniapp: {
