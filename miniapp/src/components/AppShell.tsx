@@ -30,6 +30,8 @@ type TabItem = {
   icon: JSX.Element;
 };
 
+type PopupButtons = Parameters<NonNullable<typeof popup.show>>[0]['buttons'];
+
 const baseTabs: TabItem[] = [
   {
     label: 'Dashboard',
@@ -291,7 +293,7 @@ export function AppShell() {
 
   const showMoreMenu = useCallback(async () => {
     if (!popup.show?.isAvailable?.()) return;
-    const buttons = [];
+    const buttons: PopupButtons = [];
     if (botUrl) {
       buttons.push({ id: 'reload', type: 'default', text: 'Reload' });
     }
@@ -314,7 +316,7 @@ export function AppShell() {
     if (menuBusyRef.current) return;
     menuBusyRef.current = true;
     try {
-      const buttons = [
+      const buttons: PopupButtons = [
         { id: 'settings', type: 'default', text: 'Settings' },
         botUrl
           ? { id: 'bot', type: 'default', text: 'Open Bot' }
