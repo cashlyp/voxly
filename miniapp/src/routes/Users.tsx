@@ -140,7 +140,7 @@ export function Users() {
   if (!isAdmin) {
     return (
       <div className="wallet-page">
-        <Banner type="error" header="Access denied" description="Only administrators can manage users." />
+        <Banner type="inline" header="Access denied" description="Only administrators can manage users." />
       </div>
     );
   }
@@ -149,18 +149,16 @@ export function Users() {
     <div className="wallet-page">
       {error && (
         <Banner 
-          type="error" 
+          type="inline" 
           header="Error" 
           description={error}
-          onClose={clearMessages}
         />
       )}
       {success && (
         <Banner 
-          type="success" 
+          type="inline" 
           header="Success" 
           description={success}
-          onClose={clearMessages}
         />
       )}
       

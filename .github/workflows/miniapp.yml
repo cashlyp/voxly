@@ -6,7 +6,7 @@ on:
       - main
     paths:
       - 'miniapp/**'
-      - '.github/workflows/deploy-miniapp.yml'
+      - '.github/workflows/miniapp.yml'
   workflow_dispatch:
 
 jobs:
@@ -52,11 +52,13 @@ jobs:
         run: |
           vercel deploy \
             --prod \
+            --yes \
             --token=${{ secrets.VERCEL_TOKEN }} \
             --org-id=${{ secrets.VERCEL_ORG_ID }} \
             --project-id=${{ secrets.VERCEL_PROJECT_ID }}
         env:
           VITE_API_BASE: ${{ secrets.MINIAPP_API_BASE }}
+          VITE_BASE: /
 
       - name: Deployment Summary
         if: always()
