@@ -8,16 +8,9 @@ export interface EnvironmentConfig {
   isTesting: boolean;
 }
 
-// @ts-expect-error - Helper for potential future use
-function getRequiredEnvVar(_key: string, fallback?: string): string {
-  // Note: This is a helper for potential future use
-  // Currently using getOptionalEnvVar with fallbacks instead
-  return fallback || "";
-}
-
 function getOptionalEnvVar(key: string, fallback?: string): string | null {
   const value = import.meta.env[`VITE_${key}`] as string | undefined;
-  return value || fallback || null;
+  return value ?? fallback ?? null;
 }
 
 export function validateUrl(urlString: string): boolean {
@@ -31,14 +24,14 @@ export function validateUrl(urlString: string): boolean {
 
 export function getEnvironmentConfig(): EnvironmentConfig {
   const apiBase =
-    getOptionalEnvVar("API_BASE", "") ||
-    (import.meta.env.VITE_API_BASE as string);
+    getOptionalEnvVar("API_BASE", "") ??
+    String(import.meta.env.VITE_API_BASE ?? "");
   const isDev = import.meta.env.DEV;
   const isTesting =
     typeof process !== "undefined" && process.env.NODE_ENV === "test";
 
   // Validate API base URL format if provided
-  if (apiBase && !validateUrl(apiBase)) {
+  if (apiBase !== "" && !validateUrl(apiBase)) {
     const message = `Invalid API base URL: ${apiBase}. Must be a valid URL.`;
     if (!isDev) {
       throw new Error(message);

@@ -9,11 +9,21 @@ export function resolveRoleTier(roles: string[] = []): RoleTier {
 
 export function canAccessRoute(role: RoleTier, routeName: string) {
   if (role === 'admin') return true;
+  const baseRoutes = [
+    'dashboard',
+    'inbox',
+    'calls',
+    'callConsole',
+    'sms',
+    'settings',
+    'transcripts',
+    'transcriptDetail',
+  ];
   if (role === 'operator') {
-    return ['dashboard', 'inbox', 'calls', 'callConsole'].includes(routeName);
+    return baseRoutes.includes(routeName);
   }
   if (role === 'viewer') {
-    return ['dashboard', 'calls', 'callConsole'].includes(routeName);
+    return baseRoutes.includes(routeName);
   }
   return routeName === 'dashboard';
 }

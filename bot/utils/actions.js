@@ -8,7 +8,6 @@ const SIGN_PREFIX = 'cb';
 const MENU_ACTION_LOG_INTERVAL = 25;
 const MENU_ACTIONS = new Set([
   'CALL',
-  'CALLS',
   'CALLLOG',
   'CALLLOG_RECENT',
   'CALLLOG_SEARCH',

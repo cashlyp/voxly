@@ -1,4 +1,5 @@
 import {
+  Banner,
   Button,
   Cell,
   InlineButtons,
@@ -8,31 +9,42 @@ import {
   Select,
 } from "@telegram-apps/telegram-ui";
 import { useCallback, useEffect, useState } from "react";
+import { MaskedPhone } from "../components/MaskedPhone";
+import { SkeletonList } from "../components/Skeleton";
 import { navigate } from "../lib/router";
 import { loadUiState, updateCallsFilters } from "../lib/uiState";
 import { useCalls } from "../state/calls";
 
+function formatUpdatedAt(timestamp: number | null) {
+  if (timestamp === null) return "";
+  const diffMs = Date.now() - timestamp;
+  if (diffMs < 60000) return "Updated just now";
+  if (diffMs < 3600000) return `Updated ${Math.floor(diffMs / 60000)}m ago`;
+  if (diffMs < 86400000) return `Updated ${Math.floor(diffMs / 3600000)}h ago`;
+  return `Updated ${Math.floor(diffMs / 86400000)}d ago`;
+}
+
 export function Calls() {
-  const { calls, fetchCalls, nextCursor, loading } = useCalls();
+  const { calls, fetchCalls, nextCursor, callsMeta } = useCalls();
   const saved = loadUiState().callsFilters;
-  const [statusFilter, setStatusFilter] = useState(saved?.status || "");
-  const [search, setSearch] = useState(saved?.query || "");
-  const [cursor, setCursor] = useState(saved?.cursor || 0);
+  const [statusFilter, setStatusFilter] = useState(saved?.status ?? "");
+  const [search, setSearch] = useState(saved?.query ?? "");
+  const [cursor, setCursor] = useState(saved?.cursor ?? 0);
 
   const loadCalls = useCallback(
     async (nextCursorValue = 0) => {
       await fetchCalls({
         limit: 20,
         cursor: nextCursorValue,
-        status: statusFilter || undefined,
-        q: search || undefined,
+        status: statusFilter !== "" ? statusFilter : undefined,
+        q: search !== "" ? search : undefined,
       });
     },
     [fetchCalls, statusFilter, search],
   );
 
   useEffect(() => {
-    loadCalls(0);
+    void loadCalls(0);
   }, [loadCalls]);
 
   useEffect(() => {
@@ -42,26 +54,43 @@ export function Calls() {
   const handleNext = () => {
     if (nextCursor !== null) {
       setCursor(nextCursor);
-      loadCalls(nextCursor);
+      void loadCalls(nextCursor);
     }
   };
 
   const handlePrev = () => {
     const prev = Math.max(0, cursor - 20);
     setCursor(prev);
-    loadCalls(prev);
+    void loadCalls(prev);
   };
 
   const handleClear = () => {
     setStatusFilter("");
     setSearch("");
     setCursor(0);
-    loadCalls(0);
+    void loadCalls(0);
   };
+
+  const footerParts = [];
+  if (callsMeta.refreshing) footerParts.push("Refreshing");
+  if (callsMeta.stale && !callsMeta.refreshing)
+    footerParts.push("Showing cached data");
+  if (callsMeta.updatedAt !== null)
+    footerParts.push(formatUpdatedAt(callsMeta.updatedAt));
+  footerParts.push(
+    `Showing ${calls.length} calls${cursor !== 0 ? ` from ${cursor + 1}` : ""}${statusFilter !== "" ? ` | ${statusFilter}` : ""}${search !== "" ? ` | "${search}"` : ""}`,
+  );
 
   return (
     <div className="wallet-page">
       <List className="wallet-list">
+        {callsMeta.error !== null && callsMeta.error !== "" && (
+          <Banner
+            type="inline"
+            header={callsMeta.errorKind === "offline" ? "You're offline" : "Error"}
+            description={callsMeta.error}
+          />
+        )}
         <Section header="Filters" className="wallet-section">
           <Input
             header="Search"
@@ -71,7 +100,7 @@ export function Calls() {
             onKeyDown={(event) => {
               if (event.key === "Enter") {
                 setCursor(0);
-                loadCalls(0);
+                void loadCalls(0);
               }
             }}
           />
@@ -93,7 +122,7 @@ export function Calls() {
               mode="filled"
               onClick={() => {
                 setCursor(0);
-                loadCalls(0);
+                void loadCalls(0);
               }}
             >
               Apply
@@ -106,20 +135,20 @@ export function Calls() {
 
         <Section
           header="Call log"
-          footer={`Showing ${calls.length} calls${cursor !== 0 ? ` from ${cursor + 1}` : ""}${statusFilter !== "" ? ` | ${statusFilter}` : ""}${search !== "" ? ` | "${search}"` : ""}`}
+          footer={footerParts.join(" | ")}
           className="wallet-section"
         >
-          {loading && calls.length === 0 ? (
-            <Cell subtitle="Loading calls...">Please wait</Cell>
+          {callsMeta.loading && calls.length === 0 ? (
+            <SkeletonList rows={5} />
           ) : (
             calls.map((call) => (
               <Cell
                 key={call.call_sid}
-                subtitle={`${call.status || "unknown"} • ${call.created_at || "-"}`}
+                subtitle={`${call.status ?? "unknown"} • ${call.created_at ?? "-"}`}
                 description={call.call_sid}
                 onClick={() => navigate(`/calls/${call.call_sid}`)}
               >
-                {call.phone_number || call.call_sid}
+                <MaskedPhone value={call.phone_number ?? call.call_sid} />
               </Cell>
             ))
           )}

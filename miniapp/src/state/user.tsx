@@ -15,6 +15,7 @@ import {
   getStoredRoles,
   getStoredUser,
   getTokenExpiry,
+  isTokenValid,
   AuthError,
   type AuthErrorKind,
   type WebappUser,
@@ -45,6 +46,8 @@ export function UserProvider({ children }: PropsWithChildren) {
   const [environment, setEnvironment] = useState<string | null>(null);
   const [tenantId, setTenantId] = useState<string | null>(null);
   const authStartRef = useRef<number | null>(Date.now());
+  const resumeInFlightRef = useRef(false);
+  const lastResumeRef = useRef(0);
 
   const refresh = useCallback(async () => {
     setStatus('loading');
@@ -54,7 +57,7 @@ export function UserProvider({ children }: PropsWithChildren) {
     try {
       const session = await ensureAuth();
       setUser(session.user);
-      setRoles(session.roles || []);
+      setRoles(session.roles);
       setEnvironment(session.environment ?? null);
       setTenantId(session.tenant_id ?? null);
       setStatus('ready');
@@ -81,7 +84,7 @@ export function UserProvider({ children }: PropsWithChildren) {
     try {
       const session = await authenticate();
       setUser(session.user);
-      setRoles(session.roles || []);
+      setRoles(session.roles);
       setEnvironment(session.environment ?? null);
       setTenantId(session.tenant_id ?? null);
       setStatus('ready');
@@ -112,13 +115,45 @@ export function UserProvider({ children }: PropsWithChildren) {
   }, []);
 
   useEffect(() => {
-    refresh();
+    void refresh();
   }, [refresh]);
+
+  const attemptResume = useCallback(() => {
+    if (status === 'loading' || resumeInFlightRef.current) return;
+    const now = Date.now();
+    if (now - lastResumeRef.current < 5000) return;
+    if (isTokenValid(60) && status === 'ready') return;
+    lastResumeRef.current = now;
+    resumeInFlightRef.current = true;
+    refresh()
+      .catch(() => {})
+      .finally(() => {
+        resumeInFlightRef.current = false;
+      });
+  }, [status, refresh]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        attemptResume();
+      }
+    };
+    const handleFocus = () => {
+      attemptResume();
+    };
+    window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [attemptResume]);
 
   useEffect(() => {
     if (status !== 'ready') return;
     const expIso = getTokenExpiry();
-    if (!expIso) return;
+    if (expIso === null || expIso === "") return;
     const exp = Date.parse(expIso);
     if (!Number.isFinite(exp)) return;
     const bufferMs = 60 * 1000;

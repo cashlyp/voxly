@@ -29,7 +29,6 @@ const {
   VonageVoiceAdapter,
 } = require("./adapters");
 const { v4: uuidv4 } = require("uuid");
-const apiPackage = require("./package.json");
 const { WaveFile } = require("wavefile");
 
 const isProduction = process.env.NODE_ENV === "production";
@@ -143,6 +142,95 @@ const WEBAPP_TENANT_ID = String(
   config.miniapp?.tenantId || process.env.TENANT_ID || "default",
 );
 let backgroundWorkersStarted = false;
+
+let testDbInitPromise = null;
+const testMiniappSessions = new Map();
+
+function installTestMiniappSessionStore(targetDb) {
+  if (!targetDb || targetDb.__testMiniappSessions) return;
+  targetDb.__testMiniappSessions = true;
+
+  targetDb.createMiniappSession = async (session) => {
+    if (!session?.session_token) return 0;
+    testMiniappSessions.set(session.session_token, { ...session });
+    if (session.refresh_token) {
+      testMiniappSessions.set(`refresh:${session.refresh_token}`, {
+        session_token: session.session_token,
+      });
+    }
+    return 1;
+  };
+
+  targetDb.getMiniappSessionByToken = async (token) => {
+    if (!token) return null;
+    const session = testMiniappSessions.get(token);
+    return session ? { ...session } : null;
+  };
+
+  targetDb.getMiniappSessionByRefresh = async (refreshToken) => {
+    if (!refreshToken) return null;
+    const ref = testMiniappSessions.get(`refresh:${refreshToken}`);
+    if (!ref?.session_token) return null;
+    const session = testMiniappSessions.get(ref.session_token);
+    return session ? { ...session } : null;
+  };
+
+  targetDb.rotateMiniappSession = async (refreshToken, next) => {
+    const existing = await targetDb.getMiniappSessionByRefresh(refreshToken);
+    if (!existing) return 0;
+    testMiniappSessions.delete(existing.session_token);
+    testMiniappSessions.delete(`refresh:${refreshToken}`);
+    const merged = { ...existing, ...next };
+    testMiniappSessions.set(merged.session_token, merged);
+    if (merged.refresh_token) {
+      testMiniappSessions.set(`refresh:${merged.refresh_token}`, {
+        session_token: merged.session_token,
+      });
+    }
+    return 1;
+  };
+
+  targetDb.revokeMiniappSession = async (token) => {
+    const existing = await targetDb.getMiniappSessionByToken(token);
+    if (existing?.refresh_token) {
+      testMiniappSessions.delete(`refresh:${existing.refresh_token}`);
+    }
+    return testMiniappSessions.delete(token) ? 1 : 0;
+  };
+
+  targetDb.updateMiniappSessionLastSeen = async (token, ip, userAgent) => {
+    const existing = await targetDb.getMiniappSessionByToken(token);
+    if (!existing) return 0;
+    testMiniappSessions.set(token, {
+      ...existing,
+      ip: ip || existing.ip || null,
+      user_agent: userAgent || existing.user_agent || null,
+      last_seen_at: new Date().toISOString(),
+    });
+    return 1;
+  };
+
+  targetDb.logMiniappAudit = async () => {};
+}
+
+async function ensureTestDbReady() {
+  if (db) return db;
+  if (process.env.NODE_ENV !== "test") return null;
+  if (!testDbInitPromise) {
+    db = new Database();
+    testDbInitPromise = db
+      .initialize()
+      .then(() => {
+        installTestMiniappSessionStore(db);
+        return db;
+      })
+      .catch((error) => {
+        testDbInitPromise = null;
+        throw error;
+      });
+  }
+  return testDbInitPromise;
+}
 
 const CALL_STATUS_DEDUPE_MS = 3000;
 const CALL_STATUS_DEDUPE_MAX = 5000;
@@ -445,16 +533,16 @@ function resolveMiniappOrigin(req) {
 }
 
 function isMiniappOriginAllowed(origin) {
+  const allowlist = config.miniapp?.allowedOrigins || [];
   if (!origin) {
-    const allowlist = config.miniapp?.allowedOrigins || [];
-    return !isProduction || !allowlist.length;
+    if (isProduction) return false;
+    return !allowlist.length;
   }
   if (!origin.startsWith("https://")) {
     return !isProduction;
   }
-  const allowlist = config.miniapp?.allowedOrigins || [];
   if (!allowlist.length) {
-    return true;
+    return !isProduction;
   }
   return allowlist.includes(origin);
 }
@@ -472,6 +560,12 @@ function requireMiniappOrigin(req, res, next) {
 }
 
 async function createMiniappSession(user = null, req = null) {
+  if (!db) {
+    await ensureTestDbReady();
+  }
+  if (!db) {
+    throw new Error("Database not initialized");
+  }
   const token = crypto.randomBytes(24).toString("hex");
   const refreshToken = crypto.randomBytes(32).toString("hex");
   const now = Date.now();
@@ -501,7 +595,12 @@ function resolveMiniappToken(req) {
   const direct = req.headers["x-miniapp-token"];
   if (direct) return String(direct);
   const queryToken = req.query?.token || req.query?.session;
-  if (queryToken) return String(queryToken);
+  if (queryToken) {
+    const path = req.path || req.originalUrl || "";
+    if (path.startsWith("/miniapp/stream")) {
+      return String(queryToken);
+    }
+  }
   return null;
 }
 
@@ -519,6 +618,12 @@ function resolveMiniappRefreshToken(req) {
 
 async function requireMiniappSession(req, res, next) {
   try {
+    if (!db) {
+      await ensureTestDbReady();
+    }
+    if (!db) {
+      return res.status(500).json({ ok: false, error: "db_unavailable" });
+    }
     const token = resolveMiniappToken(req);
     if (!token) {
       return res.status(401).json({ ok: false, error: "missing_session" });
@@ -657,8 +762,14 @@ function verifyWebappJwt(token) {
     const payloadRaw = base64UrlDecode(encodedPayload);
     const payload = JSON.parse(payloadRaw);
     const now = Math.floor(Date.now() / 1000);
+    if (!payload.iss) {
+      return { ok: false, error: "missing_issuer" };
+    }
     if (payload.iss && payload.iss !== WEBAPP_JWT_ISSUER) {
       return { ok: false, error: "invalid_issuer" };
+    }
+    if (!payload.aud) {
+      return { ok: false, error: "missing_audience" };
     }
     if (payload.aud && payload.aud !== WEBAPP_JWT_AUDIENCE) {
       return { ok: false, error: "invalid_audience" };
@@ -669,7 +780,14 @@ function verifyWebappJwt(token) {
     if (payload.iat && payload.iat - now > WEBAPP_JWT_CLOCK_SKEW_S) {
       return { ok: false, error: "invalid_issued_at" };
     }
-    if (payload.exp && now >= payload.exp) {
+    if (payload.exp === undefined || payload.exp === null) {
+      return { ok: false, error: "missing_exp" };
+    }
+    const exp = Number(payload.exp);
+    if (!Number.isFinite(exp)) {
+      return { ok: false, error: "invalid_exp" };
+    }
+    if (now >= exp) {
       return { ok: false, error: "token_expired" };
     }
     return { ok: true, payload };
@@ -686,7 +804,12 @@ function resolveWebappToken(req) {
   const direct = req.headers["x-webapp-token"];
   if (direct) return String(direct);
   const queryToken = req.query?.token || req.query?.session;
-  if (queryToken) return String(queryToken);
+  if (queryToken) {
+    const path = req.path || req.originalUrl || "";
+    if (path.startsWith("/webapp/sse")) {
+      return String(queryToken);
+    }
+  }
   return null;
 }
 
@@ -705,6 +828,10 @@ function webappErrorMessage(code) {
     missing_user: "Telegram user payload is missing.",
     not_authorized: "User is not authorized for this Mini App.",
     missing_token: "Auth token is missing.",
+    missing_issuer: "Auth token is missing an issuer.",
+    missing_audience: "Auth token is missing an audience.",
+    missing_exp: "Auth token is missing an expiry.",
+    invalid_exp: "Auth token expiry is invalid.",
     invalid_token: "Auth token is invalid or expired.",
     origin_not_allowed: "Origin not allowed for this Mini App.",
   };
@@ -2242,83 +2369,6 @@ async function activateDtmfFallback(
   return true;
 }
 
-function getTranscriptAudioEntry(callSid) {
-  const entry = transcriptAudioJobs.get(callSid);
-  if (!entry) return null;
-  if (Date.now() - entry.updatedAt > TRANSCRIPT_AUDIO_TTL_MS) {
-    transcriptAudioJobs.delete(callSid);
-    return null;
-  }
-  return entry;
-}
-
-async function generateTranscriptAudioBuffer(callSid) {
-  if (!config.deepgram?.apiKey) {
-    throw new Error("Deepgram API key not configured");
-  }
-  const call = await db.getCall(callSid);
-  if (!call) {
-    throw new Error("Call not found");
-  }
-  const transcripts = await db.getCallTranscripts(callSid);
-  if (!Array.isArray(transcripts) || transcripts.length === 0) {
-    throw new Error("Transcript not available");
-  }
-  const voiceModel =
-    resolveVoiceModel(call) || config.deepgram.voiceModel || "aura-asteria-en";
-  const lines = transcripts.map((entry) => {
-    const speaker = entry.speaker === "user" ? "User" : "Agent";
-    return `${speaker}: ${entry.message || ""}`.trim();
-  });
-  const text = lines.join("\n");
-  const url = `https://api.deepgram.com/v1/speak?model=${encodeURIComponent(voiceModel)}&encoding=mp3`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Token ${config.deepgram.apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ text }),
-  });
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(
-      `TTS failed (${response.status}): ${errorText || response.statusText}`,
-    );
-  }
-  const audioBuffer = Buffer.from(await response.arrayBuffer());
-  if (!audioBuffer.length) {
-    throw new Error("Transcript audio empty");
-  }
-  return audioBuffer;
-}
-
-async function ensureTranscriptAudio(callSid) {
-  const existing = getTranscriptAudioEntry(callSid);
-  if (existing?.status === "ready" || existing?.status === "processing") {
-    return existing;
-  }
-  const entry = {
-    status: "processing",
-    buffer: null,
-    error: null,
-    updatedAt: Date.now(),
-  };
-  transcriptAudioJobs.set(callSid, entry);
-  generateTranscriptAudioBuffer(callSid)
-    .then((buffer) => {
-      entry.status = "ready";
-      entry.buffer = buffer;
-      entry.updatedAt = Date.now();
-    })
-    .catch((error) => {
-      entry.status = "error";
-      entry.error = error.message || "Transcript audio failed";
-      entry.updatedAt = Date.now();
-    });
-  return entry;
-}
-
 function estimateAudioLevelFromBase64(base64 = "") {
   if (!base64) return null;
   let buffer;
@@ -3128,8 +3178,6 @@ const callFunctionSystems = new Map(); // Store generated functions per call
 const callEndLocks = new Map();
 const gatherEventDedupe = new Map();
 const silenceTimers = new Map();
-const transcriptAudioJobs = new Map();
-const TRANSCRIPT_AUDIO_TTL_MS = 60 * 60 * 1000;
 const twilioTtsCache = new Map();
 const twilioTtsPending = new Map();
 const TWILIO_TTS_CACHE_TTL_MS =
@@ -7796,36 +7844,6 @@ app.post("/admin/provider", requireAdminToken, async (req, res) => {
   return res.json({ success: true, provider: currentProvider, changed });
 });
 
-app.post("/admin/replay/call-status", requireAdminToken, async (req, res) => {
-  try {
-    const payload = req.body || {};
-    const sample = payload.sample;
-    const callSid = payload.call_sid || payload.CallSid;
-    if (sample && !callSid) {
-      return res.status(400).json({
-        success: false,
-        error: "call_sid is required when using sample",
-      });
-    }
-    const resolvedPayload = sample
-      ? buildSampleCallStatusPayload(sample, callSid) || payload
-      : payload;
-    const result = await processCallStatusWebhookPayload(resolvedPayload, {
-      source: "replay",
-      skipDedupe: true,
-    });
-    if (!result?.ok) {
-      return res
-        .status(404)
-        .json({ success: false, error: result?.error || "call_not_found" });
-    }
-    return res.json({ success: true, ...result });
-  } catch (error) {
-    console.error("Replay call-status error:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
-});
-
 // Personas list for bot selection
 app.get("/api/personas", async (req, res) => {
   res.json({
@@ -8070,27 +8088,6 @@ app.get("/api/caller-flags", requireAdminToken, async (req, res) => {
   }
 });
 
-app.get("/api/caller-flags/:phone", requireAdminToken, async (req, res) => {
-  try {
-    const phone = normalizePhoneForFlag(req.params?.phone) || req.params?.phone;
-    if (!phone) {
-      return res
-        .status(400)
-        .json({ success: false, error: "phone is required" });
-    }
-    const flag = await db.getCallerFlag(phone);
-    if (!flag) {
-      return res.status(404).json({ success: false, error: "Not found" });
-    }
-    res.json({ success: true, flag });
-  } catch (error) {
-    console.error("Failed to fetch caller flag:", error);
-    res
-      .status(500)
-      .json({ success: false, error: "Failed to fetch caller flag" });
-  }
-});
-
 app.post("/api/caller-flags", requireAdminToken, async (req, res) => {
   try {
     const phoneInput = req.body?.phone_number || req.body?.phone || null;
@@ -8119,27 +8116,6 @@ app.post("/api/caller-flags", requireAdminToken, async (req, res) => {
     res
       .status(500)
       .json({ success: false, error: "Failed to set caller flag" });
-  }
-});
-
-app.delete("/api/caller-flags/:phone", requireAdminToken, async (req, res) => {
-  try {
-    const phone = normalizePhoneForFlag(req.params?.phone) || req.params?.phone;
-    if (!phone) {
-      return res
-        .status(400)
-        .json({ success: false, error: "phone is required" });
-    }
-    const removed = await db.clearCallerFlag(phone);
-    if (!removed) {
-      return res.status(404).json({ success: false, error: "Not found" });
-    }
-    res.json({ success: true });
-  } catch (error) {
-    console.error("Failed to clear caller flag:", error);
-    res
-      .status(500)
-      .json({ success: false, error: "Failed to clear caller flag" });
   }
 });
 
@@ -8574,43 +8550,6 @@ app.post("/outbound-call", async (req, res) => {
   }
 });
 
-function buildSampleCallStatusPayload(sample, callSid) {
-  if (!callSid) {
-    return null;
-  }
-  const normalized = String(sample || "").toLowerCase();
-  const base = {
-    CallSid: callSid,
-    From: "+15551230000",
-    To: "+15551239999",
-  };
-  if (normalized === "voicemail") {
-    return {
-      ...base,
-      CallStatus: "completed",
-      AnsweredBy: "machine_start",
-      CallDuration: "0",
-      DialCallDuration: "0",
-    };
-  }
-  if (normalized === "human") {
-    return {
-      ...base,
-      CallStatus: "completed",
-      AnsweredBy: "human",
-      CallDuration: "42",
-      DialCallDuration: "42",
-    };
-  }
-  if (normalized === "no-answer") {
-    return {
-      ...base,
-      CallStatus: "no-answer",
-    };
-  }
-  return null;
-}
-
 async function processCallStatusWebhookPayload(payload = {}, options = {}) {
   const {
     CallSid,
@@ -8912,7 +8851,6 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
 }
 
 // Enhanced webhook endpoint for call status updates
-
 app.post("/webhook/call-status", async (req, res) => {
   try {
     if (!requireValidTwilioSignature(req, res, "/webhook/call-status")) {
@@ -9202,6 +9140,12 @@ app.post("/miniapp/bootstrap", async (req, res) => {
 
 app.post("/miniapp/refresh", async (req, res) => {
   try {
+    if (!db) {
+      await ensureTestDbReady();
+    }
+    if (!db) {
+      return res.status(500).json({ ok: false, error: "db_unavailable" });
+    }
     const refreshToken = resolveMiniappRefreshToken(req);
     if (!refreshToken) {
       return res.status(401).json({ ok: false, error: "missing_refresh" });
@@ -9810,6 +9754,25 @@ app.get("/webapp/calls/:callSid", requireWebappJwt, async (req, res) => {
   }
 });
 
+app.get(
+  "/webapp/calls/:callSid/transcripts",
+  requireWebappJwt,
+  async (req, res) => {
+    try {
+      if (!db) {
+        return res.json({ ok: true, transcripts: [] });
+      }
+      const transcripts = await db.getCallTranscripts(req.params.callSid);
+      return res.json({ ok: true, transcripts: transcripts || [] });
+    } catch (error) {
+      console.error("Webapp transcripts error:", error);
+      return res
+        .status(500)
+        .json({ ok: false, error: "failed_to_fetch_transcripts" });
+    }
+  },
+);
+
 app.get("/webapp/calls/:callSid/events", requireWebappJwt, async (req, res) => {
   try {
     const after = Number(req.query?.after || 0);
@@ -10122,6 +10085,99 @@ app.post(
     } catch (error) {
       console.error("Webapp decline error:", error);
       return res.status(500).json({ ok: false, error: "decline_failed" });
+    }
+  },
+);
+
+app.post(
+  "/webapp/outbound-call",
+  requireWebappJwt,
+  requireWebappAdmin,
+  async (req, res) => {
+    const idempotency = applyIdempotency(req, res);
+    if (idempotency.handled) return;
+    try {
+      const payload = req.body || {};
+      const number = String(payload.number || "").trim();
+      const prompt = String(payload.prompt || "").trim();
+      const firstMessage = String(
+        payload.first_message || payload.firstMessage || "",
+      ).trim();
+      if (!number || !prompt || !firstMessage) {
+        return res.status(400).json({
+          ok: false,
+          error: "missing_fields",
+          message: "Missing required fields: number, prompt, first_message.",
+        });
+      }
+      if (!number.match(/^\+[1-9]\d{1,14}$/)) {
+        return res.status(400).json({
+          ok: false,
+          error: "invalid_number",
+          message: "Invalid phone number format. Use E.164 format.",
+        });
+      }
+
+      const scriptIdRaw = payload.script_id ?? payload.scriptId;
+      const scriptId = Number.isFinite(Number(scriptIdRaw))
+        ? Number(scriptIdRaw)
+        : null;
+
+      const callPayload = {
+        number,
+        prompt,
+        first_message: firstMessage,
+        user_chat_id: null,
+        customer_name: payload.customer_name || null,
+        business_id: payload.business_id || null,
+        script: payload.script || null,
+        script_id: scriptId,
+        purpose: payload.purpose || null,
+        emotion: payload.emotion || null,
+        urgency: payload.urgency || null,
+        technical_level: payload.technical_level || null,
+        voice_model: payload.voice_model || null,
+        collection_profile: payload.collection_profile || null,
+        collection_expected_length: payload.collection_expected_length || null,
+        collection_timeout_s: payload.collection_timeout_s || null,
+        collection_max_retries: payload.collection_max_retries || null,
+        collection_mask_for_gpt: payload.collection_mask_for_gpt,
+        collection_speak_confirmation: payload.collection_speak_confirmation,
+      };
+
+      const host = resolveHost(req) || config.server?.hostname;
+      const result = await placeOutboundCall(callPayload, host);
+
+      await db
+        ?.logMiniappAudit?.({
+          user_id: String(req.webappSession?.user?.id || ""),
+          action: "webapp.outbound_call",
+          call_sid: result.callId,
+          metadata: {
+            to: maskPhoneForLog(number),
+            script_id: scriptId,
+            script: payload.script || null,
+            prompt: truncatePrompt(prompt, 120),
+          },
+          ip: req.ip,
+          user_agent: req.headers["user-agent"],
+        })
+        .catch(() => {});
+
+      return res.json({
+        ok: true,
+        call_sid: result.callId,
+        to: number,
+        status: result.callStatus,
+        provider: currentProvider,
+      });
+    } catch (error) {
+      console.error("Webapp outbound call error:", error);
+      return res.status(500).json({
+        ok: false,
+        error: "outbound_failed",
+        message: "Failed to create outbound call.",
+      });
     }
   },
 );
@@ -10999,40 +11055,6 @@ app.get("/api/calls/:callSid", async (req, res) => {
   }
 });
 
-app.get("/api/calls/:callSid/transcript/audio", async (req, res) => {
-  try {
-    const { callSid } = req.params;
-    const call = await db.getCall(callSid);
-    if (!call) {
-      return res.status(404).json({ error: "Call not found" });
-    }
-    const entry = await ensureTranscriptAudio(callSid);
-    if (entry.status === "processing") {
-      return res
-        .status(202)
-        .json({ status: "processing", retry_after_ms: 2000 });
-    }
-    if (entry.status === "error") {
-      return res.status(500).json({
-        status: "error",
-        error: entry.error || "Transcript audio failed",
-      });
-    }
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader(
-      "Content-Disposition",
-      'attachment; filename="transcript.mp3"',
-    );
-    return res.status(200).send(entry.buffer);
-  } catch (error) {
-    console.error("Error generating transcript audio:", error);
-    return res.status(500).json({
-      status: "error",
-      error: error.message || "Transcript audio failed",
-    });
-  }
-});
-
 // Enhanced call status endpoint with real-time metrics
 app.get("/api/calls/:callSid/status", async (req, res) => {
   try {
@@ -11105,325 +11127,8 @@ app.get("/api/calls/:callSid/status", async (req, res) => {
 });
 
 // Call latency diagnostics endpoint (best-effort)
-app.get("/api/calls/:callSid/latency", async (req, res) => {
-  try {
-    const { callSid } = req.params;
-    const call = await db.getCall(callSid);
-    if (!call) {
-      return res.status(404).json({ error: "Call not found" });
-    }
-
-    const states = await new Promise((resolve, reject) => {
-      db.db.all(
-        `SELECT state, timestamp FROM call_states
-         WHERE call_sid = ?
-           AND state IN ('user_spoke', 'ai_responded', 'tts_ready')
-         ORDER BY timestamp DESC`,
-        [callSid],
-        (err, rows) => {
-          if (err) reject(err);
-          else resolve(rows || []);
-        },
-      );
-    });
-
-    const latest = { user_spoke: null, ai_responded: null, tts_ready: null };
-    for (const row of states) {
-      if (!latest[row.state]) {
-        latest[row.state] = row;
-      }
-    }
-
-    const toMs = (row) =>
-      row?.timestamp ? new Date(row.timestamp).getTime() : null;
-    const userSpokeAt = toMs(latest.user_spoke);
-    const aiRespondedAt = toMs(latest.ai_responded);
-    const ttsReadyAt = toMs(latest.tts_ready);
-
-    const gptMs =
-      userSpokeAt && aiRespondedAt && aiRespondedAt >= userSpokeAt
-        ? aiRespondedAt - userSpokeAt
-        : null;
-    const ttsMs =
-      aiRespondedAt && ttsReadyAt && ttsReadyAt >= aiRespondedAt
-        ? ttsReadyAt - aiRespondedAt
-        : null;
-
-    res.json({
-      call_sid: callSid,
-      latency_metrics: {
-        stt_ms: null,
-        gpt_ms: gptMs,
-        tts_ms: ttsMs,
-      },
-      call_duration: call.duration || 0,
-      source: "call_states",
-      computed_at: new Date().toISOString(),
-    });
-  } catch (error) {
-    console.error("Error fetching call latency:", error);
-    res.status(500).json({ error: "Failed to fetch call latency" });
-  }
-});
-
 // Manual notification trigger endpoint (for testing)
-app.post("/api/calls/:callSid/notify", async (req, res) => {
-  try {
-    const { callSid } = req.params;
-    const { status, user_chat_id } = req.body;
-
-    if (!status || !user_chat_id) {
-      return res.status(400).json({
-        error: "Both status and user_chat_id are required",
-      });
-    }
-
-    const call = await db.getCall(callSid);
-    if (!call) {
-      return res.status(404).json({ error: "Call not found" });
-    }
-
-    // Send immediate enhanced notification
-    const success = await webhookService.sendImmediateStatus(
-      callSid,
-      status,
-      user_chat_id,
-    );
-
-    if (success) {
-      res.json({
-        success: true,
-        message: `Enhanced manual notification sent: ${status}`,
-        call_sid: callSid,
-        enhanced: true,
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        error: "Failed to send enhanced notification",
-      });
-    }
-  } catch (error) {
-    console.error("Error sending enhanced manual notification:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to send notification",
-      details: error.message,
-    });
-  }
-});
-
 // Get enhanced adaptation analytics dashboard data
-app.get("/api/analytics/adaptations", async (req, res) => {
-  try {
-    const limit = parseInt(req.query.limit) || 50;
-    const calls = await db.getCallsWithTranscripts(limit);
-
-    const analyticsData = {
-      total_calls: calls.length,
-      calls_with_adaptations: 0,
-      total_adaptations: 0,
-      personality_usage: {},
-      industry_breakdown: {},
-      adaptation_triggers: {},
-      enhanced_features: true,
-    };
-
-    calls.forEach((call) => {
-      try {
-        if (call.ai_analysis) {
-          const analysis = JSON.parse(call.ai_analysis);
-          if (
-            analysis.adaptation &&
-            analysis.adaptation.personalityChanges > 0
-          ) {
-            analyticsData.calls_with_adaptations++;
-            analyticsData.total_adaptations +=
-              analysis.adaptation.personalityChanges;
-
-            // Track final personality usage
-            const finalPersonality = analysis.adaptation.finalPersonality;
-            if (finalPersonality) {
-              analyticsData.personality_usage[finalPersonality] =
-                (analyticsData.personality_usage[finalPersonality] || 0) + 1;
-            }
-
-            // Track industry usage
-            const industry = analysis.adaptation.businessContext?.industry;
-            if (industry) {
-              analyticsData.industry_breakdown[industry] =
-                (analyticsData.industry_breakdown[industry] || 0) + 1;
-            }
-          }
-        }
-      } catch (e) {
-        // Skip calls with invalid analysis data
-      }
-    });
-
-    analyticsData.adaptation_rate =
-      analyticsData.total_calls > 0
-        ? (
-            (analyticsData.calls_with_adaptations / analyticsData.total_calls) *
-            100
-          ).toFixed(1)
-        : 0;
-
-    analyticsData.avg_adaptations_per_call =
-      analyticsData.calls_with_adaptations > 0
-        ? (
-            analyticsData.total_adaptations /
-            analyticsData.calls_with_adaptations
-          ).toFixed(1)
-        : 0;
-
-    res.json(analyticsData);
-  } catch (error) {
-    console.error("Error fetching enhanced adaptation analytics:", error);
-    res.status(500).json({ error: "Failed to fetch analytics" });
-  }
-});
-
-// Enhanced notification analytics endpoint
-app.get("/api/analytics/notifications", async (req, res) => {
-  try {
-    const limit = parseInt(req.query.limit) || 100;
-    const hours = parseInt(req.query.hours) || 24;
-
-    const notificationStats = await new Promise((resolve, reject) => {
-      db.db.all(
-        `
-        SELECT 
-          notification_type,
-          status,
-          COUNT(*) as count,
-          AVG(CASE 
-            WHEN sent_at IS NOT NULL AND created_at IS NOT NULL 
-            THEN (julianday(sent_at) - julianday(created_at)) * 86400 
-            ELSE NULL 
-          END) as avg_delivery_time_seconds,
-          AVG(delivery_time_ms) as avg_delivery_time_ms
-        FROM webhook_notifications 
-        WHERE created_at >= datetime('now', '-${hours} hours')
-        GROUP BY notification_type, status
-        ORDER BY notification_type, status
-      `,
-        (err, rows) => {
-          if (err) reject(err);
-          else resolve(rows || []);
-        },
-      );
-    });
-
-    const recentNotifications = await new Promise((resolve, reject) => {
-      db.db.all(
-        `
-        SELECT 
-          wn.*,
-          c.phone_number,
-          c.status as call_status,
-          c.twilio_status
-        FROM webhook_notifications wn
-        LEFT JOIN calls c ON wn.call_sid = c.call_sid
-        WHERE wn.created_at >= datetime('now', '-${hours} hours')
-        ORDER BY wn.created_at DESC
-        LIMIT ${limit}
-      `,
-        (err, rows) => {
-          if (err) reject(err);
-          else resolve(rows || []);
-        },
-      );
-    });
-
-    // Calculate enhanced summary metrics
-    const totalNotifications = notificationStats.reduce(
-      (sum, stat) => sum + stat.count,
-      0,
-    );
-    const successfulNotifications = notificationStats
-      .filter((stat) => stat.status === "sent")
-      .reduce((sum, stat) => sum + stat.count, 0);
-
-    const successRate =
-      totalNotifications > 0
-        ? ((successfulNotifications / totalNotifications) * 100).toFixed(1)
-        : 0;
-
-    const avgDeliveryTime = notificationStats
-      .filter((stat) => stat.avg_delivery_time_seconds !== null)
-      .reduce((sum, stat, _, arr) => {
-        return sum + stat.avg_delivery_time_seconds / arr.length;
-      }, 0);
-
-    // Get notification metrics from database
-    const notificationMetrics = await db.getNotificationAnalytics(
-      Math.ceil(hours / 24),
-    );
-
-    res.json({
-      summary: {
-        total_notifications: totalNotifications,
-        successful_notifications: successfulNotifications,
-        success_rate_percent: parseFloat(successRate),
-        average_delivery_time_seconds: avgDeliveryTime.toFixed(2),
-        time_period_hours: hours,
-        enhanced_tracking: true,
-      },
-      notification_breakdown: notificationStats,
-      recent_notifications: recentNotifications,
-      historical_metrics: notificationMetrics,
-      webhook_service_health: await webhookService.healthCheck(),
-    });
-  } catch (error) {
-    console.error("Error fetching enhanced notification analytics:", error);
-    res.status(500).json({
-      error: "Failed to fetch notification analytics",
-      details: error.message,
-    });
-  }
-});
-
-// Generate functions for a given prompt (testing endpoint)
-app.post("/api/generate-functions", async (req, res) => {
-  try {
-    const { prompt, first_message } = req.body;
-
-    if (!prompt || !first_message) {
-      return res
-        .status(400)
-        .json({ error: "Both prompt and first_message are required" });
-    }
-
-    const functionSystem = functionEngine.generateAdaptiveFunctionSystem(
-      prompt,
-      first_message,
-    );
-
-    res.json({
-      success: true,
-      business_context: functionSystem.context,
-      functions: functionSystem.functions,
-      function_count: functionSystem.functions.length,
-      analysis: functionEngine.getBusinessAnalysis(),
-      enhanced: true,
-    });
-  } catch (error) {
-    console.error("Error generating enhanced functions:", error);
-    res.status(500).json({ error: "Failed to generate functions" });
-  }
-});
-
-// Version info endpoint for bot diagnostics
-app.get("/api/version", (req, res) => {
-  res.json({
-    name: apiPackage.name || "api",
-    version: apiPackage.version || "unknown",
-    provider: currentProvider,
-    timestamp: new Date().toISOString(),
-  });
-});
-
 // Enhanced health endpoint with comprehensive system status
 app.get("/health", async (req, res) => {
   try {
@@ -11539,44 +11244,6 @@ app.get("/health", async (req, res) => {
 });
 
 // Enhanced system maintenance endpoint
-app.post("/api/system/cleanup", async (req, res) => {
-  try {
-    const { days_to_keep = 30 } = req.body;
-
-    console.log(
-      `Starting enhanced system cleanup (keeping ${days_to_keep} days)...`,
-    );
-
-    const cleanedRecords = await db.cleanupOldRecords(days_to_keep);
-
-    // Log cleanup operation
-    await db.logServiceHealth("system_maintenance", "cleanup_completed", {
-      records_cleaned: cleanedRecords,
-      days_kept: days_to_keep,
-    });
-
-    res.json({
-      success: true,
-      records_cleaned: cleanedRecords,
-      days_kept: days_to_keep,
-      timestamp: new Date().toISOString(),
-      enhanced: true,
-    });
-  } catch (error) {
-    console.error("Error during enhanced system cleanup:", error);
-
-    await db.logServiceHealth("system_maintenance", "cleanup_failed", {
-      error: error.message,
-    });
-
-    res.status(500).json({
-      success: false,
-      error: "System cleanup failed",
-      details: error.message,
-    });
-  }
-});
-
 // Basic calls list endpoint
 app.get("/api/calls", async (req, res) => {
   try {
@@ -11832,120 +11499,6 @@ function normalizeCallRecordForApi(call) {
 }
 
 // Add calls analytics endpoint
-app.get("/api/calls/analytics", async (req, res) => {
-  try {
-    const days = parseInt(req.query.days) || 7;
-    const dateFrom = new Date(
-      Date.now() - days * 24 * 60 * 60 * 1000,
-    ).toISOString();
-
-    // Get comprehensive analytics
-    const analytics = await new Promise((resolve, reject) => {
-      const queries = {
-        // Total calls in period
-        totalCalls: `SELECT COUNT(*) as count FROM calls WHERE created_at >= ?`,
-
-        // Calls by status
-        statusBreakdown: `
-          SELECT status, COUNT(*) as count 
-          FROM calls 
-          WHERE created_at >= ? 
-          GROUP BY status 
-          ORDER BY count DESC
-        `,
-
-        // Average call duration
-        avgDuration: `
-          SELECT AVG(duration) as avg_duration 
-          FROM calls 
-          WHERE created_at >= ? AND duration > 0
-        `,
-
-        // Success rate (completed calls with conversation)
-        successRate: `
-          SELECT 
-            COUNT(CASE WHEN c.status = 'completed' AND t.transcript_count > 0 THEN 1 END) as successful,
-            COUNT(*) as total
-          FROM calls c
-          LEFT JOIN (
-            SELECT call_sid, COUNT(*) as transcript_count 
-            FROM transcripts 
-            WHERE speaker = 'user' 
-            GROUP BY call_sid
-          ) t ON c.call_sid = t.call_sid
-          WHERE c.created_at >= ?
-        `,
-
-        // Daily call volume
-        dailyVolume: `
-          SELECT 
-            DATE(created_at) as date,
-            COUNT(*) as calls,
-            COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed
-          FROM calls 
-          WHERE created_at >= ? 
-          GROUP BY DATE(created_at) 
-          ORDER BY date DESC
-        `,
-      };
-
-      const results = {};
-      let completed = 0;
-      const total = Object.keys(queries).length;
-
-      for (const [key, query] of Object.entries(queries)) {
-        db.db.all(query, [dateFrom], (err, rows) => {
-          if (err) {
-            console.error(`Analytics query error for ${key}:`, err);
-            results[key] = null;
-          } else {
-            results[key] = rows;
-          }
-
-          completed++;
-          if (completed === total) {
-            resolve(results);
-          }
-        });
-      }
-    });
-
-    // Process analytics data
-    const processedAnalytics = {
-      period: {
-        days: days,
-        from: dateFrom,
-        to: new Date().toISOString(),
-      },
-      summary: {
-        total_calls: analytics.totalCalls?.[0]?.count || 0,
-        average_duration: analytics.avgDuration?.[0]?.avg_duration
-          ? Math.round(analytics.avgDuration[0].avg_duration)
-          : 0,
-        success_rate: analytics.successRate?.[0]
-          ? Math.round(
-              (analytics.successRate[0].successful /
-                analytics.successRate[0].total) *
-                100,
-            )
-          : 0,
-      },
-      status_breakdown: analytics.statusBreakdown || [],
-      daily_volume: analytics.dailyVolume || [],
-      enhanced_features: true,
-    };
-
-    res.json(processedAnalytics);
-  } catch (error) {
-    console.error("Error fetching call analytics:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to fetch analytics",
-      details: error.message,
-    });
-  }
-});
-
 // Search calls endpoint
 app.get("/api/calls/search", async (req, res) => {
   try {
@@ -13150,463 +12703,6 @@ app.get("/api/sms/bulk/status", async (req, res) => {
     res.status(500).json({
       success: false,
       error: "Failed to fetch bulk SMS status",
-      details: error.message,
-    });
-  }
-});
-
-// SMS analytics dashboard endpoint
-app.get("/api/sms/analytics", async (req, res) => {
-  try {
-    const days = parseInt(req.query.days) || 7;
-    const dateFrom = new Date(
-      Date.now() - days * 24 * 60 * 60 * 1000,
-    ).toISOString();
-
-    const analytics = await new Promise((resolve, reject) => {
-      const queries = {
-        // Daily message volume
-        dailyVolume: `
-                    SELECT 
-                        DATE(created_at) as date,
-                        COUNT(*) as total,
-                        COUNT(CASE WHEN direction = 'outbound' THEN 1 END) as sent,
-                        COUNT(CASE WHEN direction = 'inbound' THEN 1 END) as received,
-                        COUNT(CASE WHEN status = 'delivered' THEN 1 END) as delivered,
-                        COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed
-                    FROM sms_messages 
-                    WHERE created_at >= ?
-                    GROUP BY DATE(created_at) 
-                    ORDER BY date DESC
-                `,
-
-        // Hourly distribution
-        hourlyDistribution: `
-                    SELECT 
-                        strftime('%H', created_at) as hour,
-                        COUNT(*) as count
-                    FROM sms_messages 
-                    WHERE created_at >= ?
-                    GROUP BY strftime('%H', created_at)
-                    ORDER BY hour
-                `,
-
-        // Top phone numbers (anonymized)
-        topNumbers: `
-                    SELECT 
-                        SUBSTR(COALESCE(to_number, from_number), 1, 6) || 'XXXX' as phone_prefix,
-                        COUNT(*) as message_count
-                    FROM sms_messages 
-                    WHERE created_at >= ?
-                    GROUP BY SUBSTR(COALESCE(to_number, from_number), 1, 6)
-                    ORDER BY message_count DESC 
-                    LIMIT 10
-                `,
-
-        // Error analysis
-        errorAnalysis: `
-                    SELECT 
-                        error_code,
-                        error_message,
-                        COUNT(*) as count
-                    FROM sms_messages 
-                    WHERE created_at >= ? AND error_code IS NOT NULL
-                    GROUP BY error_code, error_message
-                    ORDER BY count DESC
-                    LIMIT 10
-                `,
-      };
-
-      const results = {};
-      let completed = 0;
-      const total = Object.keys(queries).length;
-
-      for (const [key, query] of Object.entries(queries)) {
-        db.db.all(query, [dateFrom], (err, rows) => {
-          if (err) {
-            console.error(`SMS analytics query error for ${key}:`, err);
-            results[key] = [];
-          } else {
-            results[key] = rows || [];
-          }
-
-          completed++;
-          if (completed === total) {
-            resolve(results);
-          }
-        });
-      }
-    });
-
-    // Calculate summary metrics
-    const summary = {
-      total_messages: 0,
-      total_sent: 0,
-      total_received: 0,
-      total_delivered: 0,
-      total_failed: 0,
-      delivery_rate: 0,
-      error_rate: 0,
-    };
-
-    analytics.dailyVolume.forEach((day) => {
-      summary.total_messages += day.total;
-      summary.total_sent += day.sent;
-      summary.total_received += day.received;
-      summary.total_delivered += day.delivered;
-      summary.total_failed += day.failed;
-    });
-
-    if (summary.total_sent > 0) {
-      summary.delivery_rate = Math.round(
-        (summary.total_delivered / summary.total_sent) * 100,
-      );
-      summary.error_rate = Math.round(
-        (summary.total_failed / summary.total_sent) * 100,
-      );
-    }
-
-    res.json({
-      success: true,
-      period: {
-        days: days,
-        from: dateFrom,
-        to: new Date().toISOString(),
-      },
-      summary: summary,
-      daily_volume: analytics.dailyVolume,
-      hourly_distribution: analytics.hourlyDistribution,
-      top_numbers: analytics.topNumbers,
-      error_analysis: analytics.errorAnalysis,
-      enhanced_analytics: true,
-    });
-  } catch (error) {
-    console.error("❌ Error fetching SMS analytics:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to fetch SMS analytics",
-      details: error.message,
-    });
-  }
-});
-
-// SMS search endpoint
-app.get("/api/sms/search", async (req, res) => {
-  try {
-    const query = req.query.q;
-    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
-    const direction = req.query.direction; // 'inbound', 'outbound', or null for all
-    const status = req.query.status; // message status filter
-
-    if (!query || query.length < 2) {
-      return res.status(400).json({
-        success: false,
-        error: "Search query must be at least 2 characters",
-      });
-    }
-
-    let whereClause = `WHERE (body LIKE ? OR to_number LIKE ? OR from_number LIKE ?)`;
-    let queryParams = [`%${query}%`, `%${query}%`, `%${query}%`];
-
-    if (direction) {
-      whereClause += ` AND direction = ?`;
-      queryParams.push(direction);
-    }
-
-    if (status) {
-      whereClause += ` AND status = ?`;
-      queryParams.push(status);
-    }
-
-    queryParams.push(limit);
-
-    const searchResults = await new Promise((resolve, reject) => {
-      const searchQuery = `
-                SELECT * FROM sms_messages 
-                ${whereClause}
-                ORDER BY created_at DESC
-                LIMIT ?
-            `;
-
-      db.db.all(searchQuery, queryParams, (err, rows) => {
-        if (err) {
-          console.error("SMS search query error:", err);
-          reject(err);
-        } else {
-          resolve(rows || []);
-        }
-      });
-    });
-
-    // Format results for display
-    const formattedResults = searchResults.map((msg) => ({
-      message_sid: msg.message_sid,
-      phone: msg.to_number || msg.from_number,
-      direction: msg.direction,
-      status: msg.status,
-      body: msg.body,
-      created_at: msg.created_at,
-      created_date: new Date(msg.created_at).toLocaleDateString(),
-      created_time: new Date(msg.created_at).toLocaleTimeString(),
-      // Highlight matching text (basic implementation)
-      highlighted_body: msg.body.replace(
-        new RegExp(query, "gi"),
-        `**${query}**`,
-      ),
-      error_info: msg.error_code
-        ? {
-            code: msg.error_code,
-            message: msg.error_message,
-          }
-        : null,
-    }));
-
-    res.json({
-      success: true,
-      query: query,
-      filters: { direction, status },
-      results: formattedResults,
-      result_count: formattedResults.length,
-      enhanced_search: true,
-    });
-  } catch (error) {
-    console.error("❌ Error in SMS search:", error);
-    res.status(500).json({
-      success: false,
-      error: "Search failed",
-      details: error.message,
-    });
-  }
-});
-
-// Export SMS data endpoint
-app.get("/api/sms/export", async (req, res) => {
-  try {
-    const format = req.query.format || "json"; // 'json' or 'csv'
-    const days = parseInt(req.query.days) || 30;
-    const dateFrom = new Date(
-      Date.now() - days * 24 * 60 * 60 * 1000,
-    ).toISOString();
-
-    const messages = await new Promise((resolve, reject) => {
-      db.db.all(
-        `
-                SELECT 
-                    message_sid,
-                    to_number,
-                    from_number,
-                    body,
-                    status,
-                    direction,
-                    created_at,
-                    updated_at,
-                    error_code,
-                    error_message,
-                    ai_response
-                FROM sms_messages 
-                WHERE created_at >= ?
-                ORDER BY created_at DESC
-            `,
-        [dateFrom],
-        (err, rows) => {
-          if (err) {
-            reject(err);
-          } else {
-            resolve(rows || []);
-          }
-        },
-      );
-    });
-
-    if (format === "csv") {
-      // Generate CSV
-      const csvHeaders = [
-        "Message SID",
-        "To Number",
-        "From Number",
-        "Message Body",
-        "Status",
-        "Direction",
-        "Created At",
-        "Updated At",
-        "Error Code",
-        "Error Message",
-        "AI Response",
-      ];
-
-      let csvContent = csvHeaders.join(",") + "\n";
-
-      messages.forEach((msg) => {
-        const row = [
-          msg.message_sid || "",
-          msg.to_number || "",
-          msg.from_number || "",
-          `"${(msg.body || "").replace(/"/g, '""')}"`, // Escape quotes
-          msg.status || "",
-          msg.direction || "",
-          msg.created_at || "",
-          msg.updated_at || "",
-          msg.error_code || "",
-          `"${(msg.error_message || "").replace(/"/g, '""')}"`,
-          `"${(msg.ai_response || "").replace(/"/g, '""')}"`,
-        ];
-        csvContent += row.join(",") + "\n";
-      });
-
-      res.setHeader("Content-Type", "text/csv");
-      res.setHeader(
-        "Content-Disposition",
-        `attachment; filename="sms-export-${new Date().toISOString().split("T")[0]}.csv"`,
-      );
-      res.send(csvContent);
-    } else {
-      // Return JSON
-      res.json({
-        success: true,
-        export_info: {
-          total_messages: messages.length,
-          date_range: {
-            from: dateFrom,
-            to: new Date().toISOString(),
-          },
-          exported_at: new Date().toISOString(),
-        },
-        messages: messages,
-      });
-    }
-  } catch (error) {
-    console.error("❌ Error exporting SMS data:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to export SMS data",
-      details: error.message,
-    });
-  }
-});
-
-// SMS system health check
-app.get("/api/sms/health", async (req, res) => {
-  try {
-    const health = {
-      timestamp: new Date().toISOString(),
-      status: "healthy",
-      services: {
-        database: { status: "unknown" },
-        twilio: { status: "unknown" },
-        sms_service: { status: "unknown" },
-      },
-      statistics: {
-        active_conversations: 0,
-        scheduled_messages: 0,
-        recent_messages: 0,
-      },
-    };
-
-    // Check database connectivity
-    try {
-      const dbTest = await new Promise((resolve, reject) => {
-        db.db.get(
-          "SELECT COUNT(*) as count FROM sms_messages LIMIT 1",
-          (err, row) => {
-            if (err) reject(err);
-            else resolve(row);
-          },
-        );
-      });
-
-      health.services.database.status = "healthy";
-      health.services.database.message_count = dbTest.count;
-    } catch (dbError) {
-      health.services.database.status = "unhealthy";
-      health.services.database.error = dbError.message;
-      health.status = "degraded";
-    }
-
-    // Check SMS service if available
-    try {
-      if (smsService) {
-        const stats = smsService.getStatistics();
-        health.services.sms_service.status = "healthy";
-        health.statistics.active_conversations = stats.active_conversations;
-        health.statistics.scheduled_messages = stats.scheduled_messages;
-      } else {
-        health.services.sms_service.status = "not_initialized";
-      }
-    } catch (smsError) {
-      health.services.sms_service.status = "unhealthy";
-      health.services.sms_service.error = smsError.message;
-    }
-
-    // Check recent activity
-    try {
-      const recentCount = await new Promise((resolve, reject) => {
-        const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-        db.db.get(
-          "SELECT COUNT(*) as count FROM sms_messages WHERE created_at >= ?",
-          [oneHourAgo],
-          (err, row) => {
-            if (err) reject(err);
-            else resolve(row.count || 0);
-          },
-        );
-      });
-
-      health.statistics.recent_messages = recentCount;
-    } catch (recentError) {
-      console.warn("Could not get recent message count:", recentError);
-    }
-
-    // Check Twilio connectivity (basic check)
-    try {
-      if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
-        health.services.twilio.status = "configured";
-        health.services.twilio.account_sid =
-          process.env.TWILIO_ACCOUNT_SID.substring(0, 8) + "...";
-      } else {
-        health.services.twilio.status = "not_configured";
-        health.status = "degraded";
-      }
-    } catch (twilioError) {
-      health.services.twilio.status = "error";
-      health.services.twilio.error = twilioError.message;
-    }
-
-    res.json(health);
-  } catch (error) {
-    console.error("❌ SMS health check error:", error);
-    res.status(500).json({
-      timestamp: new Date().toISOString(),
-      status: "unhealthy",
-      error: "Health check failed",
-      details: error.message,
-    });
-  }
-});
-
-// Clean up old SMS conversations (manual trigger)
-app.post("/api/sms/cleanup-conversations", async (req, res) => {
-  try {
-    if (!smsService) {
-      return res.status(500).json({
-        success: false,
-        error: "SMS service not initialized",
-      });
-    }
-
-    const maxAgeHours = parseInt(req.body.max_age_hours) || 24;
-    const cleaned = smsService.cleanupOldConversations(maxAgeHours);
-
-    res.json({
-      success: true,
-      cleaned_count: cleaned,
-      max_age_hours: maxAgeHours,
-      timestamp: new Date().toISOString(),
-    });
-  } catch (error) {
-    console.error("❌ Error cleaning up SMS conversations:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to cleanup conversations",
       details: error.message,
     });
   }

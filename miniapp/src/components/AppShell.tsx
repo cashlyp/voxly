@@ -5,7 +5,6 @@ import {
   backButton,
   openLink,
   openTelegramLink,
-  popup,
 } from "@tma.js/sdk-react";
 import {
   Suspense,
@@ -37,28 +36,29 @@ import { Settings } from "../routes/Settings";
 import { CallsProvider, useCalls } from "../state/calls";
 import { useUser } from "../state/user";
 
-const Scripts = lazy(() =>
-  import("../routes/Scripts").then((module) => ({ default: module.Scripts })),
-);
-const Personas = lazy(() =>
-  import("../routes/Personas").then((module) => ({ default: module.Personas })),
-);
-const CallerFlags = lazy(() =>
-  import("../routes/CallerFlags").then((module) => ({
-    default: module.CallerFlags,
-  })),
-);
 const Sms = lazy(() =>
   import("../routes/Sms").then((module) => ({ default: module.Sms })),
 );
-const Email = lazy(() =>
-  import("../routes/Email").then((module) => ({ default: module.Email })),
-);
-const Health = lazy(() =>
-  import("../routes/Health").then((module) => ({ default: module.Health })),
-);
 const Users = lazy(() =>
   import("../routes/Users").then((module) => ({ default: module.Users })),
+);
+const Transcripts = lazy(() =>
+  import("../routes/Transcripts").then((module) => ({
+    default: module.Transcripts,
+  })),
+);
+const TranscriptDetail = lazy(() =>
+  import("../routes/TranscriptDetail").then((module) => ({
+    default: module.TranscriptDetail,
+  })),
+);
+const Logs = lazy(() =>
+  import("../routes/Logs").then((module) => ({ default: module.Logs })),
+);
+const ProviderStatus = lazy(() =>
+  import("../routes/Provider").then((module) => ({
+    default: module.Provider,
+  })),
 );
 
 type TabItem = {
@@ -66,8 +66,6 @@ type TabItem = {
   path: string;
   icon: JSX.Element;
 };
-
-type PopupButtons = Parameters<NonNullable<typeof popup.show>>[0]["buttons"];
 
 const baseTabs: TabItem[] = [
   {
@@ -83,8 +81,8 @@ const baseTabs: TabItem[] = [
     ),
   },
   {
-    label: "Calls",
-    path: "/calls",
+    label: "Call",
+    path: "/inbox",
     icon: (
       <svg className="tab-icon" viewBox="0 0 24 24" aria-hidden="true">
         <path
@@ -148,20 +146,29 @@ const baseTabs: TabItem[] = [
   },
 ];
 
-const adminMenuItems: TabItem[] = [
+type DrawerItem = {
+  label: string;
+  path: string;
+  icon: JSX.Element;
+  adminOnly?: boolean;
+  matchRoutes?: string[];
+};
+
+const drawerNavItems: DrawerItem[] = [
   {
-    label: "Scripts",
-    path: "/scripts",
+    label: "Calls history",
+    path: "/calls",
+    matchRoutes: ["calls", "callConsole"],
     icon: (
       <svg className="tab-icon" viewBox="0 0 24 24" aria-hidden="true">
         <path
-          d="M6 4h9l3 3v13H6z"
+          d="M6 4h12v16H6z"
           fill="none"
           stroke="currentColor"
           strokeWidth="1.6"
         />
         <path
-          d="M9 12h6M9 16h4M9 8h3"
+          d="M9 8h6M9 12h6M9 16h4"
           fill="none"
           stroke="currentColor"
           strokeWidth="1.6"
@@ -171,62 +178,20 @@ const adminMenuItems: TabItem[] = [
     ),
   },
   {
-    label: "Personas",
-    path: "/personas",
+    label: "Transcripts",
+    path: "/transcripts",
+    matchRoutes: ["transcripts", "transcriptDetail"],
     icon: (
       <svg className="tab-icon" viewBox="0 0 24 24" aria-hidden="true">
         <path
-          d="M12 2c5.5 0 10 4.5 10 10s-4.5 10-10 10S2 17.5 2 12 6.5 2 12 2z"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.6"
-        />
-        <path
-          d="M8 10a4 4 0 0 1 8 0"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.6"
-          strokeLinecap="round"
-        />
-        <circle cx="12" cy="7" r="1.5" fill="currentColor" />
-      </svg>
-    ),
-  },
-  {
-    label: "Flags",
-    path: "/caller-flags",
-    icon: (
-      <svg className="tab-icon" viewBox="0 0 24 24" aria-hidden="true">
-        <path
-          d="M4 4h16v16H4z"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.6"
-        />
-        <path
-          d="M7 8h10M7 12h10M7 16h6"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.6"
-          strokeLinecap="round"
-        />
-      </svg>
-    ),
-  },
-  {
-    label: "Email",
-    path: "/email",
-    icon: (
-      <svg className="tab-icon" viewBox="0 0 24 24" aria-hidden="true">
-        <path
-          d="M4 4h16l-2 8-14 0 2-8z"
+          d="M4 6h16v9H7l-3 3V6z"
           fill="none"
           stroke="currentColor"
           strokeWidth="1.6"
           strokeLinejoin="round"
         />
         <path
-          d="M4 4c-2 2-2 8-2 8 0 4 2 6 10 6s10-2 10-6c0 0 0-6-2-8"
+          d="M8 10h8M8 13h5"
           fill="none"
           stroke="currentColor"
           strokeWidth="1.6"
@@ -236,18 +201,20 @@ const adminMenuItems: TabItem[] = [
     ),
   },
   {
-    label: "Health",
-    path: "/health",
+    label: "Provider status",
+    path: "/provider",
+    matchRoutes: ["provider"],
+    adminOnly: true,
     icon: (
       <svg className="tab-icon" viewBox="0 0 24 24" aria-hidden="true">
         <path
-          d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"
+          d="M4 12a8 8 0 1 1 16 0 8 8 0 0 1-16 0z"
           fill="none"
           stroke="currentColor"
           strokeWidth="1.6"
         />
         <path
-          d="M12 6v6M15 12h-6"
+          d="M12 8v4l3 2"
           fill="none"
           stroke="currentColor"
           strokeWidth="1.6"
@@ -259,6 +226,8 @@ const adminMenuItems: TabItem[] = [
   {
     label: "Users",
     path: "/users",
+    matchRoutes: ["users"],
+    adminOnly: true,
     icon: (
       <svg className="tab-icon" viewBox="0 0 24 24" aria-hidden="true">
         <path
@@ -279,32 +248,62 @@ const adminMenuItems: TabItem[] = [
       </svg>
     ),
   },
+  {
+    label: "Logs",
+    path: "/logs",
+    matchRoutes: ["logs"],
+    adminOnly: true,
+    icon: (
+      <svg className="tab-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path
+          d="M4 4h16v16H4z"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.6"
+        />
+        <path
+          d="M8 9h8M8 13h8M8 17h5"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.6"
+          strokeLinecap="round"
+        />
+      </svg>
+    ),
+  },
 ];
-
-const menuIcon = (
-  <svg className="tab-icon" viewBox="0 0 24 24" aria-hidden="true">
-    <path
-      d="M3 6h18M3 12h18M3 18h18"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-    />
-  </svg>
-);
 
 function AccessDenied({ message }: { message: string }) {
   return <div className="panel">{message}</div>;
 }
 
-function RouteRenderer({ route, role }: { route: RouteMatch; role: RoleTier }) {
-  const { roles } = useUser();
-  const isAdmin = roles.includes("admin");
+function RouteRenderer({
+  route,
+  role,
+  status,
+  errorMessage,
+}: {
+  route: RouteMatch;
+  role: RoleTier;
+  status: "idle" | "loading" | "ready" | "error";
+  errorMessage?: string | null;
+}) {
+  if (status === "loading" || status === "idle") {
+    return <SkeletonPanel title="Authorizing..." />;
+  }
+
+  if (status === "error") {
+    return (
+      <AccessDenied
+        message={errorMessage ?? "Authentication failed. Please retry."}
+      />
+    );
+  }
 
   if (!canAccessRoute(role, route.name)) {
     return (
       <AccessDenied
-        message={t("banner.auth.unauthorized.body", "Admin access required.")}
+        message={t("banner.auth.unauthorized.body", "Access denied.")}
       />
     );
   }
@@ -318,22 +317,16 @@ function RouteRenderer({ route, role }: { route: RouteMatch; role: RoleTier }) {
       return <Calls />;
     case "callConsole":
       return <CallConsole callSid={route.params.callSid} />;
-    case "scripts":
+    case "transcripts":
       return (
-        <Suspense fallback={<SkeletonPanel title="Loading scripts" />}>
-          <Scripts />
+        <Suspense fallback={<SkeletonPanel title="Loading transcripts" />}>
+          <Transcripts />
         </Suspense>
       );
-    case "personas":
+    case "transcriptDetail":
       return (
-        <Suspense fallback={<SkeletonPanel title="Loading personas" />}>
-          <Personas />
-        </Suspense>
-      );
-    case "callerFlags":
-      return (
-        <Suspense fallback={<SkeletonPanel title="Loading caller flags" />}>
-          <CallerFlags />
+        <Suspense fallback={<SkeletonPanel title="Loading transcript" />}>
+          <TranscriptDetail callSid={route.params.callSid} />
         </Suspense>
       );
     case "sms":
@@ -342,34 +335,26 @@ function RouteRenderer({ route, role }: { route: RouteMatch; role: RoleTier }) {
           <Sms />
         </Suspense>
       );
-    case "email":
+    case "provider":
       return (
-        <Suspense fallback={<SkeletonPanel title="Loading email center" />}>
-          <Email />
-        </Suspense>
-      );
-    case "health":
-      return (
-        <Suspense fallback={<SkeletonPanel title="Loading health status" />}>
-          <Health />
+        <Suspense fallback={<SkeletonPanel title="Loading provider status" />}>
+          <ProviderStatus />
         </Suspense>
       );
     case "users":
       return (
         <Suspense fallback={<SkeletonPanel title="Loading users" />}>
-          {isAdmin ? (
-            <Users />
-          ) : (
-            <AccessDenied message="Admin access required." />
-          )}
+          <Users />
+        </Suspense>
+      );
+    case "logs":
+      return (
+        <Suspense fallback={<SkeletonPanel title="Loading logs" />}>
+          <Logs />
         </Suspense>
       );
     case "settings":
-      return isAdmin ? (
-        <Settings />
-      ) : (
-        <AccessDenied message="Admin access required." />
-      );
+      return <Settings />;
     default:
       return <AccessDenied message="Route not found." />;
   }
@@ -383,10 +368,72 @@ function CallsBootstrap({ activeCallSid }: { activeCallSid?: string | null }) {
     if (status !== "ready") return;
     fetchCalls({ limit: 10 }).catch(() => {});
     fetchInboundQueue().catch(() => {});
-    if (activeCallSid) {
+    if (activeCallSid !== null && activeCallSid !== "") {
       fetchCall(activeCallSid).catch(() => {});
     }
   }, [status, activeCallSid, fetchCalls, fetchInboundQueue, fetchCall]);
+
+  return null;
+}
+
+function InboundPoller() {
+  const { fetchInboundQueue } = useCalls();
+  const { status } = useUser();
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof document === "undefined") {
+      return undefined;
+    }
+    if (status !== "ready") return undefined;
+    const baseDelay = 5000;
+    const maxDelay = 60000;
+    let delay = baseDelay;
+    let timer: number | null = null;
+    let cancelled = false;
+
+    const schedule = (nextDelay: number) => {
+      if (timer !== null) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        void run();
+      }, nextDelay);
+    };
+
+    const run = async () => {
+      if (cancelled) return;
+      const isVisible =
+        typeof document === "undefined" ||
+        document.visibilityState === "visible";
+      if (!isVisible) {
+        schedule(baseDelay);
+        return;
+      }
+      try {
+        await fetchInboundQueue();
+        delay = baseDelay;
+      } catch {
+        delay = Math.min(delay * 2, maxDelay);
+      }
+      schedule(delay);
+    };
+
+    void run();
+
+    const handleResume = () => {
+      if (document.visibilityState === "visible") {
+        delay = baseDelay;
+        void run();
+      }
+    };
+    window.addEventListener("focus", handleResume);
+    document.addEventListener("visibilitychange", handleResume);
+
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+      window.removeEventListener("focus", handleResume);
+      document.removeEventListener("visibilitychange", handleResume);
+    };
+  }, [status, fetchInboundQueue]);
 
   return null;
 }
@@ -400,7 +447,7 @@ export function AppShell() {
     typeof navigator !== "undefined" ? navigator.onLine : true,
   );
   const [path, setPath] = useState(getHashPath());
-  const menuBusyRef = useRef(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const restoredRef = useRef(false);
   const [health, setHealth] = useState<{
     degraded: boolean;
@@ -460,10 +507,11 @@ export function AppShell() {
   useEffect(() => {
     if (status !== "ready" || restoredRef.current) return;
     const saved = loadUiState();
-    if (saved.path && saved.path !== path) {
-      const savedRoute = matchRoute(saved.path);
+    const savedPath = saved.path ?? "";
+    if (savedPath !== "" && savedPath !== path) {
+      const savedRoute = matchRoute(savedPath);
       if (canAccessRoute(roleTier, savedRoute.name)) {
-        navigate(saved.path);
+        navigate(savedPath);
       }
     }
     restoredRef.current = true;
@@ -471,21 +519,23 @@ export function AppShell() {
 
   const headerSubtitle = useMemo(() => {
     if (status === "loading") return "Authorizing...";
-    if (status === "error") return error || "Auth failed";
+    if (status === "error") return error ?? "Auth failed";
     if (!user) return "Not connected";
     const roleLabel = isAdmin
       ? "Admin"
       : roleTier === "operator"
         ? "Operator"
         : "Read-only";
-    return `${roleLabel} • ${user.username || user.first_name || user.id}`;
+    const displayName =
+      user.username ?? user.first_name ?? String(user.id ?? "");
+    return `${roleLabel} • ${displayName}`;
   }, [status, error, user, isAdmin, roleTier]);
 
-  const botUsername = import.meta.env.VITE_BOT_USERNAME || "";
-  const botUrl = botUsername ? `https://t.me/${botUsername}` : "";
-  const termsUrl = import.meta.env.VITE_TERMS_URL || "";
-  const privacyUrl = import.meta.env.VITE_PRIVACY_URL || "";
-  const addToHomeSupported = addToHomeScreen?.isAvailable?.() ?? false;
+  const botUsername = String(import.meta.env.VITE_BOT_USERNAME ?? "").trim();
+  const botUrl = botUsername !== "" ? `https://t.me/${botUsername}` : "";
+  const termsUrl = String(import.meta.env.VITE_TERMS_URL ?? "").trim();
+  const privacyUrl = String(import.meta.env.VITE_PRIVACY_URL ?? "").trim();
+  const addToHomeSupported = addToHomeScreen?.isAvailable?.() === true;
 
   const handleOpenBot = useCallback(() => {
     if (!botUrl) return;
@@ -495,8 +545,6 @@ export function AppShell() {
       openLink(botUrl);
     }
   }, [botUrl]);
-
-  const handleOpenSettings = useCallback(() => navigate("/settings"), []);
 
   const handleReload = useCallback(() => window.location.reload(), []);
 
@@ -511,123 +559,38 @@ export function AppShell() {
     }
   }, [addToHomeSupported]);
 
-  const showAdminMenu = useCallback(async () => {
-    if (!popup.show?.isAvailable?.()) return;
-    if (menuBusyRef.current === true) return;
-    menuBusyRef.current = true;
-    try {
-      const buttons: PopupButtons = adminMenuItems.map((item) => ({
-        id: item.path,
-        type: "default" as const,
-        text: item.label,
-      }));
-      buttons.push({ type: "close" });
-      const result = await popup.show({
-        title: "Admin Tools",
-        message: "Select a tool",
-        buttons,
-      });
-      if (result && result !== "close") {
-        navigate(result);
-      }
-    } finally {
-      menuBusyRef.current = false;
-    }
-  }, [adminMenuItems]);
-
-  const showLegalMenu = useCallback(async () => {
-    if (!popup.show?.isAvailable?.()) return;
-    const result = await popup.show({
-      title: "Legal",
-      message: "View policies",
-      buttons: [
-        { id: "terms", type: "default", text: "Terms" },
-        { id: "privacy", type: "default", text: "Privacy" },
-        { type: "close" },
-      ],
-    });
-    if (result === "terms") handleOpenUrl(termsUrl);
-    if (result === "privacy") handleOpenUrl(privacyUrl);
-  }, [handleOpenUrl, privacyUrl, termsUrl]);
-
-  const showMoreMenu = useCallback(async () => {
-    if (!popup.show?.isAvailable?.()) return;
-    const buttons: PopupButtons = [];
-    if (botUrl) {
-      buttons.push({ id: "reload", type: "default", text: "Reload" });
-    }
-    if (addToHomeSupported) {
-      buttons.push({ id: "add_home", type: "default", text: "Add to Home" });
-    }
-    buttons.push({ id: "legal", type: "default", text: "Legal" });
-    const result = await popup.show({
-      title: "More actions",
-      message: "Extra options",
-      buttons,
-    });
-    if (result === "reload") handleReload();
-    if (result === "add_home") handleAddToHome();
-    if (result === "legal") await showLegalMenu();
-  }, [
-    addToHomeSupported,
-    botUrl,
-    handleAddToHome,
-    handleReload,
-    showLegalMenu,
-  ]);
-
-  const showSettingsMenu = useCallback(async () => {
-    if (!popup.show?.isAvailable?.()) return;
-    if (menuBusyRef.current === true) return;
-    menuBusyRef.current = true;
-    try {
-      const buttons: PopupButtons = [
-        { id: "settings", type: "default", text: "Settings" },
-      ];
-      if (isAdmin) {
-        buttons.push({ id: "admin", type: "default", text: "Admin Tools" });
-      }
-      buttons.push(
-        botUrl
-          ? { id: "bot", type: "default", text: "Open Bot" }
-          : { id: "reload", type: "default", text: "Reload" },
-        { id: "more", type: "default", text: "More" },
-      );
-      const result = await popup.show({
-        title: "Menu",
-        message: "Choose an action",
-        buttons,
-      });
-      if (result === "settings") handleOpenSettings();
-      if (result === "admin") await showAdminMenu();
-      if (result === "bot") handleOpenBot();
-      if (result === "reload") handleReload();
-      if (result === "more") await showMoreMenu();
-    } finally {
-      menuBusyRef.current = false;
-    }
-  }, [
-    botUrl,
-    handleOpenBot,
-    handleOpenSettings,
-    handleReload,
-    isAdmin,
-    showAdminMenu,
-    showMoreMenu,
-  ]);
+  const closeDrawer = useCallback(() => setDrawerOpen(false), []);
+  const toggleDrawer = useCallback(
+    () => setDrawerOpen((prev) => !prev),
+    [],
+  );
 
   useEffect(() => {
     if (!settingsButton?.show?.isAvailable?.()) return undefined;
     settingsButton.mount?.ifAvailable?.();
     settingsButton.show();
     const off = settingsButton.onClick(() => {
-      void showSettingsMenu();
+      toggleDrawer();
     });
     return () => {
       off?.();
       settingsButton.hide?.ifAvailable?.();
     };
-  }, [showSettingsMenu]);
+  }, [toggleDrawer]);
+
+  useEffect(() => {
+    if (!drawerOpen) return undefined;
+    const original = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = original;
+    };
+  }, [drawerOpen]);
+
+  useEffect(() => {
+    if (!drawerOpen) return;
+    setDrawerOpen(false);
+  }, [path, drawerOpen]);
 
   useEffect(() => {
     if (status !== "ready") return;
@@ -650,15 +613,17 @@ export function AppShell() {
         if (!cancelled) {
           setHealth({
             degraded: response.provider.degraded,
-            lastErrorAt: response.provider.last_error_at || null,
+            lastErrorAt: response.provider.last_error_at ?? null,
           });
         }
       } catch {
         if (!cancelled) setHealth(null);
       }
     };
-    fetchHealth();
-    const timer = window.setInterval(fetchHealth, 60000);
+    void fetchHealth();
+    const timer = window.setInterval(() => {
+      void fetchHealth();
+    }, 60000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -666,7 +631,7 @@ export function AppShell() {
   }, [status]);
 
   const authBanner = useMemo(() => {
-    if (status !== "error" || !error) return null;
+    if (status !== "error" || error === null || error === "") return null;
     if (errorKind === "offline") {
       return {
         header: t("banner.offline.header", "You're offline"),
@@ -703,31 +668,186 @@ export function AppShell() {
     };
   }, [status, error, errorKind]);
 
-  const envLabel = environment ? environment.toLowerCase() : "";
+  const envLabel = environment?.toLowerCase() ?? "";
+  const environmentLabel = environment?.toUpperCase() ?? "";
 
-  const allNavItems = useMemo(() => {
-    const items = [...navItems];
-    if (isAdmin) {
-      items.push({
-        label: "Menu",
-        path: "#menu",
-        icon: menuIcon,
-      } as TabItem);
-    }
-    return items;
-  }, [navItems, isAdmin]);
+  const activeTabPath =
+    route.name === "callConsole" ? "/inbox" : route.path;
+
+  const primaryDrawerItems = useMemo(
+    () => drawerNavItems.filter((item) => item.adminOnly !== true),
+    [],
+  );
+  const adminDrawerItems = useMemo(
+    () => drawerNavItems.filter((item) => item.adminOnly === true),
+    [],
+  );
+
+  const hasEnvironment = environmentLabel !== "";
+  const hasBotUrl = botUrl !== "";
+  const hasTermsUrl = termsUrl !== "";
+  const hasPrivacyUrl = privacyUrl !== "";
 
   return (
     <CallsProvider>
       <div className="app-shell">
         <CallsBootstrap activeCallSid={activeCallSid} />
+        <InboundPoller />
         <header className="wallet-topbar">
-          <AppBrand subtitle="mini app" meta={headerSubtitle} />
+          <div className="topbar-spacer" aria-hidden="true" />
+          <AppBrand subtitle="mini app" meta={headerSubtitle} className="topbar-brand" />
+          <div className="topbar-actions">
+            <button
+              type="button"
+              className="menu-button"
+              onClick={toggleDrawer}
+              aria-label="Open menu"
+              aria-expanded={drawerOpen}
+            >
+              <svg className="tab-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M3 6h18M3 12h18M3 18h18"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                />
+              </svg>
+            </button>
+          </div>
         </header>
 
-        {environment && (
+        <div
+          className={`drawer-backdrop ${drawerOpen ? "open" : ""}`}
+          role="presentation"
+          onClick={closeDrawer}
+        />
+        <aside
+          className={`drawer-panel ${drawerOpen ? "open" : ""}`}
+          aria-hidden={!drawerOpen}
+        >
+          <div className="drawer-header">
+            <div>
+              <div className="drawer-title">Menu</div>
+              <div className="drawer-subtitle">{headerSubtitle}</div>
+            </div>
+            {isAdmin && <span className="admin-badge">Admin</span>}
+          </div>
+
+          <div className="drawer-section">
+            <div className="drawer-section-title">Activity</div>
+            {primaryDrawerItems.map((item) => {
+              const matches = item.matchRoutes?.includes(route.name) === true;
+              const active = matches || route.path === item.path;
+              return (
+                <button
+                  key={item.path}
+                  type="button"
+                  className={`drawer-item ${active ? "active" : ""}`}
+                  onClick={() => {
+                    navigate(item.path);
+                    closeDrawer();
+                  }}
+                >
+                  <span className="drawer-icon">{item.icon}</span>
+                  <span className="drawer-label">{item.label}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          {isAdmin && (
+            <div className="drawer-section">
+              <div className="drawer-section-title">
+                Admin tools <span className="drawer-badge">Admin</span>
+              </div>
+              {adminDrawerItems.map((item) => {
+                const matches = item.matchRoutes?.includes(route.name) === true;
+                const active = matches || route.path === item.path;
+                return (
+                  <button
+                    key={item.path}
+                    type="button"
+                    className={`drawer-item ${active ? "active" : ""}`}
+                    onClick={() => {
+                      navigate(item.path);
+                      closeDrawer();
+                    }}
+                  >
+                    <span className="drawer-icon">{item.icon}</span>
+                    <span className="drawer-label">{item.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          <div className="drawer-section">
+            <div className="drawer-section-title">App</div>
+            {hasBotUrl && (
+              <button
+                type="button"
+                className="drawer-item"
+                onClick={() => {
+                  handleOpenBot();
+                  closeDrawer();
+                }}
+              >
+                <span className="drawer-label">Open bot</span>
+              </button>
+            )}
+            {addToHomeSupported && (
+              <button
+                type="button"
+                className="drawer-item"
+                onClick={() => {
+                  handleAddToHome();
+                  closeDrawer();
+                }}
+              >
+                <span className="drawer-label">Add to Home</span>
+              </button>
+            )}
+            {hasTermsUrl && (
+              <button
+                type="button"
+                className="drawer-item"
+                onClick={() => {
+                  handleOpenUrl(termsUrl);
+                  closeDrawer();
+                }}
+              >
+                <span className="drawer-label">Terms</span>
+              </button>
+            )}
+            {hasPrivacyUrl && (
+              <button
+                type="button"
+                className="drawer-item"
+                onClick={() => {
+                  handleOpenUrl(privacyUrl);
+                  closeDrawer();
+                }}
+              >
+                <span className="drawer-label">Privacy</span>
+              </button>
+            )}
+            <button
+              type="button"
+              className="drawer-item"
+              onClick={() => {
+                handleReload();
+                closeDrawer();
+              }}
+            >
+              <span className="drawer-label">Reload</span>
+            </button>
+          </div>
+        </aside>
+
+        {hasEnvironment && (
           <div className={`env-ribbon env-${envLabel || "unknown"}`}>
-            {t(`env.${envLabel}`, environment.toUpperCase())}
+            {t(`env.${envLabel}`, environmentLabel)}
           </div>
         )}
 
@@ -740,12 +860,12 @@ export function AppShell() {
           />
         )}
 
-        {health?.degraded && roleTier === "admin" && (
+        {health?.degraded === true && roleTier === "admin" && (
           <Banner
             type="inline"
             header="Degraded service"
             description={
-              health.lastErrorAt
+              health.lastErrorAt !== null && health.lastErrorAt !== ""
                 ? `Provider errors detected. Last error at ${health.lastErrorAt}.`
                 : "Provider errors detected."
             }
@@ -766,26 +886,24 @@ export function AppShell() {
         )}
 
         <main key={route.path} className="content" data-route={route.name}>
-          <RouteRenderer route={route} role={roleTier} />
+          <RouteRenderer
+            route={route}
+            role={roleTier}
+            status={status}
+            errorMessage={error}
+          />
         </main>
 
         <Tabbar className="vn-tabbar">
-          {allNavItems.map((item) => {
-            const isActive =
-              item.path === "#menu" ? false : route.path === item.path;
+          {navItems.map((item) => {
+            const isActive = activeTabPath === item.path;
             return (
               <Tabbar.Item
                 key={item.path}
                 text={item.label}
                 selected={isActive}
                 className={`vn-tab ${isActive ? "is-active" : ""}`}
-                onClick={() => {
-                  if (item.path === "#menu") {
-                    void showAdminMenu();
-                  } else {
-                    navigate(item.path);
-                  }
-                }}
+                onClick={() => navigate(item.path)}
               >
                 {item.icon}
               </Tabbar.Item>

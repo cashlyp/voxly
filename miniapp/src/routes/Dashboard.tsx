@@ -1,22 +1,32 @@
-import { Button } from "@telegram-apps/telegram-ui";
+import { Banner, Button } from "@telegram-apps/telegram-ui";
 import { useEffect, useMemo, useState } from "react";
+import { MaskedPhone } from "../components/MaskedPhone";
+import { SkeletonList } from "../components/Skeleton";
 import { apiFetch } from "../lib/api";
 import { navigate } from "../lib/router";
 import { useCalls } from "../state/calls";
 import { useUser } from "../state/user";
 
 export function Dashboard() {
-  const { calls, inboundQueue, fetchCalls, fetchInboundQueue, loading } =
-    useCalls();
+  const {
+    calls,
+    inboundQueue,
+    fetchCalls,
+    fetchInboundQueue,
+    callsMeta,
+    inboundMeta,
+  } = useCalls();
   const { roles } = useUser();
   const isAdmin = roles.includes("admin");
   const [callbackTasks, setCallbackTasks] = useState<
     { id: number; run_at: string; number: string }[]
   >([]);
+  const errorMessage = callsMeta.error ?? inboundMeta.error ?? "";
+  const hasError = errorMessage !== "";
 
   useEffect(() => {
     void fetchCalls({ limit: 10 });
-    void fetchInboundQueue();
+    void fetchInboundQueue().catch(() => {});
     if (isAdmin) {
       void apiFetch<{
         ok: boolean;
@@ -46,6 +56,18 @@ export function Dashboard() {
 
   return (
     <div className="wallet-page">
+      {hasError ? (
+        <Banner
+          type="inline"
+          header={
+            callsMeta.errorKind === "offline" ||
+            inboundMeta.errorKind === "offline"
+              ? "You're offline"
+              : "Error"
+          }
+          description={errorMessage}
+        />
+      ) : null}
       <div className="hero-card">
         <div className="hero-header">
           <div>
@@ -173,7 +195,9 @@ export function Dashboard() {
             View all
           </Button>
         </div>
-        {inboundQueue.length === 0 ? (
+        {inboundMeta.loading && inboundQueue.length === 0 ? (
+          <SkeletonList rows={3} />
+        ) : inboundQueue.length === 0 ? (
           <div className="empty-card">
             <div className="empty-title">No inbound calls</div>
             <div className="empty-subtitle">You are all caught up.</div>
@@ -184,15 +208,15 @@ export function Dashboard() {
               <div key={call.call_sid} className="card-item">
                 <div className="card-item-main">
                   <div className="card-item-title">Inbound call</div>
-                  <div className="card-item-subtitle">
-                    {call.route_label || call.script || "Inbound route"}
+                    <div className="card-item-subtitle">
+                      {call.route_label ?? call.script ?? "Inbound route"}
+                    </div>
+                    <div className="card-item-meta">
+                      <MaskedPhone value={call.from ?? "Unknown caller"} />
+                    </div>
                   </div>
-                  <div className="card-item-meta">
-                    {call.from || "Unknown caller"}
-                  </div>
+                  <span className="tag">{call.decision ?? "pending"}</span>
                 </div>
-                <span className="tag">{call.decision || "pending"}</span>
-              </div>
             ))}
           </div>
         )}
@@ -202,13 +226,16 @@ export function Dashboard() {
         <div className="card-header">
           <span>Recent calls</span>
           <span className="card-header-muted">
-            {loading && calls.length === 0
+            {callsMeta.loading && calls.length === 0
               ? "Loading calls..."
               : `Showing ${calls.slice(0, 5).length}`}
           </span>
         </div>
         <div className="card-list">
-          {calls.slice(0, 5).map((call) => (
+          {callsMeta.loading && calls.length === 0 ? (
+            <SkeletonList rows={4} />
+          ) : (
+            calls.slice(0, 5).map((call) => (
             <button
               key={call.call_sid}
               type="button"
@@ -217,15 +244,16 @@ export function Dashboard() {
             >
               <div className="card-item-main">
                 <div className="card-item-title">
-                  {call.phone_number || call.call_sid}
+                  <MaskedPhone value={call.phone_number ?? call.call_sid} />
                 </div>
                 <div className="card-item-subtitle">
-                  {call.created_at || "-"}
+                  {call.created_at ?? "-"}
                 </div>
               </div>
-              <span className="tag outline">{call.status || "unknown"}</span>
+              <span className="tag outline">{call.status ?? "unknown"}</span>
             </button>
-          ))}
+            ))
+          )}
         </div>
       </div>
 
@@ -251,7 +279,9 @@ export function Dashboard() {
               {callbackTasks.map((task) => (
                 <div key={task.id} className="card-item">
                   <div className="card-item-main">
-                    <div className="card-item-title">{task.number}</div>
+                    <div className="card-item-title">
+                      <MaskedPhone value={task.number} />
+                    </div>
                     <div className="card-item-subtitle">
                       Run at {task.run_at}
                     </div>

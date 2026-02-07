@@ -14,13 +14,12 @@ import { useUser } from "../state/user";
 
 type ProviderStatus = {
   ok: boolean;
-  provider: string;
-  supported_providers: string[];
-  stored_provider: string;
-  aws_ready: boolean;
-  twilio_ready: boolean;
-  vonage_ready: boolean;
-  vonage_ready_label?: string;
+  provider: {
+    current: string;
+    stored?: string;
+    supported: string[];
+    readiness: Record<string, boolean>;
+  };
 };
 
 type SwitchResponse = {
@@ -64,7 +63,7 @@ export function Provider() {
     setLoading(true);
     setError(null);
     try {
-      const response = await apiFetch<ProviderStatus>("/admin/provider");
+      const response = await apiFetch<ProviderStatus>("/webapp/settings");
       setStatus(response);
     } catch (err) {
       setError(
@@ -76,14 +75,18 @@ export function Provider() {
   }, []);
 
   useEffect(() => {
-    loadStatus();
+    void loadStatus();
   }, [loadStatus]);
 
   const handleSwitch = async (provider: string) => {
     if (!isAdmin) return;
-    if (status?.provider === provider) return;
+    if (status?.provider.current === provider) return;
 
-    const providerInfo = PROVIDER_INFO[provider] || {};
+    const providerInfo = PROVIDER_INFO[provider] ?? {
+      name: provider,
+      emoji: "🌐",
+      description: "",
+    };
     const confirmed = await confirmAction({
       title: `Switch to ${providerInfo.name}?`,
       message: `Calls will be routed through ${providerInfo.description}.`,
@@ -96,7 +99,7 @@ export function Provider() {
     setError(null);
     setSuccess(null);
     try {
-      await apiFetch<SwitchResponse>("/admin/provider", {
+      await apiFetch<SwitchResponse>("/webapp/settings/provider", {
         method: "POST",
         body: { provider },
         idempotencyKey: createIdempotencyKey(),
@@ -149,22 +152,15 @@ export function Provider() {
   }
 
   const isReady = (provider: string) => {
-    switch (provider) {
-      case "twilio":
-        return status.twilio_ready;
-      case "aws":
-        return status.aws_ready;
-      case "vonage":
-        return status.vonage_ready;
-      default:
-        return false;
-    }
+    return !!status.provider.readiness?.[provider];
   };
 
   return (
     <div className="wallet-page">
-      {error && <Banner type="inline" header="Error" description={error} />}
-      {success && (
+      {error !== null && error !== "" && (
+        <Banner type="inline" header="Error" description={error} />
+      )}
+      {success !== null && success !== "" && (
         <Banner type="inline" header="Success" description={success} />
       )}
 
@@ -172,15 +168,15 @@ export function Provider() {
         <Section header="Current provider" className="wallet-section">
           <div className="provider-hero">
             <div className="provider-status-badge active">
-              {PROVIDER_INFO[status.provider]?.emoji || "🌐"}
+              {PROVIDER_INFO[status.provider.current]?.emoji ?? "🌐"}
             </div>
             <div className="provider-info">
               <div className="provider-name">
-                {PROVIDER_INFO[status.provider]?.name ||
-                  status.provider.toUpperCase()}
+                {PROVIDER_INFO[status.provider.current]?.name ??
+                  status.provider.current.toUpperCase()}
               </div>
               <div className="provider-description">
-                {PROVIDER_INFO[status.provider]?.description ||
+                {PROVIDER_INFO[status.provider.current]?.description ??
                   "Current voice provider"}
               </div>
             </div>
@@ -188,14 +184,14 @@ export function Provider() {
         </Section>
 
         <Section header="Available providers" className="wallet-section">
-          {status.supported_providers.map((provider) => {
-            const info = PROVIDER_INFO[provider] || {
+          {status.provider.supported.map((provider) => {
+            const info = PROVIDER_INFO[provider] ?? {
               name: provider,
               emoji: "🌐",
               description: "",
             };
             const ready = isReady(provider);
-            const current = status.provider === provider;
+            const current = status.provider.current === provider;
 
             return (
               <Cell
@@ -239,21 +235,27 @@ export function Provider() {
         <Section header="Readiness" className="wallet-section">
           <Cell
             subtitle={
-              status.twilio_ready ? "✅ Configured" : "⚠️ Missing credentials"
+              status.provider.readiness?.twilio
+                ? "✅ Configured"
+                : "⚠️ Missing credentials"
             }
           >
             Twilio
           </Cell>
           <Cell
             subtitle={
-              status.aws_ready ? "✅ Configured" : "⚠️ Missing credentials"
+              status.provider.readiness?.aws
+                ? "✅ Configured"
+                : "⚠️ Missing credentials"
             }
           >
             AWS Connect
           </Cell>
           <Cell
             subtitle={
-              status.vonage_ready ? "✅ Configured" : "⚠️ Missing credentials"
+              status.provider.readiness?.vonage
+                ? "✅ Configured"
+                : "⚠️ Missing credentials"
             }
           >
             Vonage
@@ -261,7 +263,7 @@ export function Provider() {
         </Section>
 
         <Section header="Stored default" className="wallet-section">
-          <Cell subtitle={status.stored_provider || "Not set"}>
+          <Cell subtitle={status.provider.stored ?? "Not set"}>
             Fallback provider
           </Cell>
         </Section>

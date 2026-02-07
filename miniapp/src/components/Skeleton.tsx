@@ -10,3 +10,13 @@ export function SkeletonPanel({ title }: { title?: string }) {
     </div>
   );
 }
+
+export function SkeletonList({ rows = 4 }: { rows?: number }) {
+  return (
+    <div className="skeleton-list" aria-hidden="true">
+      {Array.from({ length: rows }).map((_, index) => (
+        <div key={`skeleton-${index}`} className="skeleton-item" />
+      ))}
+    </div>
+  );
+}

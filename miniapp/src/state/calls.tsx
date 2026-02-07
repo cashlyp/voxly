@@ -6,7 +6,7 @@ import {
   useState,
   type PropsWithChildren,
 } from "react";
-import { apiFetch } from "../lib/api";
+import { ApiError, apiFetch } from "../lib/api";
 
 export type CallRecord = {
   call_sid: string;
@@ -59,6 +59,17 @@ export type InboundNotice = {
   pending_count?: number;
 };
 
+type ErrorKind = "offline" | "server" | "unknown";
+
+type FetchMeta = {
+  loading: boolean;
+  refreshing: boolean;
+  stale: boolean;
+  updatedAt: number | null;
+  error: string | null;
+  errorKind: ErrorKind | null;
+};
+
 type CallsState = {
   calls: CallRecord[];
   inboundQueue: LiveCall[];
@@ -68,8 +79,9 @@ type CallsState = {
   callEventsById: Record<string, CallEvent[]>;
   eventCursorById: Record<string, number>;
   nextCursor: number | null;
-  loading: boolean;
-  error?: string | null;
+  callsMeta: FetchMeta;
+  inboundMeta: FetchMeta;
+  activeMeta: FetchMeta;
   fetchCalls: (options?: {
     limit?: number;
     cursor?: number;
@@ -77,10 +89,79 @@ type CallsState = {
     q?: string;
   }) => Promise<void>;
   fetchInboundQueue: () => Promise<void>;
-  fetchCall: (callSid: string) => Promise<void>;
+  fetchCall: (
+    callSid: string,
+    options?: {
+      force?: boolean;
+    },
+  ) => Promise<void>;
   fetchCallEvents: (callSid: string, after?: number) => Promise<void>;
   clearActive: () => void;
 };
+
+const CALLS_CACHE_TTL_MS = 30000;
+const CALL_STATUS_CACHE_TTL_MS = 15000;
+const INBOUND_CACHE_TTL_MS = 10000;
+
+const callsCache = new Map<
+  string,
+  { calls: CallRecord[]; nextCursor: number | null; fetchedAt: number }
+>();
+const callStatusCache = new Map<
+  string,
+  { call: CallRecord; fetchedAt: number }
+>();
+const inboundCache: {
+  calls: LiveCall[];
+  notice: InboundNotice | null;
+  fetchedAt: number;
+} = {
+  calls: [],
+  notice: null,
+  fetchedAt: 0,
+};
+
+const baseMeta: FetchMeta = {
+  loading: false,
+  refreshing: false,
+  stale: false,
+  updatedAt: null,
+  error: null,
+  errorKind: null,
+};
+
+function buildCallsCacheKey(options: {
+  limit?: number;
+  cursor?: number;
+  status?: string;
+  q?: string;
+}) {
+  return JSON.stringify({
+    limit: options.limit ?? 20,
+    cursor: options.cursor ?? 0,
+    status: options.status ?? "",
+    q: options.q ?? "",
+  });
+}
+
+function describeError(error: unknown): { message: string; kind: ErrorKind } {
+  if (error instanceof ApiError) {
+    if (error.status === 0) {
+      return {
+        message: error.message || "You're offline. Check your connection.",
+        kind: "offline",
+      };
+    }
+    return {
+      message: error.message || "Server error. Please try again.",
+      kind: "server",
+    };
+  }
+  return {
+    message: error instanceof Error ? error.message : "Something went wrong.",
+    kind: "unknown",
+  };
+}
 
 const CallsContext = createContext<CallsState | null>(null);
 
@@ -99,8 +180,9 @@ export function CallsProvider({ children }: PropsWithChildren) {
     Record<string, number>
   >({});
   const [nextCursor, setNextCursor] = useState<number | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [callsMeta, setCallsMeta] = useState<FetchMeta>(baseMeta);
+  const [inboundMeta, setInboundMeta] = useState<FetchMeta>(baseMeta);
+  const [activeMeta, setActiveMeta] = useState<FetchMeta>(baseMeta);
 
   const fetchCalls = useCallback(
     async (
@@ -111,8 +193,36 @@ export function CallsProvider({ children }: PropsWithChildren) {
         q?: string;
       } = {},
     ) => {
-      setLoading(true);
-      setError(null);
+      const cacheKey = buildCallsCacheKey(options);
+      const cached = callsCache.get(cacheKey);
+      const now = Date.now();
+      const stale =
+        cached && now - cached.fetchedAt > CALLS_CACHE_TTL_MS ? true : false;
+
+      if (cached) {
+        setCalls(cached.calls);
+        setNextCursor(cached.nextCursor ?? null);
+        setCallsMeta((prev) => ({
+          ...prev,
+          loading: false,
+          refreshing: false,
+          stale,
+          updatedAt: cached.fetchedAt,
+          error: null,
+          errorKind: null,
+        }));
+        if (!stale) return;
+      }
+
+      setCallsMeta({
+        loading: !cached,
+        refreshing: !!cached,
+        stale: !!cached,
+        updatedAt: cached?.fetchedAt ?? null,
+        error: null,
+        errorKind: null,
+      });
+
       try {
         const params = new URLSearchParams();
         if (options.limit !== undefined)
@@ -128,60 +238,180 @@ export function CallsProvider({ children }: PropsWithChildren) {
           calls: CallRecord[];
           next_cursor: number | null;
         }>(`/webapp/calls?${params.toString()}`);
-        setCalls(response.calls || []);
+        const fetchedAt = Date.now();
+        const next = response.calls;
+        callsCache.set(cacheKey, {
+          calls: next,
+          nextCursor: response.next_cursor ?? null,
+          fetchedAt,
+        });
+        setCalls(next);
         setNextCursor(response.next_cursor ?? null);
+        setCallsMeta({
+          loading: false,
+          refreshing: false,
+          stale: false,
+          updatedAt: fetchedAt,
+          error: null,
+          errorKind: null,
+        });
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to load calls");
-      } finally {
-        setLoading(false);
+        const info = describeError(err);
+        setCallsMeta({
+          loading: false,
+          refreshing: false,
+          stale: !!cached,
+          updatedAt: cached?.fetchedAt ?? null,
+          error: info.message,
+          errorKind: info.kind,
+        });
       }
     },
     [],
   );
 
   const fetchInboundQueue = useCallback(async () => {
-    setError(null);
+    const now = Date.now();
+    const cached =
+      inboundCache.fetchedAt > 0
+        ? {
+            calls: inboundCache.calls,
+            notice: inboundCache.notice,
+            fetchedAt: inboundCache.fetchedAt,
+          }
+        : null;
+    const stale =
+      cached && now - cached.fetchedAt > INBOUND_CACHE_TTL_MS ? true : false;
+
+    if (cached) {
+      setInboundQueue(cached.calls);
+      setInboundNotice(cached.notice ?? null);
+      setInboundMeta({
+        loading: false,
+        refreshing: false,
+        stale,
+        updatedAt: cached.fetchedAt,
+        error: null,
+        errorKind: null,
+      });
+      if (!stale) return;
+    }
+
+    setInboundMeta({
+      loading: !cached,
+      refreshing: !!cached,
+      stale: !!cached,
+      updatedAt: cached?.fetchedAt ?? null,
+      error: null,
+      errorKind: null,
+    });
     try {
       const response = await apiFetch<{
         ok: boolean;
         calls: LiveCall[];
         notice?: InboundNotice | null;
       }>("/webapp/inbound/queue");
-      setInboundQueue(response.calls || []);
+      const fetchedAt = Date.now();
+      inboundCache.calls = response.calls;
+      inboundCache.notice = response.notice ?? null;
+      inboundCache.fetchedAt = fetchedAt;
+      setInboundQueue(response.calls);
       setInboundNotice(response.notice ?? null);
+      setInboundMeta({
+        loading: false,
+        refreshing: false,
+        stale: false,
+        updatedAt: fetchedAt,
+        error: null,
+        errorKind: null,
+      });
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : "Failed to load inbound queue",
-      );
+      const info = describeError(err);
+      setInboundMeta({
+        loading: false,
+        refreshing: false,
+        stale: !!cached,
+        updatedAt: cached?.fetchedAt ?? null,
+        error: info.message,
+        errorKind: info.kind,
+      });
+      throw err;
     }
   }, []);
 
-  const fetchCall = useCallback(async (callSid: string) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const response = await apiFetch<{
-        ok: boolean;
-        call: CallRecord;
-        inbound_gate?: CallRecord["inbound_gate"];
-        live?: Record<string, unknown> | null;
-      }>(`/webapp/calls/${callSid}`);
-      const merged = {
-        ...response.call,
-        inbound_gate:
-          response.inbound_gate ?? response.call.inbound_gate ?? null,
-        live: response.live ?? response.call.live ?? null,
-      };
-      setActiveCall(merged);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load call");
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const fetchCall = useCallback(
+    async (callSid: string, options: { force?: boolean } = {}) => {
+      const cached = callStatusCache.get(callSid);
+      const now = Date.now();
+      const stale =
+        cached && now - cached.fetchedAt > CALL_STATUS_CACHE_TTL_MS
+          ? true
+          : false;
+
+      if (cached) {
+        setActiveCall(cached.call);
+        setActiveMeta((prev) => ({
+          ...prev,
+          loading: false,
+          refreshing: false,
+          stale,
+          updatedAt: cached.fetchedAt,
+          error: null,
+          errorKind: null,
+        }));
+        const force = options.force === true;
+        if (!stale && !force) return;
+      }
+
+      setActiveMeta({
+        loading: !cached,
+        refreshing: !!cached,
+        stale: !!cached,
+        updatedAt: cached?.fetchedAt ?? null,
+        error: null,
+        errorKind: null,
+      });
+
+      try {
+        const response = await apiFetch<{
+          ok: boolean;
+          call: CallRecord;
+          inbound_gate?: CallRecord["inbound_gate"];
+          live?: Record<string, unknown> | null;
+        }>(`/webapp/calls/${callSid}`);
+        const merged = {
+          ...response.call,
+          inbound_gate:
+            response.inbound_gate ?? response.call.inbound_gate ?? null,
+          live: response.live ?? response.call.live ?? null,
+        };
+        const fetchedAt = Date.now();
+        callStatusCache.set(callSid, { call: merged, fetchedAt });
+        setActiveCall(merged);
+        setActiveMeta({
+          loading: false,
+          refreshing: false,
+          stale: false,
+          updatedAt: fetchedAt,
+          error: null,
+          errorKind: null,
+        });
+      } catch (err) {
+        const info = describeError(err);
+        setActiveMeta({
+          loading: false,
+          refreshing: false,
+          stale: !!cached,
+          updatedAt: cached?.fetchedAt ?? null,
+          error: info.message,
+          errorKind: info.kind,
+        });
+      }
+    },
+    [],
+  );
 
   const fetchCallEvents = useCallback(async (callSid: string, after = 0) => {
-    setError(null);
     try {
       const params = new URLSearchParams();
       if (after) params.set("after", String(after));
@@ -190,9 +420,9 @@ export function CallsProvider({ children }: PropsWithChildren) {
         events: CallEvent[];
         latest_sequence?: number;
       }>(`/webapp/calls/${callSid}/events?${params.toString()}`);
-      const incoming = response.events || [];
+      const incoming = response.events;
       setCallEventsById((prev) => {
-        const existing = prev[callSid] || [];
+        const existing = prev[callSid] ?? [];
         const merged = after > 0 ? [...existing, ...incoming] : incoming;
         const deduped = merged.filter(
           (event: CallEvent, index: number, arr: CallEvent[]) =>
@@ -207,9 +437,9 @@ export function CallsProvider({ children }: PropsWithChildren) {
         ...prev,
         [callSid]:
           response.latest_sequence ??
-          (incoming.length
+          (incoming.length > 0
             ? incoming[incoming.length - 1].sequence_number
-            : prev[callSid] || 0),
+            : prev[callSid] ?? 0),
       }));
       setCallEvents((prev) => {
         if (after > 0) {
@@ -225,15 +455,19 @@ export function CallsProvider({ children }: PropsWithChildren) {
         return incoming;
       });
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : "Failed to load call events",
-      );
+      const info = describeError(err);
+      setActiveMeta((prev) => ({
+        ...prev,
+        error: info.message,
+        errorKind: info.kind,
+      }));
     }
   }, []);
 
   const clearActive = useCallback(() => {
     setActiveCall(null);
     setCallEvents([]);
+    setActiveMeta(baseMeta);
   }, []);
 
   const value = useMemo<CallsState>(
@@ -246,8 +480,9 @@ export function CallsProvider({ children }: PropsWithChildren) {
       callEventsById,
       eventCursorById,
       nextCursor,
-      loading,
-      error,
+      callsMeta,
+      inboundMeta,
+      activeMeta,
       fetchCalls,
       fetchInboundQueue,
       fetchCall,
@@ -263,8 +498,9 @@ export function CallsProvider({ children }: PropsWithChildren) {
       callEventsById,
       eventCursorById,
       nextCursor,
-      loading,
-      error,
+      callsMeta,
+      inboundMeta,
+      activeMeta,
       fetchCalls,
       fetchInboundQueue,
       fetchCall,
