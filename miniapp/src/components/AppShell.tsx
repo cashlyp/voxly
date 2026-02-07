@@ -360,7 +360,7 @@ function RouteRenderer({
   }
 }
 
-function CallsBootstrap({ activeCallSid }: { activeCallSid?: string | null }) {
+function CallsBootstrap({ activeCallSid }: { activeCallSid: string | null }) {
   const { fetchCalls, fetchInboundQueue, fetchCall } = useCalls();
   const { status } = useUser();
 
