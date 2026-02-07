@@ -1,4 +1,3 @@
-import { useCallback, useEffect, useState } from 'react';
 import {
   Banner,
   Button,
@@ -7,17 +6,18 @@ import {
   Section,
   Select,
   Textarea,
-} from '@telegram-apps/telegram-ui';
-import { apiFetch, createIdempotencyKey } from '../lib/api';
-import { confirmAction, hapticSuccess, hapticError } from '../lib/ux';
-import { trackEvent } from '../lib/telemetry';
-import { useUser } from '../state/user';
+} from "@telegram-apps/telegram-ui";
+import { useCallback, useEffect, useState } from "react";
+import { apiFetch, createIdempotencyKey } from "../lib/api";
+import { trackEvent } from "../lib/telemetry";
+import { confirmAction, hapticError, hapticSuccess } from "../lib/ux";
+import { useUser } from "../state/user";
 
 type SmsMessage = {
   id: number;
   phone_number: string;
   body: string;
-  status: 'pending' | 'sent' | 'failed' | 'scheduled';
+  status: "pending" | "sent" | "failed" | "scheduled";
   created_at: string;
   scheduled_for?: string | null;
   error_message?: string | null;
@@ -38,7 +38,7 @@ type SendSmsResponse = {
 
 export function Sms() {
   const { roles } = useUser();
-  const isAdmin = roles.includes('admin');
+  const isAdmin = roles.includes("admin");
 
   const [messages, setMessages] = useState<SmsMessage[]>([]);
   const [templates, setTemplates] = useState<SmsTemplate[]>([]);
@@ -46,29 +46,29 @@ export function Sms() {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<'send' | 'history'>('send');
+  const [activeTab, setActiveTab] = useState<"send" | "history">("send");
 
   // Form state
-  const [phoneNumber, setPhoneNumber] = useState('');
-  const [messageBody, setMessageBody] = useState('');
-  const [selectedTemplate, setSelectedTemplate] = useState('');
-  const [scheduleTime, setScheduleTime] = useState('');
-  const [statusFilter, setStatusFilter] = useState('');
+  const [phoneNumber, setPhoneNumber] = useState("");
+  const [messageBody, setMessageBody] = useState("");
+  const [selectedTemplate, setSelectedTemplate] = useState("");
+  const [scheduleTime, setScheduleTime] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
 
   const loadMessages = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       const params = new URLSearchParams();
-      if (statusFilter) params.set('status', statusFilter);
-      params.set('limit', '20');
+      if (statusFilter !== "") params.set("status", statusFilter);
+      params.set("limit", "20");
       const response = await apiFetch<{ ok: boolean; messages: SmsMessage[] }>(
-        `/webapp/sms?${params.toString()}`
+        `/webapp/sms?${params.toString()}`,
       );
       setMessages(response.messages || []);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load messages');
-      trackEvent('sms_load_failed');
+      setError(err instanceof Error ? err.message : "Failed to load messages");
+      trackEvent("sms_load_failed");
     } finally {
       setLoading(false);
     }
@@ -76,9 +76,10 @@ export function Sms() {
 
   const loadTemplates = useCallback(async () => {
     try {
-      const response = await apiFetch<{ ok: boolean; templates: SmsTemplate[] }>(
-        '/webapp/sms/templates'
-      );
+      const response = await apiFetch<{
+        ok: boolean;
+        templates: SmsTemplate[];
+      }>("/webapp/sms/templates");
       setTemplates(response.templates || []);
     } catch {
       // Templates are optional
@@ -92,12 +93,12 @@ export function Sms() {
 
   const handleSendMessage = async () => {
     if (!phoneNumber.trim()) {
-      setError('Phone number is required');
+      setError("Phone number is required");
       return;
     }
 
     if (!messageBody.trim()) {
-      setError('Message body is required');
+      setError("Message body is required");
       return;
     }
 
@@ -106,8 +107,8 @@ export function Sms() {
     setSuccess(null);
 
     try {
-      const response = await apiFetch<SendSmsResponse>('/webapp/sms/send', {
-        method: 'POST',
+      const response = await apiFetch<SendSmsResponse>("/webapp/sms/send", {
+        method: "POST",
         body: {
           phone_number: phoneNumber.trim(),
           body: messageBody.trim(),
@@ -121,21 +122,21 @@ export function Sms() {
         setSuccess(
           scheduleTime
             ? `Message scheduled for ${scheduleTime}`
-            : 'Message sent successfully!'
+            : "Message sent successfully!",
         );
-        setPhoneNumber('');
-        setMessageBody('');
-        setScheduleTime('');
-        setSelectedTemplate('');
-        trackEvent('sms_sent', { scheduled: !!scheduleTime });
+        setPhoneNumber("");
+        setMessageBody("");
+        setScheduleTime("");
+        setSelectedTemplate("");
+        trackEvent("sms_sent", { scheduled: !!scheduleTime });
         await loadMessages();
       } else {
-        throw new Error(response.error || 'Failed to send message');
+        throw new Error(response.error || "Failed to send message");
       }
     } catch (err) {
       hapticError();
-      setError(err instanceof Error ? err.message : 'Failed to send message');
-      trackEvent('sms_send_failed');
+      setError(err instanceof Error ? err.message : "Failed to send message");
+      trackEvent("sms_send_failed");
     } finally {
       setSending(false);
     }
@@ -143,7 +144,7 @@ export function Sms() {
 
   const handleApplyTemplate = (templateId: string) => {
     const template = templates.find((t) => String(t.id) === templateId);
-    if (template) {
+    if (template !== undefined) {
       setMessageBody(template.body);
       setSelectedTemplate(templateId);
     }
@@ -153,9 +154,9 @@ export function Sms() {
     if (!isAdmin) return;
 
     const confirmed = await confirmAction({
-      title: 'Retry Message?',
-      message: 'Re-send this failed message.',
-      confirmText: 'Retry',
+      title: "Retry Message?",
+      message: "Re-send this failed message.",
+      confirmText: "Retry",
       destructive: false,
     });
 
@@ -166,18 +167,18 @@ export function Sms() {
 
     try {
       await apiFetch(`/webapp/sms/${messageId}/retry`, {
-        method: 'POST',
+        method: "POST",
         idempotencyKey: createIdempotencyKey(),
       });
 
       hapticSuccess();
-      setSuccess('Message retry queued');
-      trackEvent('sms_retry', { message_id: messageId });
+      setSuccess("Message retry queued");
+      trackEvent("sms_retry", { message_id: messageId });
       await loadMessages();
     } catch (err) {
       hapticError();
-      setError(err instanceof Error ? err.message : 'Failed to retry message');
-      trackEvent('sms_retry_failed', { message_id: messageId });
+      setError(err instanceof Error ? err.message : "Failed to retry message");
+      trackEvent("sms_retry_failed", { message_id: messageId });
     } finally {
       setSending(false);
     }
@@ -187,31 +188,33 @@ export function Sms() {
     <div className="wallet-page">
       <List className="wallet-list">
         {error && <Banner type="inline" header="Error" description={error} />}
-        {success && <Banner type="inline" header="Success" description={success} />}
+        {success && (
+          <Banner type="inline" header="Success" description={success} />
+        )}
 
         <Section header="Message Sender" className="wallet-section">
           <div className="tabs-container">
             <button
-              className={`tab-button ${activeTab === 'send' ? 'active' : ''}`}
-              onClick={() => setActiveTab('send')}
+              className={`tab-button ${activeTab === "send" ? "active" : ""}`}
+              onClick={() => void setActiveTab("send")}
             >
               Send Message
             </button>
             <button
-              className={`tab-button ${activeTab === 'history' ? 'active' : ''}`}
-              onClick={() => setActiveTab('history')}
+              className={`tab-button ${activeTab === "history" ? "active" : ""}`}
+              onClick={() => void setActiveTab("history")}
             >
               History
             </button>
           </div>
 
-          {activeTab === 'send' && (
+          {activeTab === "send" && (
             <>
               <Input
                 header="Phone Number"
                 placeholder="+1234567890"
                 value={phoneNumber}
-                onChange={(e) => setPhoneNumber(e.target.value)}
+                onChange={(e) => void setPhoneNumber(e.target.value)}
                 disabled={sending}
                 type="tel"
               />
@@ -220,7 +223,7 @@ export function Sms() {
                 <Select
                   header="Message Templates"
                   value={selectedTemplate}
-                  onChange={(e) => handleApplyTemplate(e.target.value)}
+                  onChange={(e) => void handleApplyTemplate(e.target.value)}
                 >
                   <option value="">Select a template...</option>
                   {templates.map((t) => (
@@ -235,7 +238,7 @@ export function Sms() {
                 header="Message Body"
                 placeholder="Type your message here..."
                 value={messageBody}
-                onChange={(e) => setMessageBody(e.target.value)}
+                onChange={(e) => void setMessageBody(e.target.value)}
                 disabled={sending}
               />
 
@@ -243,7 +246,7 @@ export function Sms() {
                 header="Schedule (optional)"
                 type="datetime-local"
                 value={scheduleTime}
-                onChange={(e) => setScheduleTime(e.target.value)}
+                onChange={(e) => void setScheduleTime(e.target.value)}
                 disabled={sending}
               />
 
@@ -251,21 +254,23 @@ export function Sms() {
                 <Button
                   size="m"
                   mode="filled"
-                  onClick={handleSendMessage}
-                  disabled={sending || !phoneNumber.trim() || !messageBody.trim()}
+                  onClick={() => void handleSendMessage()}
+                  disabled={
+                    sending || !phoneNumber.trim() || !messageBody.trim()
+                  }
                 >
-                  {sending ? 'Sending...' : 'Send Message'}
+                  {sending ? "Sending..." : "Send Message"}
                 </Button>
               </div>
             </>
           )}
 
-          {activeTab === 'history' && (
+          {activeTab === "history" && (
             <>
               <Select
                 header="Filter by Status"
                 value={statusFilter}
-                onChange={(e) => setStatusFilter(e.target.value)}
+                onChange={(e) => void setStatusFilter(e.target.value)}
               >
                 <option value="">All messages</option>
                 <option value="sent">Sent</option>
@@ -278,7 +283,7 @@ export function Sms() {
                 <div className="card-header">
                   <span>Message History</span>
                   <span className="card-header-muted">
-                    {loading ? 'Loading...' : `${messages.length} messages`}
+                    {loading ? "Loading..." : `${messages.length} messages`}
                   </span>
                 </div>
 
@@ -286,9 +291,9 @@ export function Sms() {
                   <div className="empty-card">
                     <div className="empty-title">No messages</div>
                     <div className="empty-subtitle">
-                      {statusFilter
-                        ? 'No messages match the selected filter.'
-                        : 'Your message history will appear here.'}
+                      {statusFilter !== ""
+                        ? "No messages match the selected filter."
+                        : "Your message history will appear here."}
                     </div>
                   </div>
                 ) : (
@@ -296,31 +301,35 @@ export function Sms() {
                     {messages.map((msg) => (
                       <div key={msg.id} className="card-item">
                         <div className="card-item-main">
-                          <div className="card-item-title">{msg.phone_number}</div>
+                          <div className="card-item-title">
+                            {msg.phone_number}
+                          </div>
                           <div className="card-item-subtitle">{msg.body}</div>
                           <div className="card-item-meta">
                             {msg.created_at}
-                            {msg.scheduled_for && ` • Scheduled: ${msg.scheduled_for}`}
-                            {msg.error_message && ` • Error: ${msg.error_message}`}
+                            {msg.scheduled_for &&
+                              ` • Scheduled: ${msg.scheduled_for}`}
+                            {msg.error_message &&
+                              ` • Error: ${msg.error_message}`}
                           </div>
                         </div>
                         <div className="tag-group">
                           <span
                             className={`tag ${
-                              msg.status === 'sent'
-                                ? 'success'
-                                : msg.status === 'failed'
-                                  ? 'error'
-                                  : ''
+                              msg.status === "sent"
+                                ? "success"
+                                : msg.status === "failed"
+                                  ? "error"
+                                  : ""
                             }`}
                           >
                             {msg.status}
                           </span>
-                          {msg.status === 'failed' && isAdmin && (
+                          {msg.status === "failed" && isAdmin && (
                             <Button
                               size="s"
                               mode="plain"
-                              onClick={() => handleRetry(msg.id)}
+                              onClick={() => void handleRetry(msg.id)}
                               disabled={sending}
                             >
                               Retry

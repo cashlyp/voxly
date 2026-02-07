@@ -46,7 +46,7 @@ export function connectEventStream(options: {
   source.addEventListener('heartbeat', (message) => {
     if (!onHeartbeat) return;
     try {
-      const payload = JSON.parse((message as MessageEvent).data) as { ts: string };
+      const payload = JSON.parse((message).data) as { ts: string };
       onHeartbeat(payload);
     } catch {
       onHeartbeat({ ts: new Date().toISOString() });

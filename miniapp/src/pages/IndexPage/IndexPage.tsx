@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { initData, useSignal } from '@tma.js/sdk-react';
+import { initData, useSignal } from "@tma.js/sdk-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-import { Page } from '@/components/Page.tsx';
+import { Page } from "@/components/Page.tsx";
 
-import './IndexPage.css';
+import "./IndexPage.css";
 
 const API_TIMEOUT_MS = 12000;
 const API_RETRY_MAX = 2;
@@ -39,14 +39,16 @@ type CallDetail = {
 
 function resolveInitialApiBase() {
   const urlParams = new URLSearchParams(window.location.search);
-  const override = urlParams.get('api');
+  const override = urlParams.get("api");
   if (override) {
-    localStorage.setItem('miniapp_api_base', override);
+    localStorage.setItem("miniapp_api_base", override);
   }
-  return override
-    || localStorage.getItem('miniapp_api_base')
-    || import.meta.env.VITE_API_BASE
-    || window.location.origin;
+  return (
+    override ||
+    localStorage.getItem("miniapp_api_base") ||
+    import.meta.env.VITE_API_BASE ||
+    window.location.origin
+  );
 }
 
 export const IndexPage = () => {
@@ -55,30 +57,37 @@ export const IndexPage = () => {
   const [apiInput, setApiInput] = useState(apiBase);
   const [sessionToken, setSessionToken] = useState<string | null>(null);
   const [refreshToken, setRefreshToken] = useState<string | null>(null);
-  const [status, setStatus] = useState('Connecting…');
+  const [status, setStatus] = useState("Connecting…");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [roles, setRoles] = useState<string[]>(['admin']);
+  const [roles, setRoles] = useState<string[]>(["admin"]);
   const [branding, setBranding] = useState<{ name?: string } | null>(null);
   const [theme, setTheme] = useState<Record<string, string> | null>(null);
-  const [tab, setTab] = useState<'dashboard' | 'live' | 'calllog' | 'settings'>('dashboard');
+  const [tab, setTab] = useState<"dashboard" | "live" | "calllog" | "settings">(
+    "dashboard",
+  );
   const [calls, setCalls] = useState<Record<string, CallSnapshot>>({});
   const [events, setEvents] = useState<MiniappEvent[]>([]);
   const [activeCallSid, setActiveCallSid] = useState<string | null>(null);
   const [callLog, setCallLog] = useState<Record<string, unknown>[]>([]);
   const [callDetails, setCallDetails] = useState<CallDetail | null>(null);
-  const [streamState, setStreamState] = useState<'connected' | 'reconnecting' | 'disconnected'>('disconnected');
+  const [streamState, setStreamState] = useState<
+    "connected" | "reconnecting" | "disconnected"
+  >("disconnected");
   const [logFilters, setLogFilters] = useState({
-    status: 'all',
-    direction: 'all',
-    query: '',
-    start: '',
-    end: ''
+    status: "all",
+    direction: "all",
+    query: "",
+    start: "",
+    end: "",
   });
-  const [accessAdminInput, setAccessAdminInput] = useState('');
-  const [accessViewerInput, setAccessViewerInput] = useState('');
+  const [accessAdminInput, setAccessAdminInput] = useState("");
+  const [accessViewerInput, setAccessViewerInput] = useState("");
   const [accessEnvAdmins, setAccessEnvAdmins] = useState<string[]>([]);
   const [accessEnvViewers, setAccessEnvViewers] = useState<string[]>([]);
-  const [accessEffective, setAccessEffective] = useState<{ admins: string[]; viewers: string[] }>({ admins: [], viewers: [] });
+  const [accessEffective, setAccessEffective] = useState<{
+    admins: string[];
+    viewers: string[];
+  }>({ admins: [], viewers: [] });
   const [accessLoaded, setAccessLoaded] = useState(false);
   const [accessNote, setAccessNote] = useState<string | null>(null);
   const [loadingActive, setLoadingActive] = useState(false);
@@ -88,11 +97,13 @@ export const IndexPage = () => {
   const sessionTokenRef = useRef<string | null>(null);
   const refreshTokenRef = useRef<string | null>(null);
   const lastSequenceRef = useRef(0);
-  const initialCallSidRef = useRef<string | null>(new URLSearchParams(window.location.search).get('call'));
+  const initialCallSidRef = useRef<string | null>(
+    new URLSearchParams(window.location.search).get("call"),
+  );
 
   const callList = useMemo(() => Object.values(calls), [calls]);
   const activeCall = activeCallSid ? calls[activeCallSid] : null;
-  const isAdmin = useMemo(() => roles.includes('admin'), [roles]);
+  const isAdmin = useMemo(() => roles.includes("admin"), [roles]);
 
   function sleep(ms: number) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -102,29 +113,37 @@ export const IndexPage = () => {
     try {
       return btoa(unescape(encodeURIComponent(raw)));
     } catch {
-      return '';
+      return "";
     }
   }
 
   const metrics = useMemo(() => {
     const active = callList.length;
-    const pending = callList.filter((c) => c.inbound && ['ringing', 'initiated'].includes(String(c.status))).length;
+    const pending = callList.filter(
+      (c) => c.inbound && ["ringing", "initiated"].includes(String(c.status)),
+    ).length;
     const now = Date.now();
     const missed = callLog.filter((c) => {
-      const statusValue = String(c.status || '').toLowerCase();
+      const statusValue = String(c.status || "").toLowerCase();
       const ts = c.created_at ? Date.parse(String(c.created_at)) : null;
       if (!ts) return false;
-      return (now - ts) <= 24 * 60 * 60 * 1000
-        && ['no-answer', 'failed', 'canceled'].includes(statusValue);
+      return (
+        now - ts <= 24 * 60 * 60 * 1000 &&
+        ["no-answer", "failed", "canceled"].includes(statusValue)
+      );
     }).length;
-    const completed = callLog.filter((c) => String(c.status || '').toLowerCase() === 'completed').length;
+    const completed = callLog.filter(
+      (c) => String(c.status || "").toLowerCase() === "completed",
+    ).length;
     const total = callLog.length;
     const answerRate = total ? Math.round((completed / total) * 100) : 0;
     const durations = callLog
       .map((c) => Number(c.duration || 0))
       .filter((value) => Number.isFinite(value) && value > 0);
     const avgDuration = durations.length
-      ? Math.round(durations.reduce((sum, val) => sum + val, 0) / durations.length)
+      ? Math.round(
+          durations.reduce((sum, val) => sum + val, 0) / durations.length,
+        )
       : 0;
     return { active, pending, missed, answerRate, avgDuration };
   }, [callList, callLog]);
@@ -134,7 +153,7 @@ export const IndexPage = () => {
   }, [apiBase]);
 
   useEffect(() => {
-    if (tab === 'settings' && isAdmin && !accessLoaded) {
+    if (tab === "settings" && isAdmin && !accessLoaded) {
       loadAccessControl().catch(() => {});
     }
   }, [tab, isAdmin, accessLoaded]);
@@ -151,13 +170,13 @@ export const IndexPage = () => {
     if (!theme) return;
     const root = document.documentElement;
     const mapping: Record<string, string> = {
-      accent: '--va-accent',
-      accent2: '--va-accent-2',
-      background: '--va-bg',
-      panel: '--va-panel',
-      surface: '--va-surface',
-      text: '--va-text',
-      muted: '--va-muted',
+      accent: "--va-accent",
+      accent2: "--va-accent-2",
+      background: "--va-bg",
+      panel: "--va-panel",
+      surface: "--va-surface",
+      text: "--va-text",
+      muted: "--va-muted",
     };
     Object.entries(mapping).forEach(([key, cssVar]) => {
       const value = theme[key];
@@ -167,12 +186,12 @@ export const IndexPage = () => {
 
   useEffect(() => {
     if (!initDataRaw) {
-      setStatus('Missing init data.');
+      setStatus("Missing init data.");
       return;
     }
     bootstrap();
     return () => {
-      if (eventSourceRef.current) {
+      if (eventSourceRef.current !== null) {
         eventSourceRef.current.close();
       }
     };
@@ -188,71 +207,86 @@ export const IndexPage = () => {
     if (!refresh) return false;
     try {
       const res = await fetch(`${apiBase}/miniapp/refresh`, {
-        method: 'POST',
+        method: "POST",
         headers: {
           Authorization: `Bearer ${refresh}`,
-          ...(initDataRaw ? { 'X-Telegram-Init-Data': initDataRaw } : {})
+          ...(initDataRaw ? { "X-Telegram-Init-Data": initDataRaw } : {}),
         },
       });
       if (!res.ok) {
         return false;
       }
       const data = await res.json();
-      if (!data?.session_token) return false;
+      if (!data?.session_token || data.session_token === "") return false;
       setSessionToken(data.session_token);
       sessionTokenRef.current = data.session_token;
       const nextRefresh = data.refresh_token || refresh;
       setRefreshToken(nextRefresh);
       refreshTokenRef.current = nextRefresh;
       setRoles(data.roles || roles);
-      setStatus('Connected');
+      setStatus("Connected");
       return true;
     } catch {
       return false;
     }
   }
 
-  async function apiFetch(path: string, options: RequestInit = {}, attempt = 0) {
+  async function apiFetch(
+    path: string,
+    options: RequestInit = {},
+    attempt = 0,
+  ) {
     const headers: Record<string, string> = {};
-    if (options.headers && typeof options.headers === 'object') {
+    if (options.headers && typeof options.headers === "object") {
       Object.assign(headers, options.headers as Record<string, string>);
     }
     const token = sessionTokenRef.current || sessionToken;
-    if (token) {
+    if (token !== null && token !== undefined) {
       headers.Authorization = `Bearer ${token}`;
     }
-    if (initDataRaw) {
-      headers['X-Telegram-Init-Data'] = initDataRaw;
+    if (initDataRaw !== null && initDataRaw !== undefined) {
+      headers["X-Telegram-Init-Data"] = initDataRaw;
     }
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
     try {
-      const res = await fetch(`${apiBase}${path}`, { ...options, headers, signal: controller.signal });
-      if (res.status === 401 && attempt === 0 && (refreshTokenRef.current || refreshToken)) {
+      const res = await fetch(`${apiBase}${path}`, {
+        ...options,
+        headers,
+        signal: controller.signal,
+      });
+      if (
+        res.status === 401 &&
+        attempt === 0 &&
+        (refreshTokenRef.current !== null || refreshToken !== null)
+      ) {
         const refreshed = await refreshSession();
         if (refreshed) {
           return apiFetch(path, options, attempt + 1);
         }
-        setStatus('Session expired.');
+        setStatus("Session expired.");
       }
-      if ((res.status === 429 || res.status >= 500) && attempt < API_RETRY_MAX) {
+      if (
+        (res.status === 429 || res.status >= 500) &&
+        attempt < API_RETRY_MAX
+      ) {
         const delay = 400 + Math.random() * 600 + attempt * 300;
         await sleep(delay);
         return apiFetch(path, options, attempt + 1);
       }
       if (res.status === 401 || res.status === 403) {
-        setErrorMessage('Not authorized. Check admin access.');
+        setErrorMessage("Not authorized. Check admin access.");
       } else if (res.status === 429) {
-        setErrorMessage('Rate limited. Please retry shortly.');
+        setErrorMessage("Rate limited. Please retry shortly.");
       } else if (res.status >= 500) {
-        setErrorMessage('API error. Try again.');
+        setErrorMessage("API error. Try again.");
       }
       return res;
     } catch (error) {
-      if ((error as Error)?.name === 'AbortError') {
-        setErrorMessage('Request timed out. Check your connection.');
+      if ((error as Error)?.name === "AbortError") {
+        setErrorMessage("Request timed out. Check your connection.");
       } else {
-        setErrorMessage('Network error. API unreachable.');
+        setErrorMessage("Network error. API unreachable.");
       }
       if (attempt < API_RETRY_MAX) {
         await sleep(600 + Math.random() * 800 + attempt * 300);
@@ -265,17 +299,17 @@ export const IndexPage = () => {
   }
 
   async function bootstrap() {
-    setStatus('Authorizing…');
+    setStatus("Authorizing…");
     try {
       const res = await fetch(`${apiBase}/miniapp/bootstrap`, {
-        method: 'POST',
+        method: "POST",
         headers: { Authorization: `tma ${initDataRaw}` },
       });
       if (!res.ok) {
         const payload = await res.json().catch(() => ({}));
-        const reason = payload?.error ? ` (${payload.error})` : '';
+        const reason = payload?.error ? ` (${payload.error})` : "";
         setStatus(`Authorization failed${reason}.`);
-        setErrorMessage('Not authorized. Check admin access and bot token.');
+        setErrorMessage("Not authorized. Check admin access and bot token.");
         return;
       }
       const data = await res.json();
@@ -284,16 +318,16 @@ export const IndexPage = () => {
       const nextRefresh = data.refresh_token || null;
       setRefreshToken(nextRefresh);
       refreshTokenRef.current = nextRefresh;
-      setRoles(data.roles || ['admin']);
+      setRoles(data.roles || ["admin"]);
       setBranding(data.branding || null);
       setTheme(data.theme || null);
-      setStatus('Connected');
+      setStatus("Connected");
       setErrorMessage(null);
       await loadActiveCalls(data.session_token);
       await loadCallLog(data.session_token);
     } catch {
-      setStatus('Authorization failed.');
-      setErrorMessage('API unreachable. Check network and API base URL.');
+      setStatus("Authorization failed.");
+      setErrorMessage("API unreachable. Check network and API base URL.");
     }
   }
 
@@ -305,9 +339,9 @@ export const IndexPage = () => {
       ? await fetch(`${apiBase}/miniapp/calls/active`, {
           headers: { Authorization: `Bearer ${token}` },
         })
-      : await apiFetch('/miniapp/calls/active', {});
+      : await apiFetch("/miniapp/calls/active", {});
     if (!res.ok) {
-      setErrorMessage('Failed to load active calls.');
+      setErrorMessage("Failed to load active calls.");
       setLoadingActive(false);
       return;
     }
@@ -321,7 +355,7 @@ export const IndexPage = () => {
     const initialSid = initialCallSidRef.current;
     if (initialSid && next[initialSid]) {
       setActiveCallSid(initialSid);
-      setTab('live');
+      setTab("live");
       initialCallSidRef.current = null;
     }
   }
@@ -331,12 +365,25 @@ export const IndexPage = () => {
     if (!token) return;
     setLoadingLog(true);
     const params = new URLSearchParams();
-    params.set('limit', '20');
-    if (filters.status && filters.status !== 'all') params.set('status', filters.status);
-    if (filters.direction && filters.direction !== 'all') params.set('direction', filters.direction);
-    if (filters.query) params.set('q', filters.query);
-    if (filters.start) params.set('start', filters.start);
-    if (filters.end) params.set('end', filters.end);
+    params.set("limit", "20");
+    if (
+      filters.status !== undefined &&
+      filters.status !== null &&
+      filters.status !== "all"
+    )
+      params.set("status", filters.status);
+    if (
+      filters.direction !== undefined &&
+      filters.direction !== null &&
+      filters.direction !== "all"
+    )
+      params.set("direction", filters.direction);
+    if (filters.query !== undefined && filters.query !== null)
+      params.set("q", filters.query);
+    if (filters.start !== undefined && filters.start !== null)
+      params.set("start", filters.start);
+    if (filters.end !== undefined && filters.end !== null)
+      params.set("end", filters.end);
     const path = `/miniapp/calls/recent?${params.toString()}`;
     const res = tokenOverride
       ? await fetch(`${apiBase}${path}`, {
@@ -344,7 +391,7 @@ export const IndexPage = () => {
         })
       : await apiFetch(path, {});
     if (!res.ok) {
-      setErrorMessage('Failed to load call log.');
+      setErrorMessage("Failed to load call log.");
       setLoadingLog(false);
       return;
     }
@@ -357,20 +404,20 @@ export const IndexPage = () => {
     setLoadingDetails(true);
     const res = await apiFetch(`/miniapp/calls/${callSid}`, {});
     if (!res.ok) {
-      setErrorMessage('Failed to load call details.');
+      setErrorMessage("Failed to load call details.");
       setLoadingDetails(false);
       return;
     }
     const data = await res.json().catch(() => ({}));
     const call = data.call;
     if (!call) {
-      setCallDetails({ call: { error: 'Call not found' }, states: [] });
+      setCallDetails({ call: { error: "Call not found" }, states: [] });
       setLoadingDetails(false);
       return;
     }
     const statusRes = await apiFetch(`/miniapp/calls/${callSid}/status`, {});
     if (!statusRes.ok) {
-      setErrorMessage('Failed to load call status.');
+      setErrorMessage("Failed to load call status.");
       setLoadingDetails(false);
       return;
     }
@@ -379,16 +426,16 @@ export const IndexPage = () => {
     setLoadingDetails(false);
   }
 
-  async function handleDecision(callSid: string, action: 'answer' | 'decline') {
+  async function handleDecision(callSid: string, action: "answer" | "decline") {
     if (!isAdmin) {
-      setErrorMessage('Read-only access: action not allowed.');
+      setErrorMessage("Read-only access: action not allowed.");
       return;
     }
     const res = await apiFetch(`/miniapp/calls/${callSid}/${action}`, {
-      method: 'POST',
+      method: "POST",
     });
     if (!res.ok) {
-      setErrorMessage('Action failed. Try again.');
+      setErrorMessage("Action failed. Try again.");
       return;
     }
     await loadActiveCalls();
@@ -414,35 +461,40 @@ export const IndexPage = () => {
   }
 
   function applyMiniappEvent(payload: MiniappEvent) {
-    if (!payload || typeof payload.sequence !== 'number') return;
+    if (!payload || typeof payload.sequence !== "number") return;
     if (payload.sequence <= lastSequenceRef.current) return;
     lastSequenceRef.current = payload.sequence;
     setEvents((prev) => prev.concat(payload).slice(-80));
-    if (payload.type === 'call.console.opened') {
+    if (payload.type === "call.console.opened") {
       updateCall(payload.call_sid, payload.data as CallSnapshot);
-      if (initialCallSidRef.current && payload.call_sid === initialCallSidRef.current) {
+      if (
+        initialCallSidRef.current !== null &&
+        payload.call_sid === initialCallSidRef.current
+      ) {
         setActiveCallSid(payload.call_sid);
-        setTab('live');
+        setTab("live");
         initialCallSidRef.current = null;
       }
     }
-    if (payload.type === 'call.status') {
+    if (payload.type === "call.status") {
       updateCall(payload.call_sid, {
-        status: String(payload.data?.status || payload.data?.label || ''),
-        status_label: String(payload.data?.label || ''),
+        status: String(payload.data?.status || payload.data?.label || ""),
+        status_label: String(payload.data?.label || ""),
       });
     }
-    if (payload.type === 'call.phase') {
+    if (payload.type === "call.phase") {
       updateCall(payload.call_sid, {
-        phase: String(payload.data?.phase || ''),
-        phase_label: String(payload.data?.label || ''),
+        phase: String(payload.data?.phase || ""),
+        phase_label: String(payload.data?.label || ""),
       });
     }
-    if (payload.type === 'call.console.event') {
-      appendEvent(payload.call_sid, String(payload.data?.line || ''));
+    if (payload.type === "call.console.event") {
+      appendEvent(payload.call_sid, String(payload.data?.line || ""));
     }
-    if (payload.type === 'call.inbound_gate') {
-      updateCall(payload.call_sid, { gate_status: String(payload.data?.status || '') });
+    if (payload.type === "call.inbound_gate") {
+      updateCall(payload.call_sid, {
+        gate_status: String(payload.data?.status || ""),
+      });
     }
   }
 
@@ -465,18 +517,19 @@ export const IndexPage = () => {
 
   function connectStream() {
     if (!sessionToken) return;
-    if (eventSourceRef.current) {
+    if (eventSourceRef.current !== null) {
       eventSourceRef.current.close();
     }
     const since = lastSequenceRef.current;
-    const initB64 = initDataRaw ? encodeInitData(initDataRaw) : '';
-    const url = `${apiBase}/miniapp/stream?token=${encodeURIComponent(sessionToken)}&since=${since}` +
-      (initB64 ? `&init_b64=${encodeURIComponent(initB64)}` : '');
+    const initB64 = initDataRaw ? encodeInitData(initDataRaw) : "";
+    const url =
+      `${apiBase}/miniapp/stream?token=${encodeURIComponent(sessionToken)}&since=${since}` +
+      (initB64 ? `&init_b64=${encodeURIComponent(initB64)}` : "");
     const source = new EventSource(url);
     eventSourceRef.current = source;
-    setStreamState('reconnecting');
+    setStreamState("reconnecting");
     source.onopen = () => {
-      setStreamState('connected');
+      setStreamState("connected");
       resyncStream().catch(() => {});
     };
     source.onmessage = (event) => {
@@ -485,8 +538,8 @@ export const IndexPage = () => {
       applyMiniappEvent(payload);
     };
     source.onerror = () => {
-      setStreamState('reconnecting');
-      setStatus('Realtime disconnected. Reconnecting…');
+      setStreamState("reconnecting");
+      setStatus("Realtime disconnected. Reconnecting…");
       setTimeout(async () => {
         if (await refreshSession()) {
           connectStream();
@@ -500,7 +553,7 @@ export const IndexPage = () => {
   function saveApiBase() {
     const value = apiInput.trim();
     if (!value || value === apiBase) return;
-    localStorage.setItem('miniapp_api_base', value);
+    localStorage.setItem("miniapp_api_base", value);
     setApiBase(value);
   }
 
@@ -513,31 +566,53 @@ export const IndexPage = () => {
   }
 
   async function resetCallLogFilters() {
-    const defaults = { status: 'all', direction: 'all', query: '', start: '', end: '' };
+    const defaults = {
+      status: "all",
+      direction: "all",
+      query: "",
+      start: "",
+      end: "",
+    };
     setLogFilters(defaults);
     await loadCallLog(undefined, defaults);
   }
 
   async function exportCallLog() {
     if (!isAdmin) {
-      setErrorMessage('Read-only access: export not allowed.');
+      setErrorMessage("Read-only access: export not allowed.");
       return;
     }
     const params = new URLSearchParams();
-    params.set('limit', '1000');
-    if (logFilters.status && logFilters.status !== 'all') params.set('status', logFilters.status);
-    if (logFilters.direction && logFilters.direction !== 'all') params.set('direction', logFilters.direction);
-    if (logFilters.query) params.set('q', logFilters.query);
-    if (logFilters.start) params.set('start', logFilters.start);
-    if (logFilters.end) params.set('end', logFilters.end);
-    const res = await apiFetch(`/miniapp/calls/export?${params.toString()}`, {});
+    params.set("limit", "1000");
+    if (
+      logFilters.status !== undefined &&
+      logFilters.status !== null &&
+      logFilters.status !== "all"
+    )
+      params.set("status", logFilters.status);
+    if (
+      logFilters.direction !== undefined &&
+      logFilters.direction !== null &&
+      logFilters.direction !== "all"
+    )
+      params.set("direction", logFilters.direction);
+    if (logFilters.query !== undefined && logFilters.query !== null)
+      params.set("q", logFilters.query);
+    if (logFilters.start !== undefined && logFilters.start !== null)
+      params.set("start", logFilters.start);
+    if (logFilters.end !== undefined && logFilters.end !== null)
+      params.set("end", logFilters.end);
+    const res = await apiFetch(
+      `/miniapp/calls/export?${params.toString()}`,
+      {},
+    );
     if (!res.ok) {
-      setErrorMessage('Export failed. Try again.');
+      setErrorMessage("Export failed. Try again.");
       return;
     }
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
+    const link = document.createElement("a");
     link.href = url;
     link.download = `voxly_calls_${new Date().toISOString().slice(0, 10)}.csv`;
     document.body.appendChild(link);
@@ -547,15 +622,15 @@ export const IndexPage = () => {
   }
 
   function formatAccessList(list: string[]) {
-    if (!list.length) return 'None';
-    return list.join(', ');
+    if (!list.length) return "None";
+    return list.join(", ");
   }
 
   async function loadAccessControl() {
     if (!isAdmin) return;
-    const res = await apiFetch('/miniapp/access', {});
+    const res = await apiFetch("/miniapp/access", {});
     if (!res.ok) {
-      setErrorMessage('Failed to load access control.');
+      setErrorMessage("Failed to load access control.");
       return;
     }
     const data = await res.json().catch(() => ({}));
@@ -563,28 +638,28 @@ export const IndexPage = () => {
     setAccessEnvViewers(data.env_viewers || []);
     setAccessEffective({
       admins: data.admins || [],
-      viewers: data.viewers || []
+      viewers: data.viewers || [],
     });
     const customAdmins = data.custom_admins || [];
     const customViewers = data.custom_viewers || [];
-    setAccessAdminInput(customAdmins.join(', '));
-    setAccessViewerInput(customViewers.join(', '));
+    setAccessAdminInput(customAdmins.join(", "));
+    setAccessViewerInput(customViewers.join(", "));
     setAccessLoaded(true);
     setAccessNote(null);
   }
 
   async function saveAccessControl() {
     if (!isAdmin) return;
-    const res = await apiFetch('/miniapp/access', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+    const res = await apiFetch("/miniapp/access", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         admins: accessAdminInput,
-        viewers: accessViewerInput
-      })
+        viewers: accessViewerInput,
+      }),
     });
     if (!res.ok) {
-      setErrorMessage('Failed to update access control.');
+      setErrorMessage("Failed to update access control.");
       return;
     }
     const data = await res.json().catch(() => ({}));
@@ -592,11 +667,11 @@ export const IndexPage = () => {
     setAccessEnvViewers(data.env_viewers || []);
     setAccessEffective({
       admins: data.admins || [],
-      viewers: data.viewers || []
+      viewers: data.viewers || [],
     });
-    setAccessAdminInput((data.custom_admins || []).join(', '));
-    setAccessViewerInput((data.custom_viewers || []).join(', '));
-    setAccessNote('Access lists updated.');
+    setAccessAdminInput((data.custom_admins || []).join(", "));
+    setAccessViewerInput((data.custom_viewers || []).join(", "));
+    setAccessNote("Access lists updated.");
   }
 
   return (
@@ -604,33 +679,37 @@ export const IndexPage = () => {
       <div className="va-shell">
         <header className="va-header">
           <div>
-            <div className="va-title">{branding?.name || 'VOICEDNUT'} Live Ops</div>
+            <div className="va-title">
+              {branding?.name || "VOICEDNUT"} Live Ops
+            </div>
             <div className="va-subtitle">{status}</div>
           </div>
           <div className="va-badges">
-            <div className={`va-pill ${streamState}`}>Realtime: {streamState}</div>
-            <div className="va-badge">{roles.join(', ').toUpperCase()}</div>
+            <div className={`va-pill ${streamState}`}>
+              Realtime: {streamState}
+            </div>
+            <div className="va-badge">{roles.join(", ").toUpperCase()}</div>
           </div>
         </header>
-        {errorMessage && (
-          <div className="va-alert">
-            {errorMessage}
-          </div>
-        )}
+        {errorMessage && <div className="va-alert">{errorMessage}</div>}
 
         <nav className="va-tabs">
-          {(['dashboard', 'live', 'calllog', 'settings'] as const).map((key) => (
-            <button
-              key={key}
-              className={`va-tab ${tab === key ? 'active' : ''}`}
-              onClick={() => setTab(key)}
-            >
-              {key === 'calllog' ? 'Call Log' : key.charAt(0).toUpperCase() + key.slice(1)}
-            </button>
-          ))}
+          {(["dashboard", "live", "calllog", "settings"] as const).map(
+            (key) => (
+              <button
+                key={key}
+                className={`va-tab ${tab === key ? "active" : ""}`}
+                onClick={() => setTab(key)}
+              >
+                {key === "calllog"
+                  ? "Call Log"
+                  : key.charAt(0).toUpperCase() + key.slice(1)}
+              </button>
+            ),
+          )}
         </nav>
 
-        {tab === 'dashboard' && (
+        {tab === "dashboard" && (
           <section className="va-panel">
             <div className="va-metrics">
               <div className="va-card">
@@ -651,58 +730,83 @@ export const IndexPage = () => {
               </div>
               <div className="va-card">
                 <div className="va-card-label">Avg Duration (s)</div>
-                <div className="va-card-value">{metrics.avgDuration || '—'}</div>
+                <div className="va-card-value">
+                  {metrics.avgDuration || "—"}
+                </div>
               </div>
             </div>
             <div className="va-section">
               <h3>Recent Events</h3>
               <div className="va-events">
                 {events.length
-                  ? events.slice(-6).map((evt) => `${evt.type} — ${evt.call_sid} — ${evt.ts}`).join('\n')
-                  : 'Waiting for events…'}
+                  ? events
+                      .slice(-6)
+                      .map((evt) => `${evt.type} — ${evt.call_sid} — ${evt.ts}`)
+                      .join("\n")
+                  : "Waiting for events…"}
               </div>
             </div>
           </section>
         )}
 
-        {tab === 'live' && (
+        {tab === "live" && (
           <section className="va-panel">
             <div className="va-section">
               <h3>Live Calls</h3>
               <div className="va-list">
                 {loadingActive
-                  ? 'Loading active calls…'
+                  ? "Loading active calls…"
                   : callList.length
-                  ? callList.map((call) => (
-                      <div className="va-list-item" key={call.call_sid}>
-                        <div className="va-list-title">
-                          <strong>{call.inbound ? 'Inbound' : 'Outbound'}</strong> — {call.name || call.from || 'Unknown'}
+                    ? callList.map((call) => (
+                        <div className="va-list-item" key={call.call_sid}>
+                          <div className="va-list-title">
+                            <strong>
+                              {call.inbound ? "Inbound" : "Outbound"}
+                            </strong>{" "}
+                            — {call.name || call.from || "Unknown"}
+                          </div>
+                          <div className="va-list-meta">
+                            Status:{" "}
+                            {call.status_label || call.status || "unknown"} |
+                            Phase: {call.phase_label || call.phase || "—"}
+                          </div>
+                          <div className="va-list-meta">
+                            Call SID: {call.call_sid}
+                          </div>
+                          <div className="va-actions">
+                            <button
+                              className="va-btn secondary"
+                              onClick={() => setActiveCallSid(call.call_sid)}
+                            >
+                              View
+                            </button>
+                            {call.inbound && isAdmin && (
+                              <>
+                                <button
+                                  className="va-btn"
+                                  onClick={() =>
+                                    handleDecision(call.call_sid, "answer")
+                                  }
+                                >
+                                  Answer
+                                </button>
+                                <button
+                                  className="va-btn secondary"
+                                  onClick={() =>
+                                    handleDecision(call.call_sid, "decline")
+                                  }
+                                >
+                                  Decline
+                                </button>
+                              </>
+                            )}
+                            {call.inbound && !isAdmin && (
+                              <span className="va-muted-label">Read-only</span>
+                            )}
+                          </div>
                         </div>
-                        <div className="va-list-meta">
-                          Status: {call.status_label || call.status || 'unknown'} | Phase: {call.phase_label || call.phase || '—'}
-                        </div>
-                        <div className="va-list-meta">Call SID: {call.call_sid}</div>
-                        <div className="va-actions">
-                          <button className="va-btn secondary" onClick={() => setActiveCallSid(call.call_sid)}>
-                            View
-                          </button>
-                          {call.inbound && isAdmin && (
-                            <>
-                              <button className="va-btn" onClick={() => handleDecision(call.call_sid, 'answer')}>
-                                Answer
-                              </button>
-                              <button className="va-btn secondary" onClick={() => handleDecision(call.call_sid, 'decline')}>
-                                Decline
-                              </button>
-                            </>
-                          )}
-                          {call.inbound && !isAdmin && (
-                            <span className="va-muted-label">Read-only</span>
-                          )}
-                        </div>
-                      </div>
-                    ))
-                  : 'No active calls.'}
+                      ))
+                    : "No active calls."}
               </div>
             </div>
             <div className="va-section">
@@ -711,26 +815,41 @@ export const IndexPage = () => {
                 {activeCall ? (
                   <>
                     <div className="va-console-title">
-                      <strong>{activeCall.inbound ? 'Inbound' : 'Outbound'} Call</strong> — {activeCall.name || activeCall.from || 'Unknown'}
+                      <strong>
+                        {activeCall.inbound ? "Inbound" : "Outbound"} Call
+                      </strong>{" "}
+                      — {activeCall.name || activeCall.from || "Unknown"}
                     </div>
-                    <div>Status: {activeCall.status_label || activeCall.status || 'unknown'}</div>
-                    <div>Phase: {activeCall.phase_label || activeCall.phase || '—'}</div>
+                    <div>
+                      Status:{" "}
+                      {activeCall.status_label ||
+                        activeCall.status ||
+                        "unknown"}
+                    </div>
+                    <div>
+                      Phase: {activeCall.phase_label || activeCall.phase || "—"}
+                    </div>
                     {activeCall.inbound && (
-                      <div>Gate: {activeCall.gate_status || 'pending'}</div>
+                      <div>Gate: {activeCall.gate_status || "pending"}</div>
                     )}
-                    <div>Route: {activeCall.route_label || '—'} | Script: {activeCall.script || '—'}</div>
+                    <div>
+                      Route: {activeCall.route_label || "—"} | Script:{" "}
+                      {activeCall.script || "—"}
+                    </div>
                     <div className="va-console-events">Events:</div>
-                    <pre>{(activeCall.last_events || []).join('\n') || '—'}</pre>
+                    <pre>
+                      {(activeCall.last_events || []).join("\n") || "—"}
+                    </pre>
                   </>
                 ) : (
-                  'Select a call to view details.'
+                  "Select a call to view details."
                 )}
               </div>
             </div>
           </section>
         )}
 
-        {tab === 'calllog' && (
+        {tab === "calllog" && (
           <section className="va-panel">
             <div className="va-section">
               <h3>Call Log</h3>
@@ -740,7 +859,9 @@ export const IndexPage = () => {
                   <select
                     id="filter-status"
                     value={logFilters.status}
-                    onChange={(event) => updateFilter('status', event.target.value)}
+                    onChange={(event) =>
+                      updateFilter("status", event.target.value)
+                    }
                   >
                     <option value="all">All</option>
                     <option value="completed">Completed</option>
@@ -756,7 +877,9 @@ export const IndexPage = () => {
                   <select
                     id="filter-direction"
                     value={logFilters.direction}
-                    onChange={(event) => updateFilter('direction', event.target.value)}
+                    onChange={(event) =>
+                      updateFilter("direction", event.target.value)
+                    }
                   >
                     <option value="all">All</option>
                     <option value="inbound">Inbound</option>
@@ -769,7 +892,9 @@ export const IndexPage = () => {
                     id="filter-query"
                     type="text"
                     value={logFilters.query}
-                    onChange={(event) => updateFilter('query', event.target.value)}
+                    onChange={(event) =>
+                      updateFilter("query", event.target.value)
+                    }
                     placeholder="Phone or Call SID"
                   />
                 </div>
@@ -779,7 +904,9 @@ export const IndexPage = () => {
                     id="filter-start"
                     type="date"
                     value={logFilters.start}
-                    onChange={(event) => updateFilter('start', event.target.value)}
+                    onChange={(event) =>
+                      updateFilter("start", event.target.value)
+                    }
                   />
                 </div>
                 <div className="va-field">
@@ -788,18 +915,26 @@ export const IndexPage = () => {
                     id="filter-end"
                     type="date"
                     value={logFilters.end}
-                    onChange={(event) => updateFilter('end', event.target.value)}
+                    onChange={(event) =>
+                      updateFilter("end", event.target.value)
+                    }
                   />
                 </div>
                 <div className="va-actions">
                   <button className="va-btn" onClick={applyCallLogFilters}>
                     Apply
                   </button>
-                  <button className="va-btn secondary" onClick={resetCallLogFilters}>
+                  <button
+                    className="va-btn secondary"
+                    onClick={resetCallLogFilters}
+                  >
                     Reset
                   </button>
                   {isAdmin && (
-                    <button className="va-btn secondary" onClick={exportCallLog}>
+                    <button
+                      className="va-btn secondary"
+                      onClick={exportCallLog}
+                    >
                       Export CSV
                     </button>
                   )}
@@ -807,55 +942,79 @@ export const IndexPage = () => {
               </div>
               <div className="va-list">
                 {loadingLog
-                  ? 'Loading call log…'
+                  ? "Loading call log…"
                   : callLog.length
-                  ? callLog.map((call) => (
-                      <div className="va-list-item" key={String(call.call_sid)}>
-                        <div className="va-list-title">
-                          <strong>{String(call.status || 'unknown')}</strong> — {String(call.phone_number || 'unknown')}
+                    ? callLog.map((call) => (
+                        <div
+                          className="va-list-item"
+                          key={String(call.call_sid)}
+                        >
+                          <div className="va-list-title">
+                            <strong>{String(call.status || "unknown")}</strong>{" "}
+                            — {String(call.phone_number || "unknown")}
+                          </div>
+                          <div className="va-list-meta">
+                            Direction: {String(call.direction || "unknown")} |
+                            Call SID: {String(call.call_sid)}
+                          </div>
+                          <button
+                            className="va-btn secondary"
+                            onClick={() =>
+                              loadCallDetails(String(call.call_sid))
+                            }
+                          >
+                            Details
+                          </button>
                         </div>
-                        <div className="va-list-meta">
-                          Direction: {String(call.direction || 'unknown')} | Call SID: {String(call.call_sid)}
-                        </div>
-                        <button className="va-btn secondary" onClick={() => loadCallDetails(String(call.call_sid))}>
-                          Details
-                        </button>
-                      </div>
-                    ))
-                  : 'No calls found.'}
+                      ))
+                    : "No calls found."}
               </div>
             </div>
             <div className="va-section">
               <h3>Call Details</h3>
               <div className="va-console">
                 {loadingDetails ? (
-                  'Loading call details…'
+                  "Loading call details…"
                 ) : callDetails ? (
                   <>
                     <div className="va-console-title">
-                      <strong>{String(callDetails.call.call_sid || 'unknown')}</strong>
+                      <strong>
+                        {String(callDetails.call.call_sid || "unknown")}
+                      </strong>
                     </div>
-                    <div>Status: {String(callDetails.call.status || 'unknown')}</div>
-                    <div>Direction: {String(callDetails.call.direction || '—')}</div>
-                    <div>Phone: {String(callDetails.call.phone_number || '—')}</div>
-                    <div>Duration: {String(callDetails.call.duration || '—')}</div>
-                    <div>Created: {String(callDetails.call.created_at || '—')}</div>
+                    <div>
+                      Status: {String(callDetails.call.status || "unknown")}
+                    </div>
+                    <div>
+                      Direction: {String(callDetails.call.direction || "—")}
+                    </div>
+                    <div>
+                      Phone: {String(callDetails.call.phone_number || "—")}
+                    </div>
+                    <div>
+                      Duration: {String(callDetails.call.duration || "—")}
+                    </div>
+                    <div>
+                      Created: {String(callDetails.call.created_at || "—")}
+                    </div>
                     <div className="va-console-events">Recent Events:</div>
                     <pre>
                       {callDetails.states.length
-                        ? callDetails.states.map((s) => `${s.state} @ ${s.timestamp}`).join('\n')
-                        : '—'}
+                        ? callDetails.states
+                            .map((s) => `${s.state} @ ${s.timestamp}`)
+                            .join("\n")
+                        : "—"}
                     </pre>
                   </>
                 ) : (
-                  'Select a call to view details.'
+                  "Select a call to view details."
                 )}
               </div>
             </div>
           </section>
         )}
 
-        {tab === 'settings' && (
+        {tab === "settings" && (
           <section className="va-panel">
             <div className="va-section">
               <h3>Settings</h3>
@@ -868,9 +1027,13 @@ export const IndexPage = () => {
                   onChange={(event) => setApiInput(event.target.value)}
                   placeholder="https://api.example.com"
                 />
-                <button className="va-btn" onClick={saveApiBase}>Save</button>
+                <button className="va-btn" onClick={saveApiBase}>
+                  Save
+                </button>
               </div>
-              <div className="va-hint">Use this only if the Mini App is hosted on a different domain.</div>
+              <div className="va-hint">
+                Use this only if the Mini App is hosted on a different domain.
+              </div>
             </div>
             {isAdmin && (
               <div className="va-section">
@@ -887,7 +1050,9 @@ export const IndexPage = () => {
                     id="access-admins"
                     type="text"
                     value={accessAdminInput}
-                    onChange={(event) => setAccessAdminInput(event.target.value)}
+                    onChange={(event) =>
+                      setAccessAdminInput(event.target.value)
+                    }
                     placeholder="Comma-separated Telegram user IDs"
                   />
                 </div>
@@ -897,7 +1062,9 @@ export const IndexPage = () => {
                     id="access-viewers"
                     type="text"
                     value={accessViewerInput}
-                    onChange={(event) => setAccessViewerInput(event.target.value)}
+                    onChange={(event) =>
+                      setAccessViewerInput(event.target.value)
+                    }
                     placeholder="Comma-separated Telegram user IDs"
                   />
                 </div>
@@ -905,7 +1072,10 @@ export const IndexPage = () => {
                   <button className="va-btn" onClick={saveAccessControl}>
                     Save Access
                   </button>
-                  <button className="va-btn secondary" onClick={loadAccessControl}>
+                  <button
+                    className="va-btn secondary"
+                    onClick={loadAccessControl}
+                  >
                     Refresh
                   </button>
                 </div>
@@ -921,7 +1091,9 @@ export const IndexPage = () => {
             {!isAdmin && (
               <div className="va-section">
                 <h3>Access Control</h3>
-                <div className="va-hint">Read-only access. Contact an admin to change access lists.</div>
+                <div className="va-hint">
+                  Read-only access. Contact an admin to change access lists.
+                </div>
               </div>
             )}
           </section>

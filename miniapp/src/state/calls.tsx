@@ -5,8 +5,8 @@ import {
   useMemo,
   useState,
   type PropsWithChildren,
-} from 'react';
-import { apiFetch } from '../lib/api';
+} from "react";
+import { apiFetch } from "../lib/api";
 
 export type CallRecord = {
   call_sid: string;
@@ -55,7 +55,7 @@ export type CallEvent = {
 
 export type InboundNotice = {
   message: string;
-  level?: 'info' | 'warning' | 'danger';
+  level?: "info" | "warning" | "danger";
   pending_count?: number;
 };
 
@@ -70,7 +70,12 @@ type CallsState = {
   nextCursor: number | null;
   loading: boolean;
   error?: string | null;
-  fetchCalls: (options?: { limit?: number; cursor?: number; status?: string; q?: string }) => Promise<void>;
+  fetchCalls: (options?: {
+    limit?: number;
+    cursor?: number;
+    status?: string;
+    q?: string;
+  }) => Promise<void>;
   fetchInboundQueue: () => Promise<void>;
   fetchCall: (callSid: string) => Promise<void>;
   fetchCallEvents: (callSid: string, after?: number) => Promise<void>;
@@ -82,48 +87,72 @@ const CallsContext = createContext<CallsState | null>(null);
 export function CallsProvider({ children }: PropsWithChildren) {
   const [calls, setCalls] = useState<CallRecord[]>([]);
   const [inboundQueue, setInboundQueue] = useState<LiveCall[]>([]);
-  const [inboundNotice, setInboundNotice] = useState<InboundNotice | null>(null);
+  const [inboundNotice, setInboundNotice] = useState<InboundNotice | null>(
+    null,
+  );
   const [activeCall, setActiveCall] = useState<CallRecord | null>(null);
   const [callEvents, setCallEvents] = useState<CallEvent[]>([]);
-  const [callEventsById, setCallEventsById] = useState<Record<string, CallEvent[]>>({});
-  const [eventCursorById, setEventCursorById] = useState<Record<string, number>>({});
+  const [callEventsById, setCallEventsById] = useState<
+    Record<string, CallEvent[]>
+  >({});
+  const [eventCursorById, setEventCursorById] = useState<
+    Record<string, number>
+  >({});
   const [nextCursor, setNextCursor] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const fetchCalls = useCallback(async (options: { limit?: number; cursor?: number; status?: string; q?: string } = {}) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const params = new URLSearchParams();
-      if (options.limit) params.set('limit', String(options.limit));
-      if (options.cursor !== undefined) params.set('cursor', String(options.cursor));
-      if (options.status) params.set('status', options.status);
-      if (options.q) params.set('q', options.q);
-      const response = await apiFetch<{
-        ok: boolean;
-        calls: CallRecord[];
-        next_cursor: number | null;
-      }>(`/webapp/calls?${params.toString()}`);
-      setCalls(response.calls || []);
-      setNextCursor(response.next_cursor ?? null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load calls');
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const fetchCalls = useCallback(
+    async (
+      options: {
+        limit?: number;
+        cursor?: number;
+        status?: string;
+        q?: string;
+      } = {},
+    ) => {
+      setLoading(true);
+      setError(null);
+      try {
+        const params = new URLSearchParams();
+        if (options.limit !== undefined)
+          params.set("limit", String(options.limit));
+        if (options.cursor !== undefined)
+          params.set("cursor", String(options.cursor));
+        if (options.status !== undefined && options.status !== null)
+          params.set("status", options.status);
+        if (options.q !== undefined && options.q !== null)
+          params.set("q", options.q);
+        const response = await apiFetch<{
+          ok: boolean;
+          calls: CallRecord[];
+          next_cursor: number | null;
+        }>(`/webapp/calls?${params.toString()}`);
+        setCalls(response.calls || []);
+        setNextCursor(response.next_cursor ?? null);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to load calls");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [],
+  );
 
   const fetchInboundQueue = useCallback(async () => {
     setError(null);
     try {
-      const response = await apiFetch<{ ok: boolean; calls: LiveCall[]; notice?: InboundNotice | null }>(
-        '/webapp/inbound/queue',
-      );
+      const response = await apiFetch<{
+        ok: boolean;
+        calls: LiveCall[];
+        notice?: InboundNotice | null;
+      }>("/webapp/inbound/queue");
       setInboundQueue(response.calls || []);
       setInboundNotice(response.notice ?? null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load inbound queue');
+      setError(
+        err instanceof Error ? err.message : "Failed to load inbound queue",
+      );
     }
   }, []);
 
@@ -131,17 +160,21 @@ export function CallsProvider({ children }: PropsWithChildren) {
     setLoading(true);
     setError(null);
     try {
-      const response = await apiFetch<{ ok: boolean; call: CallRecord; inbound_gate?: CallRecord['inbound_gate']; live?: Record<string, unknown> | null }>(
-        `/webapp/calls/${callSid}`,
-      );
+      const response = await apiFetch<{
+        ok: boolean;
+        call: CallRecord;
+        inbound_gate?: CallRecord["inbound_gate"];
+        live?: Record<string, unknown> | null;
+      }>(`/webapp/calls/${callSid}`);
       const merged = {
         ...response.call,
-        inbound_gate: response.inbound_gate ?? response.call.inbound_gate ?? null,
+        inbound_gate:
+          response.inbound_gate ?? response.call.inbound_gate ?? null,
         live: response.live ?? response.call.live ?? null,
       };
       setActiveCall(merged);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load call');
+      setError(err instanceof Error ? err.message : "Failed to load call");
     } finally {
       setLoading(false);
     }
@@ -151,30 +184,50 @@ export function CallsProvider({ children }: PropsWithChildren) {
     setError(null);
     try {
       const params = new URLSearchParams();
-      if (after) params.set('after', String(after));
-      const response = await apiFetch<{ ok: boolean; events: CallEvent[]; latest_sequence?: number }>(
-        `/webapp/calls/${callSid}/events?${params.toString()}`,
-      );
+      if (after) params.set("after", String(after));
+      const response = await apiFetch<{
+        ok: boolean;
+        events: CallEvent[];
+        latest_sequence?: number;
+      }>(`/webapp/calls/${callSid}/events?${params.toString()}`);
       const incoming = response.events || [];
       setCallEventsById((prev) => {
         const existing = prev[callSid] || [];
         const merged = after > 0 ? [...existing, ...incoming] : incoming;
-        const deduped = merged.filter((event, index, arr) => arr.findIndex((item) => item.sequence_number === event.sequence_number) === index);
+        const deduped = merged.filter(
+          (event: CallEvent, index: number, arr: CallEvent[]) =>
+            arr.findIndex(
+              (item: CallEvent) =>
+                item.sequence_number === event.sequence_number,
+            ) === index,
+        );
         return { ...prev, [callSid]: deduped };
       });
       setEventCursorById((prev) => ({
         ...prev,
-        [callSid]: response.latest_sequence ?? (incoming.length ? incoming[incoming.length - 1].sequence_number : prev[callSid] || 0),
+        [callSid]:
+          response.latest_sequence ??
+          (incoming.length
+            ? incoming[incoming.length - 1].sequence_number
+            : prev[callSid] || 0),
       }));
       setCallEvents((prev) => {
         if (after > 0) {
           const merged = [...prev, ...incoming];
-          return merged.filter((event, index, arr) => arr.findIndex((item) => item.sequence_number === event.sequence_number) === index);
+          return merged.filter(
+            (event: CallEvent, index: number, arr: CallEvent[]) =>
+              arr.findIndex(
+                (item: CallEvent) =>
+                  item.sequence_number === event.sequence_number,
+              ) === index,
+          );
         }
         return incoming;
       });
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load call events');
+      setError(
+        err instanceof Error ? err.message : "Failed to load call events",
+      );
     }
   }, []);
 
@@ -183,51 +236,52 @@ export function CallsProvider({ children }: PropsWithChildren) {
     setCallEvents([]);
   }, []);
 
-  const value = useMemo<CallsState>(() => ({
-    calls,
-    inboundQueue,
-    inboundNotice,
-    activeCall,
-    callEvents,
-    callEventsById,
-    eventCursorById,
-    nextCursor,
-    loading,
-    error,
-    fetchCalls,
-    fetchInboundQueue,
-    fetchCall,
-    fetchCallEvents,
-    clearActive,
-  }), [
-    calls,
-    inboundQueue,
-    inboundNotice,
-    activeCall,
-    callEvents,
-    callEventsById,
-    eventCursorById,
-    nextCursor,
-    loading,
-    error,
-    fetchCalls,
-    fetchInboundQueue,
-    fetchCall,
-    fetchCallEvents,
-    clearActive,
-  ]);
+  const value = useMemo<CallsState>(
+    () => ({
+      calls,
+      inboundQueue,
+      inboundNotice,
+      activeCall,
+      callEvents,
+      callEventsById,
+      eventCursorById,
+      nextCursor,
+      loading,
+      error,
+      fetchCalls,
+      fetchInboundQueue,
+      fetchCall,
+      fetchCallEvents,
+      clearActive,
+    }),
+    [
+      calls,
+      inboundQueue,
+      inboundNotice,
+      activeCall,
+      callEvents,
+      callEventsById,
+      eventCursorById,
+      nextCursor,
+      loading,
+      error,
+      fetchCalls,
+      fetchInboundQueue,
+      fetchCall,
+      fetchCallEvents,
+      clearActive,
+    ],
+  );
 
   return (
-    <CallsContext.Provider value={value}>
-      {children}
-    </CallsContext.Provider>
+    <CallsContext.Provider value={value}>{children}</CallsContext.Provider>
   );
 }
 
 export function useCalls() {
   const context = useContext(CallsContext);
   if (!context) {
-    throw new Error('useCalls must be used within CallsProvider');
+    throw new Error("useCalls must be used within CallsProvider");
   }
   return context;
 }

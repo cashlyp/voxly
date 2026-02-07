@@ -1,8 +1,14 @@
-import { useCallback, useEffect, useState } from 'react';
-import { Banner, Button, List, Section, Placeholder } from '@telegram-apps/telegram-ui';
-import { apiFetch } from '../lib/api';
-import { trackEvent } from '../lib/telemetry';
-import { useUser } from '../state/user';
+import {
+  Banner,
+  Button,
+  List,
+  Placeholder,
+  Section,
+} from "@telegram-apps/telegram-ui";
+import { useCallback, useEffect, useState } from "react";
+import { apiFetch } from "../lib/api";
+import { trackEvent } from "../lib/telemetry";
+import { useUser } from "../state/user";
 
 type HealthStatus = {
   ok: boolean;
@@ -32,7 +38,7 @@ type HealthStatus = {
 
 export function Health() {
   const { roles } = useUser();
-  const isAdmin = roles.includes('admin');
+  const isAdmin = roles.includes("admin");
 
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [loading, setLoading] = useState(true);
@@ -43,20 +49,22 @@ export function Health() {
     setLoading(true);
     setError(null);
     try {
-      const response = await apiFetch<HealthStatus>('/webapp/ping');
+      const response = await apiFetch<HealthStatus>("/webapp/ping");
       setHealth(response);
       setLastUpdated(new Date());
-      trackEvent('health_check');
+      trackEvent("health_check");
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load health status');
-      trackEvent('health_check_failed');
+      setError(
+        err instanceof Error ? err.message : "Failed to load health status",
+      );
+      trackEvent("health_check_failed");
     } finally {
       setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    loadHealth();
+    void loadHealth();
     const interval = setInterval(loadHealth, 30000); // Refresh every 30 seconds
     return () => clearInterval(interval);
   }, [loadHealth]);
@@ -71,13 +79,17 @@ export function Health() {
     return `${minutes}m`;
   };
 
-  const getStatusColor = (status: boolean) => (status ? '#28a745' : '#dc3545');
-  const getStatusText = (status: boolean) => (status ? '✓ Operational' : '✗ Down');
+  const getStatusColor = (status: boolean) => (status ? "#28a745" : "#dc3545");
+  const getStatusText = (status: boolean) =>
+    status ? "✓ Operational" : "✗ Down";
 
   if (loading && !health) {
     return (
       <div className="wallet-page">
-        <Placeholder header="Loading Health Status" description="Please wait..." />
+        <Placeholder
+          header="Loading Health Status"
+          description="Please wait..."
+        />
       </div>
     );
   }
@@ -85,7 +97,11 @@ export function Health() {
   if (error || !health) {
     return (
       <div className="wallet-page">
-        <Banner type="inline" header="Error" description={error || 'Failed to load health status'} />
+        <Banner
+          type="inline"
+          header="Error"
+          description={error || "Failed to load health status"}
+        />
       </div>
     );
   }
@@ -96,7 +112,11 @@ export function Health() {
     <div className="wallet-page">
       <List className="wallet-list">
         {isDegraded && (
-          <Banner type="inline" header="Warning" description="Provider Health Degraded - Some services may be impacted." />
+          <Banner
+            type="inline"
+            header="Warning"
+            description="Provider Health Degraded - Some services may be impacted."
+          />
         )}
 
         <Section header="System Status">
@@ -129,10 +149,10 @@ export function Health() {
                   style={{
                     color:
                       health.memory.percentage > 80
-                        ? '#dc3545'
+                        ? "#dc3545"
                         : health.memory.percentage > 60
-                          ? '#ffc107'
-                          : '#28a745',
+                          ? "#ffc107"
+                          : "#28a745",
                   }}
                 >
                   {Math.round(health.memory.percentage)}%
@@ -147,7 +167,9 @@ export function Health() {
             <div className="provider-card">
               <div className="provider-header">
                 <div className="provider-label">Current Provider</div>
-                <div className="provider-name">{health.provider?.current || 'Unknown'}</div>
+                <div className="provider-name">
+                  {health.provider?.current || "Unknown"}
+                </div>
               </div>
 
               {isDegraded && (
@@ -156,34 +178,44 @@ export function Health() {
                 </div>
               )}
 
-              {health.provider?.last_error_at && (
-                <div className="error-info">
-                  Last error: {new Date(health.provider.last_error_at).toLocaleString()}
-                </div>
-              )}
+              {health.provider.last_error_at !== null &&
+                health.provider.last_error_at !== undefined && (
+                  <div className="error-info">
+                    Last error:{" "}
+                    {new Date(health.provider.last_error_at).toLocaleString()}
+                  </div>
+                )}
 
-              {health.provider?.last_success_at && (
-                <div className="success-info">
-                  Last success: {new Date(health.provider.last_success_at).toLocaleString()}
-                </div>
-              )}
+              {health.provider.last_success_at !== null &&
+                health.provider.last_success_at !== undefined && (
+                  <div className="success-info">
+                    Last success:{" "}
+                    {new Date(health.provider.last_success_at).toLocaleString()}
+                  </div>
+                )}
             </div>
 
-            {health.provider?.readiness && Object.keys(health.provider.readiness).length > 0 && (
-              <div className="readiness-section">
-                <div className="section-title">Provider Readiness</div>
-                <div className="readiness-list">
-                  {Object.entries(health.provider.readiness).map(([provider, ready]) => (
-                    <div key={provider} className="readiness-item">
-                      <div className="readiness-icon" style={{ color: getStatusColor(ready) }}>
-                        {getStatusText(ready)}
-                      </div>
-                      <div className="readiness-name">{provider}</div>
-                    </div>
-                  ))}
+            {health.provider?.readiness &&
+              Object.keys(health.provider.readiness).length > 0 && (
+                <div className="readiness-section">
+                  <div className="section-title">Provider Readiness</div>
+                  <div className="readiness-list">
+                    {Object.entries(health.provider.readiness).map(
+                      ([provider, ready]) => (
+                        <div key={provider} className="readiness-item">
+                          <div
+                            className="readiness-icon"
+                            style={{ color: getStatusColor(ready) }}
+                          >
+                            {getStatusText(ready)}
+                          </div>
+                          <div className="readiness-name">{provider}</div>
+                        </div>
+                      ),
+                    )}
+                  </div>
                 </div>
-              </div>
-            )}
+              )}
           </div>
         </Section>
 
@@ -200,7 +232,9 @@ export function Health() {
               </div>
               <div className="status-item">
                 <span>Last Checked</span>
-                <span>{new Date(health.database.last_checked).toLocaleString()}</span>
+                <span>
+                  {new Date(health.database.last_checked).toLocaleString()}
+                </span>
               </div>
             </div>
           </Section>
@@ -218,7 +252,9 @@ export function Health() {
               {health.webhook.last_event_at && (
                 <div className="status-item">
                   <span>Last Event</span>
-                  <span>{new Date(health.webhook.last_event_at).toLocaleString()}</span>
+                  <span>
+                    {new Date(health.webhook.last_event_at).toLocaleString()}
+                  </span>
                 </div>
               )}
             </div>
@@ -227,8 +263,13 @@ export function Health() {
 
         <Section>
           <div className="section-actions">
-            <Button size="m" mode="filled" onClick={loadHealth} disabled={loading}>
-              {loading ? 'Checking...' : 'Refresh Status'}
+            <Button
+              size="m"
+              mode="filled"
+              onClick={() => void loadHealth()}
+              disabled={loading}
+            >
+              {loading ? "Checking..." : "Refresh Status"}
             </Button>
           </div>
           {lastUpdated && (

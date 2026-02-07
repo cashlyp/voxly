@@ -1,12 +1,12 @@
-require('dotenv').config();
-const fs = require('fs');
-const path = require('path');
+require("dotenv").config();
+const fs = require("fs");
+const path = require("path");
 
-const isProduction = process.env.NODE_ENV === 'production';
+const isProduction = process.env.NODE_ENV === "production";
 
 function readEnv(name) {
   const value = process.env[name];
-  if (typeof value === 'string' && value.length > 0) {
+  if (typeof value === "string" && value.length > 0) {
     return value;
   }
   return undefined;
@@ -19,7 +19,9 @@ function ensure(name, fallback) {
   }
   if (fallback !== undefined) {
     if (!isProduction) {
-      console.warn(`Environment variable "${name}" is missing. Using fallback value in development.`);
+      console.warn(
+        `Environment variable "${name}" is missing. Using fallback value in development.`,
+      );
     }
     return fallback;
   }
@@ -28,141 +30,207 @@ function ensure(name, fallback) {
     throw new Error(message);
   }
   console.warn(`${message} Continuing because NODE_ENV !== 'production'.`);
-  return '';
+  return "";
 }
 
 function normalizeHostname(value) {
-  if (!value) return '';
+  if (!value) return "";
   const trimmed = String(value).trim();
-  if (!trimmed) return '';
+  if (!trimmed) return "";
   try {
-    if (trimmed.includes('://')) {
+    if (trimmed.includes("://")) {
       const parsed = new URL(trimmed);
       return parsed.host;
     }
   } catch {
     // fall through to basic cleanup
   }
-  return trimmed.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+  return trimmed.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
 }
 
 function parseList(rawValue) {
   if (!rawValue) return [];
   return String(rawValue)
-    .split(',')
+    .split(",")
     .map((value) => value.trim())
     .filter(Boolean);
 }
 
-const corsOriginsRaw = ensure('CORS_ORIGINS', process.env.WEB_APP_URL || '');
+const corsOriginsRaw = ensure("CORS_ORIGINS", process.env.WEB_APP_URL || "");
 const corsOrigins = corsOriginsRaw
-  .split(',')
+  .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
 
-const recordingEnabled = String(readEnv('RECORDING_ENABLED') || 'false').toLowerCase() === 'true';
-const transferNumber = readEnv('TRANSFER_NUMBER');
-const defaultSmsBusinessId = readEnv('DEFAULT_SMS_BUSINESS_ID') || null;
-const deepgramModel = readEnv('DEEPGRAM_MODEL') || 'nova-2';
-const twilioGatherFallback = String(readEnv('TWILIO_GATHER_FALLBACK') || 'true').toLowerCase() === 'true';
-const twilioMachineDetection = readEnv('TWILIO_MACHINE_DETECTION') || 'Enable';
-const twilioMachineDetectionTimeoutRaw = readEnv('TWILIO_MACHINE_DETECTION_TIMEOUT');
-const twilioMachineDetectionTimeout = Number.isFinite(Number(twilioMachineDetectionTimeoutRaw))
+const recordingEnabled =
+  String(readEnv("RECORDING_ENABLED") || "false").toLowerCase() === "true";
+const transferNumber = readEnv("TRANSFER_NUMBER");
+const defaultSmsBusinessId = readEnv("DEFAULT_SMS_BUSINESS_ID") || null;
+const deepgramModel = readEnv("DEEPGRAM_MODEL") || "nova-2";
+const twilioGatherFallback =
+  String(readEnv("TWILIO_GATHER_FALLBACK") || "true").toLowerCase() === "true";
+const twilioMachineDetection = readEnv("TWILIO_MACHINE_DETECTION") || "Enable";
+const twilioMachineDetectionTimeoutRaw = readEnv(
+  "TWILIO_MACHINE_DETECTION_TIMEOUT",
+);
+const twilioMachineDetectionTimeout = Number.isFinite(
+  Number(twilioMachineDetectionTimeoutRaw),
+)
   ? Number(twilioMachineDetectionTimeoutRaw)
   : undefined;
-const twilioTtsMaxWaitMs = Number(readEnv('TWILIO_TTS_MAX_WAIT_MS') || '1200');
-const twilioWebhookValidationRaw = (readEnv('TWILIO_WEBHOOK_VALIDATION') || (isProduction ? 'strict' : 'warn')).toLowerCase();
-const twilioWebhookValidationModes = new Set(['strict', 'warn', 'off']);
-const twilioWebhookValidation = twilioWebhookValidationModes.has(twilioWebhookValidationRaw)
+const twilioTtsMaxWaitMs = Number(readEnv("TWILIO_TTS_MAX_WAIT_MS") || "1200");
+const twilioWebhookValidationRaw = (
+  readEnv("TWILIO_WEBHOOK_VALIDATION") || (isProduction ? "strict" : "warn")
+).toLowerCase();
+const twilioWebhookValidationModes = new Set(["strict", "warn", "off"]);
+const twilioWebhookValidation = twilioWebhookValidationModes.has(
+  twilioWebhookValidationRaw,
+)
   ? twilioWebhookValidationRaw
-  : (isProduction ? 'strict' : 'warn');
+  : isProduction
+    ? "strict"
+    : "warn";
 
-const callProvider = ensure('CALL_PROVIDER', 'twilio').toLowerCase();
-const awsRegion = ensure('AWS_REGION', 'us-east-1');
-const apiSecret = readEnv('API_SECRET');
-const adminApiToken = apiSecret || readEnv('ADMIN_API_TOKEN');
-const complianceModeRaw = (readEnv('CONFIG_COMPLIANCE_MODE') || 'safe').toLowerCase();
-const allowedComplianceModes = new Set(['safe', 'dev_insecure']);
-const complianceMode = allowedComplianceModes.has(complianceModeRaw) ? complianceModeRaw : 'safe';
+const callProvider = ensure("CALL_PROVIDER", "twilio").toLowerCase();
+const awsRegion = ensure("AWS_REGION", "us-east-1");
+const apiSecret = readEnv("API_SECRET");
+const adminApiToken = apiSecret || readEnv("ADMIN_API_TOKEN");
+const complianceModeRaw = (
+  readEnv("CONFIG_COMPLIANCE_MODE") || "safe"
+).toLowerCase();
+const allowedComplianceModes = new Set(["safe", "dev_insecure"]);
+const complianceMode = allowedComplianceModes.has(complianceModeRaw)
+  ? complianceModeRaw
+  : "safe";
 if (!allowedComplianceModes.has(complianceModeRaw) && !isProduction) {
-  console.warn(`Invalid CONFIG_COMPLIANCE_MODE "${complianceModeRaw}". Falling back to "safe".`);
+  console.warn(
+    `Invalid CONFIG_COMPLIANCE_MODE "${complianceModeRaw}". Falling back to "safe".`,
+  );
 }
-const dtmfEncryptionKey = readEnv('DTMF_ENCRYPTION_KEY');
-const apiHmacSecret = apiSecret || readEnv('API_HMAC_SECRET');
-const apiHmacMaxSkewMs = Number(readEnv('API_HMAC_MAX_SKEW_MS') || '300000');
+const dtmfEncryptionKey = readEnv("DTMF_ENCRYPTION_KEY");
+const apiHmacSecret = apiSecret || readEnv("API_HMAC_SECRET");
+const apiHmacMaxSkewMs = Number(readEnv("API_HMAC_MAX_SKEW_MS") || "300000");
 if (!apiHmacSecret) {
-  const message = 'Missing required environment variable "API_SECRET" (or legacy API_HMAC_SECRET).';
+  const message =
+    'Missing required environment variable "API_SECRET" (or legacy API_HMAC_SECRET).';
   if (isProduction) {
     throw new Error(message);
   }
   console.warn(`${message} HMAC auth will be disabled.`);
 }
-const streamAuthSecret = readEnv('STREAM_AUTH_SECRET') || apiHmacSecret;
-const streamAuthMaxSkewMs = Number(readEnv('STREAM_AUTH_MAX_SKEW_MS') || apiHmacMaxSkewMs || '300000');
+const streamAuthSecret = readEnv("STREAM_AUTH_SECRET") || apiHmacSecret;
+const streamAuthMaxSkewMs = Number(
+  readEnv("STREAM_AUTH_MAX_SKEW_MS") || apiHmacMaxSkewMs || "300000",
+);
 
 function parseJsonObject(rawValue, label) {
   if (!rawValue) return {};
   try {
     const parsed = JSON.parse(rawValue);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new Error('JSON must be an object');
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("JSON must be an object");
     }
     return parsed;
   } catch (error) {
-    const tag = label ? ` (${label})` : '';
+    const tag = label ? ` (${label})` : "";
     console.warn(`Unable to parse JSON config${tag}: ${error.message}`);
     return {};
   }
 }
 
-const inboundDefaultPrompt = readEnv('INBOUND_PROMPT');
-const inboundDefaultFirstMessage = readEnv('INBOUND_FIRST_MESSAGE');
-const inboundRoutes = parseJsonObject(readEnv('INBOUND_NUMBER_ROUTES'), 'INBOUND_NUMBER_ROUTES');
-const inboundPreConnectMessage = readEnv('INBOUND_PRECONNECT_MESSAGE');
-const inboundPreConnectPauseSeconds = Number(readEnv('INBOUND_PRECONNECT_PAUSE_S') || '1');
-const inboundFirstMediaTimeoutMs = Number(readEnv('INBOUND_STREAM_FIRST_MEDIA_TIMEOUT_MS') || '8000');
-const inboundRateLimitWindowMs = Number(readEnv('INBOUND_RATE_LIMIT_WINDOW_S') || '60') * 1000;
-const inboundRateLimitMax = Number(readEnv('INBOUND_RATE_LIMIT_MAX') || '0');
-const inboundRateLimitSmsEnabled = String(readEnv('INBOUND_RATE_LIMIT_SMS') || 'false').toLowerCase() === 'true';
-const inboundRateLimitCallbackEnabled = String(readEnv('INBOUND_RATE_LIMIT_CALLBACK') || 'false').toLowerCase() === 'true';
-const inboundCallbackDelayMinutes = Number(readEnv('INBOUND_CALLBACK_DELAY_MIN') || '15');
+const inboundDefaultPrompt = readEnv("INBOUND_PROMPT");
+const inboundDefaultFirstMessage = readEnv("INBOUND_FIRST_MESSAGE");
+const inboundRoutes = parseJsonObject(
+  readEnv("INBOUND_NUMBER_ROUTES"),
+  "INBOUND_NUMBER_ROUTES",
+);
+const inboundPreConnectMessage = readEnv("INBOUND_PRECONNECT_MESSAGE");
+const inboundPreConnectPauseSeconds = Number(
+  readEnv("INBOUND_PRECONNECT_PAUSE_S") || "1",
+);
+const inboundFirstMediaTimeoutMs = Number(
+  readEnv("INBOUND_STREAM_FIRST_MEDIA_TIMEOUT_MS") || "8000",
+);
+const inboundRateLimitWindowMs =
+  Number(readEnv("INBOUND_RATE_LIMIT_WINDOW_S") || "60") * 1000;
+const inboundRateLimitMax = Number(readEnv("INBOUND_RATE_LIMIT_MAX") || "0");
+const inboundRateLimitSmsEnabled =
+  String(readEnv("INBOUND_RATE_LIMIT_SMS") || "false").toLowerCase() === "true";
+const inboundRateLimitCallbackEnabled =
+  String(readEnv("INBOUND_RATE_LIMIT_CALLBACK") || "false").toLowerCase() ===
+  "true";
+const inboundCallbackDelayMinutes = Number(
+  readEnv("INBOUND_CALLBACK_DELAY_MIN") || "15",
+);
 
-const miniappAllowedOrigins = parseList(readEnv('MINIAPP_ALLOWED_ORIGINS'));
-const miniappPublicUrl = readEnv('MINIAPP_PUBLIC_URL') || readEnv('MINIAPP_URL');
-const miniappBotUsernameRaw = readEnv('MINIAPP_BOT_USERNAME') || readEnv('TELEGRAM_BOT_USERNAME');
-const miniappBotUsername = miniappBotUsernameRaw ? miniappBotUsernameRaw.replace(/^@/, '') : '';
-const miniappSessionTtlMs = Number(readEnv('MINIAPP_SESSION_TTL_MS') || '3600000');
-const miniappRefreshTtlMs = Number(readEnv('MINIAPP_REFRESH_TTL_MS') || String(7 * 24 * 60 * 60 * 1000));
-const miniappRateLimitWindowMs = Number(readEnv('MINIAPP_RATE_LIMIT_WINDOW_MS') || '60000');
-const miniappRateLimitMax = Number(readEnv('MINIAPP_RATE_LIMIT_MAX') || '120');
-const miniappBrandName = readEnv('MINIAPP_BRAND_NAME') || 'VOICEDNUT';
-const miniappThemeRaw = parseJsonObject(readEnv('MINIAPP_THEME_JSON'), 'MINIAPP_THEME_JSON');
-const miniappTheme = miniappThemeRaw && Object.keys(miniappThemeRaw).length ? miniappThemeRaw : null;
-const miniappJwtSecret = readEnv('MINIAPP_JWT_SECRET') || apiSecret;
-const miniappJwtTtlSeconds = Number(readEnv('MINIAPP_JWT_TTL_S') || '900');
-const miniappInitDataMaxAgeS = Number(readEnv('MINIAPP_INITDATA_MAX_AGE_S') || '120');
-const providerFailoverEnabled = String(readEnv('PROVIDER_FAILOVER_ENABLED') || 'true').toLowerCase() === 'true';
-const providerFailoverThreshold = Number(readEnv('PROVIDER_ERROR_THRESHOLD') || '3');
-const providerFailoverWindowMs = Number(readEnv('PROVIDER_ERROR_WINDOW_S') || '120') * 1000;
-const providerFailoverCooldownMs = Number(readEnv('PROVIDER_COOLDOWN_S') || '300') * 1000;
-const callJobIntervalMs = Number(readEnv('CALL_JOB_PROCESSOR_INTERVAL_MS') || '5000');
-const callJobRetryBaseMs = Number(readEnv('CALL_JOB_RETRY_BASE_MS') || '5000');
-const callJobRetryMaxMs = Number(readEnv('CALL_JOB_RETRY_MAX_MS') || '60000');
-const callJobMaxAttempts = Number(readEnv('CALL_JOB_MAX_ATTEMPTS') || '3');
-const callSloFirstMediaMs = Number(readEnv('CALL_SLO_FIRST_MEDIA_MS') || '4000');
-const callSloAnswerDelayMs = Number(readEnv('CALL_SLO_ANSWER_DELAY_MS') || '12000');
-const callSloSttFailures = Number(readEnv('CALL_SLO_STT_FAILURES') || '3');
-const webhookRetryBaseMs = Number(readEnv('WEBHOOK_RETRY_BASE_MS') || '5000');
-const webhookRetryMaxMs = Number(readEnv('WEBHOOK_RETRY_MAX_MS') || '60000');
-const webhookRetryMaxAttempts = Number(readEnv('WEBHOOK_RETRY_MAX_ATTEMPTS') || '5');
+const miniappAllowedOrigins = parseList(readEnv("MINIAPP_ALLOWED_ORIGINS"));
+const miniappPublicUrl =
+  readEnv("MINIAPP_PUBLIC_URL") || readEnv("MINIAPP_URL");
+const miniappBotUsernameRaw =
+  readEnv("MINIAPP_BOT_USERNAME") || readEnv("TELEGRAM_BOT_USERNAME");
+const miniappBotUsername = miniappBotUsernameRaw
+  ? miniappBotUsernameRaw.replace(/^@/, "")
+  : "";
+const miniappSessionTtlMs = Number(
+  readEnv("MINIAPP_SESSION_TTL_MS") || "3600000",
+);
+const miniappRefreshTtlMs = Number(
+  readEnv("MINIAPP_REFRESH_TTL_MS") || String(7 * 24 * 60 * 60 * 1000),
+);
+const miniappRateLimitWindowMs = Number(
+  readEnv("MINIAPP_RATE_LIMIT_WINDOW_MS") || "60000",
+);
+const miniappRateLimitMax = Number(readEnv("MINIAPP_RATE_LIMIT_MAX") || "120");
+const miniappBrandName = readEnv("MINIAPP_BRAND_NAME") || "VOICEDNUT";
+const miniappThemeRaw = parseJsonObject(
+  readEnv("MINIAPP_THEME_JSON"),
+  "MINIAPP_THEME_JSON",
+);
+const miniappTheme =
+  miniappThemeRaw && Object.keys(miniappThemeRaw).length
+    ? miniappThemeRaw
+    : null;
+const miniappJwtSecret = readEnv("MINIAPP_JWT_SECRET") || apiSecret;
+const miniappJwtTtlSeconds = Number(readEnv("MINIAPP_JWT_TTL_S") || "900");
+const miniappInitDataMaxAgeS = Number(
+  readEnv("MINIAPP_INITDATA_MAX_AGE_S") || "120",
+);
+const providerFailoverEnabled =
+  String(readEnv("PROVIDER_FAILOVER_ENABLED") || "true").toLowerCase() ===
+  "true";
+const providerFailoverThreshold = Number(
+  readEnv("PROVIDER_ERROR_THRESHOLD") || "3",
+);
+const providerFailoverWindowMs =
+  Number(readEnv("PROVIDER_ERROR_WINDOW_S") || "120") * 1000;
+const providerFailoverCooldownMs =
+  Number(readEnv("PROVIDER_COOLDOWN_S") || "300") * 1000;
+const callJobIntervalMs = Number(
+  readEnv("CALL_JOB_PROCESSOR_INTERVAL_MS") || "5000",
+);
+const callJobRetryBaseMs = Number(readEnv("CALL_JOB_RETRY_BASE_MS") || "5000");
+const callJobRetryMaxMs = Number(readEnv("CALL_JOB_RETRY_MAX_MS") || "60000");
+const callJobMaxAttempts = Number(readEnv("CALL_JOB_MAX_ATTEMPTS") || "3");
+const callSloFirstMediaMs = Number(
+  readEnv("CALL_SLO_FIRST_MEDIA_MS") || "4000",
+);
+const callSloAnswerDelayMs = Number(
+  readEnv("CALL_SLO_ANSWER_DELAY_MS") || "12000",
+);
+const callSloSttFailures = Number(readEnv("CALL_SLO_STT_FAILURES") || "3");
+const webhookRetryBaseMs = Number(readEnv("WEBHOOK_RETRY_BASE_MS") || "5000");
+const webhookRetryMaxMs = Number(readEnv("WEBHOOK_RETRY_MAX_MS") || "60000");
+const webhookRetryMaxAttempts = Number(
+  readEnv("WEBHOOK_RETRY_MAX_ATTEMPTS") || "5",
+);
 
 function loadPrivateKey(rawValue) {
   if (!rawValue) {
     return undefined;
   }
 
-  const normalized = rawValue.replace(/\\n/g, '\n');
-  if (normalized.includes('-----BEGIN')) {
+  const normalized = rawValue.replace(/\\n/g, "\n");
+  if (normalized.includes("-----BEGIN")) {
     return normalized;
   }
 
@@ -170,120 +238,163 @@ function loadPrivateKey(rawValue) {
     const filePath = path.isAbsolute(normalized)
       ? normalized
       : path.join(process.cwd(), normalized);
-    return fs.readFileSync(filePath, 'utf8');
+    return fs.readFileSync(filePath, "utf8");
   } catch (error) {
-    console.warn(`Unable to load Vonage private key from path "${normalized}": ${error.message}`);
+    console.warn(
+      `Unable to load Vonage private key from path "${normalized}": ${error.message}`,
+    );
     return undefined;
   }
 }
 
-const vonagePrivateKey = loadPrivateKey(readEnv('VONAGE_PRIVATE_KEY'));
-const serverHostname = normalizeHostname(ensure('SERVER', ''));
-const liveConsoleAudioTickMs = Number(readEnv('LIVE_CONSOLE_AUDIO_TICK_MS') || '160');
-const liveConsoleEditDebounceMs = Number(readEnv('LIVE_CONSOLE_EDIT_DEBOUNCE_MS') || '700');
-const liveConsoleUserLevelThreshold = Number(readEnv('LIVE_CONSOLE_USER_LEVEL_THRESHOLD') || '0.08');
-const liveConsoleUserHoldMs = Number(readEnv('LIVE_CONSOLE_USER_HOLD_MS') || '450');
-const liveConsoleCarrier = readEnv('LIVE_CONSOLE_CARRIER') || 'VOICEDNUT';
-const liveConsoleNetworkLabel = readEnv('LIVE_CONSOLE_NETWORK_LABEL') || 'LTE';
-const telegramAdminChatId = readEnv('TELEGRAM_ADMIN_CHAT_ID') || readEnv('ADMIN_TELEGRAM_ID');
-const telegramAdminChatIds = parseList(readEnv('TELEGRAM_ADMIN_CHAT_IDS'));
-const telegramOperatorChatIds = parseList(readEnv('TELEGRAM_OPERATOR_CHAT_IDS'));
-const telegramViewerChatIds = parseList(readEnv('TELEGRAM_VIEWER_CHAT_IDS'));
+const vonagePrivateKey = loadPrivateKey(readEnv("VONAGE_PRIVATE_KEY"));
+const serverHostname = normalizeHostname(ensure("SERVER", ""));
+const liveConsoleAudioTickMs = Number(
+  readEnv("LIVE_CONSOLE_AUDIO_TICK_MS") || "160",
+);
+const liveConsoleEditDebounceMs = Number(
+  readEnv("LIVE_CONSOLE_EDIT_DEBOUNCE_MS") || "700",
+);
+const liveConsoleUserLevelThreshold = Number(
+  readEnv("LIVE_CONSOLE_USER_LEVEL_THRESHOLD") || "0.08",
+);
+const liveConsoleUserHoldMs = Number(
+  readEnv("LIVE_CONSOLE_USER_HOLD_MS") || "450",
+);
+const liveConsoleCarrier = readEnv("LIVE_CONSOLE_CARRIER") || "VOICEDNUT";
+const liveConsoleNetworkLabel = readEnv("LIVE_CONSOLE_NETWORK_LABEL") || "LTE";
+const telegramAdminChatId =
+  readEnv("TELEGRAM_ADMIN_CHAT_ID") || readEnv("ADMIN_TELEGRAM_ID");
+const telegramAdminChatIds = parseList(readEnv("TELEGRAM_ADMIN_CHAT_IDS"));
+const telegramAdminUserIds = parseList(readEnv("TELEGRAM_ADMIN_USER_IDS"));
+const telegramOperatorChatIds = parseList(
+  readEnv("TELEGRAM_OPERATOR_CHAT_IDS"),
+);
+const telegramOperatorUserIds = parseList(
+  readEnv("TELEGRAM_OPERATOR_USER_IDS"),
+);
+const telegramViewerChatIds = parseList(readEnv("TELEGRAM_VIEWER_CHAT_IDS"));
+const telegramViewerUserIds = parseList(readEnv("TELEGRAM_VIEWER_USER_IDS"));
 if (!telegramAdminChatIds.length && telegramAdminChatId) {
   telegramAdminChatIds.push(telegramAdminChatId);
 }
-const emailProvider = (readEnv('EMAIL_PROVIDER') || 'sendgrid').toLowerCase();
-const emailDefaultFrom = readEnv('EMAIL_DEFAULT_FROM') || '';
-const emailVerifiedDomains = (readEnv('EMAIL_VERIFIED_DOMAINS') || '')
-  .split(',')
+const emailProvider = (readEnv("EMAIL_PROVIDER") || "sendgrid").toLowerCase();
+const emailDefaultFrom = readEnv("EMAIL_DEFAULT_FROM") || "";
+const emailVerifiedDomains = (readEnv("EMAIL_VERIFIED_DOMAINS") || "")
+  .split(",")
   .map((value) => value.trim().toLowerCase())
   .filter(Boolean);
-const emailRateLimitProvider = Number(readEnv('EMAIL_RATE_LIMIT_PROVIDER_PER_MIN') || '120');
-const emailRateLimitTenant = Number(readEnv('EMAIL_RATE_LIMIT_TENANT_PER_MIN') || '120');
-const emailRateLimitDomain = Number(readEnv('EMAIL_RATE_LIMIT_DOMAIN_PER_MIN') || '120');
-const emailQueueIntervalMs = Number(readEnv('EMAIL_QUEUE_INTERVAL_MS') || '5000');
-const emailMaxRetries = Number(readEnv('EMAIL_MAX_RETRIES') || '5');
-const emailUnsubscribeUrl = readEnv('EMAIL_UNSUBSCRIBE_URL') || (serverHostname ? `https://${serverHostname}/webhook/email-unsubscribe` : '');
-const emailWarmupMaxPerDay = Number(readEnv('EMAIL_WARMUP_MAX_PER_DAY') || '0');
-const emailDkimEnabled = String(readEnv('EMAIL_DKIM_ENABLED') || 'true').toLowerCase() === 'true';
-const emailSpfEnabled = String(readEnv('EMAIL_SPF_ENABLED') || 'true').toLowerCase() === 'true';
-const emailDmarcPolicy = readEnv('EMAIL_DMARC_POLICY') || 'none';
-const sendgridApiKey = readEnv('SENDGRID_API_KEY');
-const sendgridBaseUrl = readEnv('SENDGRID_BASE_URL');
-const mailgunApiKey = readEnv('MAILGUN_API_KEY');
-const mailgunDomain = readEnv('MAILGUN_DOMAIN');
-const mailgunBaseUrl = readEnv('MAILGUN_BASE_URL');
-const sesRegion = readEnv('SES_REGION') || awsRegion;
-const sesAccessKeyId = readEnv('SES_ACCESS_KEY_ID') || readEnv('AWS_ACCESS_KEY_ID');
-const sesSecretAccessKey = readEnv('SES_SECRET_ACCESS_KEY') || readEnv('AWS_SECRET_ACCESS_KEY');
-const sesSessionToken = readEnv('SES_SESSION_TOKEN') || readEnv('AWS_SESSION_TOKEN');
+const emailRateLimitProvider = Number(
+  readEnv("EMAIL_RATE_LIMIT_PROVIDER_PER_MIN") || "120",
+);
+const emailRateLimitTenant = Number(
+  readEnv("EMAIL_RATE_LIMIT_TENANT_PER_MIN") || "120",
+);
+const emailRateLimitDomain = Number(
+  readEnv("EMAIL_RATE_LIMIT_DOMAIN_PER_MIN") || "120",
+);
+const emailQueueIntervalMs = Number(
+  readEnv("EMAIL_QUEUE_INTERVAL_MS") || "5000",
+);
+const emailMaxRetries = Number(readEnv("EMAIL_MAX_RETRIES") || "5");
+const emailUnsubscribeUrl =
+  readEnv("EMAIL_UNSUBSCRIBE_URL") ||
+  (serverHostname ? `https://${serverHostname}/webhook/email-unsubscribe` : "");
+const emailWarmupMaxPerDay = Number(readEnv("EMAIL_WARMUP_MAX_PER_DAY") || "0");
+const emailDkimEnabled =
+  String(readEnv("EMAIL_DKIM_ENABLED") || "true").toLowerCase() === "true";
+const emailSpfEnabled =
+  String(readEnv("EMAIL_SPF_ENABLED") || "true").toLowerCase() === "true";
+const emailDmarcPolicy = readEnv("EMAIL_DMARC_POLICY") || "none";
+const sendgridApiKey = readEnv("SENDGRID_API_KEY");
+const sendgridBaseUrl = readEnv("SENDGRID_BASE_URL");
+const mailgunApiKey = readEnv("MAILGUN_API_KEY");
+const mailgunDomain = readEnv("MAILGUN_DOMAIN");
+const mailgunBaseUrl = readEnv("MAILGUN_BASE_URL");
+const sesRegion = readEnv("SES_REGION") || awsRegion;
+const sesAccessKeyId =
+  readEnv("SES_ACCESS_KEY_ID") || readEnv("AWS_ACCESS_KEY_ID");
+const sesSecretAccessKey =
+  readEnv("SES_SECRET_ACCESS_KEY") || readEnv("AWS_SECRET_ACCESS_KEY");
+const sesSessionToken =
+  readEnv("SES_SESSION_TOKEN") || readEnv("AWS_SESSION_TOKEN");
 
 module.exports = {
   platform: {
     provider: callProvider,
   },
   twilio: {
-    accountSid: ensure('TWILIO_ACCOUNT_SID'),
-    authToken: ensure('TWILIO_AUTH_TOKEN'),
-    fromNumber: ensure('FROM_NUMBER'),
+    accountSid: ensure("TWILIO_ACCOUNT_SID"),
+    authToken: ensure("TWILIO_AUTH_TOKEN"),
+    fromNumber: ensure("FROM_NUMBER"),
     transferNumber,
     gatherFallback: twilioGatherFallback,
     machineDetection: twilioMachineDetection,
     machineDetectionTimeout: twilioMachineDetectionTimeout,
-    ttsMaxWaitMs: Number.isFinite(twilioTtsMaxWaitMs) ? twilioTtsMaxWaitMs : 1200,
-    webhookValidation: twilioWebhookValidation
+    ttsMaxWaitMs: Number.isFinite(twilioTtsMaxWaitMs)
+      ? twilioTtsMaxWaitMs
+      : 1200,
+    webhookValidation: twilioWebhookValidation,
   },
   aws: {
     region: awsRegion,
     connect: {
-      instanceId: ensure('AWS_CONNECT_INSTANCE_ID', ''),
-      contactFlowId: ensure('AWS_CONNECT_CONTACT_FLOW_ID', ''),
-      queueId: readEnv('AWS_CONNECT_QUEUE_ID'),
-      sourcePhoneNumber: readEnv('AWS_CONNECT_SOURCE_PHONE_NUMBER'),
-      transcriptsQueueUrl: readEnv('AWS_TRANSCRIPTS_QUEUE_URL'),
-      eventBusName: readEnv('AWS_EVENT_BUS_NAME'),
+      instanceId: ensure("AWS_CONNECT_INSTANCE_ID", ""),
+      contactFlowId: ensure("AWS_CONNECT_CONTACT_FLOW_ID", ""),
+      queueId: readEnv("AWS_CONNECT_QUEUE_ID"),
+      sourcePhoneNumber: readEnv("AWS_CONNECT_SOURCE_PHONE_NUMBER"),
+      transcriptsQueueUrl: readEnv("AWS_TRANSCRIPTS_QUEUE_URL"),
+      eventBusName: readEnv("AWS_EVENT_BUS_NAME"),
     },
     polly: {
-      voiceId: ensure('AWS_POLLY_VOICE_ID', 'Joanna'),
-      outputBucket: readEnv('AWS_POLLY_OUTPUT_BUCKET'),
-      outputPrefix: readEnv('AWS_POLLY_OUTPUT_PREFIX') || 'tts/',
+      voiceId: ensure("AWS_POLLY_VOICE_ID", "Joanna"),
+      outputBucket: readEnv("AWS_POLLY_OUTPUT_BUCKET"),
+      outputPrefix: readEnv("AWS_POLLY_OUTPUT_PREFIX") || "tts/",
     },
     s3: {
-      mediaBucket: readEnv('AWS_MEDIA_BUCKET') || readEnv('AWS_POLLY_OUTPUT_BUCKET'),
+      mediaBucket:
+        readEnv("AWS_MEDIA_BUCKET") || readEnv("AWS_POLLY_OUTPUT_BUCKET"),
     },
     pinpoint: {
-      applicationId: readEnv('AWS_PINPOINT_APPLICATION_ID'),
-      originationNumber: readEnv('AWS_PINPOINT_ORIGINATION_NUMBER') || readEnv('AWS_CONNECT_SOURCE_PHONE_NUMBER'),
-      region: readEnv('AWS_PINPOINT_REGION') || awsRegion,
+      applicationId: readEnv("AWS_PINPOINT_APPLICATION_ID"),
+      originationNumber:
+        readEnv("AWS_PINPOINT_ORIGINATION_NUMBER") ||
+        readEnv("AWS_CONNECT_SOURCE_PHONE_NUMBER"),
+      region: readEnv("AWS_PINPOINT_REGION") || awsRegion,
     },
     transcribe: {
-      languageCode: ensure('AWS_TRANSCRIBE_LANGUAGE_CODE', 'en-US'),
-      vocabularyFilterName: readEnv('AWS_TRANSCRIBE_VOCABULARY_FILTER_NAME'),
+      languageCode: ensure("AWS_TRANSCRIBE_LANGUAGE_CODE", "en-US"),
+      vocabularyFilterName: readEnv("AWS_TRANSCRIBE_VOCABULARY_FILTER_NAME"),
     },
   },
   vonage: {
-    apiKey: readEnv('VONAGE_API_KEY'),
-    apiSecret: readEnv('VONAGE_API_SECRET'),
-    applicationId: readEnv('VONAGE_APPLICATION_ID'),
+    apiKey: readEnv("VONAGE_API_KEY"),
+    apiSecret: readEnv("VONAGE_API_SECRET"),
+    applicationId: readEnv("VONAGE_APPLICATION_ID"),
     privateKey: vonagePrivateKey,
     voice: {
-      fromNumber: readEnv('VONAGE_VOICE_FROM_NUMBER'),
-      answerUrl: readEnv('VONAGE_ANSWER_URL'),
-      eventUrl: readEnv('VONAGE_EVENT_URL'),
+      fromNumber: readEnv("VONAGE_VOICE_FROM_NUMBER"),
+      answerUrl: readEnv("VONAGE_ANSWER_URL"),
+      eventUrl: readEnv("VONAGE_EVENT_URL"),
     },
     sms: {
-      fromNumber: readEnv('VONAGE_SMS_FROM_NUMBER'),
+      fromNumber: readEnv("VONAGE_SMS_FROM_NUMBER"),
     },
   },
   telegram: {
-    botToken: ensure('TELEGRAM_BOT_TOKEN', process.env.BOT_TOKEN),
+    botToken: ensure("TELEGRAM_BOT_TOKEN", process.env.BOT_TOKEN),
     adminChatId: telegramAdminChatId,
     adminChatIds: telegramAdminChatIds,
+    adminUserIds: telegramAdminUserIds,
     operatorChatIds: telegramOperatorChatIds,
-    viewerChatIds: telegramViewerChatIds
+    operatorUserIds: telegramOperatorUserIds,
+    viewerChatIds: telegramViewerChatIds,
+    viewerUserIds: telegramViewerUserIds,
   },
   miniapp: {
-    allowedOrigins: miniappAllowedOrigins.length ? miniappAllowedOrigins : corsOrigins,
+    allowedOrigins: miniappAllowedOrigins.length
+      ? miniappAllowedOrigins
+      : corsOrigins,
     sessionTtlMs: miniappSessionTtlMs,
     refreshTtlMs: miniappRefreshTtlMs,
     jwtSecret: miniappJwtSecret,
@@ -296,28 +407,28 @@ module.exports = {
     brandName: miniappBrandName,
     theme: miniappTheme,
     publicUrl: miniappPublicUrl,
-    botUsername: miniappBotUsername
+    botUsername: miniappBotUsername,
   },
   openRouter: {
-    apiKey: ensure('OPENROUTER_API_KEY'),
-    model: ensure('OPENROUTER_MODEL', 'meta-llama/llama-3.1-8b-instruct:free'),
-    backupModel: readEnv('OPENROUTER_BACKUP_MODEL'),
-    siteUrl: ensure('YOUR_SITE_URL', 'http://localhost:3000'),
-    siteName: ensure('YOUR_SITE_NAME', 'Voice Call Bot'),
-    maxTokens: Number(ensure('OPENROUTER_MAX_TOKENS', '160'))
+    apiKey: ensure("OPENROUTER_API_KEY"),
+    model: ensure("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free"),
+    backupModel: readEnv("OPENROUTER_BACKUP_MODEL"),
+    siteUrl: ensure("YOUR_SITE_URL", "http://localhost:3000"),
+    siteName: ensure("YOUR_SITE_NAME", "Voice Call Bot"),
+    maxTokens: Number(ensure("OPENROUTER_MAX_TOKENS", "160")),
   },
   deepgram: {
-    apiKey: ensure('DEEPGRAM_API_KEY'),
-    voiceModel: ensure('VOICE_MODEL', 'aura-asteria-en'),
+    apiKey: ensure("DEEPGRAM_API_KEY"),
+    voiceModel: ensure("VOICE_MODEL", "aura-asteria-en"),
     model: deepgramModel,
   },
   server: {
-    port: Number(ensure('PORT', '3000')),
+    port: Number(ensure("PORT", "3000")),
     hostname: serverHostname,
     corsOrigins,
     rateLimit: {
-      windowMs: Number(ensure('RATE_LIMIT_WINDOW_MS', '60000')),
-      max: Number(ensure('RATE_LIMIT_MAX', '300')),
+      windowMs: Number(ensure("RATE_LIMIT_WINDOW_MS", "60000")),
+      max: Number(ensure("RATE_LIMIT_MAX", "300")),
     },
   },
   admin: {
@@ -326,55 +437,71 @@ module.exports = {
   compliance: {
     mode: complianceMode,
     encryptionKey: dtmfEncryptionKey,
-    isSafe: complianceMode !== 'dev_insecure',
+    isSafe: complianceMode !== "dev_insecure",
   },
   recording: {
     enabled: recordingEnabled,
   },
   liveConsole: {
-    audioTickMs: Number.isFinite(liveConsoleAudioTickMs) ? liveConsoleAudioTickMs : 160,
-    editDebounceMs: Number.isFinite(liveConsoleEditDebounceMs) ? liveConsoleEditDebounceMs : 700,
-    userLevelThreshold: Number.isFinite(liveConsoleUserLevelThreshold) ? liveConsoleUserLevelThreshold : 0.08,
-    userHoldMs: Number.isFinite(liveConsoleUserHoldMs) ? liveConsoleUserHoldMs : 450,
+    audioTickMs: Number.isFinite(liveConsoleAudioTickMs)
+      ? liveConsoleAudioTickMs
+      : 160,
+    editDebounceMs: Number.isFinite(liveConsoleEditDebounceMs)
+      ? liveConsoleEditDebounceMs
+      : 700,
+    userLevelThreshold: Number.isFinite(liveConsoleUserLevelThreshold)
+      ? liveConsoleUserLevelThreshold
+      : 0.08,
+    userHoldMs: Number.isFinite(liveConsoleUserHoldMs)
+      ? liveConsoleUserHoldMs
+      : 450,
     carrier: liveConsoleCarrier,
-    networkLabel: liveConsoleNetworkLabel
+    networkLabel: liveConsoleNetworkLabel,
   },
   email: {
     provider: emailProvider,
     defaultFrom: emailDefaultFrom,
     verifiedDomains: emailVerifiedDomains,
-    queueIntervalMs: Number.isFinite(emailQueueIntervalMs) ? emailQueueIntervalMs : 5000,
+    queueIntervalMs: Number.isFinite(emailQueueIntervalMs)
+      ? emailQueueIntervalMs
+      : 5000,
     maxRetries: Number.isFinite(emailMaxRetries) ? emailMaxRetries : 5,
     unsubscribeUrl: emailUnsubscribeUrl,
     rateLimits: {
-      perProviderPerMinute: Number.isFinite(emailRateLimitProvider) ? emailRateLimitProvider : 120,
-      perTenantPerMinute: Number.isFinite(emailRateLimitTenant) ? emailRateLimitTenant : 120,
-      perDomainPerMinute: Number.isFinite(emailRateLimitDomain) ? emailRateLimitDomain : 120,
+      perProviderPerMinute: Number.isFinite(emailRateLimitProvider)
+        ? emailRateLimitProvider
+        : 120,
+      perTenantPerMinute: Number.isFinite(emailRateLimitTenant)
+        ? emailRateLimitTenant
+        : 120,
+      perDomainPerMinute: Number.isFinite(emailRateLimitDomain)
+        ? emailRateLimitDomain
+        : 120,
     },
     warmup: {
       enabled: emailWarmupMaxPerDay > 0,
-      maxPerDay: emailWarmupMaxPerDay
+      maxPerDay: emailWarmupMaxPerDay,
     },
     deliverability: {
       dkimEnabled: emailDkimEnabled,
       spfEnabled: emailSpfEnabled,
-      dmarcPolicy: emailDmarcPolicy
+      dmarcPolicy: emailDmarcPolicy,
     },
     sendgrid: {
       apiKey: sendgridApiKey,
-      baseUrl: sendgridBaseUrl
+      baseUrl: sendgridBaseUrl,
     },
     mailgun: {
       apiKey: mailgunApiKey,
       domain: mailgunDomain,
-      baseUrl: mailgunBaseUrl
+      baseUrl: mailgunBaseUrl,
     },
     ses: {
       region: sesRegion,
       accessKeyId: sesAccessKeyId,
       secretAccessKey: sesSecretAccessKey,
-      sessionToken: sesSessionToken
-    }
+      sessionToken: sesSessionToken,
+    },
   },
   smsDefaults: {
     businessId: defaultSmsBusinessId,
@@ -398,28 +525,28 @@ module.exports = {
     rateLimitMax: inboundRateLimitMax,
     rateLimitSmsEnabled: inboundRateLimitSmsEnabled,
     rateLimitCallbackEnabled: inboundRateLimitCallbackEnabled,
-    callbackDelayMinutes: inboundCallbackDelayMinutes
+    callbackDelayMinutes: inboundCallbackDelayMinutes,
   },
   providerFailover: {
     enabled: providerFailoverEnabled,
     errorThreshold: providerFailoverThreshold,
     errorWindowMs: providerFailoverWindowMs,
-    cooldownMs: providerFailoverCooldownMs
+    cooldownMs: providerFailoverCooldownMs,
   },
   callJobs: {
     intervalMs: callJobIntervalMs,
     retryBaseMs: callJobRetryBaseMs,
     retryMaxMs: callJobRetryMaxMs,
-    maxAttempts: callJobMaxAttempts
+    maxAttempts: callJobMaxAttempts,
   },
   callSlo: {
     firstMediaMs: callSloFirstMediaMs,
     answerDelayMs: callSloAnswerDelayMs,
-    sttFailureThreshold: callSloSttFailures
+    sttFailureThreshold: callSloSttFailures,
   },
   webhook: {
     retryBaseMs: webhookRetryBaseMs,
     retryMaxMs: webhookRetryMaxMs,
-    retryMaxAttempts: webhookRetryMaxAttempts
-  }
+    retryMaxAttempts: webhookRetryMaxAttempts,
+  },
 };

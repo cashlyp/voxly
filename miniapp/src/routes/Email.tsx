@@ -1,4 +1,3 @@
-import { useCallback, useEffect, useState } from 'react';
 import {
   Banner,
   Button,
@@ -7,16 +6,17 @@ import {
   Section,
   Select,
   Textarea,
-} from '@telegram-apps/telegram-ui';
-import { apiFetch, createIdempotencyKey } from '../lib/api';
-import { hapticSuccess, hapticError } from '../lib/ux';
-import { trackEvent } from '../lib/telemetry';
+} from "@telegram-apps/telegram-ui";
+import { useCallback, useEffect, useState } from "react";
+import { apiFetch, createIdempotencyKey } from "../lib/api";
+import { trackEvent } from "../lib/telemetry";
+import { hapticError, hapticSuccess } from "../lib/ux";
 
 type EmailMessage = {
   id: number;
   to: string;
   subject: string;
-  status: 'pending' | 'sent' | 'failed' | 'bounced';
+  status: "pending" | "sent" | "failed" | "bounced";
   created_at: string;
   sent_at?: string | null;
   error_message?: string | null;
@@ -43,29 +43,30 @@ export function Email() {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<'compose' | 'history'>('compose');
+  const [activeTab, setActiveTab] = useState<"compose" | "history">("compose");
 
   // Form state
-  const [toEmail, setToEmail] = useState('');
-  const [subject, setSubject] = useState('');
-  const [body, setBody] = useState('');
-  const [selectedTemplate, setSelectedTemplate] = useState('');
-  const [statusFilter, setStatusFilter] = useState('');
+  const [toEmail, setToEmail] = useState("");
+  const [subject, setSubject] = useState("");
+  const [body, setBody] = useState("");
+  const [selectedTemplate, setSelectedTemplate] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
 
   const loadMessages = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       const params = new URLSearchParams();
-      if (statusFilter) params.set('status', statusFilter);
-      params.set('limit', '20');
-      const response = await apiFetch<{ ok: boolean; messages: EmailMessage[] }>(
-        `/webapp/emails?${params.toString()}`
-      );
+      if (statusFilter !== "") params.set("status", statusFilter);
+      params.set("limit", "20");
+      const response = await apiFetch<{
+        ok: boolean;
+        messages: EmailMessage[];
+      }>(`/webapp/emails?${params.toString()}`);
       setMessages(response.messages || []);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load emails');
-      trackEvent('email_load_failed');
+      setError(err instanceof Error ? err.message : "Failed to load emails");
+      trackEvent("email_load_failed");
     } finally {
       setLoading(false);
     }
@@ -73,9 +74,10 @@ export function Email() {
 
   const loadTemplates = useCallback(async () => {
     try {
-      const response = await apiFetch<{ ok: boolean; templates: EmailTemplate[] }>(
-        '/webapp/emails/templates'
-      );
+      const response = await apiFetch<{
+        ok: boolean;
+        templates: EmailTemplate[];
+      }>("/webapp/emails/templates");
       setTemplates(response.templates || []);
     } catch {
       // Templates are optional
@@ -89,17 +91,17 @@ export function Email() {
 
   const handleSendEmail = async () => {
     if (!toEmail.trim()) {
-      setError('Email address is required');
+      setError("Email address is required");
       return;
     }
 
     if (!subject.trim()) {
-      setError('Subject is required');
+      setError("Subject is required");
       return;
     }
 
     if (!body.trim()) {
-      setError('Message body is required');
+      setError("Message body is required");
       return;
     }
 
@@ -108,32 +110,35 @@ export function Email() {
     setSuccess(null);
 
     try {
-      const response = await apiFetch<SendEmailResponse>('/webapp/emails/send', {
-        method: 'POST',
-        body: {
-          to: toEmail.trim(),
-          subject: subject.trim(),
-          body: body.trim(),
+      const response = await apiFetch<SendEmailResponse>(
+        "/webapp/emails/send",
+        {
+          method: "POST",
+          body: {
+            to: toEmail.trim(),
+            subject: subject.trim(),
+            body: body.trim(),
+          },
+          idempotencyKey: createIdempotencyKey(),
         },
-        idempotencyKey: createIdempotencyKey(),
-      });
+      );
 
       if (response.ok) {
         hapticSuccess();
-        setSuccess('Email sent successfully!');
-        setToEmail('');
-        setSubject('');
-        setBody('');
-        setSelectedTemplate('');
-        trackEvent('email_sent');
-        await loadMessages();
+        setSuccess("Email sent successfully!");
+        setToEmail("");
+        setSubject("");
+        setBody("");
+        setSelectedTemplate("");
+        trackEvent("email_sent");
+        void loadMessages();
       } else {
-        throw new Error(response.error || 'Failed to send email');
+        throw new Error(response.error || "Failed to send email");
       }
     } catch (err) {
       hapticError();
-      setError(err instanceof Error ? err.message : 'Failed to send email');
-      trackEvent('email_send_failed');
+      setError(err instanceof Error ? err.message : "Failed to send email");
+      trackEvent("email_send_failed");
     } finally {
       setSending(false);
     }
@@ -141,7 +146,7 @@ export function Email() {
 
   const handleApplyTemplate = (templateId: string) => {
     const template = templates.find((t) => String(t.id) === templateId);
-    if (template) {
+    if (template !== undefined) {
       setSubject(template.subject);
       setBody(template.body);
       setSelectedTemplate(templateId);
@@ -152,25 +157,27 @@ export function Email() {
     <div className="wallet-page">
       <List className="wallet-list">
         {error && <Banner type="inline" header="Error" description={error} />}
-        {success && <Banner type="inline" header="Success" description={success} />}
+        {success && (
+          <Banner type="inline" header="Success" description={success} />
+        )}
 
         <Section header="Email Center" className="wallet-section">
           <div className="tabs-container">
             <button
-              className={`tab-button ${activeTab === 'compose' ? 'active' : ''}`}
-              onClick={() => setActiveTab('compose')}
+              className={`tab-button ${activeTab === "compose" ? "active" : ""}`}
+              onClick={() => void setActiveTab("compose")}
             >
               Compose
             </button>
             <button
-              className={`tab-button ${activeTab === 'history' ? 'active' : ''}`}
-              onClick={() => setActiveTab('history')}
+              className={`tab-button ${activeTab === "history" ? "active" : ""}`}
+              onClick={() => void setActiveTab("history")}
             >
               History
             </button>
           </div>
 
-          {activeTab === 'compose' && (
+          {activeTab === "compose" && (
             <>
               <Input
                 header="Recipient Email"
@@ -216,23 +223,26 @@ export function Email() {
                 <Button
                   size="m"
                   mode="filled"
-                  onClick={handleSendEmail}
+                  onClick={() => void handleSendEmail()}
                   disabled={
-                    sending || !toEmail.trim() || !subject.trim() || !body.trim()
+                    sending ||
+                    !toEmail.trim() ||
+                    !subject.trim() ||
+                    !body.trim()
                   }
                 >
-                  {sending ? 'Sending...' : 'Send Email'}
+                  {sending ? "Sending..." : "Send Email"}
                 </Button>
               </div>
             </>
           )}
 
-          {activeTab === 'history' && (
+          {activeTab === "history" && (
             <>
               <Select
                 header="Filter by Status"
                 value={statusFilter}
-                onChange={(e) => setStatusFilter(e.target.value)}
+                onChange={(e) => void setStatusFilter(e.target.value)}
               >
                 <option value="">All emails</option>
                 <option value="sent">Sent</option>
@@ -245,7 +255,7 @@ export function Email() {
                 <div className="card-header">
                   <span>Email History</span>
                   <span className="card-header-muted">
-                    {loading ? 'Loading...' : `${messages.length} emails`}
+                    {loading ? "Loading..." : `${messages.length} emails`}
                   </span>
                 </div>
 
@@ -253,9 +263,9 @@ export function Email() {
                   <div className="empty-card">
                     <div className="empty-title">No emails</div>
                     <div className="empty-subtitle">
-                      {statusFilter
-                        ? 'No emails match the selected filter.'
-                        : 'Your email history will appear here.'}
+                      {statusFilter !== ""
+                        ? "No emails match the selected filter."
+                        : "Your email history will appear here."}
                     </div>
                   </div>
                 ) : (
@@ -264,20 +274,23 @@ export function Email() {
                       <div key={msg.id} className="card-item">
                         <div className="card-item-main">
                           <div className="card-item-title">{msg.to}</div>
-                          <div className="card-item-subtitle">{msg.subject}</div>
+                          <div className="card-item-subtitle">
+                            {msg.subject}
+                          </div>
                           <div className="card-item-meta">
                             {msg.created_at}
                             {msg.sent_at && ` • Sent: ${msg.sent_at}`}
-                            {msg.error_message && ` • Error: ${msg.error_message}`}
+                            {msg.error_message &&
+                              ` • Error: ${msg.error_message}`}
                           </div>
                         </div>
                         <span
                           className={`tag ${
-                            msg.status === 'sent'
-                              ? 'success'
-                              : msg.status === 'failed'
-                                ? 'error'
-                                : ''
+                            msg.status === "sent"
+                              ? "success"
+                              : msg.status === "failed"
+                                ? "error"
+                                : ""
                           }`}
                         >
                           {msg.status}

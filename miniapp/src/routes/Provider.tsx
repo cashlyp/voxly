@@ -1,16 +1,16 @@
-import { useCallback, useEffect, useState } from 'react';
 import {
   Banner,
   Button,
   Cell,
   List,
-  Section,
   Placeholder,
-} from '@telegram-apps/telegram-ui';
-import { apiFetch, createIdempotencyKey } from '../lib/api';
-import { confirmAction, hapticSuccess, hapticError } from '../lib/ux';
-import { trackEvent } from '../lib/telemetry';
-import { useUser } from '../state/user';
+  Section,
+} from "@telegram-apps/telegram-ui";
+import { useCallback, useEffect, useState } from "react";
+import { apiFetch, createIdempotencyKey } from "../lib/api";
+import { trackEvent } from "../lib/telemetry";
+import { confirmAction, hapticError, hapticSuccess } from "../lib/ux";
+import { useUser } from "../state/user";
 
 type ProviderStatus = {
   ok: boolean;
@@ -29,28 +29,31 @@ type SwitchResponse = {
   message?: string;
 };
 
-const PROVIDER_INFO: Record<string, { name: string; emoji: string; description: string }> = {
+const PROVIDER_INFO: Record<
+  string,
+  { name: string; emoji: string; description: string }
+> = {
   twilio: {
-    name: 'Twilio',
-    emoji: '☁️',
-    description: 'PSTN calls via Twilio phone numbers',
+    name: "Twilio",
+    emoji: "☁️",
+    description: "PSTN calls via Twilio phone numbers",
   },
   aws: {
-    name: 'AWS Connect',
-    emoji: '🏗️',
-    description: 'Voice service via Amazon Connect',
+    name: "AWS Connect",
+    emoji: "🏗️",
+    description: "Voice service via Amazon Connect",
   },
   vonage: {
-    name: 'Vonage',
-    emoji: '📡',
-    description: 'Communications platform as a service',
+    name: "Vonage",
+    emoji: "📡",
+    description: "Communications platform as a service",
   },
 };
 
 export function Provider() {
   const { roles } = useUser();
-  const isAdmin = roles.includes('admin');
-  
+  const isAdmin = roles.includes("admin");
+
   const [status, setStatus] = useState<ProviderStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [switching, setSwitching] = useState(false);
@@ -61,10 +64,12 @@ export function Provider() {
     setLoading(true);
     setError(null);
     try {
-      const response = await apiFetch<ProviderStatus>('/admin/provider');
+      const response = await apiFetch<ProviderStatus>("/admin/provider");
       setStatus(response);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load provider status');
+      setError(
+        err instanceof Error ? err.message : "Failed to load provider status",
+      );
     } finally {
       setLoading(false);
     }
@@ -82,7 +87,7 @@ export function Provider() {
     const confirmed = await confirmAction({
       title: `Switch to ${providerInfo.name}?`,
       message: `Calls will be routed through ${providerInfo.description}.`,
-      confirmText: 'Switch',
+      confirmText: "Switch",
       destructive: false,
     });
     if (!confirmed) return;
@@ -91,19 +96,21 @@ export function Provider() {
     setError(null);
     setSuccess(null);
     try {
-      await apiFetch<SwitchResponse>('/admin/provider', {
-        method: 'POST',
+      await apiFetch<SwitchResponse>("/admin/provider", {
+        method: "POST",
         body: { provider },
         idempotencyKey: createIdempotencyKey(),
       });
       hapticSuccess();
       setSuccess(`Switched to ${providerInfo.name}`);
-      trackEvent('provider_switched', { provider });
+      trackEvent("provider_switched", { provider });
       await loadStatus();
     } catch (err) {
       hapticError();
-      setError(err instanceof Error ? err.message : 'Failed to switch provider');
-      trackEvent('provider_switch_failed', { provider });
+      setError(
+        err instanceof Error ? err.message : "Failed to switch provider",
+      );
+      trackEvent("provider_switch_failed", { provider });
     } finally {
       setSwitching(false);
     }
@@ -112,7 +119,11 @@ export function Provider() {
   if (!isAdmin) {
     return (
       <div className="wallet-page">
-        <Banner type="inline" header="Access denied" description="Only administrators can change providers." />
+        <Banner
+          type="inline"
+          header="Access denied"
+          description="Only administrators can change providers."
+        />
       </div>
     );
   }
@@ -128,18 +139,22 @@ export function Provider() {
   if (!status) {
     return (
       <div className="wallet-page">
-        <Banner type="inline" header="Error" description="Could not load provider status" />
+        <Banner
+          type="inline"
+          header="Error"
+          description="Could not load provider status"
+        />
       </div>
     );
   }
 
   const isReady = (provider: string) => {
     switch (provider) {
-      case 'twilio':
+      case "twilio":
         return status.twilio_ready;
-      case 'aws':
+      case "aws":
         return status.aws_ready;
-      case 'vonage':
+      case "vonage":
         return status.vonage_ready;
       default:
         return false;
@@ -148,33 +163,25 @@ export function Provider() {
 
   return (
     <div className="wallet-page">
-      {error && (
-        <Banner 
-          type="inline" 
-          header="Error" 
-          description={error}
-        />
-      )}
+      {error && <Banner type="inline" header="Error" description={error} />}
       {success && (
-        <Banner 
-          type="inline" 
-          header="Success" 
-          description={success}
-        />
+        <Banner type="inline" header="Success" description={success} />
       )}
 
       <List className="wallet-list">
         <Section header="Current provider" className="wallet-section">
           <div className="provider-hero">
             <div className="provider-status-badge active">
-              {PROVIDER_INFO[status.provider]?.emoji || '🌐'}
+              {PROVIDER_INFO[status.provider]?.emoji || "🌐"}
             </div>
             <div className="provider-info">
               <div className="provider-name">
-                {PROVIDER_INFO[status.provider]?.name || status.provider.toUpperCase()}
+                {PROVIDER_INFO[status.provider]?.name ||
+                  status.provider.toUpperCase()}
               </div>
               <div className="provider-description">
-                {PROVIDER_INFO[status.provider]?.description || 'Current voice provider'}
+                {PROVIDER_INFO[status.provider]?.description ||
+                  "Current voice provider"}
               </div>
             </div>
           </div>
@@ -182,29 +189,43 @@ export function Provider() {
 
         <Section header="Available providers" className="wallet-section">
           {status.supported_providers.map((provider) => {
-            const info = PROVIDER_INFO[provider] || { name: provider, emoji: '🌐', description: '' };
+            const info = PROVIDER_INFO[provider] || {
+              name: provider,
+              emoji: "🌐",
+              description: "",
+            };
             const ready = isReady(provider);
             const current = status.provider === provider;
 
             return (
               <Cell
                 key={provider}
-                subtitle={current ? '✅ Active' : ready ? '🟢 Ready' : '🔴 Not configured'}
+                subtitle={
+                  current
+                    ? "✅ Active"
+                    : ready
+                      ? "🟢 Ready"
+                      : "🔴 Not configured"
+                }
                 after={
                   !current && (
                     <Button
                       size="s"
-                      mode={ready ? 'filled' : 'outline'}
+                      mode={ready ? "filled" : "outline"}
                       disabled={switching || !ready}
-                      title={!ready ? 'Provider not fully configured' : undefined}
-                      onClick={() => handleSwitch(provider)}
+                      title={
+                        !ready ? "Provider not fully configured" : undefined
+                      }
+                      onClick={() => void handleSwitch(provider)}
                     >
-                      {ready ? 'Switch' : 'Configure'}
+                      {ready ? "Switch" : "Configure"}
                     </Button>
                   )
                 }
               >
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <div
+                  style={{ display: "flex", alignItems: "center", gap: "8px" }}
+                >
                   <span>{info.emoji}</span>
                   <div>
                     <div>{info.name}</div>
@@ -216,30 +237,42 @@ export function Provider() {
         </Section>
 
         <Section header="Readiness" className="wallet-section">
-          <Cell subtitle={status.twilio_ready ? '✅ Configured' : '⚠️ Missing credentials'}>
+          <Cell
+            subtitle={
+              status.twilio_ready ? "✅ Configured" : "⚠️ Missing credentials"
+            }
+          >
             Twilio
           </Cell>
-          <Cell subtitle={status.aws_ready ? '✅ Configured' : '⚠️ Missing credentials'}>
+          <Cell
+            subtitle={
+              status.aws_ready ? "✅ Configured" : "⚠️ Missing credentials"
+            }
+          >
             AWS Connect
           </Cell>
-          <Cell subtitle={status.vonage_ready ? '✅ Configured' : '⚠️ Missing credentials'}>
+          <Cell
+            subtitle={
+              status.vonage_ready ? "✅ Configured" : "⚠️ Missing credentials"
+            }
+          >
             Vonage
           </Cell>
         </Section>
 
         <Section header="Stored default" className="wallet-section">
-          <Cell subtitle={status.stored_provider || 'Not set'}>
+          <Cell subtitle={status.stored_provider || "Not set"}>
             Fallback provider
           </Cell>
         </Section>
 
         <Section header="Actions" className="wallet-section">
           <div className="section-actions">
-            <Button 
+            <Button
               size="s"
               mode="bezeled"
               disabled={loading || switching}
-              onClick={loadStatus}
+              onClick={() => void loadStatus()}
             >
               🔄 Refresh status
             </Button>

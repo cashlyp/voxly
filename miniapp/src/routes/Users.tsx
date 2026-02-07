@@ -1,4 +1,3 @@
-import { useCallback, useEffect, useState } from 'react';
 import {
   Banner,
   Button,
@@ -8,11 +7,12 @@ import {
   List,
   Section,
   Select,
-} from '@telegram-apps/telegram-ui';
-import { apiFetch, createIdempotencyKey } from '../lib/api';
-import { confirmAction, hapticSuccess, hapticError } from '../lib/ux';
-import { trackEvent } from '../lib/telemetry';
-import { useUser } from '../state/user';
+} from "@telegram-apps/telegram-ui";
+import { useCallback, useEffect, useState } from "react";
+import { apiFetch, createIdempotencyKey } from "../lib/api";
+import { trackEvent } from "../lib/telemetry";
+import { confirmAction, hapticError, hapticSuccess } from "../lib/ux";
+import { useUser } from "../state/user";
 
 type UsersResponse = {
   ok: boolean;
@@ -22,29 +22,29 @@ type UsersResponse = {
 
 export function Users() {
   const { roles } = useUser();
-  const isAdmin = roles.includes('admin');
-  
+  const isAdmin = roles.includes("admin");
+
   const [admins, setAdmins] = useState<string[]>([]);
   const [viewers, setViewers] = useState<string[]>([]);
-  const [newUserId, setNewUserId] = useState('');
-  const [role, setRole] = useState<'viewer' | 'admin'>('viewer');
+  const [newUserId, setNewUserId] = useState("");
+  const [role, setRole] = useState<"viewer" | "admin">("viewer");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
   const loadUsers = useCallback(async () => {
     try {
-      const response = await apiFetch<UsersResponse>('/webapp/users');
+      const response = await apiFetch<UsersResponse>("/webapp/users");
       setAdmins(response.admins || []);
       setViewers(response.viewers || []);
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load users');
+      setError(err instanceof Error ? err.message : "Failed to load users");
     }
   }, []);
 
   useEffect(() => {
-    loadUsers();
+    void loadUsers();
   }, [loadUsers]);
 
   const clearMessages = useCallback(() => {
@@ -54,26 +54,26 @@ export function Users() {
 
   const handleAdd = async () => {
     if (!newUserId.trim()) {
-      setError('Please enter a user ID');
+      setError("Please enter a user ID");
       return;
     }
     setLoading(true);
     clearMessages();
     try {
-      await apiFetch('/webapp/users', {
-        method: 'POST',
+      await apiFetch("/webapp/users", {
+        method: "POST",
         body: { user_id: newUserId.trim(), role },
         idempotencyKey: createIdempotencyKey(),
       });
       hapticSuccess();
       setSuccess(`User ${newUserId} added as ${role}`);
-      setNewUserId('');
-      trackEvent('user_added', { role });
+      setNewUserId("");
+      trackEvent("user_added", { role });
       await loadUsers();
     } catch (err) {
       hapticError();
-      setError(err instanceof Error ? err.message : 'Failed to add user');
-      trackEvent('user_add_failed', { role });
+      setError(err instanceof Error ? err.message : "Failed to add user");
+      trackEvent("user_add_failed", { role });
     } finally {
       setLoading(false);
     }
@@ -81,28 +81,28 @@ export function Users() {
 
   const handlePromote = async (userId: string) => {
     const confirmed = await confirmAction({
-      title: 'Promote to Admin?',
+      title: "Promote to Admin?",
       message: `${userId} will gain full administrative access.`,
-      confirmText: 'Promote',
+      confirmText: "Promote",
       destructive: false,
     });
     if (!confirmed) return;
-    
+
     setLoading(true);
     clearMessages();
     try {
       await apiFetch(`/webapp/users/${userId}/promote`, {
-        method: 'POST',
+        method: "POST",
         idempotencyKey: createIdempotencyKey(),
       });
       hapticSuccess();
       setSuccess(`${userId} promoted to admin`);
-      trackEvent('user_promoted', { user_id: userId });
+      trackEvent("user_promoted", { user_id: userId });
       await loadUsers();
     } catch (err) {
       hapticError();
-      setError(err instanceof Error ? err.message : 'Failed to promote user');
-      trackEvent('user_promote_failed', { user_id: userId });
+      setError(err instanceof Error ? err.message : "Failed to promote user");
+      trackEvent("user_promote_failed", { user_id: userId });
     } finally {
       setLoading(false);
     }
@@ -110,28 +110,28 @@ export function Users() {
 
   const handleRemove = async (userId: string) => {
     const confirmed = await confirmAction({
-      title: 'Remove user?',
+      title: "Remove user?",
       message: `${userId} will lose all access immediately.`,
-      confirmText: 'Remove',
+      confirmText: "Remove",
       destructive: true,
     });
     if (!confirmed) return;
-    
+
     setLoading(true);
     clearMessages();
     try {
       await apiFetch(`/webapp/users/${userId}`, {
-        method: 'DELETE',
+        method: "DELETE",
         idempotencyKey: createIdempotencyKey(),
       });
       hapticSuccess();
       setSuccess(`${userId} removed`);
-      trackEvent('user_removed', { user_id: userId });
+      trackEvent("user_removed", { user_id: userId });
       await loadUsers();
     } catch (err) {
       hapticError();
-      setError(err instanceof Error ? err.message : 'Failed to remove user');
-      trackEvent('user_remove_failed', { user_id: userId });
+      setError(err instanceof Error ? err.message : "Failed to remove user");
+      trackEvent("user_remove_failed", { user_id: userId });
     } finally {
       setLoading(false);
     }
@@ -140,52 +140,48 @@ export function Users() {
   if (!isAdmin) {
     return (
       <div className="wallet-page">
-        <Banner type="inline" header="Access denied" description="Only administrators can manage users." />
+        <Banner
+          type="inline"
+          header="Access denied"
+          description="Only administrators can manage users."
+        />
       </div>
     );
   }
 
   return (
     <div className="wallet-page">
-      {error && (
-        <Banner 
-          type="inline" 
-          header="Error" 
-          description={error}
-        />
-      )}
+      {error && <Banner type="inline" header="Error" description={error} />}
       {success && (
-        <Banner 
-          type="inline" 
-          header="Success" 
-          description={success}
-        />
+        <Banner type="inline" header="Success" description={success} />
       )}
-      
+
       <List className="wallet-list">
         <Section header="Add new user" className="wallet-section">
           <Input
             header="Telegram user ID"
             placeholder="123456789"
             value={newUserId}
-            onChange={(event) => setNewUserId(event.target.value)}
+            onChange={(event) => void setNewUserId(event.target.value)}
             disabled={loading}
           />
           <Select
             header="Role"
             value={role}
-            onChange={(event) => setRole(event.target.value as 'viewer' | 'admin')}
+            onChange={(event) =>
+              void setRole(event.target.value as "viewer" | "admin")
+            }
             disabled={loading}
           >
             <option value="viewer">👁️ Viewer (read-only)</option>
             <option value="admin">🔧 Admin (full access)</option>
           </Select>
           <div className="section-actions">
-            <Button 
-              size="s" 
-              mode="filled" 
+            <Button
+              size="s"
+              mode="filled"
               disabled={loading || !newUserId.trim()}
-              onClick={handleAdd}
+              onClick={() => void handleAdd()}
             >
               Add user
             </Button>
@@ -193,21 +189,24 @@ export function Users() {
         </Section>
 
         {admins.length > 0 && (
-          <Section header={`Administrators (${admins.length})`} className="wallet-section">
+          <Section
+            header={`Administrators (${admins.length})`}
+            className="wallet-section"
+          >
             {admins.map((id) => (
               <Cell
                 key={id}
                 subtitle="🔧 Full access"
-                after={(
-                  <Button 
-                    size="s" 
-                    mode="outline" 
+                after={
+                  <Button
+                    size="s"
+                    mode="outline"
                     disabled={loading}
-                    onClick={() => handleRemove(id)}
+                    onClick={() => void handleRemove(id)}
                   >
                     Revoke
                   </Button>
-                )}
+                }
               >
                 {id}
               </Cell>
@@ -216,25 +215,28 @@ export function Users() {
         )}
 
         {viewers.length > 0 && (
-          <Section header={`Viewers (${viewers.length})`} className="wallet-section">
+          <Section
+            header={`Viewers (${viewers.length})`}
+            className="wallet-section"
+          >
             {viewers.map((id) => (
               <Cell
                 key={id}
                 subtitle="👁️ Read-only access"
-                after={(
+                after={
                   <InlineButtons mode="bezeled">
-                    <InlineButtons.Item 
-                      text="Promote" 
+                    <InlineButtons.Item
+                      text="Promote"
                       disabled={loading}
-                      onClick={() => handlePromote(id)} 
+                      onClick={() => void handlePromote(id)}
                     />
-                    <InlineButtons.Item 
-                      text="Remove" 
+                    <InlineButtons.Item
+                      text="Remove"
                       disabled={loading}
-                      onClick={() => handleRemove(id)} 
+                      onClick={() => void handleRemove(id)}
                     />
                   </InlineButtons>
-                )}
+                }
               >
                 {id}
               </Cell>
@@ -246,7 +248,9 @@ export function Users() {
           <Section className="wallet-section">
             <div className="empty-card">
               <div className="empty-title">No users yet</div>
-              <div className="empty-subtitle">Add users above to grant them access</div>
+              <div className="empty-subtitle">
+                Add users above to grant them access
+              </div>
             </div>
           </Section>
         )}

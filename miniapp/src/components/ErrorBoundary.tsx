@@ -4,7 +4,7 @@ import {
   type GetDerivedStateFromError,
   type PropsWithChildren,
   type ReactNode,
-} from 'react';
+} from "react";
 
 export interface ErrorBoundaryProps extends PropsWithChildren {
   fallback?: ReactNode | ComponentType<{ error: unknown }>;
@@ -12,9 +12,15 @@ export interface ErrorBoundaryProps extends PropsWithChildren {
 
 interface ErrorBoundaryState {
   error?: unknown;
+  errorInfo?: {
+    componentStack: string;
+  };
 }
 
-export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+export class ErrorBoundary extends Component<
+  ErrorBoundaryProps,
+  ErrorBoundaryState
+> {
   state: ErrorBoundaryState = {};
 
   static getDerivedStateFromError: GetDerivedStateFromError<
@@ -22,25 +28,28 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
     ErrorBoundaryState
   > = (error) => ({ error });
 
-  componentDidCatch(error: Error) {
-    this.setState({ error });
+  componentDidCatch(error: Error, errorInfo: { componentStack: string }): void {
+    // Log error for debugging
+    if (import.meta.env.DEV) {
+      console.error("Error Boundary caught:", error, errorInfo);
+    }
+    this.setState({ errorInfo });
   }
 
-  render() {
+  render(): React.ReactNode {
     const {
-      state: {
-        error,
-      },
-      props: {
-        fallback: Fallback,
-        children,
-      },
+      state: { error },
+      props: { fallback: Fallback, children },
     } = this;
 
-    return 'error' in this.state
-      ? typeof Fallback === 'function'
-        ? <Fallback error={error} />
-        : Fallback
-      : children;
+    return "error" in this.state ? (
+      typeof Fallback === "function" ? (
+        <Fallback error={error} />
+      ) : (
+        Fallback
+      )
+    ) : (
+      children
+    );
   }
 }

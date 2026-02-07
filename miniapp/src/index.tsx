@@ -1,44 +1,50 @@
 // Include Telegram UI styles first to allow our code override the package CSS.
-import '@telegram-apps/telegram-ui/dist/styles.css';
+import "@telegram-apps/telegram-ui/dist/styles.css";
 
-import ReactDOM from 'react-dom/client';
-import { StrictMode } from 'react';
-import { retrieveLaunchParams } from '@tma.js/sdk-react';
+import { retrieveLaunchParams } from "@tma.js/sdk-react";
+import { StrictMode } from "react";
+import ReactDOM from "react-dom/client";
 
-import { Root } from '@/components/Root.tsx';
-import { EnvUnsupported } from '@/components/EnvUnsupported.tsx';
-import { init } from '@/init.ts';
+import { EnvUnsupported } from "@/components/EnvUnsupported.tsx";
+import { Root } from "@/components/Root.tsx";
+import { init } from "@/init.ts";
 
-import './index.css';
+import "./index.css";
 
 // Mock the environment in case, we are outside Telegram.
-import './mockEnv.ts';
+import "./mockEnv.ts";
 
-const root = ReactDOM.createRoot(document.getElementById('root')!);
+const rootElement = document.getElementById("root");
+if (!rootElement) {
+  throw new Error("Root element not found");
+}
 
-async function start() {
+const root = ReactDOM.createRoot(rootElement);
+
+async function start(): Promise<void> {
   try {
     const launchParams = retrieveLaunchParams();
     const { tgWebAppPlatform: platform } = launchParams;
-    const debug = (launchParams.tgWebAppStartParam || '').includes('debug')
-      || import.meta.env.DEV;
-    const enableEruda = import.meta.env.DEV
-      && debug
-      && ['ios', 'android'].includes(platform);
+    const debug =
+      (launchParams.tgWebAppStartParam || "").includes("debug") ||
+      import.meta.env.DEV;
+    const enableEruda =
+      import.meta.env.DEV && debug && ["ios", "android"].includes(platform);
 
     await init({
       debug,
       eruda: enableEruda,
-      mockForMacOS: platform === 'macos',
+      mockForMacOS: platform === "macos",
     });
 
     root.render(
       <StrictMode>
-        <Root/>
+        <Root />
       </StrictMode>,
     );
-  } catch {
-    root.render(<EnvUnsupported/>);
+  } catch (error) {
+    console.error("Failed to initialize app:", error);
+    root.render(<EnvUnsupported />);
   }
 }
 

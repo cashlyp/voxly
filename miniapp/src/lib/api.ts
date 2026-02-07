@@ -14,7 +14,7 @@ export class ApiError extends Error {
 
   constructor(payload: ApiErrorPayload) {
     super(payload.message);
-    this.name = 'ApiError';
+    this.name = "ApiError";
     this.status = payload.status;
     this.code = payload.code;
     this.details = payload.details;
@@ -22,8 +22,8 @@ export class ApiError extends Error {
   }
 }
 
-export function createIdempotencyKey() {
-  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+export function createIdempotencyKey(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
     return crypto.randomUUID();
   }
   return `idem_${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -42,36 +42,64 @@ export function setAuthRefreshProvider(provider: () => Promise<void>) {
   authRefreshProvider = provider;
 }
 
-const API_BASE = import.meta.env.VITE_API_BASE || '';
+const API_BASE = (import.meta.env.VITE_API_BASE as string) || "";
 const DEFAULT_TIMEOUT_MS = 8000;
 const DEFAULT_RETRIES = 2;
 
-// Validate API base is configured
-if (!API_BASE && typeof window !== 'undefined') {
-  console.warn('⚠️ VITE_API_BASE environment variable is not set. API communication may fail.');
+// Validate API base is configured in production
+if (!API_BASE && typeof window !== "undefined" && import.meta.env.PROD) {
+  console.error(
+    "❌ CRITICAL: VITE_API_BASE environment variable is not set. API communication will fail.",
+  );
+}
+
+if (!API_BASE && typeof window !== "undefined" && import.meta.env.DEV) {
+  console.warn(
+    "⚠️  VITE_API_BASE environment variable is not set. API communication may fail.",
+  );
 }
 
 export function getApiBase() {
   return API_BASE;
 }
 
-function buildUrl(path: string) {
-  if (path.startsWith('http://') || path.startsWith('https://')) return path;
-  return `${API_BASE}${path}`;
+function buildUrl(path: string): string {
+  if (path.startsWith("http://") || path.startsWith("https://")) {
+    return path;
+  }
+  if (!API_BASE) {
+    throw new ApiError({
+      status: 0,
+      code: "no_api_base",
+      message:
+        "API base URL is not configured. Set VITE_API_BASE environment variable.",
+      retryable: false,
+    });
+  }
+  // Ensure no double slashes except in protocol
+  const normalized = `${API_BASE}${path}`.replace(/([^:]\/)\/+/g, "$1");
+  if (import.meta.env.DEV) {
+    console.debug(`[API URL] ${normalized}`);
+  }
+  return normalized;
 }
 
-function shouldRetry(status: number) {
+function shouldRetry(status: number): boolean {
+  // Retry on specific server/network errors
   return [408, 429, 502, 503, 504].includes(status);
 }
 
-async function readJsonSafely(response: Response) {
-  const contentType = response.headers.get('content-type') || '';
-  if (!contentType.includes('application/json')) {
+async function readJsonSafely(response: Response): Promise<unknown> {
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
     return null;
   }
   try {
     return await response.json();
-  } catch {
+  } catch (error) {
+    if (import.meta.env.DEV) {
+      console.warn("Failed to parse response JSON:", error);
+    }
     return null;
   }
 }
@@ -89,7 +117,7 @@ export async function apiFetch<T>(
   } = {},
 ): Promise<T> {
   const {
-    method = 'GET',
+    method = "GET",
     body,
     headers = {},
     timeoutMs = DEFAULT_TIMEOUT_MS,
@@ -100,14 +128,14 @@ export async function apiFetch<T>(
 
   const token = auth ? authTokenProvider() : null;
   const requestHeaders: Record<string, string> = {
-    Accept: 'application/json',
+    Accept: "application/json",
     ...headers,
   };
   if (idempotencyKey) {
-    requestHeaders['Idempotency-Key'] = idempotencyKey;
+    requestHeaders["Idempotency-Key"] = idempotencyKey;
   }
   if (body !== undefined) {
-    requestHeaders['Content-Type'] = 'application/json';
+    requestHeaders["Content-Type"] = "application/json";
   }
   if (token) {
     requestHeaders.Authorization = `Bearer ${token}`;
@@ -115,22 +143,29 @@ export async function apiFetch<T>(
 
   let attempt = 0;
   let refreshed = false;
+  const fullUrl = buildUrl(path);
+
   while (true) {
     attempt += 1;
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const response = await fetch(buildUrl(path), {
+      const response = await fetch(fullUrl, {
         method,
         headers: requestHeaders,
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: controller.signal,
-        credentials: 'include',
+        credentials: "include",
       });
       window.clearTimeout(timeout);
 
       if (!response.ok) {
-        if (response.status === 401 && auth && authRefreshProvider && !refreshed) {
+        if (
+          response.status === 401 &&
+          auth &&
+          authRefreshProvider &&
+          !refreshed
+        ) {
           refreshed = true;
           try {
             await authRefreshProvider();
@@ -139,18 +174,31 @@ export async function apiFetch<T>(
           }
           continue;
         }
-        const payload = await readJsonSafely(response);
+        const payload = (await readJsonSafely(response)) as Record<
+          string,
+          unknown
+        > | null;
         const error = new ApiError({
           status: response.status,
-          code: payload?.error || payload?.code || `http_${response.status}`,
-          message: payload?.message || payload?.error || response.statusText || `Request failed (${response.status})`,
-          details: payload,
+          code:
+            (payload?.error as string) ||
+            (payload?.code as string) ||
+            `http_${response.status}`,
+          message:
+            (payload?.message as string) ||
+            (payload?.error as string) ||
+            response.statusText ||
+            `Request failed (${response.status})`,
+          details: {
+            ...payload,
+            url: import.meta.env.DEV ? fullUrl : undefined,
+          },
           retryable: shouldRetry(response.status),
         });
-        
+
         // Log API errors for debugging
         if (import.meta.env.DEV) {
-          console.error(`[API Error] ${method} ${path}:`, {
+          console.error(`[API Error] ${method} ${fullUrl}:`, {
             status: response.status,
             statusText: response.statusText,
             code: error.code,
@@ -158,27 +206,32 @@ export async function apiFetch<T>(
             payload,
           });
         }
-        
+
         if (error.retryable && attempt <= retries) {
-          await new Promise((resolve) => window.setTimeout(resolve, 300 * attempt));
+          await new Promise((resolve) =>
+            window.setTimeout(resolve, 300 * attempt),
+          );
           continue;
         }
         throw error;
       }
 
       const data = await readJsonSafely(response);
-      
+
       // Log successful API calls in development
       if (import.meta.env.DEV) {
-        console.debug(`[API Success] ${method} ${path}`, data);
+        console.debug(`[API Success] ${method} ${fullUrl}`, data);
       }
-      
+
       return data as T;
     } catch (error) {
       window.clearTimeout(timeout);
-      const isAbort = error instanceof DOMException && error.name === 'AbortError';
+      const isAbort =
+        error instanceof DOMException && error.name === "AbortError";
       if ((isAbort || error instanceof TypeError) && attempt <= retries) {
-        await new Promise((resolve) => window.setTimeout(resolve, 300 * attempt));
+        await new Promise((resolve) =>
+          window.setTimeout(resolve, 300 * attempt),
+        );
         continue;
       }
       if (error instanceof ApiError) {
@@ -187,26 +240,26 @@ export async function apiFetch<T>(
       if (isAbort) {
         throw new ApiError({
           status: 0,
-          code: 'timeout',
-          message: 'Request timed out',
-          details: error,
+          code: "timeout",
+          message: "Request timed out",
+          details: { url: import.meta.env.DEV ? fullUrl : undefined, error },
           retryable: true,
         });
       }
       if (error instanceof TypeError) {
         throw new ApiError({
           status: 0,
-          code: 'network_error',
-          message: 'Cannot reach API (network/CORS/DNS)',
-          details: error,
+          code: "network_error",
+          message: "Cannot reach API (network/CORS/DNS)",
+          details: { url: import.meta.env.DEV ? fullUrl : undefined, error },
           retryable: true,
         });
       }
       throw new ApiError({
         status: 0,
-        code: 'unknown_error',
-        message: 'Unexpected network failure',
-        details: error,
+        code: "unknown_error",
+        message: "Unexpected network failure",
+        details: { url: import.meta.env.DEV ? fullUrl : undefined, error },
         retryable: true,
       });
     }
@@ -219,7 +272,7 @@ export async function apiFetch<T>(
 export const validate = {
   /** Validate phone number (basic E.164 check) */
   phoneNumber: (phone: string): boolean => {
-    return /^\+?[1-9]\d{1,14}$/.test(phone.replace(/\D/g, ''));
+    return /^\+?[1-9]\d{1,14}$/.test(phone.replace(/\D/g, ""));
   },
 
   /** Validate email address */

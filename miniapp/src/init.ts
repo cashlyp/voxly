@@ -1,34 +1,39 @@
 import {
-  setDebug,
-  themeParams,
+  backButton,
+  emitEvent,
   initData,
-  viewport,
   init as initSDK,
+  miniApp,
   mockTelegramEnv,
   retrieveLaunchParams,
-  emitEvent,
-  miniApp,
-  backButton,
-} from '@tma.js/sdk-react';
+  setDebug,
+  themeParams,
+  viewport,
+} from "@tma.js/sdk-react";
+
+export interface InitOptions {
+  debug: boolean;
+  eruda: boolean;
+  mockForMacOS: boolean;
+}
 
 /**
  * Initializes the application and configures its dependencies.
  */
-export async function init(options: {
-  debug: boolean;
-  eruda: boolean;
-  mockForMacOS: boolean;
-}): Promise<void> {
+export async function init(options: InitOptions): Promise<void> {
   // Set @telegram-apps/sdk-react debug mode and initialize it.
   setDebug(options.debug);
   initSDK();
 
   // Add Eruda if needed (dev-only).
   if (options.eruda && import.meta.env.DEV) {
-    void import('eruda').then(({ default: eruda }) => {
+    try {
+      const { default: eruda } = await import("eruda");
       eruda.init();
-      eruda.position({ x: window.innerWidth - 50, y: 0 });
-    });
+      eruda.position({ x: Math.max(0, window.innerWidth - 50), y: 0 });
+    } catch (error) {
+      console.warn("Failed to initialize Eruda:", error);
+    }
   }
 
   // Telegram for macOS has a ton of bugs, including cases, when the client doesn't
@@ -38,12 +43,17 @@ export async function init(options: {
     const launchTheme = retrieveLaunchParams().tgWebAppThemeParams || {};
     mockTelegramEnv({
       onEvent(event, next) {
-        if (event.name === 'web_app_request_theme') {
-          return emitEvent('theme_changed', { theme_params: launchTheme });
+        if (event.name === "web_app_request_theme") {
+          return emitEvent("theme_changed", { theme_params: launchTheme });
         }
 
-        if (event.name === 'web_app_request_safe_area') {
-          return emitEvent('safe_area_changed', { left: 0, top: 0, right: 0, bottom: 0 });
+        if (event.name === "web_app_request_safe_area") {
+          return emitEvent("safe_area_changed", {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+          });
         }
 
         next();
@@ -62,8 +72,15 @@ export async function init(options: {
   }
 
   if (viewport.mount.isAvailable()) {
-    viewport.mount().then(() => {
-      viewport.bindCssVars();
-    });
+    await viewport
+      .mount()
+      .then(() => {
+        viewport.bindCssVars();
+      })
+      .catch((error) => {
+        if (import.meta.env.DEV) {
+          console.warn("Failed to mount viewport:", error);
+        }
+      });
   }
 }

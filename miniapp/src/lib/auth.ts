@@ -1,6 +1,12 @@
-import { retrieveRawInitData } from '@tma.js/sdk-react';
+import { retrieveRawInitData } from "@tma.js/sdk-react";
 
-import { ApiError, apiFetch, getApiBase, setAuthRefreshProvider, setAuthTokenProvider } from './api';
+import {
+  ApiError,
+  apiFetch,
+  getApiBase,
+  setAuthRefreshProvider,
+  setAuthTokenProvider,
+} from "./api";
 
 export type WebappUser = {
   id: string | number;
@@ -18,10 +24,10 @@ export type AuthSession = {
   tenant_id?: string | null;
 };
 
-const STORAGE_KEY = 'voicednut.webapp.jwt';
-const STORAGE_EXP_KEY = 'voicednut.webapp.jwt.exp';
-const STORAGE_USER_KEY = 'voicednut.webapp.user';
-const STORAGE_ROLES_KEY = 'voicednut.webapp.roles';
+const STORAGE_KEY = "voicednut.webapp.jwt";
+const STORAGE_EXP_KEY = "voicednut.webapp.jwt.exp";
+const STORAGE_USER_KEY = "voicednut.webapp.user";
+const STORAGE_ROLES_KEY = "voicednut.webapp.roles";
 
 let cachedToken: string | null = null;
 
@@ -30,16 +36,26 @@ type InitDataContext = {
   user: WebappUser | null;
 };
 
-export type AuthErrorKind = 'offline' | 'unauthorized' | 'initdata' | 'server' | 'unknown';
+export type AuthErrorKind =
+  | "offline"
+  | "unauthorized"
+  | "initdata"
+  | "server"
+  | "unknown";
 
 export class AuthError extends Error {
   kind: AuthErrorKind;
   status?: number;
   code?: string;
 
-  constructor(message: string, kind: AuthErrorKind, status?: number, code?: string) {
+  constructor(
+    message: string,
+    kind: AuthErrorKind,
+    status?: number,
+    code?: string,
+  ) {
     super(message);
-    this.name = 'AuthError';
+    this.name = "AuthError";
     this.kind = kind;
     this.status = status;
     this.code = code;
@@ -48,9 +64,12 @@ export class AuthError extends Error {
 
 function parseJwtPayload(token: string) {
   try {
-    const payload = token.split('.')[1];
-    const normalized = payload.replace(/-/g, '+').replace(/_/g, '/');
-    const padded = normalized.padEnd(normalized.length + (4 - (normalized.length % 4 || 4)), '=');
+    const payload = token.split(".")[1];
+    const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(
+      normalized.length + (4 - (normalized.length % 4 || 4)),
+      "=",
+    );
     const json = atob(padded);
     return JSON.parse(json);
   } catch {
@@ -65,7 +84,12 @@ export function getStoredToken() {
   return token;
 }
 
-export function setStoredToken(token: string, expiresAt: string, user: WebappUser, roles: string[]) {
+export function setStoredToken(
+  token: string,
+  expiresAt: string,
+  user: WebappUser,
+  roles: string[],
+) {
   cachedToken = token;
   window.localStorage.setItem(STORAGE_KEY, token);
   window.localStorage.setItem(STORAGE_EXP_KEY, expiresAt);
@@ -112,13 +136,19 @@ export function getTokenExpiry() {
   return new Date(payload.exp * 1000).toISOString();
 }
 
-export function isTokenValid(bufferSeconds = 30) {
+export function isTokenValid(bufferSeconds = 30): boolean {
   const token = getStoredToken();
-  if (!token) return false;
+  if (!token) {
+    return false;
+  }
   const expIso = getTokenExpiry();
-  if (!expIso) return false;
+  if (!expIso) {
+    return false;
+  }
   const exp = Date.parse(expIso);
-  if (!Number.isFinite(exp)) return false;
+  if (!Number.isFinite(exp)) {
+    return false;
+  }
   return Date.now() + bufferSeconds * 1000 < exp;
 }
 
@@ -131,14 +161,20 @@ export function getInitData() {
   } catch {
     // fall through to legacy WebApp initData lookup
   }
-  const webapp = (window as Window & { Telegram?: { WebApp?: { initData?: string } } }).Telegram?.WebApp;
-  return webapp?.initData || '';
+  const webapp = (
+    window as Window & { Telegram?: { WebApp?: { initData?: string } } }
+  ).Telegram?.WebApp;
+  return webapp?.initData || "";
 }
 
 function getInitDataContext(): InitDataContext {
-  const webapp = (window as Window & {
-    Telegram?: { WebApp?: { initData?: string; initDataUnsafe?: { user?: WebappUser } } };
-  }).Telegram?.WebApp;
+  const webapp = (
+    window as Window & {
+      Telegram?: {
+        WebApp?: { initData?: string; initDataUnsafe?: { user?: WebappUser } };
+      };
+    }
+  ).Telegram?.WebApp;
   return {
     initData: getInitData(),
     user: webapp?.initDataUnsafe?.user || null,
@@ -149,41 +185,83 @@ function describeAuthError(error: unknown) {
   if (error instanceof ApiError) {
     const apiBase = getApiBase() || window.location.origin;
     if (error.status === 0) {
-      if (error.code === 'timeout') {
-        return new AuthError(`Cannot reach API (timeout). Check ${apiBase}.`, 'offline', 0, error.code);
+      if (error.code === "timeout") {
+        return new AuthError(
+          `Cannot reach API (timeout). Check ${apiBase}.`,
+          "offline",
+          0,
+          error.code,
+        );
       }
-      return new AuthError(`Cannot reach API (network/CORS/DNS). Check ${apiBase}.`, 'offline', 0, error.code);
+      // Add URL details in dev mode
+      const urlInfo =
+        import.meta.env.DEV && (error.details as any)?.url
+          ? ` (${(error.details as any).url})`
+          : "";
+      return new AuthError(
+        `Cannot reach API (network/CORS/DNS). Check ${apiBase}${urlInfo}.`,
+        "offline",
+        0,
+        error.code,
+      );
     }
     const initDataErrors: Record<string, string> = {
-      missing_initdata: 'Telegram init data is missing. Open the Mini App from Telegram.',
-      missing_hash: 'Telegram init data hash is missing.',
-      invalid_hash: 'Telegram init data signature is invalid.',
-      expired_init_data: 'Telegram init data expired. Close and reopen the Mini App.',
-      invalid_auth_date: 'Telegram init data has an invalid timestamp.',
-      missing_bot_token: 'Server is missing the bot token for initData verification.',
-      invalid_initdata: 'Telegram init data is invalid.',
-      not_authorized: 'You are not authorized for this Mini App.',
-      origin_not_allowed: 'Origin not allowed. Add MINI_APP_URL to the API allowlist.',
+      missing_initdata:
+        "Telegram init data is missing. Open the Mini App from Telegram.",
+      missing_hash: "Telegram init data hash is missing.",
+      invalid_hash: "Telegram init data signature is invalid.",
+      expired_init_data:
+        "Telegram init data expired. Close and reopen the Mini App.",
+      invalid_auth_date: "Telegram init data has an invalid timestamp.",
+      missing_bot_token:
+        "Server is missing the bot token for initData verification.",
+      invalid_initdata: "Telegram init data is invalid.",
+      not_authorized: "You are not authorized for this Mini App.",
+      origin_not_allowed:
+        "Origin not allowed. Add MINI_APP_URL to the API allowlist.",
     };
     const mapped = initDataErrors[error.code];
-    const reason = mapped || error.message || error.code || 'Auth failed';
-    const kind = ['missing_initdata', 'missing_hash', 'invalid_hash', 'expired_init_data', 'invalid_auth_date', 'invalid_initdata'].includes(error.code)
-      ? 'initdata'
+    const reason = mapped || error.message || error.code || "Auth failed";
+    const kind = [
+      "missing_initdata",
+      "missing_hash",
+      "invalid_hash",
+      "expired_init_data",
+      "invalid_auth_date",
+      "invalid_initdata",
+    ].includes(error.code)
+      ? "initdata"
       : error.status === 401 || error.status === 403
-        ? 'unauthorized'
+        ? "unauthorized"
         : error.status >= 500
-          ? 'server'
-          : 'unknown';
-    return new AuthError(`Auth failed (${error.status}): ${reason}`, kind, error.status, error.code);
+          ? "server"
+          : "unknown";
+    return new AuthError(
+      `Auth failed (${error.status}): ${reason}`,
+      kind,
+      error.status,
+      error.code,
+    );
   }
   if (error instanceof AuthError) {
     return error;
   }
-  return new AuthError(error instanceof Error ? error.message : 'Auth failed', 'unknown');
+  return new AuthError(
+    error instanceof Error ? error.message : "Auth failed",
+    "unknown",
+  );
 }
 
-async function fetchSessionDetails(): Promise<Pick<AuthSession, 'user' | 'roles' | 'environment' | 'tenant_id'>> {
-  const response = await apiFetch<{ ok: boolean; user: WebappUser; roles: string[]; environment?: string | null; tenant_id?: string | null }>('/webapp/me');
+async function fetchSessionDetails(): Promise<
+  Pick<AuthSession, "user" | "roles" | "environment" | "tenant_id">
+> {
+  const response = await apiFetch<{
+    ok: boolean;
+    user: WebappUser;
+    roles: string[];
+    environment?: string | null;
+    tenant_id?: string | null;
+  }>("/webapp/me");
   return {
     user: response.user,
     roles: response.roles || [],
@@ -196,7 +274,12 @@ export async function authenticate(initData?: string): Promise<AuthSession> {
   const context = getInitDataContext();
   const rawInitData = initData || context.initData;
   if (!rawInitData) {
-    throw new AuthError('Telegram init data is missing. Open the Mini App from Telegram.', 'initdata', 401, 'missing_initdata');
+    throw new AuthError(
+      "Telegram init data is missing. Open the Mini App from Telegram.",
+      "initdata",
+      401,
+      "missing_initdata",
+    );
   }
   try {
     const response = await apiFetch<{
@@ -207,11 +290,11 @@ export async function authenticate(initData?: string): Promise<AuthSession> {
       roles: string[];
       environment?: string | null;
       tenant_id?: string | null;
-    }>('/webapp/auth', {
-      method: 'POST',
+    }>("/webapp/auth", {
+      method: "POST",
       headers: {
         Authorization: `tma ${rawInitData}`,
-        'X-Telegram-Init-Data': rawInitData,
+        "X-Telegram-Init-Data": rawInitData,
       },
       body: { initData: rawInitData },
       auth: false,
@@ -224,12 +307,17 @@ export async function authenticate(initData?: string): Promise<AuthSession> {
       environment: response.environment ?? null,
       tenant_id: response.tenant_id ?? null,
     };
-    setStoredToken(session.token, session.expiresAt, session.user, session.roles);
+    setStoredToken(
+      session.token,
+      session.expiresAt,
+      session.user,
+      session.roles,
+    );
 
     const details = await fetchSessionDetails();
     const merged = {
       ...session,
-      user: details.user || session.user || context.user || { id: '' },
+      user: details.user || session.user || context.user || { id: "" },
       roles: details.roles || [],
       environment: details.environment ?? session.environment ?? null,
       tenant_id: details.tenant_id ?? session.tenant_id ?? null,
@@ -241,13 +329,17 @@ export async function authenticate(initData?: string): Promise<AuthSession> {
     if (described instanceof AuthError) {
       throw described;
     }
-    throw new AuthError(String(described || 'Auth failed'), 'unknown');
+    throw new AuthError(String(described || "Auth failed"), "unknown");
   }
 }
 
 export async function ensureAuth(
   initData?: string,
-  options: { minValiditySeconds?: number; forceRefresh?: boolean; verify?: boolean } = {},
+  options: {
+    minValiditySeconds?: number;
+    forceRefresh?: boolean;
+    verify?: boolean;
+  } = {},
 ): Promise<AuthSession> {
   const minValiditySeconds = options.minValiditySeconds ?? 60;
   const verify = options.verify ?? true;
@@ -256,25 +348,30 @@ export async function ensureAuth(
       try {
         const details = await fetchSessionDetails();
         const session = {
-          token: getStoredToken() || '',
-          expiresAt: getTokenExpiry() || '',
-          user: details.user || getStoredUser() || { id: '' },
+          token: getStoredToken() || "",
+          expiresAt: getTokenExpiry() || "",
+          user: details.user || getStoredUser() || { id: "" },
           roles: details.roles || [],
           environment: details.environment ?? null,
           tenant_id: details.tenant_id ?? null,
         };
-        setStoredToken(session.token, session.expiresAt, session.user, session.roles);
+        setStoredToken(
+          session.token,
+          session.expiresAt,
+          session.user,
+          session.roles,
+        );
         return session;
       } catch (error) {
         const described = describeAuthError(error);
         if (described instanceof AuthError) throw described;
-        throw new AuthError('Auth failed', 'unknown');
+        throw new AuthError("Auth failed", "unknown");
       }
     }
     return {
-      token: getStoredToken() || '',
-      expiresAt: getTokenExpiry() || '',
-      user: getStoredUser() || { id: '' },
+      token: getStoredToken() || "",
+      expiresAt: getTokenExpiry() || "",
+      user: getStoredUser() || { id: "" },
       roles: getStoredRoles(),
       environment: null,
       tenant_id: null,

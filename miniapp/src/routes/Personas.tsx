@@ -1,4 +1,3 @@
-import { useCallback, useEffect, useState } from 'react';
 import {
   Badge,
   Banner,
@@ -7,11 +6,12 @@ import {
   List,
   Section,
   Textarea,
-} from '@telegram-apps/telegram-ui';
-import { apiFetch, createIdempotencyKey } from '../lib/api';
-import { confirmAction, hapticSuccess, hapticError } from '../lib/ux';
-import { trackEvent } from '../lib/telemetry';
-import { useUser } from '../state/user';
+} from "@telegram-apps/telegram-ui";
+import { useCallback, useEffect, useState } from "react";
+import { apiFetch, createIdempotencyKey } from "../lib/api";
+import { trackEvent } from "../lib/telemetry";
+import { confirmAction, hapticError, hapticSuccess } from "../lib/ux";
+import { useUser } from "../state/user";
 
 type Persona = {
   id: number;
@@ -24,15 +24,15 @@ type Persona = {
 };
 
 const emptyDraft: Partial<Persona> = {
-  name: '',
-  description: '',
-  system_prompt: '',
-  voice_model: '',
+  name: "",
+  description: "",
+  system_prompt: "",
+  voice_model: "",
 };
 
 export function Personas() {
   const { roles } = useUser();
-  const isAdmin = roles.includes('admin');
+  const isAdmin = roles.includes("admin");
 
   const [personas, setPersonas] = useState<Persona[]>([]);
   const [selected, setSelected] = useState<Persona | null>(null);
@@ -48,7 +48,7 @@ export function Personas() {
     setError(null);
     try {
       const response = await apiFetch<{ ok: boolean; personas: Persona[] }>(
-        '/webapp/personas'
+        "/webapp/personas",
       );
       setPersonas(response.personas || []);
       const fallback = response.personas?.[0] || null;
@@ -56,8 +56,8 @@ export function Personas() {
       setDraft(fallback || emptyDraft);
       setIsEditing(false);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load personas');
-      trackEvent('personas_load_failed');
+      setError(err instanceof Error ? err.message : "Failed to load personas");
+      trackEvent("personas_load_failed");
     } finally {
       setLoading(false);
     }
@@ -83,7 +83,7 @@ export function Personas() {
 
   const handleCancel = () => {
     setIsEditing(false);
-    if (selected) {
+    if (selected !== null && selected !== undefined) {
       setDraft(selected);
     }
   };
@@ -92,7 +92,7 @@ export function Personas() {
     if (!isAdmin) return;
 
     if (!draft.name?.trim()) {
-      setError('Name is required');
+      setError("Name is required");
       return;
     }
 
@@ -101,12 +101,12 @@ export function Personas() {
     setSuccess(null);
 
     try {
-      if (selected?.id) {
+      if (selected?.id !== undefined) {
         // Update existing
         const response = await apiFetch<{ ok: boolean; persona: Persona }>(
           `/webapp/personas/${selected.id}`,
           {
-            method: 'PUT',
+            method: "PUT",
             body: {
               name: draft.name?.trim(),
               description: draft.description?.trim() || null,
@@ -114,25 +114,25 @@ export function Personas() {
               voice_model: draft.voice_model?.trim() || null,
             },
             idempotencyKey: createIdempotencyKey(),
-          }
+          },
         );
 
         if (response.ok) {
           hapticSuccess();
-          setSuccess('Persona updated successfully!');
+          setSuccess("Persona updated successfully!");
           setSelected(response.persona);
           setDraft(response.persona);
-          trackEvent('persona_updated', { persona_id: selected.id });
+          trackEvent("persona_updated", { persona_id: selected.id });
           await loadPersonas();
         } else {
-          throw new Error('Failed to update persona');
+          throw new Error("Failed to update persona");
         }
       } else {
         // Create new
         const response = await apiFetch<{ ok: boolean; persona: Persona }>(
-          '/webapp/personas',
+          "/webapp/personas",
           {
-            method: 'POST',
+            method: "POST",
             body: {
               name: draft.name?.trim(),
               description: draft.description?.trim() || null,
@@ -140,29 +140,29 @@ export function Personas() {
               voice_model: draft.voice_model?.trim() || null,
             },
             idempotencyKey: createIdempotencyKey(),
-          }
+          },
         );
 
         if (response.ok) {
           hapticSuccess();
-          setSuccess('Persona created successfully!');
+          setSuccess("Persona created successfully!");
           setSelected(response.persona);
           setDraft(response.persona);
-          trackEvent('persona_created');
+          trackEvent("persona_created");
           await loadPersonas();
         } else {
-          throw new Error('Failed to create persona');
+          throw new Error("Failed to create persona");
         }
       }
 
       setIsEditing(false);
     } catch (err) {
       hapticError();
-      setError(err instanceof Error ? err.message : 'Failed to save persona');
+      setError(err instanceof Error ? err.message : "Failed to save persona");
       if (selected?.id) {
-        trackEvent('persona_update_failed', { persona_id: selected.id });
+        trackEvent("persona_update_failed", { persona_id: selected.id });
       } else {
-        trackEvent('persona_create_failed');
+        trackEvent("persona_create_failed");
       }
     } finally {
       setSaving(false);
@@ -173,9 +173,9 @@ export function Personas() {
     if (!isAdmin || !selected?.id) return;
 
     const confirmed = await confirmAction({
-      title: 'Delete Persona?',
+      title: "Delete Persona?",
       message: `This will permanently delete "${selected.name}".`,
-      confirmText: 'Delete',
+      confirmText: "Delete",
       destructive: true,
     });
 
@@ -186,19 +186,19 @@ export function Personas() {
 
     try {
       await apiFetch(`/webapp/personas/${selected.id}`, {
-        method: 'DELETE',
+        method: "DELETE",
         idempotencyKey: createIdempotencyKey(),
       });
 
       hapticSuccess();
-      setSuccess('Persona deleted successfully!');
-      trackEvent('persona_deleted', { persona_id: selected.id });
+      setSuccess("Persona deleted successfully!");
+      trackEvent("persona_deleted", { persona_id: selected.id });
       await loadPersonas();
       setIsEditing(false);
     } catch (err) {
       hapticError();
-      setError(err instanceof Error ? err.message : 'Failed to delete persona');
-      trackEvent('persona_delete_failed', { persona_id: selected.id });
+      setError(err instanceof Error ? err.message : "Failed to delete persona");
+      trackEvent("persona_delete_failed", { persona_id: selected.id });
     } finally {
       setSaving(false);
     }
@@ -218,7 +218,9 @@ export function Personas() {
     <div className="wallet-page">
       <List className="wallet-list">
         {error && <Banner type="inline" header="Error" description={error} />}
-        {success && <Banner type="inline" header="Success" description={success} />}
+        {success && (
+          <Banner type="inline" header="Success" description={success} />
+        )}
 
         <Section header="AI Personas" className="wallet-section">
           <div className="card-header">
@@ -239,8 +241,8 @@ export function Personas() {
               <div className="empty-title">No personas</div>
               <div className="empty-subtitle">
                 {isAdmin
-                  ? 'Create a new persona to get started.'
-                  : 'No personas available.'}
+                  ? "Create a new persona to get started."
+                  : "No personas available."}
               </div>
             </div>
           ) : (
@@ -250,17 +252,19 @@ export function Personas() {
                   key={persona.id}
                   type="button"
                   className={`card-item card-item-button ${
-                    selected?.id === persona.id ? 'selected' : ''
+                    selected?.id === persona.id ? "selected" : ""
                   }`}
-                  onClick={() => handleSelect(persona)}
+                  onClick={() => void handleSelect(persona)}
                 >
                   <div className="card-item-main">
                     <div className="card-item-title">{persona.name}</div>
                     <div className="card-item-subtitle">
-                      {persona.description || 'No description'}
+                      {persona.description || "No description"}
                     </div>
                     {persona.voice_model && (
-                      <div className="card-item-meta">Voice: {persona.voice_model}</div>
+                      <div className="card-item-meta">
+                        Voice: {persona.voice_model}
+                      </div>
                     )}
                   </div>
                   {persona.id && <Badge type="dot">Info</Badge>}
@@ -271,36 +275,44 @@ export function Personas() {
         </Section>
 
         {(selected || isEditing) && (
-          <Section header={isEditing ? 'Edit Persona' : 'Persona Details'}>
+          <Section header={isEditing ? "Edit Persona" : "Persona Details"}>
             <Input
               header="Name"
               placeholder="Persona name"
-              value={draft.name || ''}
-              onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+              value={draft.name || ""}
+              onChange={(e) =>
+                void setDraft({ ...draft, name: e.target.value })
+              }
               disabled={!isEditing || saving}
             />
 
             <Input
               header="Voice Model"
               placeholder="e.g., en-US-Neural2-C"
-              value={draft.voice_model || ''}
-              onChange={(e) => setDraft({ ...draft, voice_model: e.target.value })}
+              value={draft.voice_model || ""}
+              onChange={(e) =>
+                void setDraft({ ...draft, voice_model: e.target.value })
+              }
               disabled={!isEditing || saving}
             />
 
             <Textarea
               header="Description"
               placeholder="Brief description of this persona..."
-              value={draft.description || ''}
-              onChange={(e) => setDraft({ ...draft, description: e.target.value })}
+              value={draft.description || ""}
+              onChange={(e) =>
+                void setDraft({ ...draft, description: e.target.value })
+              }
               disabled={!isEditing || saving}
             />
 
             <Textarea
               header="System Prompt"
               placeholder="The instruction prompt that defines this AI persona's behavior..."
-              value={draft.system_prompt || ''}
-              onChange={(e) => setDraft({ ...draft, system_prompt: e.target.value })}
+              value={draft.system_prompt || ""}
+              onChange={(e) =>
+                void setDraft({ ...draft, system_prompt: e.target.value })
+              }
               disabled={!isEditing || saving}
             />
 
@@ -309,21 +321,26 @@ export function Personas() {
                 <Button
                   size="m"
                   mode="filled"
-                  onClick={handleSave}
+                  onClick={() => void handleSave()}
                   disabled={saving || !draft.name?.trim()}
                 >
-                  {saving ? 'Saving...' : 'Save Changes'}
+                  {saving ? "Saving..." : "Save Changes"}
                 </Button>
-                <Button size="m" mode="plain" onClick={handleCancel} disabled={saving}>
+                <Button
+                  size="m"
+                  mode="plain"
+                  onClick={() => void handleCancel()}
+                  disabled={saving}
+                >
                   Cancel
                 </Button>
                 {hasSelection && isAdmin && (
                   <Button
                     size="m"
                     mode="plain"
-                    onClick={handleDelete}
+                    onClick={() => void handleDelete()}
                     disabled={saving}
-                    style={{ color: 'var(--tg-theme-destructive-text-color)' }}
+                    style={{ color: "var(--tg-theme-destructive-text-color)" }}
                   >
                     Delete
                   </Button>
@@ -332,7 +349,11 @@ export function Personas() {
             ) : (
               <div className="section-actions">
                 {isAdmin && (
-                  <Button size="m" mode="filled" onClick={handleEdit}>
+                  <Button
+                    size="m"
+                    mode="filled"
+                    onClick={() => void handleEdit()}
+                  >
                     Edit
                   </Button>
                 )}
