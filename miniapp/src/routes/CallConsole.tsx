@@ -29,6 +29,19 @@ type TranscriptEntry = {
   partial: boolean;
 };
 
+function readString(value: unknown): string | null {
+  if (typeof value === "string" && value !== "") return value;
+  return null;
+}
+
+function toSafeText(value: unknown, fallback: string): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return fallback;
+}
+
 export function CallConsole({ callSid }: { callSid: string }) {
   const {
     activeCall,
@@ -60,17 +73,16 @@ export function CallConsole({ callSid }: { callSid: string }) {
   const [streamEpoch, setStreamEpoch] = useState(0);
 
   useEffect(() => {
-    fetchCall(callSid);
-    fetchCallEvents(callSid, 0);
+    void fetchCall(callSid);
+    void fetchCallEvents(callSid, 0);
     setLiveEvents([]);
     setTranscript([]);
     setStreamHealth(null);
-    lastSequenceRef.current = eventCursorById[callSid] || 0;
     lastSeenRef.current = Date.now();
   }, [callSid, fetchCall, fetchCallEvents]);
 
   useEffect(() => {
-    const cursor = eventCursorById[callSid] || 0;
+    const cursor = eventCursorById[callSid] ?? 0;
     if (cursor > lastSequenceRef.current) {
       lastSequenceRef.current = cursor;
     }
@@ -100,11 +112,11 @@ export function CallConsole({ callSid }: { callSid: string }) {
           since,
           onEvent: (event) => {
             if (event.call_sid !== callSid) return;
-            if (event.sequence && event.sequence <= lastSequenceRef.current)
+            if (event.sequence !== undefined && event.sequence <= lastSequenceRef.current)
               return;
             lastSequenceRef.current = Math.max(
               lastSequenceRef.current,
-              event.sequence || 0,
+              event.sequence ?? 0,
             );
             lastSeenRef.current = Date.now();
             setLiveEvents((prev) => [...prev.slice(-50), event]);
@@ -113,8 +125,8 @@ export function CallConsole({ callSid }: { callSid: string }) {
               event.type === "transcript.final"
             ) {
               const entry: TranscriptEntry = {
-                speaker: String(event.data?.speaker || "unknown"),
-                message: String(event.data?.message || ""),
+                speaker: toSafeText(event.data?.speaker, "unknown"),
+                message: toSafeText(event.data?.message, ""),
                 ts: event.ts,
                 partial: event.type === "transcript.partial",
               };
@@ -138,7 +150,7 @@ export function CallConsole({ callSid }: { callSid: string }) {
                 event.type,
               )
             ) {
-              fetchCall(callSid);
+              void fetchCall(callSid, { force: true });
             }
           },
           onHeartbeat: () => {
@@ -187,42 +199,42 @@ export function CallConsole({ callSid }: { callSid: string }) {
 
   useEffect(() => {
     const interval = window.setInterval(() => {
-      const cursor = eventCursorById[callSid] || 0;
-      fetchCallEvents(callSid, cursor);
+      const cursor = eventCursorById[callSid] ?? 0;
+      void fetchCallEvents(callSid, cursor);
     }, 5000);
     return () => window.clearInterval(interval);
   }, [callSid, eventCursorById, fetchCallEvents]);
 
   useEffect(() => {
     if (!isAdmin) return;
-    void apiFetch<{ ok: boolean; scripts: { id: number; name: string }[] }>(
+    void apiFetch<{ ok: boolean; scripts?: { id: number; name: string }[] }>(
       "/webapp/scripts",
     )
-      .then((response) => setScripts(response.scripts || []))
+      .then((response) => setScripts(response.scripts ?? []))
       .catch(() => {});
   }, [isAdmin]);
 
   const statusLine = useMemo(() => {
     if (!activeCall) return "Loading call...";
-    return `${activeCall.status || "unknown"} - ${activeCall.direction || "n/a"}`;
+    return `${activeCall.status ?? "unknown"} - ${activeCall.direction ?? "n/a"}`;
   }, [activeCall]);
 
   const ruleLabel = useMemo(() => {
     const live = activeCall?.live as Record<string, unknown> | undefined;
-    return String(
-      live?.route_label ||
-        live?.script ||
-        (activeCall as Record<string, unknown> | null)?.route_label ||
-        "default",
-    );
+    const label =
+      readString(live?.route_label) ??
+      readString(live?.script) ??
+      readString((activeCall as Record<string, unknown> | null)?.route_label) ??
+      "default";
+    return toSafeText(label, "default");
   }, [activeCall]);
 
   const riskLabel = useMemo(() => {
     const live = activeCall?.live as Record<string, unknown> | undefined;
-    return String(live?.risk_level || "normal");
+    return toSafeText(live?.risk_level ?? "normal", "normal");
   }, [activeCall]);
 
-  const timeline = callEventsById[callSid] || [];
+  const timeline = callEventsById[callSid] ?? [];
 
   const handleInboundAction = async (action: "answer" | "decline") => {
     if (action === "decline") {
@@ -244,7 +256,7 @@ export function CallConsole({ callSid }: { callSid: string }) {
       });
       hapticSuccess();
       trackEvent(`console_${action}_success`, { call_sid: callSid });
-      await fetchCall(callSid);
+      await fetchCall(callSid, { force: true });
     } catch (error) {
       hapticError();
       trackEvent(`console_${action}_failed`, { call_sid: callSid });
@@ -265,7 +277,7 @@ export function CallConsole({ callSid }: { callSid: string }) {
         idempotencyKey: createIdempotencyKey(),
       });
       trackEvent("console_callback_scheduled", { call_sid: callSid });
-      await fetchCall(callSid);
+      await fetchCall(callSid, { force: true });
     } catch (error) {
       trackEvent("console_callback_failed", { call_sid: callSid });
       throw error;
@@ -302,7 +314,7 @@ export function CallConsole({ callSid }: { callSid: string }) {
       }
       hapticSuccess();
       trackEvent(`console_stream_${action}_success`, { call_sid: callSid });
-      await fetchCall(callSid);
+      await fetchCall(callSid, { force: true });
     } catch (error) {
       hapticError();
       trackEvent(`console_stream_${action}_failed`, { call_sid: callSid });
@@ -313,7 +325,7 @@ export function CallConsole({ callSid }: { callSid: string }) {
   };
 
   const handleScriptInject = async () => {
-    if (!selectedScript) return;
+    if (selectedScript === null) return;
     setActionBusy("script");
     try {
       trackEvent("console_script_inject_clicked", {
@@ -388,17 +400,17 @@ export function CallConsole({ callSid }: { callSid: string }) {
               <InlineButtons mode="bezeled">
                 <InlineButtons.Item
                   text="Answer"
-                  disabled={!!actionBusy}
+                  disabled={actionBusy !== null}
                   onClick={() => void handleInboundAction("answer")}
                 />
                 <InlineButtons.Item
                   text="Decline"
-                  disabled={!!actionBusy}
+                  disabled={actionBusy !== null}
                   onClick={() => void handleInboundAction("decline")}
                 />
                 <InlineButtons.Item
                   text="Callback"
-                  disabled={!!actionBusy}
+                  disabled={actionBusy !== null}
                   onClick={() => void handleCallback()}
                 />
               </InlineButtons>
@@ -406,17 +418,17 @@ export function CallConsole({ callSid }: { callSid: string }) {
             <InlineButtons mode="gray">
               <InlineButtons.Item
                 text="Retry stream"
-                disabled={!!actionBusy}
+                disabled={actionBusy !== null}
                 onClick={() => void handleStreamAction("retry")}
               />
               <InlineButtons.Item
                 text="Switch to keypad"
-                disabled={!!actionBusy}
+                disabled={actionBusy !== null}
                 onClick={() => void handleStreamAction("fallback")}
               />
               <InlineButtons.Item
                 text="End call"
-                disabled={!!actionBusy}
+                disabled={actionBusy !== null}
                 onClick={() => void handleStreamAction("end")}
               />
             </InlineButtons>
@@ -440,7 +452,7 @@ export function CallConsole({ callSid }: { callSid: string }) {
                 <Button
                   size="s"
                   mode="filled"
-                  disabled={!selectedScript || !!actionBusy}
+                  disabled={selectedScript === null || actionBusy !== null}
                   onClick={() => void handleScriptInject()}
                 >
                   Inject script

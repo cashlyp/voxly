@@ -31,6 +31,11 @@ export default tseslint.config(
       react,
       "react-hooks": reactHooks,
     },
+    settings: {
+      react: {
+        version: "detect",
+      },
+    },
     rules: {
       // React rules
       "react/react-in-jsx-scope": "off", // Not needed with modern React

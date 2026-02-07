@@ -7,12 +7,12 @@ export type ApiErrorPayload = {
 };
 
 export class ApiError extends Error {
-  status: number;
-  code: string;
-  details?: unknown;
-  retryable?: boolean;
+  public status: number;
+  public code: string;
+  public details?: unknown;
+  public retryable?: boolean;
 
-  constructor(payload: ApiErrorPayload) {
+  public constructor(payload: ApiErrorPayload) {
     super(payload.message);
     this.name = "ApiError";
     this.status = payload.status;
@@ -47,13 +47,13 @@ const DEFAULT_TIMEOUT_MS = 8000;
 const DEFAULT_RETRIES = 2;
 
 // Validate API base is configured in production
-if (!API_BASE && typeof window !== "undefined" && import.meta.env.PROD) {
+if (API_BASE === "" && typeof window !== "undefined" && import.meta.env.PROD) {
   console.error(
     "❌ CRITICAL: VITE_API_BASE environment variable is not set. API communication will fail.",
   );
 }
 
-if (!API_BASE && typeof window !== "undefined" && import.meta.env.DEV) {
+if (API_BASE === "" && typeof window !== "undefined" && import.meta.env.DEV) {
   console.warn(
     "⚠️  VITE_API_BASE environment variable is not set. API communication may fail.",
   );
@@ -79,7 +79,7 @@ function buildUrl(path: string): string {
   // Ensure no double slashes except in protocol
   const normalized = `${API_BASE}${path}`.replace(/([^:]\/)\/+/g, "$1");
   if (import.meta.env.DEV) {
-    console.debug(`[API URL] ${normalized}`);
+    console.warn(`[API URL] ${normalized}`);
   }
   return normalized;
 }
@@ -90,7 +90,7 @@ function shouldRetry(status: number): boolean {
 }
 
 async function readJsonSafely(response: Response): Promise<unknown> {
-  const contentType = response.headers.get("content-type") || "";
+  const contentType = response.headers.get("content-type") ?? "";
   if (!contentType.includes("application/json")) {
     return null;
   }
@@ -131,15 +131,19 @@ export async function apiFetch<T>(
     Accept: "application/json",
     ...headers,
   };
-  if (idempotencyKey) {
+  if (idempotencyKey !== undefined && idempotencyKey !== "") {
     requestHeaders["Idempotency-Key"] = idempotencyKey;
   }
   if (body !== undefined) {
     requestHeaders["Content-Type"] = "application/json";
   }
-  if (token) {
+  if (token !== null && token !== "") {
     requestHeaders.Authorization = `Bearer ${token}`;
   }
+
+  const methodUpper = method.toUpperCase();
+  const safeMethod = ["GET", "HEAD"].includes(methodUpper);
+  const maxRetries = safeMethod ? retries : 0;
 
   let attempt = 0;
   let refreshed = false;
@@ -207,7 +211,7 @@ export async function apiFetch<T>(
           });
         }
 
-        if (error.retryable && attempt <= retries) {
+        if (error.retryable === true && attempt <= maxRetries) {
           await new Promise((resolve) =>
             window.setTimeout(resolve, 300 * attempt),
           );
@@ -220,7 +224,7 @@ export async function apiFetch<T>(
 
       // Log successful API calls in development
       if (import.meta.env.DEV) {
-        console.debug(`[API Success] ${method} ${fullUrl}`, data);
+        console.warn(`[API Success] ${method} ${fullUrl}`, data);
       }
 
       return data as T;
@@ -228,7 +232,7 @@ export async function apiFetch<T>(
       window.clearTimeout(timeout);
       const isAbort =
         error instanceof DOMException && error.name === "AbortError";
-      if ((isAbort || error instanceof TypeError) && attempt <= retries) {
+      if ((isAbort || error instanceof TypeError) && attempt <= maxRetries) {
         await new Promise((resolve) =>
           window.setTimeout(resolve, 300 * attempt),
         );

@@ -8,6 +8,7 @@ import {
   Textarea,
 } from "@telegram-apps/telegram-ui";
 import { useCallback, useEffect, useState } from "react";
+import { MaskedPhone } from "../components/MaskedPhone";
 import { apiFetch, createIdempotencyKey } from "../lib/api";
 import { trackEvent } from "../lib/telemetry";
 import { confirmAction, hapticError, hapticSuccess } from "../lib/ux";
@@ -62,10 +63,13 @@ export function Sms() {
       const params = new URLSearchParams();
       if (statusFilter !== "") params.set("status", statusFilter);
       params.set("limit", "20");
-      const response = await apiFetch<{ ok: boolean; messages: SmsMessage[] }>(
+      const response = await apiFetch<{
+        ok: boolean;
+        messages?: SmsMessage[];
+      }>(
         `/webapp/sms?${params.toString()}`,
       );
-      setMessages(response.messages || []);
+      setMessages(response.messages ?? []);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load messages");
       trackEvent("sms_load_failed");
@@ -78,17 +82,17 @@ export function Sms() {
     try {
       const response = await apiFetch<{
         ok: boolean;
-        templates: SmsTemplate[];
+        templates?: SmsTemplate[];
       }>("/webapp/sms/templates");
-      setTemplates(response.templates || []);
+      setTemplates(response.templates ?? []);
     } catch {
       // Templates are optional
     }
   }, []);
 
   useEffect(() => {
-    loadMessages();
-    loadTemplates();
+    void loadMessages();
+    void loadTemplates();
   }, [loadMessages, loadTemplates]);
 
   const handleSendMessage = async () => {
@@ -112,7 +116,7 @@ export function Sms() {
         body: {
           phone_number: phoneNumber.trim(),
           body: messageBody.trim(),
-          scheduled_for: scheduleTime || undefined,
+          scheduled_for: scheduleTime !== "" ? scheduleTime : undefined,
         },
         idempotencyKey: createIdempotencyKey(),
       });
@@ -131,7 +135,7 @@ export function Sms() {
         trackEvent("sms_sent", { scheduled: !!scheduleTime });
         await loadMessages();
       } else {
-        throw new Error(response.error || "Failed to send message");
+        throw new Error(response.error ?? "Failed to send message");
       }
     } catch (err) {
       hapticError();
@@ -187,8 +191,10 @@ export function Sms() {
   return (
     <div className="wallet-page">
       <List className="wallet-list">
-        {error && <Banner type="inline" header="Error" description={error} />}
-        {success && (
+        {error !== null && error !== "" && (
+          <Banner type="inline" header="Error" description={error} />
+        )}
+        {success !== null && success !== "" && (
           <Banner type="inline" header="Success" description={success} />
         )}
 
@@ -302,14 +308,18 @@ export function Sms() {
                       <div key={msg.id} className="card-item">
                         <div className="card-item-main">
                           <div className="card-item-title">
-                            {msg.phone_number}
+                            <MaskedPhone value={msg.phone_number} />
                           </div>
                           <div className="card-item-subtitle">{msg.body}</div>
                           <div className="card-item-meta">
                             {msg.created_at}
-                            {msg.scheduled_for &&
+                            {msg.scheduled_for !== null &&
+                              msg.scheduled_for !== undefined &&
+                              msg.scheduled_for !== "" &&
                               ` • Scheduled: ${msg.scheduled_for}`}
-                            {msg.error_message &&
+                            {msg.error_message !== null &&
+                              msg.error_message !== undefined &&
+                              msg.error_message !== "" &&
                               ` • Error: ${msg.error_message}`}
                           </div>
                         </div>

@@ -40,13 +40,27 @@ jobs:
           VITE_API_BASE: ${{ secrets.MINIAPP_API_BASE }}
           VITE_BASE: /
 
-      - name: Install Vercel CLI
-        run: npm install -g vercel
+      - name: Pull Vercel settings
+        working-directory: miniapp
+        run: npx vercel@latest pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Build with Vercel
+        working-directory: miniapp
+        run: |
+          npx vercel@latest build \
+            --prod \
+            --token=${{ secrets.VERCEL_TOKEN }} \
+            --org-id=${{ secrets.VERCEL_ORG_ID }} \
+            --project-id=${{ secrets.VERCEL_PROJECT_ID }}
+        env:
+          VITE_API_BASE: ${{ secrets.MINIAPP_API_BASE }}
+          VITE_BASE: /
 
       - name: Deploy to Vercel
         working-directory: miniapp
         run: |
-          vercel deploy \
+          npx vercel@latest deploy \
+            --prebuilt \
             --prod \
             --yes \
             --token=${{ secrets.VERCEL_TOKEN }} \
