@@ -33,39 +33,62 @@ jobs:
         working-directory: miniapp
         run: npm run type-check
 
-      - name: Build production
-        working-directory: miniapp
-        run: npm run build
-        env:
-          VITE_API_BASE: ${{ secrets.MINIAPP_API_BASE }}
-          VITE_BASE: /
-
       - name: Pull Vercel settings
         working-directory: miniapp
-        run: npx vercel@latest pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_SCOPE: ${{ secrets.VERCEL_SCOPE }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          set -e
+          args=(--yes --environment=production --token="$VERCEL_TOKEN")
+          if [ -n "${VERCEL_SCOPE:-}" ]; then
+            args+=(--scope "$VERCEL_SCOPE")
+          fi
+          npx vercel@latest pull "${args[@]}"
+
+      - name: Verify Vercel project config
+        working-directory: miniapp
+        run: |
+          if [ ! -f .vercel/project.json ]; then
+            echo "::error::Missing .vercel/project.json. Ensure 'vercel pull' ran successfully or set VERCEL_SCOPE/VERCEL_ORG_ID/VERCEL_PROJECT_ID secrets."
+            exit 1
+          fi
 
       - name: Build with Vercel
         working-directory: miniapp
-        run: |
-          npx vercel@latest build \
-            --prod \
-            --token=${{ secrets.VERCEL_TOKEN }} \
-            --org-id=${{ secrets.VERCEL_ORG_ID }} \
-            --project-id=${{ secrets.VERCEL_PROJECT_ID }}
         env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_SCOPE: ${{ secrets.VERCEL_SCOPE }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
           VITE_API_BASE: ${{ secrets.MINIAPP_API_BASE }}
           VITE_BASE: /
+        run: |
+          set -e
+          args=(--prod --token="$VERCEL_TOKEN")
+          if [ -n "${VERCEL_SCOPE:-}" ]; then
+            args+=(--scope "$VERCEL_SCOPE")
+          fi
+          npx vercel@latest build \
+            "${args[@]}"
 
       - name: Deploy to Vercel
         working-directory: miniapp
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_SCOPE: ${{ secrets.VERCEL_SCOPE }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: |
+          set -e
+          args=(--prebuilt --prod --yes --token="$VERCEL_TOKEN")
+          if [ -n "${VERCEL_SCOPE:-}" ]; then
+            args+=(--scope "$VERCEL_SCOPE")
+          fi
           npx vercel@latest deploy \
-            --prebuilt \
-            --prod \
-            --yes \
-            --token=${{ secrets.VERCEL_TOKEN }} \
-            --org-id=${{ secrets.VERCEL_ORG_ID }} \
-            --project-id=${{ secrets.VERCEL_PROJECT_ID }}
+            "${args[@]}"
 
       - name: Deployment Summary
         if: always()
