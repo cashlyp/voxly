@@ -1,6 +1,6 @@
 # Miniapp Deployment to Vercel - Complete Summary
 
-## What's Been Done ✅
+### What's Been Done ✅
 
 Your Voxly miniapp has been fully configured for **automated deployment to Vercel** with the following improvements:
 
