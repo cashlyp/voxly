@@ -42,25 +42,44 @@ export function setAuthRefreshProvider(provider: () => Promise<void>) {
   authRefreshProvider = provider;
 }
 
-const API_BASE = (import.meta.env.VITE_API_BASE as string) || "";
+const API_BASE = String(import.meta.env.VITE_API_URL ?? "").trim();
 const DEFAULT_TIMEOUT_MS = 8000;
 const DEFAULT_RETRIES = 2;
 
 // Validate API base is configured in production
 if (API_BASE === "" && typeof window !== "undefined" && import.meta.env.PROD) {
   console.error(
-    "❌ CRITICAL: VITE_API_BASE environment variable is not set. API communication will fail.",
+    "❌ CRITICAL: VITE_API_URL environment variable is not set. API communication will fail.",
   );
 }
 
 if (API_BASE === "" && typeof window !== "undefined" && import.meta.env.DEV) {
   console.warn(
-    "⚠️  VITE_API_BASE environment variable is not set. API communication may fail.",
+    "⚠️  VITE_API_URL environment variable is not set. API communication may fail.",
   );
 }
 
 export function getApiBase() {
   return API_BASE;
+}
+
+export type ApiPingResponse = {
+  ok: boolean;
+  ts: string;
+  version?: string | null;
+};
+
+export async function pingApi(options: { timeoutMs?: number } = {}) {
+  const start = Date.now();
+  const payload = await apiFetch<ApiPingResponse>("/webapp/ping", {
+    auth: false,
+    retries: 0,
+    timeoutMs: options.timeoutMs ?? 5000,
+  });
+  return {
+    payload,
+    latencyMs: Date.now() - start,
+  };
 }
 
 function buildUrl(path: string): string {
@@ -72,7 +91,7 @@ function buildUrl(path: string): string {
       status: 0,
       code: "no_api_base",
       message:
-        "API base URL is not configured. Set VITE_API_BASE environment variable.",
+        "API URL is not configured. Set VITE_API_URL environment variable.",
       retryable: false,
     });
   }
@@ -165,7 +184,7 @@ export async function apiFetch<T>(
 
       if (!response.ok) {
         if (
-          response.status === 401 &&
+          (response.status === 401 || response.status === 403) &&
           auth &&
           authRefreshProvider &&
           !refreshed

@@ -13,6 +13,7 @@ export type WebappUser = {
   username?: string | null;
   first_name?: string | null;
   last_name?: string | null;
+  role?: string | null;
 };
 
 export type AuthSession = {
@@ -267,6 +268,14 @@ function getErrorDetailUrl(details: unknown): string | null {
 
 function describeAuthError(error: unknown) {
   if (error instanceof ApiError) {
+    if (error.code === "no_api_base") {
+      return new AuthError(
+        "API URL not configured. Set VITE_API_URL in the Mini App environment.",
+        "offline",
+        0,
+        error.code,
+      );
+    }
     const apiBase = getApiBase();
     const resolvedBase =
       apiBase !== "" ? apiBase : window.location.origin;
@@ -370,24 +379,36 @@ export async function authenticate(initData?: string): Promise<AuthSession> {
   try {
     const response = await apiFetch<{
       ok: boolean;
-      token: string;
-      expires_at: string;
+      token?: string;
+      accessToken?: string;
+      expires_at?: string;
+      expiresIn?: number;
       user: WebappUser;
       roles: string[];
       environment?: string | null;
       tenant_id?: string | null;
     }>("/webapp/auth", {
       method: "POST",
-      headers: {
-        Authorization: `tma ${rawInitData}`,
-        "X-Telegram-Init-Data": rawInitData,
-      },
       body: { initData: rawInitData },
       auth: false,
     });
+    const resolvedToken = response.accessToken ?? response.token ?? "";
+    if (!resolvedToken) {
+      throw new AuthError(
+        "Auth token missing from response.",
+        "server",
+        500,
+        "missing_token",
+      );
+    }
+    const fallbackExpirySeconds =
+      typeof response.expiresIn === "number" ? response.expiresIn : 900;
+    const resolvedExpiry =
+      response.expires_at ??
+      new Date(Date.now() + fallbackExpirySeconds * 1000).toISOString();
     const session: AuthSession = {
-      token: response.token,
-      expiresAt: response.expires_at,
+      token: resolvedToken,
+      expiresAt: resolvedExpiry,
       user: response.user,
       roles: response.roles,
       environment: response.environment ?? null,

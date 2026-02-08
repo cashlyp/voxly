@@ -32,6 +32,19 @@ const { v4: uuidv4 } = require("uuid");
 const { WaveFile } = require("wavefile");
 
 const isProduction = process.env.NODE_ENV === "production";
+const appVersion = (() => {
+  try {
+    return (
+      process.env.APP_VERSION ||
+      process.env.VERCEL_GIT_COMMIT_SHA ||
+      process.env.GIT_SHA ||
+      require("./package.json").version ||
+      "unknown"
+    );
+  } catch {
+    return "unknown";
+  }
+})();
 
 const twilio = require("twilio");
 const VoiceResponse = twilio.twiml.VoiceResponse;
@@ -125,8 +138,14 @@ const MINIAPP_EVENT_BUFFER_MAX = 500;
 const MINIAPP_INITDATA_MAX_AGE_S = 24 * 60 * 60;
 const MINIAPP_ACCESS_CACHE_TTL_MS = 30000;
 const MINIAPP_ACCESS_ADMIN_KEY = "miniapp_admin_ids";
+const MINIAPP_ACCESS_OPERATOR_KEY = "miniapp_operator_ids";
 const MINIAPP_ACCESS_VIEWER_KEY = "miniapp_viewer_ids";
-const miniappAccessCache = { admins: [], viewers: [], loadedAt: 0 };
+const miniappAccessCache = {
+  admins: [],
+  operators: [],
+  viewers: [],
+  loadedAt: 0,
+};
 const WEBAPP_JWT_TTL_S = Number(config.miniapp?.jwtTtlSeconds || 900);
 const WEBAPP_INITDATA_MAX_AGE_S = Number(
   config.miniapp?.initDataMaxAgeS || 120,
@@ -461,11 +480,13 @@ async function loadMiniappAccessCache(force = false) {
     return miniappAccessCache;
   }
   try {
-    const [adminsRaw, viewersRaw] = await Promise.all([
+    const [adminsRaw, operatorsRaw, viewersRaw] = await Promise.all([
       db.getSetting(MINIAPP_ACCESS_ADMIN_KEY).catch(() => null),
+      db.getSetting(MINIAPP_ACCESS_OPERATOR_KEY).catch(() => null),
       db.getSetting(MINIAPP_ACCESS_VIEWER_KEY).catch(() => null),
     ]);
     miniappAccessCache.admins = parseAccessList(adminsRaw);
+    miniappAccessCache.operators = parseAccessList(operatorsRaw);
     miniappAccessCache.viewers = parseAccessList(viewersRaw);
     miniappAccessCache.loadedAt = now;
   } catch (error) {
@@ -492,6 +513,7 @@ async function getMiniappAccessLists() {
       envOperators,
       envViewers,
       customAdmins: [],
+      customOperators: [],
       customViewers: [],
       admins: envAdmins,
       operators: envOperators,
@@ -500,25 +522,33 @@ async function getMiniappAccessLists() {
   }
   const cache = await loadMiniappAccessCache();
   const admins = mergeAccessLists(envAdmins, cache.admins);
+  const operators = mergeAccessLists(envOperators, cache.operators);
   const viewers = mergeAccessLists(envViewers, cache.viewers);
   return {
     envAdmins,
     envOperators,
     envViewers,
     customAdmins: cache.admins,
+    customOperators: cache.operators,
     customViewers: cache.viewers,
     admins,
-    operators: envOperators,
+    operators,
     viewers,
   };
 }
 
 async function resolveMiniappRoles(userId) {
   const { admins, operators, viewers } = await getMiniappAccessLists();
-  if (!admins.length && !viewers.length && !isProduction) return ["admin"];
-  if (admins.map(String).includes(String(userId))) return ["admin"];
-  if (operators.map(String).includes(String(userId))) return ["operator"];
-  if (viewers.map(String).includes(String(userId))) return ["viewer"];
+  const id = String(userId || "");
+  const adminOverride =
+    String(process.env.ADMIN_TELEGRAM_ID || config.telegram?.adminChatId || "");
+  if (!admins.length && !operators.length && !viewers.length && !isProduction) {
+    return ["admin"];
+  }
+  if (adminOverride && id === String(adminOverride)) return ["admin"];
+  if (admins.map(String).includes(id)) return ["admin"];
+  if (operators.map(String).includes(id)) return ["operator"];
+  if (viewers.map(String).includes(id)) return ["operator"];
   return [];
 }
 
@@ -705,7 +735,9 @@ function base64UrlDecode(input) {
 function getWebappJwtSecret() {
   const secret = config.miniapp?.jwtSecret;
   if (!secret) {
-    console.warn("Miniapp JWT secret is missing. Set MINIAPP_JWT_SECRET.");
+    console.warn(
+      "Miniapp JWT secret is missing. Set WEB_APP_SECRET or MINIAPP_JWT_SECRET.",
+    );
   }
   return secret;
 }
@@ -862,39 +894,36 @@ function requireWebappInitData(req, res, next) {
   return next();
 }
 
-async function requireWebappJwt(req, res, next) {
-  try {
-    const token = resolveWebappToken(req);
-    if (!token) {
-      return res.status(401).json({
-        ok: false,
-        error: "missing_token",
-        message: webappErrorMessage("missing_token"),
-      });
-    }
-    const verification = verifyWebappJwt(token);
-    if (!verification.ok) {
-      const code = verification.error || "invalid_token";
-      return res.status(401).json({
-        ok: false,
-        error: code,
-        message: webappErrorMessage(code),
-      });
-    }
-    const payload = verification.payload || {};
-    const userId = payload.sub || payload.user_id || payload.userId;
-    if (!userId) {
-      return res.status(401).json({ ok: false, error: "missing_user" });
-    }
-    const roles = await resolveMiniappRoles(userId);
-    if (!roles.length) {
-      return res.status(403).json({
-        ok: false,
-        error: "not_authorized",
-        message: webappErrorMessage("not_authorized"),
-      });
-    }
-    req.webappSession = {
+function isJwtToken(token) {
+  if (!token) return false;
+  return String(token).split(".").length === 3;
+}
+
+async function resolveWebappSession(req) {
+  const token = resolveWebappToken(req);
+  if (!token) {
+    return { ok: false, status: 401, error: "missing_token" };
+  }
+  const verification = verifyWebappJwt(token);
+  if (!verification.ok) {
+    return {
+      ok: false,
+      status: 401,
+      error: verification.error || "invalid_token",
+    };
+  }
+  const payload = verification.payload || {};
+  const userId = payload.sub || payload.user_id || payload.userId;
+  if (!userId) {
+    return { ok: false, status: 401, error: "missing_user" };
+  }
+  const roles = await resolveMiniappRoles(userId);
+  if (!roles.length) {
+    return { ok: false, status: 403, error: "not_authorized" };
+  }
+  return {
+    ok: true,
+    session: {
       token,
       user: {
         id: String(userId),
@@ -904,10 +933,61 @@ async function requireWebappJwt(req, res, next) {
       },
       roles,
       tenant_id: payload.tenant_id || WEBAPP_TENANT_ID,
-    };
+    },
+  };
+}
+
+async function requireWebappJwt(req, res, next) {
+  try {
+    const resolved = await resolveWebappSession(req);
+    if (!resolved.ok) {
+      return res.status(resolved.status || 401).json({
+        ok: false,
+        error: resolved.error,
+        message: webappErrorMessage(resolved.error),
+      });
+    }
+    req.webappSession = resolved.session;
     return next();
   } catch (error) {
     console.error("Webapp auth error:", error);
+    return res.status(500).json({ ok: false, error: "auth_error" });
+  }
+}
+
+async function requireMiniappAccessAdmin(req, res, next) {
+  try {
+    const token = resolveWebappToken(req);
+    if (token && isJwtToken(token)) {
+      const resolved = await resolveWebappSession(req);
+      if (!resolved.ok) {
+        return res.status(resolved.status || 401).json({
+          ok: false,
+          error: resolved.error,
+          message: webappErrorMessage(resolved.error),
+        });
+      }
+      const roles = resolved.session?.roles || [];
+      if (!roles.includes("admin")) {
+        return res.status(403).json({
+          ok: false,
+          error: "not_authorized",
+          message: webappErrorMessage("not_authorized"),
+        });
+      }
+      req.webappSession = resolved.session;
+      req.miniappSession = {
+        token: resolved.session.token,
+        user: resolved.session.user,
+        roles: resolved.session.roles,
+      };
+      return next();
+    }
+    return requireMiniappSession(req, res, () =>
+      requireMiniappAdmin(req, res, next),
+    );
+  } catch (error) {
+    console.error("Miniapp access auth error:", error);
     return res.status(500).json({ ok: false, error: "auth_error" });
   }
 }
@@ -9205,18 +9285,20 @@ app.post("/miniapp/refresh", async (req, res) => {
 
 app.get(
   "/miniapp/access",
-  requireMiniappSession,
-  requireMiniappAdmin,
+  requireMiniappAccessAdmin,
   async (req, res) => {
     try {
       const access = await getMiniappAccessLists();
       return res.json({
         ok: true,
         admins: access.admins,
+        operators: access.operators,
         viewers: access.viewers,
         env_admins: access.envAdmins,
+        env_operators: access.envOperators,
         env_viewers: access.envViewers,
         custom_admins: access.customAdmins,
+        custom_operators: access.customOperators,
         custom_viewers: access.customViewers,
       });
     } catch (error) {
@@ -9228,15 +9310,20 @@ app.get(
 
 app.post(
   "/miniapp/access",
-  requireMiniappSession,
-  requireMiniappAdmin,
+  requireMiniappAccessAdmin,
   async (req, res) => {
     try {
       const adminsInput =
         req.body?.admins ?? req.body?.admin_ids ?? req.body?.adminIds ?? "";
+      const operatorsInput =
+        req.body?.operators ??
+        req.body?.operator_ids ??
+        req.body?.operatorIds ??
+        "";
       const viewersInput =
         req.body?.viewers ?? req.body?.viewer_ids ?? req.body?.viewerIds ?? "";
       const admins = parseAccessList(adminsInput);
+      const operators = parseAccessList(operatorsInput);
       const viewers = parseAccessList(viewersInput);
       const access = await getMiniappAccessLists();
       const currentAdmin = String(req.miniappSession?.user?.id || "");
@@ -9248,6 +9335,10 @@ app.post(
         admins.push(currentAdmin);
       }
       await db.setSetting(MINIAPP_ACCESS_ADMIN_KEY, JSON.stringify(admins));
+      await db.setSetting(
+        MINIAPP_ACCESS_OPERATOR_KEY,
+        JSON.stringify(operators),
+      );
       await db.setSetting(MINIAPP_ACCESS_VIEWER_KEY, JSON.stringify(viewers));
       await loadMiniappAccessCache(true);
       const updated = await getMiniappAccessLists();
@@ -9257,6 +9348,7 @@ app.post(
           action: "miniapp.access.update",
           metadata: {
             admins_count: updated.admins.length,
+            operators_count: updated.operators.length,
             viewers_count: updated.viewers.length,
           },
           ip: req.ip,
@@ -9266,10 +9358,13 @@ app.post(
       return res.json({
         ok: true,
         admins: updated.admins,
+        operators: updated.operators,
         viewers: updated.viewers,
         env_admins: updated.envAdmins,
+        env_operators: updated.envOperators,
         env_viewers: updated.envViewers,
         custom_admins: updated.customAdmins,
+        custom_operators: updated.customOperators,
         custom_viewers: updated.customViewers,
       });
     } catch (error) {
@@ -9569,17 +9664,27 @@ app.post(
         { roles, token_id: tokenId },
         user.id,
       );
+      const role = roles.includes("admin")
+        ? "admin"
+        : roles.includes("operator")
+          ? "operator"
+          : "unknown";
+      const expiresIn = WEBAPP_JWT_TTL_S;
       return res.json({
         ok: true,
+        accessToken: token,
         token,
+        expiresIn,
         expires_at: new Date((now + WEBAPP_JWT_TTL_S) * 1000).toISOString(),
         user: {
           id: user.id,
           username: user.username || null,
           first_name: user.first_name || null,
           last_name: user.last_name || null,
+          role,
         },
         roles,
+        role,
         environment: WEBAPP_ENVIRONMENT,
         tenant_id: WEBAPP_TENANT_ID,
       });
@@ -9601,12 +9706,10 @@ app.get("/webapp/me", requireWebappJwt, async (req, res) => {
     ? "admin"
     : roles.includes("operator")
       ? "operator"
-      : roles.includes("viewer")
-        ? "viewer"
-        : "unknown";
+      : "unknown";
   return res.json({
     ok: true,
-    user: session?.user || null,
+    user: session?.user ? { ...session.user, role } : null,
     roles,
     role,
     environment: WEBAPP_ENVIRONMENT,
@@ -9643,7 +9746,20 @@ app.post("/webapp/telemetry", requireWebappJwt, async (req, res) => {
   }
 });
 
-app.get("/webapp/ping", requireWebappJwt, async (req, res) => {
+app.get("/webapp/ping", async (req, res) => {
+  try {
+    return res.json({
+      ok: true,
+      ts: new Date().toISOString(),
+      version: appVersion,
+    });
+  } catch (error) {
+    console.error("Webapp ping error:", error);
+    return res.status(500).json({ ok: false, error: "ping_failed" });
+  }
+});
+
+app.get("/webapp/health", requireWebappJwt, async (req, res) => {
   try {
     const readiness = getProviderReadiness();
     const health = getProviderHealthEntry(currentProvider);
@@ -9664,8 +9780,8 @@ app.get("/webapp/ping", requireWebappJwt, async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("Webapp ping error:", error);
-    return res.status(500).json({ ok: false, error: "ping_failed" });
+    console.error("Webapp health error:", error);
+    return res.status(500).json({ ok: false, error: "health_failed" });
   }
 });
 

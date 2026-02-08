@@ -24,19 +24,28 @@ export function validateUrl(urlString: string): boolean {
 
 export function getEnvironmentConfig(): EnvironmentConfig {
   const apiBase =
-    getOptionalEnvVar("API_BASE", "") ??
-    String(import.meta.env.VITE_API_BASE ?? "");
+    getOptionalEnvVar("API_URL", "") ??
+    String(import.meta.env.VITE_API_URL ?? "");
   const isDev = import.meta.env.DEV;
   const isTesting =
     typeof process !== "undefined" && process.env.NODE_ENV === "test";
 
   // Validate API base URL format if provided
   if (apiBase !== "" && !validateUrl(apiBase)) {
-    const message = `Invalid API base URL: ${apiBase}. Must be a valid URL.`;
+    const message = `Invalid API URL: ${apiBase}. Must be a valid URL.`;
     if (!isDev) {
       throw new Error(message);
     }
     console.warn(message);
+  }
+
+  if (apiBase !== "" && !isDev) {
+    const parsed = new URL(apiBase);
+    if (parsed.protocol !== "https:") {
+      throw new Error(
+        `API URL must use https in production. Received: ${apiBase}`,
+      );
+    }
   }
 
   return {

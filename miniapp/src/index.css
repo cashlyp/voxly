@@ -381,6 +381,36 @@ textarea {
   box-shadow: var(--vn-shadow-soft);
 }
 
+.wallet-banner-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.banner-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 6px;
+}
+
+.chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 4px 12px;
+}
+
+.allowlist-input {
+  width: 100%;
+  border-radius: var(--vn-radius-sm);
+  border: 1px solid var(--vn-border);
+  background: var(--vn-surface);
+  color: var(--vn-text);
+  padding: 10px 12px;
+  min-height: 64px;
+  resize: vertical;
+}
+
 .wallet-page {
   display: flex;
   flex-direction: column;
@@ -813,6 +843,12 @@ textarea {
   border: 1px solid var(--vn-border);
   color: var(--vn-text);
   text-align: center;
+}
+
+.panel-subtitle {
+  margin: 8px 0 12px;
+  color: var(--vn-muted);
+  font-size: 13px;
 }
 
 .skeleton-panel {

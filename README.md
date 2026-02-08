@@ -132,7 +132,7 @@ Open the dev URL in Telegram (Mini App URL) or a browser:
 By default the UI calls the API on `window.location.origin` (same host).
 Override the API base with a build-time env:
 ```
-VITE_API_BASE=https://api.example.com
+VITE_API_URL=https://api.example.com
 ```
 
 ### API endpoints used

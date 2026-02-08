@@ -98,7 +98,7 @@ process.env.NODE_ENV = 'test';
 process.env.TELEGRAM_BOT_TOKEN = 'test-bot-token';
 process.env.MINIAPP_JWT_SECRET = 'test-jwt-secret';
 process.env.TELEGRAM_ADMIN_CHAT_IDS = '1111';
-process.env.TELEGRAM_VIEWER_CHAT_IDS = '2222';
+process.env.TELEGRAM_OPERATOR_CHAT_IDS = '2222';
 process.env.CALL_PROVIDER = 'twilio';
 process.env.TWILIO_ACCOUNT_SID = 'ACXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX';
 process.env.TWILIO_AUTH_TOKEN = 'test';
@@ -137,14 +137,14 @@ function requestServer() {
   return request(server);
 }
 
-function buildInitData(userId) {
+function buildInitData(userId, authDateOverride) {
   const user = {
     id: userId,
     username: `user${userId}`,
     first_name: 'Test',
     last_name: 'User',
   };
-  const authDate = Math.floor(Date.now() / 1000);
+  const authDate = authDateOverride ?? Math.floor(Date.now() / 1000);
   const params = new URLSearchParams();
   params.set('auth_date', String(authDate));
   params.set('user', JSON.stringify(user));
@@ -208,7 +208,18 @@ describe('Webapp auth and roles', () => {
     expect(response.status).toBe(200);
     expect(response.body.ok).toBe(true);
     expect(response.body.token).toBeTruthy();
+    expect(response.body.accessToken).toBeTruthy();
+    expect(response.body.accessToken).toBe(response.body.token);
     expect(response.body.roles).toContain('admin');
+  });
+
+  it('authenticates operator user and returns operator role', async () => {
+    if (!allowListen) return;
+    const response = await authAs(2222);
+    expect(response.status).toBe(200);
+    expect(response.body.ok).toBe(true);
+    expect(response.body.roles).toContain('operator');
+    expect(response.body.role).toBe('operator');
   });
 
   it('rejects unauthorized user', async () => {
@@ -218,14 +229,25 @@ describe('Webapp auth and roles', () => {
     expect(response.body.error).toBe('not_authorized');
   });
 
-  it('blocks viewer from admin settings', async () => {
+  it('blocks operator from admin settings', async () => {
     if (!allowListen) return;
     const authResponse = await authAs(2222);
-    const token = authResponse.body.token;
+    const token = authResponse.body.accessToken || authResponse.body.token;
     const response = await requestServer()
       .get('/webapp/settings')
       .set('Authorization', `Bearer ${token}`);
     expect(response.status).toBe(403);
+  });
+
+  it('rejects expired initData', async () => {
+    if (!allowListen) return;
+    const expired = Math.floor(Date.now() / 1000) - 3600;
+    const initData = buildInitData(1111, expired);
+    const response = await requestServer()
+      .post('/webapp/auth')
+      .send({ initData });
+    expect(response.status).toBe(401);
+    expect(response.body.error).toBe('expired_init_data');
   });
 
   it('rejects tokens missing required claims', async () => {
@@ -364,7 +386,7 @@ describe('Origin allowlist (production)', () => {
       process.env.TELEGRAM_BOT_TOKEN = 'test-bot-token';
       process.env.MINIAPP_JWT_SECRET = 'test-jwt-secret';
       process.env.TELEGRAM_ADMIN_CHAT_IDS = '1111';
-      process.env.TELEGRAM_VIEWER_CHAT_IDS = '2222';
+      process.env.TELEGRAM_OPERATOR_CHAT_IDS = '2222';
       process.env.CALL_PROVIDER = 'twilio';
       process.env.TWILIO_ACCOUNT_SID = 'ACXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX';
       process.env.TWILIO_AUTH_TOKEN = 'test';

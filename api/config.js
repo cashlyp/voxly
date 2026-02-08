@@ -163,9 +163,21 @@ const inboundCallbackDelayMinutes = Number(
   readEnv("INBOUND_CALLBACK_DELAY_MIN") || "15",
 );
 
-const miniappAllowedOrigins = parseList(readEnv("MINIAPP_ALLOWED_ORIGINS"));
+const miniappOriginSeeds = [
+  readEnv("MINIAPP_ALLOWED_ORIGINS"),
+  readEnv("MINI_APP_URL"),
+  readEnv("MINIAPP_PUBLIC_URL"),
+  readEnv("MINIAPP_URL"),
+]
+  .filter(Boolean)
+  .join(",");
+const miniappAllowedOrigins = Array.from(
+  new Set([...parseList(miniappOriginSeeds), ...corsOrigins]),
+);
 const miniappPublicUrl =
-  readEnv("MINIAPP_PUBLIC_URL") || readEnv("MINIAPP_URL");
+  readEnv("MINIAPP_PUBLIC_URL") ||
+  readEnv("MINIAPP_URL") ||
+  readEnv("MINI_APP_URL");
 const miniappBotUsernameRaw =
   readEnv("MINIAPP_BOT_USERNAME") || readEnv("TELEGRAM_BOT_USERNAME");
 const miniappBotUsername = miniappBotUsernameRaw
@@ -190,7 +202,8 @@ const miniappTheme =
   miniappThemeRaw && Object.keys(miniappThemeRaw).length
     ? miniappThemeRaw
     : null;
-const miniappJwtSecret = readEnv("MINIAPP_JWT_SECRET") || apiSecret;
+const miniappJwtSecret =
+  readEnv("WEB_APP_SECRET") || readEnv("MINIAPP_JWT_SECRET") || apiSecret;
 const miniappJwtTtlSeconds = Number(readEnv("MINIAPP_JWT_TTL_S") || "900");
 const miniappInitDataMaxAgeS = Number(
   readEnv("MINIAPP_INITDATA_MAX_AGE_S") || "120",
@@ -392,9 +405,7 @@ module.exports = {
     viewerUserIds: telegramViewerUserIds,
   },
   miniapp: {
-    allowedOrigins: miniappAllowedOrigins.length
-      ? miniappAllowedOrigins
-      : corsOrigins,
+    allowedOrigins: miniappAllowedOrigins,
     sessionTtlMs: miniappSessionTtlMs,
     refreshTtlMs: miniappRefreshTtlMs,
     jwtSecret: miniappJwtSecret,

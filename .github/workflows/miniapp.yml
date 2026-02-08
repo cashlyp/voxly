@@ -63,7 +63,7 @@ jobs:
           VERCEL_SCOPE: ${{ secrets.VERCEL_SCOPE }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-          VITE_API_BASE: ${{ secrets.MINIAPP_API_BASE }}
+          VITE_API_URL: ${{ secrets.MINIAPP_API_URL }}
           VITE_BASE: /
         run: |
           set -e
@@ -89,6 +89,39 @@ jobs:
           fi
           npx vercel@latest deploy \
             "${args[@]}"
+
+      - name: Smoke test API
+        env:
+          API_URL: ${{ secrets.MINIAPP_API_URL }}
+          WEBAPP_SMOKE_INITDATA: ${{ secrets.WEBAPP_SMOKE_INITDATA }}
+        run: |
+          set -e
+          if [ -z "${API_URL:-}" ]; then
+            echo "::error::Missing MINIAPP_API_URL secret for smoke test."
+            exit 1
+          fi
+          echo "Pinging ${API_URL}/webapp/ping"
+          curl -fsS --max-time 10 "${API_URL}/webapp/ping" \
+            | node -e 'const fs=require("fs");const d=JSON.parse(fs.readFileSync(0,"utf8"));if(!d.ok){process.exit(1)}'
+          if [ -n "${WEBAPP_SMOKE_INITDATA:-}" ]; then
+            payload=$(node -e 'console.log(JSON.stringify({initData: process.env.WEBAPP_SMOKE_INITDATA}))')
+            auth=$(curl -fsS --max-time 10 \
+              -H "Content-Type: application/json" \
+              -d "${payload}" \
+              "${API_URL}/webapp/auth")
+            token=$(node -e 'const d=JSON.parse(process.env.AUTH||"{}");console.log(d.accessToken||d.token||"")' AUTH="$auth")
+            if [ -z "$token" ]; then
+              echo "::error::Failed to obtain access token from /webapp/auth."
+              exit 1
+            fi
+            echo "Checking ${API_URL}/webapp/health"
+            curl -fsS --max-time 10 \
+              -H "Authorization: Bearer ${token}" \
+              "${API_URL}/webapp/health" \
+              | node -e 'const fs=require("fs");const d=JSON.parse(fs.readFileSync(0,"utf8"));if(!d.ok){process.exit(1)}'
+          else
+            echo "WEBAPP_SMOKE_INITDATA not set; skipping /webapp/health."
+          fi
 
       - name: Deployment Summary
         if: always()

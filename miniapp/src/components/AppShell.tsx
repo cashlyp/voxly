@@ -1,4 +1,4 @@
-import { Banner, Tabbar } from "@telegram-apps/telegram-ui";
+import { Banner, Button, Tabbar } from "@telegram-apps/telegram-ui";
 import { settingsButton } from "@tma.js/sdk";
 import {
   addToHomeScreen,
@@ -17,7 +17,7 @@ import {
 } from "react";
 import { AppBrand } from "../components/AppBrand";
 import { SkeletonPanel } from "../components/Skeleton";
-import { apiFetch } from "../lib/api";
+import { ApiError, apiFetch, getApiBase, pingApi } from "../lib/api";
 import { t } from "../lib/i18n";
 import { canAccessRoute, resolveRoleTier, type RoleTier } from "../lib/roles";
 import {
@@ -277,22 +277,128 @@ function AccessDenied({ message }: { message: string }) {
   return <div className="panel">{message}</div>;
 }
 
+type ApiConnectivityState = "checking" | "ok" | "error" | "missing";
+
+type ApiConnectivity = {
+  state: ApiConnectivityState;
+  latencyMs?: number | null;
+  error?: { message: string; status?: number; code?: string } | null;
+};
+
+function ApiUnavailable({
+  title,
+  description,
+  onRetry,
+}: {
+  title: string;
+  description: string;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="panel">
+      <div className="skeleton-title">{title}</div>
+      <div className="panel-subtitle">{description}</div>
+      <div className="skeleton-line" />
+      <div className="skeleton-line" />
+      <div className="section-actions">
+        <Button size="s" mode="bezeled" onClick={onRetry}>
+          Retry
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function describeApiConnectivityError(error: unknown) {
+  if (error instanceof ApiError) {
+    if (error.code === "no_api_base") {
+      return {
+        message: "API URL not configured. Set VITE_API_URL in your environment.",
+        status: 0,
+        code: error.code,
+      };
+    }
+    if (error.code === "timeout") {
+      return {
+        message: "API request timed out. Check your network connection.",
+        status: 0,
+        code: error.code,
+      };
+    }
+    if (error.code === "network_error") {
+      return {
+        message: "CORS blocked or network error. Verify API URL and allowlist.",
+        status: 0,
+        code: error.code,
+      };
+    }
+    return {
+      message: error.message || "API request failed.",
+      status: error.status,
+      code: error.code,
+    };
+  }
+  return {
+    message: error instanceof Error ? error.message : "API request failed.",
+  };
+}
+
 function RouteRenderer({
   route,
   role,
   status,
   errorMessage,
+  errorKind,
+  apiConnectivity,
+  onRetry,
 }: {
   route: RouteMatch;
   role: RoleTier;
   status: "idle" | "loading" | "ready" | "error";
   errorMessage?: string | null;
+  errorKind?: string | null;
+  apiConnectivity: ApiConnectivity;
+  onRetry: () => void;
 }) {
+  if (apiConnectivity.state === "missing") {
+    return (
+      <ApiUnavailable
+        title="API URL not configured"
+        description="Set VITE_API_URL for this Mini App."
+        onRetry={onRetry}
+      />
+    );
+  }
+
+  if (apiConnectivity.state === "error") {
+    return (
+      <ApiUnavailable
+        title="Cannot reach API"
+        description={apiConnectivity.error?.message ?? "Check connectivity."}
+        onRetry={onRetry}
+      />
+    );
+  }
+
   if (status === "loading" || status === "idle") {
     return <SkeletonPanel title="Authorizing..." />;
   }
 
   if (status === "error") {
+    if (errorKind === "offline") {
+      return (
+        <ApiUnavailable
+          title="Cannot reach API"
+          description={errorMessage ?? "Check connectivity."}
+          onRetry={onRetry}
+        />
+      );
+    }
+    if (errorKind === "unauthorized") {
+      return (
+        <AccessDenied message="Not authorized for this Mini App." />
+      );
+    }
     return (
       <AccessDenied
         message={errorMessage ?? "Authentication failed. Please retry."}
@@ -439,10 +545,19 @@ function InboundPoller() {
 }
 
 export function AppShell() {
-  const { status, user, roles, error, errorKind, environment, tenantId } =
-    useUser();
+  const {
+    status,
+    user,
+    roles,
+    error,
+    errorKind,
+    environment,
+    tenantId,
+    refresh,
+  } = useUser();
   const roleTier = useMemo(() => resolveRoleTier(roles), [roles]);
   const isAdmin = roleTier === "admin";
+  const apiBase = getApiBase();
   const [isOnline, setIsOnline] = useState(() =>
     typeof navigator !== "undefined" ? navigator.onLine : true,
   );
@@ -453,6 +568,9 @@ export function AppShell() {
     degraded: boolean;
     lastErrorAt?: string | null;
   } | null>(null);
+  const [apiConnectivity, setApiConnectivity] = useState<ApiConnectivity>(() =>
+    apiBase ? { state: "checking" } : { state: "missing" },
+  );
 
   useEffect(() => {
     const handler = () => setPath(getHashPath());
@@ -466,6 +584,42 @@ export function AppShell() {
   const showBack = !tabPaths.includes(route.path);
   const activeCallSid =
     route.name === "callConsole" ? route.params.callSid : null;
+
+  const runPing = useCallback(async () => {
+    if (!apiBase) {
+      setApiConnectivity({ state: "missing" });
+      return;
+    }
+    setApiConnectivity((prev) => ({
+      ...prev,
+      state: "checking",
+    }));
+    try {
+      const { payload, latencyMs } = await pingApi({ timeoutMs: 5000 });
+      if (payload.ok) {
+        setApiConnectivity({ state: "ok", latencyMs });
+      } else {
+        setApiConnectivity({
+          state: "error",
+          latencyMs,
+          error: { message: "Ping failed. API returned not ok." },
+        });
+      }
+    } catch (err) {
+      const detail = describeApiConnectivityError(err);
+      setApiConnectivity({
+        state: detail.code === "no_api_base" ? "missing" : "error",
+        error: detail,
+      });
+    }
+  }, [apiBase]);
+
+  const handleRetry = useCallback(() => {
+    void runPing();
+    if (apiBase) {
+      void refresh();
+    }
+  }, [runPing, refresh, apiBase]);
 
   useEffect(() => {
     const handleBack = () => {
@@ -490,7 +644,10 @@ export function AppShell() {
   }, [showBack]);
 
   useEffect(() => {
-    const handleOnline = () => setIsOnline(true);
+    const handleOnline = () => {
+      setIsOnline(true);
+      void runPing();
+    };
     const handleOffline = () => setIsOnline(false);
     window.addEventListener("online", handleOnline);
     window.addEventListener("offline", handleOffline);
@@ -498,7 +655,11 @@ export function AppShell() {
       window.removeEventListener("online", handleOnline);
       window.removeEventListener("offline", handleOffline);
     };
-  }, []);
+  }, [runPing]);
+
+  useEffect(() => {
+    void runPing();
+  }, [runPing]);
 
   useEffect(() => {
     saveUiState({ path, activeCallSid });
@@ -609,7 +770,7 @@ export function AppShell() {
       try {
         const response = await apiFetch<{
           provider: { degraded: boolean; last_error_at?: string | null };
-        }>("/webapp/ping");
+        }>("/webapp/health");
         if (!cancelled) {
           setHealth({
             degraded: response.provider.degraded,
@@ -667,6 +828,31 @@ export function AppShell() {
       body: error,
     };
   }, [status, error, errorKind]);
+
+  const apiBanner = useMemo(() => {
+    if (apiConnectivity.state === "missing") {
+      return {
+        header: "API URL not configured",
+        body: "Set VITE_API_URL for this Mini App.",
+      };
+    }
+    if (apiConnectivity.state === "error") {
+      const detail = apiConnectivity.error?.message ?? "Cannot reach API.";
+      const statusLabel =
+        apiConnectivity.error?.status && apiConnectivity.error?.status > 0
+          ? ` (status ${apiConnectivity.error.status})`
+          : "";
+      return {
+        header: "Cannot reach API",
+        body: `${detail}${statusLabel}`,
+      };
+    }
+    return null;
+  }, [apiConnectivity]);
+
+  const showAuthBanner =
+    authBanner !== null &&
+    !(errorKind === "offline" && apiConnectivity.state !== "ok");
 
   const envLabel = environment?.toLowerCase() ?? "";
   const environmentLabel = environment?.toUpperCase() ?? "";
@@ -851,11 +1037,27 @@ export function AppShell() {
           </div>
         )}
 
-        {authBanner && (
+        {apiBanner && (
+          <div className="wallet-banner-group">
+            <Banner
+              type="inline"
+              header={apiBanner.header}
+              description={apiBanner.body}
+              className="wallet-banner"
+            />
+            <div className="banner-actions">
+              <Button size="s" mode="bezeled" onClick={handleRetry}>
+                Retry
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {showAuthBanner && (
           <Banner
             type="inline"
-            header={authBanner.header}
-            description={authBanner.body}
+            header={authBanner?.header}
+            description={authBanner?.body}
             className="wallet-banner"
           />
         )}
@@ -873,7 +1075,7 @@ export function AppShell() {
           />
         )}
 
-        {!isOnline && !authBanner && (
+        {!isOnline && !showAuthBanner && apiBanner === null && (
           <Banner
             type="inline"
             header={t("banner.offline.header", "You're offline")}
@@ -891,6 +1093,9 @@ export function AppShell() {
             role={roleTier}
             status={status}
             errorMessage={error}
+            errorKind={errorKind}
+            apiConnectivity={apiConnectivity}
+            onRetry={handleRetry}
           />
         </main>
 
