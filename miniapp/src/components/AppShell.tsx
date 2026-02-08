@@ -360,7 +360,9 @@ function RouteRenderer({
   apiConnectivity: ApiConnectivity;
   onRetry: () => void;
 }) {
-  if (apiConnectivity.state === "missing") {
+  const isSettingsRoute = route.name === "settings";
+
+  if (apiConnectivity.state === "missing" && !isSettingsRoute) {
     return (
       <ApiUnavailable
         title="API URL not configured"
@@ -370,7 +372,7 @@ function RouteRenderer({
     );
   }
 
-  if (apiConnectivity.state === "error") {
+  if (apiConnectivity.state === "error" && !isSettingsRoute) {
     return (
       <ApiUnavailable
         title="Cannot reach API"
@@ -380,11 +382,11 @@ function RouteRenderer({
     );
   }
 
-  if (status === "loading" || status === "idle") {
+  if ((status === "loading" || status === "idle") && !isSettingsRoute) {
     return <SkeletonPanel title="Authorizing..." />;
   }
 
-  if (status === "error") {
+  if (status === "error" && !isSettingsRoute) {
     if (errorKind === "offline") {
       return (
         <ApiUnavailable
@@ -406,7 +408,7 @@ function RouteRenderer({
     );
   }
 
-  if (!canAccessRoute(role, route.name)) {
+  if (!canAccessRoute(role, route.name) && !isSettingsRoute) {
     return (
       <AccessDenied
         message={t("banner.auth.unauthorized.body", "Access denied.")}

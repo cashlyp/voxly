@@ -5,10 +5,10 @@
 4 silly config load:file:/workspaces/voxly/miniapp/.npmrc
 5 silly config load:file:/workspaces/voxly/miniapp/~/.npmrc
 6 silly config load:file:/usr/local/share/nvm/versions/node/v24.11.1/etc/npmrc
-7 verbose title npm exec vercel pull --yes --environment=production --token 1QHs8uspIiGgbynaQj7Tbk2y
-8 verbose argv "exec" "--" "vercel" "pull" "--yes" "--environment=production" "--token" "1QHs8uspIiGgbynaQj7Tbk2y"
-9 verbose logfile logs-max:10 dir:/workspaces/voxly/miniapp/~/.npm/_logs/2026-02-08T07_36_32_104Z-
-10 verbose logfile /workspaces/voxly/miniapp/~/.npm/_logs/2026-02-08T07_36_32_104Z-debug-0.log
+7 verbose title npm exec vercel pull --yes --environment=production --token 1QHs8uspIiGgbynaQj7Tbk2y --scope voicednut
+8 verbose argv "exec" "--" "vercel" "pull" "--yes" "--environment=production" "--token" "1QHs8uspIiGgbynaQj7Tbk2y" "--scope" "voicednut"
+9 verbose logfile logs-max:10 dir:/workspaces/voxly/miniapp/~/.npm/_logs/2026-02-08T08_47_17_023Z-
+10 verbose logfile /workspaces/voxly/miniapp/~/.npm/_logs/2026-02-08T08_47_17_023Z-debug-0.log
 11 silly logfile start cleaning logs, removing 1 files
 12 silly logfile done cleaning log files
 13 verbose cwd /workspaces/voxly/miniapp

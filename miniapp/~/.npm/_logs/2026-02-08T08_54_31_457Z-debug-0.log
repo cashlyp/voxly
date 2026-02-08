@@ -5,15 +5,15 @@
 4 silly config load:file:/workspaces/voxly/miniapp/.npmrc
 5 silly config load:file:/workspaces/voxly/miniapp/~/.npmrc
 6 silly config load:file:/usr/local/share/nvm/versions/node/v24.11.1/etc/npmrc
-7 verbose title npm exec vercel env rm VITE_BASE preview --yes --token 1QHs8uspIiGgbynaQj7Tbk2y
-8 verbose argv "exec" "--" "vercel" "env" "rm" "VITE_BASE" "preview" "--yes" "--token" "1QHs8uspIiGgbynaQj7Tbk2y"
-9 verbose logfile logs-max:10 dir:/workspaces/voxly/miniapp/~/.npm/_logs/2026-02-08T07_35_44_828Z-
-10 verbose logfile /workspaces/voxly/miniapp/~/.npm/_logs/2026-02-08T07_35_44_828Z-debug-0.log
+7 verbose title npm exec vercel deploy --prebuilt --prod --token 1QHs8uspIiGgbynaQj7Tbk2y --scope voicednut
+8 verbose argv "exec" "--" "vercel" "deploy" "--prebuilt" "--prod" "--token" "1QHs8uspIiGgbynaQj7Tbk2y" "--scope" "voicednut"
+9 verbose logfile logs-max:10 dir:/workspaces/voxly/miniapp/~/.npm/_logs/2026-02-08T08_54_31_457Z-
+10 verbose logfile /workspaces/voxly/miniapp/~/.npm/_logs/2026-02-08T08_54_31_457Z-debug-0.log
 11 silly logfile start cleaning logs, removing 1 files
 12 silly logfile done cleaning log files
 13 verbose cwd /workspaces/voxly/miniapp
 14 verbose os Linux 6.8.0-1030-azure
 15 verbose node v24.11.1
 16 verbose npm  v11.9.0
-17 verbose exit 1
-18 verbose code 1
+17 verbose exit 0
+18 info ok
