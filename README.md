@@ -7,7 +7,7 @@
 
 A comprehensive Telegram bot system for making AI-powered voice calls using Twilio, OpenRouter APIs, and real-time transcription with Deepgram.
 
-## 🌟 Features
+### 🌟 Features
 
 ### 🤖 Bot Features
 
