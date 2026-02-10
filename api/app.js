@@ -4112,7 +4112,12 @@ async function loadStoredCallProvider() {
   if (!db?.getSetting) return;
   try {
     const raw = await db.getSetting(CALL_PROVIDER_SETTING_KEY);
-    if (!raw) return;
+    if (!raw) {
+      console.log(
+        `☎️ Default call provider from env: ${String(currentProvider || "twilio").toUpperCase()}`,
+      );
+      return;
+    }
     const normalized = String(raw).trim().toLowerCase();
     if (!SUPPORTED_PROVIDERS.includes(normalized)) {
       console.warn(
@@ -4124,10 +4129,16 @@ async function loadStoredCallProvider() {
     const readiness = getProviderReadiness();
     if (readiness[normalized]) {
       currentProvider = normalized;
+      console.log(
+        `☎️ Loaded default call provider from storage: ${normalized.toUpperCase()} (active)`,
+      );
       return;
     }
     console.warn(
       `Stored provider "${normalized}" is not configured/ready in this environment. Keeping active provider "${currentProvider}".`,
+    );
+    console.log(
+      `☎️ Default call provider remains: ${String(currentProvider || "twilio").toUpperCase()}`,
     );
   } catch (error) {
     console.error("Failed to load stored call provider:", error);
@@ -4925,6 +4936,18 @@ async function startServer(options = {}) {
     await loadStoredCallProvider();
     await refreshInboundDefaultScript(true);
     await loadKeypadProviderOverrides();
+    const voiceAgentMode = resolveVoiceAgentExecutionMode();
+    logStartupRuntimeProfile(voiceAgentMode);
+    console.log(
+      `☎️ Default call provider: ${String(storedProvider || currentProvider || "twilio").toUpperCase()} (active: ${String(currentProvider || "twilio").toUpperCase()})`,
+    );
+    if (voiceAgentMode.enabled) {
+      console.log("🤖 Voice agent default mode: enabled");
+    } else {
+      console.log(
+        `🤖 Voice agent default mode: legacy STT+GPT+TTS fallback (${voiceAgentMode.reason})`,
+      );
+    }
 
     // Start webhook service after database is ready
     console.log("Starting enhanced webhook service...");
@@ -4988,6 +5011,54 @@ function buildVoiceAgentFunctions(functionSystem = null) {
       };
     })
     .filter(Boolean);
+}
+
+function resolveVoiceAgentExecutionMode() {
+  const requested = config.deepgram?.voiceAgent?.enabled === true;
+  if (!requested) {
+    return {
+      requested: false,
+      enabled: false,
+      reason: "disabled_by_config",
+    };
+  }
+  if (!config.deepgram?.apiKey) {
+    return {
+      requested: true,
+      enabled: false,
+      reason: "missing_deepgram_api_key",
+    };
+  }
+  if (!String(config.deepgram?.voiceAgent?.endpoint || "").trim()) {
+    return {
+      requested: true,
+      enabled: false,
+      reason: "missing_voice_agent_endpoint",
+    };
+  }
+  return {
+    requested: true,
+    enabled: true,
+    reason: "configured",
+  };
+}
+
+function logStartupRuntimeProfile(voiceAgentMode) {
+  const payload = {
+    type: "startup_runtime_profile",
+    timestamp: new Date().toISOString(),
+    provider: {
+      default: String(storedProvider || currentProvider || "twilio").toLowerCase(),
+      active: String(currentProvider || "twilio").toLowerCase(),
+    },
+    voice_agent: {
+      requested: Boolean(voiceAgentMode?.requested),
+      enabled: Boolean(voiceAgentMode?.enabled),
+      reason: String(voiceAgentMode?.reason || "unknown"),
+      endpoint: config.deepgram?.voiceAgent?.endpoint || null,
+    },
+  };
+  console.log(JSON.stringify(payload));
 }
 
 async function requestVoiceAgentFallback(callSid, req, reason = "") {
@@ -5456,6 +5527,7 @@ app.ws("/connection", (ws, req) => {
   const host = req?.headers?.host || "unknown-host";
   console.log(`New WebSocket connection established (host=${host}, ua=${ua})`);
   const wsParams = resolveStreamAuthParams(req);
+  const voiceAgentMode = resolveVoiceAgentExecutionMode();
   const forceLegacyVoice = ["1", "true", "yes"].includes(
     String(
       wsParams?.va_legacy ||
@@ -5467,7 +5539,7 @@ app.ws("/connection", (ws, req) => {
       .trim(),
   );
 
-  if (config.deepgram?.voiceAgent?.enabled && !forceLegacyVoice) {
+  if (voiceAgentMode.enabled && !forceLegacyVoice) {
     handleVoiceAgentWebSocket(ws, req).catch((error) => {
       console.error("Voice agent websocket handler failed:", error);
       try {
@@ -5476,8 +5548,14 @@ app.ws("/connection", (ws, req) => {
     });
     return;
   }
-  if (config.deepgram?.voiceAgent?.enabled && forceLegacyVoice) {
+  if (forceLegacyVoice) {
     console.log("Voice agent bypass requested; using legacy pipeline");
+  } else if (voiceAgentMode.requested && !voiceAgentMode.enabled) {
+    console.log(
+      `Voice agent requested but unavailable (${voiceAgentMode.reason}); using legacy STT+GPT+TTS pipeline`,
+    );
+  } else if (!voiceAgentMode.requested) {
+    console.log("Voice agent disabled by config; using legacy STT+GPT+TTS pipeline");
   }
 
   try {
@@ -8857,6 +8935,9 @@ app.post("/admin/provider", requireAdminToken, async (req, res) => {
         console.error("Failed to persist selected call provider:", error),
       );
   }
+  console.log(
+    `☎️ Default call provider updated: ${storedProvider.toUpperCase()} (active: ${currentProvider.toUpperCase()}, changed=${changed})`,
+  );
   return res.json({ success: true, provider: currentProvider, changed });
 });
 

@@ -49,3 +49,5 @@ bot/db/data.db
 .github/implementation.md
 Implementation.md
 codex.md
+AGENTS.md
+~/.npm/

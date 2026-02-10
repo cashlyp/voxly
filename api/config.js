@@ -68,7 +68,7 @@ const transferNumber = readEnv("TRANSFER_NUMBER");
 const defaultSmsBusinessId = readEnv("DEFAULT_SMS_BUSINESS_ID") || null;
 const deepgramModel = readEnv("DEEPGRAM_MODEL") || "nova-2";
 const deepgramVoiceAgentEnabled =
-  String(readEnv("USE_DEEPGRAM_VOICE_AGENT") || "false").toLowerCase() ===
+  String(readEnv("USE_DEEPGRAM_VOICE_AGENT") || "true").toLowerCase() ===
   "true";
 const deepgramVoiceAgentEndpoint =
   readEnv("DEEPGRAM_VOICE_AGENT_ENDPOINT") ||
