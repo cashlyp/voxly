@@ -7,6 +7,12 @@ const { buildCallbackData } = require('../utils/actions');
 
 const ADMIN_HEADER_NAME = 'x-admin-token';
 const SUPPORTED_PROVIDERS = ['twilio', 'aws', 'vonage'];
+const PROVIDER_ACTIONS = {
+    STATUS: 'PROVIDER_STATUS',
+    SET_PREFIX: 'PROVIDER_SET:',
+    OVERRIDES: 'PROVIDER_OVERRIDES',
+    CLEAR_OVERRIDES_PREFIX: 'PROVIDER_CLEAR_OVERRIDES:'
+};
 const STATUS_CACHE_TTL_MS = 8000;
 const statusCache = {
     value: null,
@@ -35,6 +41,11 @@ function formatProviderStatus(status) {
         ? status.supported_providers
         : SUPPORTED_PROVIDERS;
     const vonageReady = status.vonage_ready ? '✅ Ready' : '⚠️ Missing keys';
+    const vonageDtmfReady = status.vonage_dtmf_ready ? '✅ Enabled' : '⚠️ Disabled';
+    const keypadGuard = status.keypad_guard_enabled ? '✅ Enabled' : '⚠️ Disabled';
+    const keypadOverrides = Number.isFinite(Number(status.keypad_override_count))
+        ? Number(status.keypad_override_count)
+        : 0;
 
     const details = [
         buildLine('•', `Current Provider`, `*${current.toUpperCase()}*`),
@@ -42,6 +53,9 @@ function formatProviderStatus(status) {
         buildLine('•', `AWS Ready`, status.aws_ready ? '✅' : '⚠️'),
         buildLine('•', `Twilio Ready`, status.twilio_ready ? '✅' : '⚠️'),
         buildLine('•', `Vonage Ready`, vonageReady),
+        buildLine('•', `Vonage DTMF`, vonageDtmfReady),
+        buildLine('•', `Keypad Guard`, keypadGuard),
+        buildLine('•', `Keypad Overrides`, String(keypadOverrides)),
         buildLine('•', `Supported Backbones`, supportedValues.join(', ').toUpperCase())
     ];
 
@@ -55,14 +69,20 @@ function buildProviderKeyboard(ctx, activeProvider = '', supportedProviders = []
         const normalized = provider.toLowerCase();
         const isActive = normalized === activeProvider;
         const label = isActive ? `✅ ${normalized.toUpperCase()}` : normalized.toUpperCase();
-        keyboard.text(label, buildCallbackData(ctx, `PROVIDER_SET:${normalized}`));
+        keyboard.text(label, buildCallbackData(ctx, `${PROVIDER_ACTIONS.SET_PREFIX}${normalized}`));
 
         const shouldInsertRow = index % 2 === 1 && index < providers.length - 1;
         if (shouldInsertRow) {
             keyboard.row();
         }
     });
-    keyboard.row().text('🔄 Refresh', buildCallbackData(ctx, 'PROVIDER_STATUS'));
+    keyboard.row().text('🔄 Refresh', buildCallbackData(ctx, PROVIDER_ACTIONS.STATUS));
+    keyboard
+        .text('🔐 Overrides', buildCallbackData(ctx, PROVIDER_ACTIONS.OVERRIDES))
+        .text(
+            '🧹 Clear All',
+            buildCallbackData(ctx, `${PROVIDER_ACTIONS.CLEAR_OVERRIDES_PREFIX}all`),
+        );
     return keyboard;
 }
 
@@ -113,6 +133,142 @@ async function updateProvider(provider) {
     return response.data;
 }
 
+async function fetchKeypadOverrides() {
+    const response = await httpClient.get(
+        null,
+        `${config.apiUrl}/admin/provider/keypad-overrides`,
+        {
+            timeout: 10000,
+            headers: {
+                [ADMIN_HEADER_NAME]: config.admin.apiToken,
+                'Content-Type': 'application/json',
+            },
+        },
+    );
+    return response.data;
+}
+
+async function clearKeypadOverrides(params = {}) {
+    const response = await httpClient.post(
+        null,
+        `${config.apiUrl}/admin/provider/keypad-overrides/clear`,
+        params,
+        {
+            timeout: 15000,
+            headers: {
+                [ADMIN_HEADER_NAME]: config.admin.apiToken,
+                'Content-Type': 'application/json',
+            },
+        },
+    );
+    return response.data;
+}
+
+function formatKeypadOverridesResult(payload = {}) {
+    const overrides = Array.isArray(payload.overrides) ? payload.overrides : [];
+    const lines = [
+        '🔐 *Keypad Provider Overrides*',
+        `• Total: ${overrides.length}`,
+    ];
+    if (!overrides.length) {
+        lines.push('• None active');
+        return lines.join('\n');
+    }
+    const preview = overrides.slice(0, 12);
+    preview.forEach((item) => {
+        const scope = escapeMarkdown(item.scope_key || 'unknown');
+        const provider = escapeMarkdown(String(item.provider || 'twilio').toUpperCase());
+        const expiresAt = item.expires_at ? escapeMarkdown(item.expires_at) : 'unknown';
+        lines.push(`• ${scope} -> ${provider} (until ${expiresAt})`);
+    });
+    if (overrides.length > preview.length) {
+        lines.push(`• ...and ${overrides.length - preview.length} more`);
+    }
+    return lines.join('\n');
+}
+
+async function handleProviderOverrides(ctx) {
+    try {
+        const payload = await fetchKeypadOverrides();
+        await ctx.reply(formatKeypadOverridesResult(payload), { parse_mode: 'Markdown' });
+    } catch (error) {
+        console.error('Provider overrides command error:', error);
+        await ctx.reply(formatProviderError(error, 'fetch keypad overrides'));
+    }
+}
+
+async function handleProviderClearOverrides(ctx, args = []) {
+    try {
+        const rawScope = String(args[0] || '').trim();
+        let payload;
+        if (!rawScope || rawScope.toLowerCase() === 'all') {
+            payload = await clearKeypadOverrides({ all: true });
+            await ctx.reply(
+                `🧹 Cleared keypad overrides.\n• Cleared: ${payload.cleared || 0}\n• Remaining: ${payload.remaining || 0}`,
+            );
+            return;
+        }
+        payload = await clearKeypadOverrides({ scope_key: rawScope });
+        await ctx.reply(
+            `🧹 Cleared keypad override scope.\n• Scope: ${escapeMarkdown(rawScope)}\n• Cleared: ${payload.cleared || 0}\n• Remaining: ${payload.remaining || 0}`,
+            { parse_mode: 'Markdown' },
+        );
+    } catch (error) {
+        console.error('Provider clear overrides command error:', error);
+        await ctx.reply(formatProviderError(error, 'clear keypad overrides'));
+    }
+}
+
+async function handleProviderCommandAction(ctx, requestedAction, args = []) {
+    const normalizedAction = String(requestedAction || '').toLowerCase().trim();
+    if (!normalizedAction || normalizedAction === 'status') {
+        await renderProviderMenu(ctx, { forceRefresh: true });
+        return true;
+    }
+    if (normalizedAction === 'overrides') {
+        await handleProviderOverrides(ctx);
+        return true;
+    }
+    if (
+        normalizedAction === 'clear-overrides' ||
+        normalizedAction === 'clearoverride' ||
+        normalizedAction === 'clear_overrides' ||
+        normalizedAction === 'clear-override' ||
+        normalizedAction === 'clear_override'
+    ) {
+        await handleProviderClearOverrides(ctx, args);
+        return true;
+    }
+
+    await handleProviderSwitch(ctx, normalizedAction);
+    return true;
+}
+
+async function handleProviderCallbackAction(ctx, action = '') {
+    const normalized = String(action || '').trim();
+    if (!normalized) return false;
+
+    if (normalized === PROVIDER_ACTIONS.STATUS) {
+        await renderProviderMenu(ctx, { forceRefresh: true });
+        return true;
+    }
+    if (normalized.startsWith(PROVIDER_ACTIONS.SET_PREFIX)) {
+        const provider = normalized.slice(PROVIDER_ACTIONS.SET_PREFIX.length);
+        await handleProviderSwitch(ctx, provider.toLowerCase());
+        return true;
+    }
+    if (normalized === PROVIDER_ACTIONS.OVERRIDES) {
+        await handleProviderOverrides(ctx);
+        return true;
+    }
+    if (normalized.startsWith(PROVIDER_ACTIONS.CLEAR_OVERRIDES_PREFIX)) {
+        const target = normalized.slice(PROVIDER_ACTIONS.CLEAR_OVERRIDES_PREFIX.length);
+        await handleProviderClearOverrides(ctx, [target]);
+        return true;
+    }
+    return false;
+}
+
 async function renderProviderMenu(ctx, { status, notice, forceRefresh = false } = {}) {
     try {
         let resolvedStatus = status;
@@ -136,7 +292,7 @@ async function renderProviderMenu(ctx, { status, notice, forceRefresh = false } 
         if (notices.length) {
             message = `${notices.join('\n')}\n\n${message}`;
         }
-        message += '\n\nTap a provider below to switch.';
+        message += '\n\nUse the buttons below to switch provider or manage keypad overrides.';
         await renderMenu(ctx, message, keyboard, { parseMode: 'Markdown' });
     } catch (error) {
         console.error('Provider status command error:', error);
@@ -174,7 +330,7 @@ async function handleProviderSwitch(ctx, requestedProvider) {
         if (!normalized || !supported.includes(normalized)) {
             const options = supported.map((item) => `• /provider ${item}`).join('\n');
             await ctx.reply(
-                `❌ Unsupported provider "${escapeMarkdown(requestedProvider || '')}".\n\nUsage:\n• /provider status\n${options}`
+                `❌ Unsupported provider "${escapeMarkdown(requestedProvider || '')}".\n\nUsage:\n• /provider status\n• /provider overrides\n• /provider clear-override <scope|all>\n${options}`
             );
             return;
         }
@@ -204,12 +360,7 @@ function registerProviderCommand(bot) {
         }
 
         try {
-            if (!requestedAction || requestedAction === 'status') {
-                await renderProviderMenu(ctx, { forceRefresh: true });
-                return;
-            }
-
-            await handleProviderSwitch(ctx, requestedAction);
+            await handleProviderCommandAction(ctx, requestedAction, args.slice(1));
         } catch (error) {
             console.error('Failed to manage provider via Telegram command:', error);
             await ctx.reply(formatProviderError(error, 'update provider'));
@@ -227,7 +378,14 @@ module.exports.fetchProviderStatus = fetchProviderStatus;
 module.exports.updateProvider = updateProvider;
 module.exports.formatProviderStatus = formatProviderStatus;
 module.exports.handleProviderSwitch = handleProviderSwitch;
+module.exports.fetchKeypadOverrides = fetchKeypadOverrides;
+module.exports.clearKeypadOverrides = clearKeypadOverrides;
+module.exports.handleProviderOverrides = handleProviderOverrides;
+module.exports.handleProviderClearOverrides = handleProviderClearOverrides;
+module.exports.handleProviderCommandAction = handleProviderCommandAction;
+module.exports.handleProviderCallbackAction = handleProviderCallbackAction;
 module.exports.renderProviderMenu = renderProviderMenu;
 module.exports.buildProviderKeyboard = buildProviderKeyboard;
 module.exports.SUPPORTED_PROVIDERS = SUPPORTED_PROVIDERS;
 module.exports.ADMIN_HEADER_NAME = ADMIN_HEADER_NAME;
+module.exports.PROVIDER_ACTIONS = PROVIDER_ACTIONS;

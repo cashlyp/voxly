@@ -5,6 +5,7 @@
   "main": "app.js",
   "scripts": {
     "test": "jest --runInBand",
+    "parity:providers": "node tests/providerParityHarness.js",
     "dev": "nodemon .",
     "start": "node .",
     "setup": "node setup-env.js"

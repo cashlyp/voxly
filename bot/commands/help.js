@@ -69,7 +69,7 @@ async function handleHelp(ctx) {
                 '🧪 /status — deep system status',
                 '🧰 /scripts — manage reusable prompts',
                 '🍃 /persona — sculpt adaptive agents',
-                '🔀 /provider — view or switch voice providers'
+                '🔀 /provider — view/switch provider and manage keypad overrides'
             ];
             helpSections.push(`<b>Admin Toolkit</b>\n${formatLines(adminList)}`);
         }

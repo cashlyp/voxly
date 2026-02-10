@@ -31,6 +31,8 @@ async function handleGuide(ctx) {
     const adminControls = [
         '📍 /provider status — see the active provider',
         '🔁 /provider <name> — switch providers on the fly',
+        '🔐 /provider overrides — list active keypad provider overrides',
+        '🧹 /provider clear-override <scope|all> — clear keypad provider overrides',
         '👥 /users — manage seats'
     ];
 

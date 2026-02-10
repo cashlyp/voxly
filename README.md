@@ -40,6 +40,36 @@ A comprehensive Telegram bot system for making AI-powered voice calls using Twil
 - Each provider has matching SMS adapters (Twilio SMS, AWS Pinpoint, Vonage SMS) so outbound texts follow the active backbone.
 - When Twilio is selected but credentials are missing, the API now fails fast with a targeted message pointing to the relevant `.env` entries and the `npm run setup --prefix api` helper.
 
+### Vonage Signed Callbacks (Recommended for production)
+
+- Enable signed callback verification with:
+  - `VONAGE_WEBHOOK_VALIDATION=strict`
+  - `VONAGE_WEBHOOK_SIGNATURE_SECRET=<your_vonage_signature_secret>`
+- Optional hardening:
+  - `VONAGE_WEBHOOK_REQUIRE_PAYLOAD_HASH=true`
+  - `VONAGE_WEBHOOK_MAX_SKEW_MS=300000`
+- Vonage websocket audio should use official Linear16:
+  - `VONAGE_WEBSOCKET_CONTENT_TYPE=audio/l16;rate=16000` (recommended)
+  - `VONAGE_WEBSOCKET_CONTENT_TYPE=audio/l16;rate=8000` (fallback for narrowband)
+- For keypad digit capture over Vonage, enable webhook DTMF ingestion:
+  - `VONAGE_DTMF_WEBHOOK_ENABLED=true`
+  - Configure your Vonage Voice app event callback to deliver DTMF events to `POST /webhook/vonage/event`
+- If `VONAGE_DTMF_WEBHOOK_ENABLED=false`, keypad-critical flows (OTP/PIN verification profiles) are automatically routed away from Vonage to prevent silent digit-capture failures.
+- Provider guard tuning for production:
+  - `KEYPAD_GUARD_ENABLED=true`
+  - `KEYPAD_VONAGE_DTMF_TIMEOUT_MS=12000`
+  - `KEYPAD_PROVIDER_OVERRIDE_COOLDOWN_S=1800`
+- When a Vonage keypad timeout is detected, the API auto-overrides future keypad flows for the affected script/profile to Twilio for the configured cooldown and emits a Telegram+health-log alert.
+- Admin override controls:
+  - `GET /admin/provider/keypad-overrides`
+  - `POST /admin/provider/keypad-overrides/clear` with one of:
+    - `{ "all": true }`
+    - `{ "scope_key": "script:12" }`
+    - `{ "scope": "profile", "value": "otp" }`
+- If callback verification fails in strict mode, the API returns `503` so Vonage can retry delivery.
+- Run a local control-plane parity smoke check with:
+  - `npm run parity:providers --prefix api`
+
 ## 🏗️ System Architecture
 
 ```mermaid

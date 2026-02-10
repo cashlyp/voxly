@@ -396,8 +396,8 @@ const {
 } = require("./commands/calllog");
 const {
   registerProviderCommand,
-  handleProviderSwitch,
-  renderProviderMenu,
+  handleProviderCallbackAction,
+  PROVIDER_ACTIONS,
 } = require("./commands/provider");
 const {
   addUserFlow,
@@ -588,7 +588,11 @@ bot.command("start", async (ctx) => {
       }
     }
 
-    const message = `${welcomeText}\n\n${userStats}\n\nTip: SMS and Email actions are grouped under /sms and /email.\n\nUse the buttons below or type /help for available commands.`;
+    const tips = ["Tip: SMS and Email actions are grouped under /sms and /email."];
+    if (isOwner) {
+      tips.push("Admin tip: Provider actions are grouped under /provider.");
+    }
+    const message = `${welcomeText}\n\n${userStats}\n\n${tips.join("\n")}\n\nUse the buttons below or type /help for available commands.`;
     await renderMenu(ctx, message, kb, { parseMode: "Markdown" });
   } catch (error) {
     console.error("Start command error:", error);
@@ -693,11 +697,16 @@ bot.on("callback_query:data", async (ctx) => {
       return;
     }
 
-    if (action.startsWith("PROVIDER_SET:")) {
-      const [, provider] = action.split(":");
+    const isProviderCallbackAction =
+      action === PROVIDER_ACTIONS.STATUS ||
+      action === PROVIDER_ACTIONS.OVERRIDES ||
+      action.startsWith(PROVIDER_ACTIONS.SET_PREFIX) ||
+      action.startsWith(PROVIDER_ACTIONS.CLEAR_OVERRIDES_PREFIX);
+    if (isProviderCallbackAction) {
       await cancelActiveFlow(ctx, `callback:${action}`);
       resetSession(ctx);
-      await handleProviderSwitch(ctx, provider?.toLowerCase());
+      await clearMenuMessages(ctx);
+      await handleProviderCallbackAction(ctx, action);
       finishMetric("ok");
       return;
     }
@@ -909,11 +918,6 @@ bot.on("callback_query:data", async (ctx) => {
 
       case "STATUS":
         await handleStatusCommand(ctx);
-        finishMetric("ok");
-        break;
-
-      case "PROVIDER_STATUS":
-        await renderProviderMenu(ctx, { forceRefresh: true });
         finishMetric("ok");
         break;
 

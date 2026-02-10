@@ -9,9 +9,12 @@ const TTS_CACHE_MAX_ITEMS = 200;
 const ttsCache = new Map(); // key -> { audio, at }
 const ttsInflight = new Map(); // key -> Promise
 
-function buildTtsCacheKey(text, voiceModel) {
+function buildTtsCacheKey(text, voiceModel, audioSpec = {}) {
   const cleanText = String(text || '').trim();
-  return `${voiceModel || 'default'}::${cleanText}`;
+  const encoding = String(audioSpec.encoding || 'mulaw').toLowerCase();
+  const sampleRate = Number(audioSpec.sampleRate) || 8000;
+  const container = String(audioSpec.container || 'none').toLowerCase();
+  return `${voiceModel || 'default'}::${encoding}:${sampleRate}:${container}::${cleanText}`;
 }
 
 function pruneTtsCache() {
@@ -29,6 +32,15 @@ class TextToSpeechService extends EventEmitter {
     this.nextExpectedIndex = 0;
     this.speechBuffer = {};
     this.voiceModel = options.voiceModel || null;
+    this.encoding = String(options.encoding || 'mulaw')
+      .toLowerCase()
+      .trim();
+    this.sampleRate = Number.isFinite(Number(options.sampleRate))
+      ? Number(options.sampleRate)
+      : 8000;
+    this.container = String(options.container || 'none')
+      .toLowerCase()
+      .trim();
     
     // Validate required environment variables
     if (!config.deepgram.apiKey) {
@@ -42,8 +54,23 @@ class TextToSpeechService extends EventEmitter {
     console.log(`🎵 TTS Service initialized with voice model: ${activeVoice}`);
   }
 
-  async fetchSpeechAudio(text, voiceModel) {
-    const url = `https://api.deepgram.com/v1/speak?model=${voiceModel}&encoding=mulaw&sample_rate=8000&container=none`;
+  async fetchSpeechAudio(text, voiceModel, audioSpec = {}) {
+    const encoding = String(audioSpec.encoding || this.encoding || 'mulaw')
+      .toLowerCase()
+      .trim();
+    const sampleRate = Number.isFinite(Number(audioSpec.sampleRate))
+      ? Number(audioSpec.sampleRate)
+      : this.sampleRate;
+    const container = String(audioSpec.container || this.container || 'none')
+      .toLowerCase()
+      .trim();
+    const query = new URLSearchParams({
+      model: voiceModel,
+      encoding,
+      sample_rate: String(sampleRate),
+      container,
+    });
+    const url = `https://api.deepgram.com/v1/speak?${query.toString()}`;
     console.log(`🌐 Making TTS request to: ${url}`.gray);
     const response = await fetch(url, {
       method: 'POST',
@@ -82,7 +109,12 @@ class TextToSpeechService extends EventEmitter {
 
     try {
       const voiceModel = options.voiceModel || this.voiceModel || config.deepgram.voiceModel || 'aura-asteria-en';
-      const key = buildTtsCacheKey(partialResponse, voiceModel);
+      const audioSpec = {
+        encoding: options.encoding || this.encoding,
+        sampleRate: options.sampleRate || this.sampleRate,
+        container: options.container || this.container,
+      };
+      const key = buildTtsCacheKey(partialResponse, voiceModel, audioSpec);
       const cached = ttsCache.get(key);
       const now = Date.now();
       if (cached && now - cached.at < TTS_CACHE_TTL_MS) {
@@ -105,7 +137,11 @@ class TextToSpeechService extends EventEmitter {
 
       const requestPromise = (async () => {
         try {
-          const base64String = await this.fetchSpeechAudio(partialResponse, voiceModel);
+          const base64String = await this.fetchSpeechAudio(
+            partialResponse,
+            voiceModel,
+            audioSpec,
+          );
           ttsCache.set(key, { audio: base64String, at: Date.now() });
           pruneTtsCache();
           return base64String;
@@ -113,8 +149,16 @@ class TextToSpeechService extends EventEmitter {
           const fallbackVoice = config.deepgram.voiceModel || 'aura-asteria-en';
           if (fallbackVoice && fallbackVoice !== voiceModel) {
             try {
-              const base64String = await this.fetchSpeechAudio(partialResponse, fallbackVoice);
-              const fallbackKey = buildTtsCacheKey(partialResponse, fallbackVoice);
+              const base64String = await this.fetchSpeechAudio(
+                partialResponse,
+                fallbackVoice,
+                audioSpec,
+              );
+              const fallbackKey = buildTtsCacheKey(
+                partialResponse,
+                fallbackVoice,
+                audioSpec,
+              );
               ttsCache.set(fallbackKey, { audio: base64String, at: Date.now() });
               pruneTtsCache();
               return base64String;

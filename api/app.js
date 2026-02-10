@@ -12,6 +12,7 @@ const { EnhancedGptService } = require("./routes/gpt");
 const { StreamService } = require("./routes/stream");
 const { TranscriptionService } = require("./routes/transcription");
 const { TextToSpeechService } = require("./routes/tts");
+const { VoiceAgentBridge } = require("./routes/voiceAgentBridge");
 const { recordingService } = require("./routes/recording");
 const { EnhancedSmsService } = require("./routes/sms.js");
 const { EmailService } = require("./routes/email");
@@ -106,6 +107,7 @@ const streamTimeoutCalls = new Set();
 const inboundRateBuckets = new Map();
 const streamStartTimes = new Map();
 const sttFailureCounts = new Map();
+const voiceAgentFallbackAttempts = new Map();
 const activeStreamConnections = new Map();
 const streamStartSeen = new Map(); // callSid -> streamSid (dedupe starts)
 const streamStopSeen = new Set(); // callSid:streamSid (dedupe stops)
@@ -118,10 +120,18 @@ const streamLastMediaAt = new Map(); // callSid -> timestamp
 const sttLastFrameAt = new Map(); // callSid -> timestamp
 const streamWatchdogState = new Map(); // callSid -> { noMediaNotifiedAt, noMediaEscalatedAt, sttNotifiedAt }
 const providerHealth = new Map();
+const keypadProviderGuardWarnings = new Set(); // provider -> warning emitted
+const keypadProviderOverrides = new Map(); // scopeKey -> { provider, expiresAt, ... }
+const keypadDtmfSeen = new Map(); // callSid -> { seenAt, source, digitsLength }
+const keypadDtmfWatchdogs = new Map(); // callSid -> timeoutId
+const vonageWebhookJtiCache = new Map(); // jti -> expiresAtMs
 let callJobProcessing = false;
 const callLifecycleCleanupTimers = new Map();
 const CALL_STATUS_DEDUPE_MS = 3000;
 const CALL_STATUS_DEDUPE_MAX = 5000;
+const VONAGE_WEBHOOK_JTI_CACHE_MAX = 5000;
+const KEYPAD_PROVIDER_OVERRIDE_SETTING_KEY = "keypad_provider_overrides_v1";
+const CALL_PROVIDER_SETTING_KEY = "call_provider_v1";
 
 function stableStringify(value) {
   if (value === null || typeof value !== "object") {
@@ -342,7 +352,9 @@ function buildInboundDefaults(route = {}) {
   return { prompt, firstMessage };
 }
 
-function buildInboundCallConfig(callSid, payload = {}) {
+function buildInboundCallConfig(callSid, payload = {}, options = {}) {
+  const provider = String(options.provider || "twilio").toLowerCase();
+  const inbound = options.inbound !== false;
   const route =
     resolveInboundRoute(
       payload.To || payload.to || payload.called || payload.Called,
@@ -364,7 +376,7 @@ function buildInboundCallConfig(callSid, payload = {}) {
     created_at: createdAt,
     user_chat_id: config.telegram?.adminChatId || route.user_chat_id || null,
     customer_name: route.customer_name || null,
-    provider: "twilio",
+    provider,
     provider_metadata: null,
     business_context: route.business_context || functionSystem.context,
     function_count: functionSystem.functions.length,
@@ -392,7 +404,7 @@ function buildInboundCallConfig(callSid, payload = {}) {
     flow_state_updated_at: createdAt,
     call_mode: "normal",
     digit_capture_active: false,
-    inbound: true,
+    inbound,
   };
   return { callConfig, functionSystem };
 }
@@ -446,7 +458,7 @@ async function refreshInboundDefaultScript(force = false) {
   return inboundDefaultScript;
 }
 
-function ensureCallSetup(callSid, payload = {}) {
+function ensureCallSetup(callSid, payload = {}, options = {}) {
   let callConfig = callConfigurations.get(callSid);
   let functionSystem = callFunctionSystems.get(callSid);
   if (callConfig && functionSystem) {
@@ -454,7 +466,7 @@ function ensureCallSetup(callSid, payload = {}) {
   }
 
   if (!callConfig) {
-    const created = buildInboundCallConfig(callSid, payload);
+    const created = buildInboundCallConfig(callSid, payload, options);
     callConfig = created.callConfig;
     functionSystem = functionSystem || created.functionSystem;
   } else if (!functionSystem) {
@@ -472,13 +484,20 @@ function ensureCallSetup(callSid, payload = {}) {
   return { callConfig, functionSystem, created: true };
 }
 
-async function ensureCallRecord(callSid, payload = {}, source = "unknown") {
+async function ensureCallRecord(
+  callSid,
+  payload = {},
+  source = "unknown",
+  setupOptions = {},
+) {
   if (!db || !callSid) return null;
-  const setup = ensureCallSetup(callSid, payload);
+  const setup = ensureCallSetup(callSid, payload, setupOptions);
   const existing = await db.getCall(callSid).catch(() => null);
   if (existing) return existing;
 
   const { callConfig, functionSystem } = setup;
+  const inbound = callConfig?.inbound !== false;
+  const direction = inbound ? "inbound" : "outbound";
   const from =
     payload.From || payload.from || payload.Caller || payload.caller || null;
   const to =
@@ -497,13 +516,15 @@ async function ensureCallRecord(callSid, payload = {}, source = "unknown") {
           .map((f) => f.function?.name || f.function?.function?.name || f.name)
           .filter(Boolean),
       ),
-      direction: "inbound",
+      direction,
     });
     await db.updateCallState(callSid, "call_created", {
-      inbound: true,
+      inbound,
       source,
       from: from || null,
       to: to || null,
+      provider: callConfig.provider || "twilio",
+      provider_metadata: callConfig.provider_metadata || null,
       business_id: callConfig.business_id || null,
       route_label: callConfig.route_label || null,
       purpose: callConfig.purpose || null,
@@ -1982,13 +2003,316 @@ async function applyInitialDigitIntent(
   return result;
 }
 
-function resolveHost(req) {
-  return (
-    config.server?.hostname ||
-    req?.headers?.["x-forwarded-host"] ||
-    req?.headers?.host ||
-    ""
+async function handleExternalDtmfInput(callSid, digits, options = {}) {
+  if (!callSid || !digitService) {
+    return { handled: false, reason: "digit_service_unavailable" };
+  }
+  const normalizedDigits = normalizeDigitString(digits);
+  if (!normalizedDigits) {
+    return { handled: false, reason: "empty_digits" };
+  }
+
+  const source = String(options.source || "dtmf").trim() || "dtmf";
+  const provider =
+    String(options.provider || callConfigurations.get(callSid)?.provider || "")
+      .trim()
+      .toLowerCase() || null;
+  const activeSession = activeCalls.get(callSid);
+  const gptService = options.gptService || activeSession?.gptService || null;
+  const interactionCount = Number.isFinite(options.interactionCount)
+    ? Number(options.interactionCount)
+    : Number.isFinite(activeSession?.interactionCount)
+      ? Number(activeSession.interactionCount)
+      : 0;
+
+  clearSilenceTimer(callSid);
+  markStreamMediaSeen(callSid);
+  streamLastMediaAt.set(callSid, Date.now());
+
+  const callConfig = callConfigurations.get(callSid);
+  if (!callConfig) {
+    return { handled: false, reason: "missing_call_config" };
+  }
+  markKeypadDtmfSeen(callSid, {
+    source,
+    digitsLength: normalizedDigits.length,
+  });
+
+  const captureActive = isCaptureActiveConfig(callConfig);
+  let isDigitIntent = callConfig?.digit_intent?.mode === "dtmf" || captureActive;
+  if (!isDigitIntent) {
+    const hasExplicitDigitConfig = Boolean(
+      callConfig.collection_profile ||
+        callConfig.script_policy?.requires_otp ||
+        callConfig.script_policy?.default_profile,
+    );
+    if (hasExplicitDigitConfig) {
+      await applyInitialDigitIntent(
+        callSid,
+        callConfig,
+        gptService,
+        interactionCount,
+      );
+      isDigitIntent = callConfig?.digit_intent?.mode === "dtmf";
+    }
+  }
+
+  const shouldBuffer =
+    isDigitIntent ||
+    digitService?.hasPlan?.(callSid) ||
+    digitService?.hasExpectation?.(callSid);
+  if (!isDigitIntent && !shouldBuffer) {
+    webhookService.addLiveEvent(
+      callSid,
+      `🔢 Keypad: ${normalizedDigits} (ignored - normal flow)`,
+      { force: true },
+    );
+    return { handled: false, reason: "normal_flow" };
+  }
+
+  const expectation = digitService?.getExpectation(callSid);
+  const activePlan = digitService?.getPlan?.(callSid);
+  const planStepIndex = Number.isFinite(activePlan?.index)
+    ? activePlan.index + 1
+    : null;
+
+  if (!expectation) {
+    if (digitService?.bufferDigits) {
+      digitService.bufferDigits(callSid, normalizedDigits, {
+        timestamp: Date.now(),
+        source,
+        early: true,
+        plan_id: activePlan?.id || null,
+        plan_step_index: planStepIndex,
+        provider,
+      });
+    }
+    webhookService.addLiveEvent(
+      callSid,
+      `🔢 Keypad: ${normalizedDigits} (buffered early)`,
+      { force: true },
+    );
+    return { handled: true, buffered: true };
+  }
+
+  await digitService.flushBufferedDigits(
+    callSid,
+    gptService,
+    interactionCount,
+    "dtmf",
+    { allowCallEnd: true },
   );
+  if (!digitService?.hasExpectation(callSid)) {
+    return { handled: true, reason: "expectation_cleared" };
+  }
+
+  const activeExpectation = digitService.getExpectation(callSid);
+  const display =
+    activeExpectation?.profile === "verification"
+      ? digitService.formatOtpForDisplay(
+          normalizedDigits,
+          "progress",
+          activeExpectation?.max_digits,
+        )
+      : `Keypad: ${normalizedDigits}`;
+  webhookService.addLiveEvent(callSid, `🔢 ${display}`, {
+    force: true,
+  });
+
+  const collection = digitService.recordDigits(callSid, normalizedDigits, {
+    timestamp: Date.now(),
+    source,
+    provider,
+    attempt_id: activeExpectation?.attempt_id || null,
+    plan_id: activeExpectation?.plan_id || null,
+    plan_step_index: activeExpectation?.plan_step_index || null,
+  });
+
+  await digitService.handleCollectionResult(
+    callSid,
+    collection,
+    gptService,
+    interactionCount,
+    "dtmf",
+    { allowCallEnd: true },
+  );
+
+  if (db?.updateCallState) {
+    await db.updateCallState(callSid, "dtmf_received", {
+      at: new Date().toISOString(),
+      source,
+      provider,
+      digits_length: normalizedDigits.length,
+      accepted: !!collection?.accepted,
+      profile: collection?.profile || null,
+      plan_id: collection?.plan_id || null,
+      plan_step_index: collection?.plan_step_index || null,
+    })
+      .catch(() => {});
+  }
+
+  return { handled: true, collection };
+}
+
+function normalizeHostValue(value) {
+  if (!value) return "";
+  const first = String(value).split(",")[0].trim();
+  if (!first) return "";
+  try {
+    if (first.includes("://")) {
+      const parsed = new URL(first);
+      return parsed.host || "";
+    }
+  } catch {
+    // Fall through to plain host normalization.
+  }
+  return first.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+}
+
+function resolveHost(req) {
+  const forwardedHost = normalizeHostValue(req?.headers?.["x-forwarded-host"]);
+  if (forwardedHost) return forwardedHost;
+  const hostHeader = normalizeHostValue(req?.headers?.host);
+  if (hostHeader) return hostHeader;
+  return normalizeHostValue(config.server?.hostname);
+}
+
+function appendQueryParamsToUrl(rawUrl, params = {}) {
+  if (!rawUrl) return rawUrl;
+  try {
+    const parsed = new URL(String(rawUrl));
+    Object.entries(params || {}).forEach(([key, value]) => {
+      if (value === undefined || value === null || value === "") return;
+      parsed.searchParams.set(key, String(value));
+    });
+    return parsed.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
+const VONAGE_WS_DEFAULT_CONTENT_TYPE = "audio/l16;rate=16000";
+let cachedVonageWebsocketAudioSpec = null;
+
+function normalizeVonageWebsocketContentType(rawValue) {
+  const fallback = {
+    contentType: VONAGE_WS_DEFAULT_CONTENT_TYPE,
+    sampleRate: 16000,
+    sttEncoding: "linear16",
+    ttsEncoding: "linear16",
+  };
+  const raw = String(rawValue || "")
+    .trim()
+    .toLowerCase();
+  if (!raw) return fallback;
+
+  const parts = raw
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const mediaType = parts[0];
+  const params = {};
+  parts.slice(1).forEach((part) => {
+    const [key, value] = part.split("=");
+    if (!key || !value) return;
+    params[String(key).toLowerCase()] = String(value).toLowerCase();
+  });
+
+  const rateCandidate =
+    Number(params.rate) ||
+    Number(params.sample_rate) ||
+    Number(params.samplerate);
+  const sampleRate =
+    Number.isFinite(rateCandidate) && rateCandidate > 0
+      ? rateCandidate
+      : fallback.sampleRate;
+
+  if (mediaType === "audio/l16") {
+    return {
+      contentType: `audio/l16;rate=${sampleRate}`,
+      sampleRate,
+      sttEncoding: "linear16",
+      ttsEncoding: "linear16",
+    };
+  }
+
+  // Keep backward compatibility for legacy installations that used PCM-u.
+  if (mediaType === "audio/pcmu") {
+    return {
+      contentType: `audio/pcmu;rate=${sampleRate}`,
+      sampleRate,
+      sttEncoding: "mulaw",
+      ttsEncoding: "mulaw",
+    };
+  }
+
+  console.warn(
+    `Unsupported VONAGE_WEBSOCKET_CONTENT_TYPE "${rawValue}". Falling back to ${fallback.contentType}.`,
+  );
+  return fallback;
+}
+
+function getVonageWebsocketAudioSpec() {
+  if (!cachedVonageWebsocketAudioSpec) {
+    cachedVonageWebsocketAudioSpec = normalizeVonageWebsocketContentType(
+      config.vonage?.voice?.websocketContentType,
+    );
+  }
+  return cachedVonageWebsocketAudioSpec;
+}
+
+function getVonageWebsocketContentType() {
+  return getVonageWebsocketAudioSpec().contentType;
+}
+
+function buildVonageAnswerWebhookUrl(req, callSid, extraParams = {}) {
+  const host = resolveHost(req) || config.server?.hostname;
+  const defaultBase = host ? `https://${host}/webhook/vonage/answer` : "";
+  const baseUrl = config.vonage?.voice?.answerUrl || defaultBase;
+  return appendQueryParamsToUrl(baseUrl, {
+    callSid: callSid || undefined,
+    ...extraParams,
+  });
+}
+
+function buildVonageEventWebhookUrl(req, callSid, extraParams = {}) {
+  const host = resolveHost(req) || config.server?.hostname;
+  const defaultBase = host ? `https://${host}/webhook/vonage/event` : "";
+  const baseUrl = config.vonage?.voice?.eventUrl || defaultBase;
+  return appendQueryParamsToUrl(baseUrl, {
+    callSid: callSid || undefined,
+    ...extraParams,
+  });
+}
+
+function buildVonageWebsocketUrl(req, callSid, extraParams = {}) {
+  const host = resolveHost(req) || config.server?.hostname;
+  if (!host || !callSid) return "";
+  const params = new URLSearchParams();
+  params.set("callSid", String(callSid));
+  Object.entries(extraParams || {}).forEach(([key, value]) => {
+    if (value === undefined || value === null || value === "") return;
+    params.set(key, String(value));
+  });
+
+  // Reuse existing stream HMAC auth for provider-neutral websocket protection.
+  if (config.streamAuth?.secret) {
+    const timestamp = String(Date.now());
+    const token = buildStreamAuthToken(String(callSid), timestamp);
+    if (token) {
+      params.set("ts", timestamp);
+      params.set("token", token);
+    }
+  }
+  return `wss://${host}/vonage/stream?${params.toString()}`;
+}
+
+function reqForHost(host) {
+  return {
+    headers: {
+      host: normalizeHostValue(host),
+    },
+  };
 }
 
 const warnOnInvalidTwilioSignature = (req, label = "") =>
@@ -2098,6 +2422,210 @@ function verifyHmacSignature(req) {
   return { ok: true };
 }
 
+function parseBearerToken(value) {
+  if (!value) return null;
+  const match = String(value).match(/^Bearer\s+(.+)$/i);
+  if (!match) return null;
+  const token = match[1]?.trim();
+  return token || null;
+}
+
+function decodeBase64UrlJson(segment) {
+  try {
+    const decoded = Buffer.from(String(segment || ""), "base64url").toString(
+      "utf8",
+    );
+    return JSON.parse(decoded);
+  } catch {
+    return null;
+  }
+}
+
+function parseVonageSignedJwt(token) {
+  if (!token) return null;
+  const parts = String(token).split(".");
+  if (parts.length !== 3) return null;
+  const [encodedHeader, encodedPayload, encodedSignature] = parts;
+  const header = decodeBase64UrlJson(encodedHeader);
+  const payload = decodeBase64UrlJson(encodedPayload);
+  if (!header || !payload) return null;
+  return {
+    token: String(token),
+    header,
+    payload,
+    encodedHeader,
+    encodedPayload,
+    encodedSignature,
+  };
+}
+
+function pruneVonageWebhookJtiCache(nowMs = Date.now()) {
+  for (const [key, expiresAt] of vonageWebhookJtiCache.entries()) {
+    if (!Number.isFinite(expiresAt) || expiresAt <= nowMs) {
+      vonageWebhookJtiCache.delete(key);
+    }
+  }
+  if (vonageWebhookJtiCache.size <= VONAGE_WEBHOOK_JTI_CACHE_MAX) return;
+  const ordered = [...vonageWebhookJtiCache.entries()].sort(
+    (a, b) => a[1] - b[1],
+  );
+  const overflow = ordered.length - VONAGE_WEBHOOK_JTI_CACHE_MAX;
+  for (let i = 0; i < overflow; i += 1) {
+    vonageWebhookJtiCache.delete(ordered[i][0]);
+  }
+}
+
+function seenVonageWebhookJti(jti, nowMs = Date.now()) {
+  if (!jti) return false;
+  pruneVonageWebhookJtiCache(nowMs);
+  const expiresAt = vonageWebhookJtiCache.get(String(jti));
+  if (!Number.isFinite(expiresAt)) return false;
+  if (expiresAt <= nowMs) {
+    vonageWebhookJtiCache.delete(String(jti));
+    return false;
+  }
+  return true;
+}
+
+function storeVonageWebhookJti(jti, expiresAtMs, nowMs = Date.now()) {
+  if (!jti) return;
+  const fallbackTtlMs = Number(config.vonage?.webhookMaxSkewMs || 300000);
+  const safeExpiry = Number.isFinite(expiresAtMs)
+    ? expiresAtMs
+    : nowMs + fallbackTtlMs;
+  vonageWebhookJtiCache.set(String(jti), safeExpiry);
+  pruneVonageWebhookJtiCache(nowMs);
+}
+
+function computeVonagePayloadHash(req) {
+  const method = String(req?.method || "GET").toUpperCase();
+  let body = "";
+  if (method !== "GET" && method !== "HEAD") {
+    if (typeof req?.rawBody === "string") {
+      body = req.rawBody;
+    } else if (Buffer.isBuffer(req?.rawBody)) {
+      body = req.rawBody.toString("utf8");
+    } else if (req?.body && Object.keys(req.body).length) {
+      body = stableStringify(req.body);
+    }
+  }
+  return crypto
+    .createHash("sha256")
+    .update(body || "")
+    .digest("hex")
+    .toLowerCase();
+}
+
+function validateVonageSignedWebhook(req) {
+  const secret = config.vonage?.webhookSignatureSecret;
+  if (!secret) {
+    return { ok: false, reason: "missing_secret" };
+  }
+  const authorization = req?.headers?.authorization || req?.headers?.Authorization;
+  const token = parseBearerToken(authorization);
+  if (!token) {
+    return { ok: false, reason: "missing_bearer_token" };
+  }
+  const parsed = parseVonageSignedJwt(token);
+  if (!parsed) {
+    return { ok: false, reason: "invalid_token_format" };
+  }
+  if (String(parsed.header?.alg || "").toUpperCase() !== "HS256") {
+    return { ok: false, reason: "unsupported_algorithm" };
+  }
+
+  let providedSignature;
+  try {
+    providedSignature = Buffer.from(parsed.encodedSignature, "base64url");
+  } catch {
+    return { ok: false, reason: "invalid_signature_encoding" };
+  }
+  const expectedSignature = crypto
+    .createHmac("sha256", secret)
+    .update(`${parsed.encodedHeader}.${parsed.encodedPayload}`)
+    .digest();
+  if (
+    expectedSignature.length !== providedSignature.length ||
+    !crypto.timingSafeEqual(expectedSignature, providedSignature)
+  ) {
+    return { ok: false, reason: "invalid_signature" };
+  }
+
+  const claims = parsed.payload || {};
+  const nowMs = Date.now();
+  const nowSec = Math.floor(nowMs / 1000);
+  const skewMs = Number(config.vonage?.webhookMaxSkewMs || 300000);
+  const skewSec = Math.ceil(skewMs / 1000);
+  const iat = Number(claims.iat);
+  const exp = Number(claims.exp);
+  const nbf = Number(claims.nbf);
+
+  if (Number.isFinite(iat) && Math.abs(nowSec - iat) > skewSec) {
+    return { ok: false, reason: "iat_out_of_range" };
+  }
+  if (Number.isFinite(exp) && nowSec > exp + skewSec) {
+    return { ok: false, reason: "token_expired" };
+  }
+  if (Number.isFinite(nbf) && nowSec + skewSec < nbf) {
+    return { ok: false, reason: "token_not_active" };
+  }
+  if (
+    claims.api_key &&
+    config.vonage?.apiKey &&
+    String(claims.api_key) !== String(config.vonage.apiKey)
+  ) {
+    return { ok: false, reason: "api_key_mismatch" };
+  }
+
+  const jti = claims.jti ? String(claims.jti) : null;
+  if (jti) {
+    if (seenVonageWebhookJti(jti, nowMs)) {
+      return { ok: false, reason: "replay_detected" };
+    }
+    const expiresAtMs = Number.isFinite(exp)
+      ? exp * 1000 + skewMs
+      : Number.isFinite(iat)
+        ? iat * 1000 + skewMs
+        : nowMs + skewMs;
+    storeVonageWebhookJti(jti, expiresAtMs, nowMs);
+  }
+
+  const payloadHash =
+    claims.payload_hash || claims.payloadHash || claims.body_hash || null;
+  const requirePayloadHash = !!config.vonage?.webhookRequirePayloadHash;
+  const method = String(req?.method || "GET").toUpperCase();
+  const shouldCheckPayloadHash =
+    method !== "GET" && method !== "HEAD" && (payloadHash || requirePayloadHash);
+  if (shouldCheckPayloadHash && !payloadHash) {
+    return { ok: false, reason: "missing_payload_hash" };
+  }
+  if (shouldCheckPayloadHash && payloadHash) {
+    const expectedHash = computeVonagePayloadHash(req);
+    if (String(payloadHash).toLowerCase() !== expectedHash) {
+      return { ok: false, reason: "payload_hash_mismatch" };
+    }
+  }
+
+  return { ok: true, claims };
+}
+
+function requireValidVonageWebhook(req, res, label = "") {
+  const mode = String(config.vonage?.webhookValidation || "warn").toLowerCase();
+  if (mode === "off") return true;
+  const result = validateVonageSignedWebhook(req);
+  if (result.ok) return true;
+  const path = label || req.originalUrl || req.path || "unknown";
+  console.warn(
+    `⚠️ Vonage webhook signature invalid for ${path}: ${result.reason || "unknown"}`,
+  );
+  if (mode === "strict") {
+    // Signed callbacks may be retried by Vonage on 5xx.
+    res.status(503).send("Temporary validation failure");
+    return false;
+  }
+  return true;
+}
+
 function selectWsProtocol(protocols) {
   if (!protocols) return false;
   if (Array.isArray(protocols) && protocols.length) return protocols[0];
@@ -2118,8 +2646,13 @@ ExpressWs(app, null, {
 // Trust the first proxy (ngrok/load balancer) so rate limiting can read X-Forwarded-For safely
 app.set("trust proxy", 1);
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+function captureRawBody(req, _res, buf) {
+  if (!buf || !buf.length) return;
+  req.rawBody = buf.toString("utf8");
+}
+
+app.use(express.json({ verify: captureRawBody }));
+app.use(express.urlencoded({ extended: true, verify: captureRawBody }));
 
 const apiLimiter = rateLimit({
   windowMs: config.server?.rateLimit?.windowMs || 60000,
@@ -3176,6 +3709,228 @@ let awsConnectAdapter = null;
 let awsTtsAdapter = null;
 let vonageVoiceAdapter = null;
 
+function rememberVonageCallMapping(callSid, vonageUuid, source = "unknown") {
+  if (!callSid || !vonageUuid) return;
+  vonageCallMap.set(String(vonageUuid), String(callSid));
+
+  const callConfig = callConfigurations.get(callSid);
+  if (callConfig) {
+    if (!callConfig.provider_metadata) {
+      callConfig.provider_metadata = {};
+    }
+    if (callConfig.provider_metadata.vonage_uuid !== vonageUuid) {
+      callConfig.provider_metadata.vonage_uuid = String(vonageUuid);
+      callConfigurations.set(callSid, callConfig);
+      if (db?.updateCallState) {
+        db.updateCallState(callSid, "provider_metadata_updated", {
+          provider: "vonage",
+          vonage_uuid: String(vonageUuid),
+          source,
+          at: new Date().toISOString(),
+        })
+          .catch(() => {});
+      }
+    }
+  }
+}
+
+async function resolveVonageCallSidFromUuid(vonageUuid) {
+  if (!vonageUuid) return null;
+  const normalizedUuid = String(vonageUuid);
+  const inMemory = vonageCallMap.get(normalizedUuid);
+  if (inMemory) return inMemory;
+
+  for (const [callSid, cfg] of callConfigurations.entries()) {
+    const cfgUuid = cfg?.provider_metadata?.vonage_uuid;
+    if (cfgUuid && String(cfgUuid) === normalizedUuid) {
+      rememberVonageCallMapping(callSid, normalizedUuid, "memory_scan");
+      return callSid;
+    }
+  }
+
+  if (!db?.db) return null;
+  const rows = await new Promise((resolve) => {
+    db.db.all(
+      `
+        SELECT call_sid, data
+        FROM call_states
+        WHERE state = 'call_created'
+          AND data LIKE ?
+        ORDER BY id DESC
+        LIMIT 50
+      `,
+      [`%${normalizedUuid}%`],
+      (err, resultRows) => {
+        if (err) {
+          resolve([]);
+          return;
+        }
+        resolve(Array.isArray(resultRows) ? resultRows : []);
+      },
+    );
+  });
+
+  for (const row of rows) {
+    try {
+      const parsed = row?.data ? JSON.parse(row.data) : null;
+      const stateUuid = parsed?.provider_metadata?.vonage_uuid;
+      if (stateUuid && String(stateUuid) === normalizedUuid && row?.call_sid) {
+        rememberVonageCallMapping(row.call_sid, normalizedUuid, "db_scan");
+        return row.call_sid;
+      }
+    } catch {
+      // Ignore malformed JSON rows.
+    }
+  }
+
+  return null;
+}
+
+async function resolveVonageCallSid(req, payload = {}) {
+  const query = req?.query || {};
+  const body = payload || {};
+
+  const directCallSid =
+    query.callSid ||
+    query.call_sid ||
+    query.callsid ||
+    query.client_ref ||
+    body.callSid ||
+    body.call_sid ||
+    body.callsid ||
+    body.client_ref;
+  if (directCallSid) {
+    return String(directCallSid);
+  }
+
+  const uuidCandidates = [
+    query.uuid,
+    query.vonage_uuid,
+    query.conversation_uuid,
+    body.uuid,
+    body.vonage_uuid,
+    body.conversation_uuid,
+  ].filter(Boolean);
+
+  for (const candidate of uuidCandidates) {
+    const resolved = await resolveVonageCallSidFromUuid(candidate);
+    if (resolved) return String(resolved);
+  }
+
+  return null;
+}
+
+function resolveVonageHangupUuid(callSid, callConfig) {
+  const direct = callConfig?.provider_metadata?.vonage_uuid;
+  if (direct) return String(direct);
+  for (const [uuid, mappedCallSid] of vonageCallMap.entries()) {
+    if (String(mappedCallSid) === String(callSid)) {
+      return String(uuid);
+    }
+  }
+  return null;
+}
+
+function buildVonageInboundCallSid(vonageUuid) {
+  const normalized = String(vonageUuid || "")
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]/g, "");
+  if (!normalized) return null;
+  return `vonage-in-${normalized}`;
+}
+
+function normalizeVonageDirection(value = "") {
+  return String(value || "")
+    .trim()
+    .toLowerCase();
+}
+
+function isOutboundVonageDirection(value = "") {
+  const normalized = normalizeVonageDirection(value);
+  return (
+    normalized.startsWith("outbound") ||
+    normalized === "outbound-api" ||
+    normalized === "api_outbound"
+  );
+}
+
+function getVonageCallPayload(req, payload = null) {
+  const body = payload || req?.body || {};
+  const query = req?.query || {};
+  const from =
+    body.from ||
+    body.from_number ||
+    body.caller ||
+    body.Caller ||
+    query.from ||
+    query.from_number ||
+    query.caller ||
+    null;
+  const to =
+    body.to ||
+    body.to_number ||
+    body.called ||
+    body.Called ||
+    query.to ||
+    query.to_number ||
+    query.called ||
+    null;
+  const direction =
+    body.direction || query.direction || body.call_direction || query.call_direction;
+  return {
+    from: from || null,
+    to: to || null,
+    direction: direction || null,
+    From: from || null,
+    To: to || null,
+    Direction: direction || null,
+  };
+}
+
+function buildVonageTalkHangupNcco(message) {
+  const text = String(message || "").trim();
+  if (!text) return [{ action: "hangup" }];
+  return [
+    { action: "talk", text },
+    { action: "hangup" },
+  ];
+}
+
+function normalizeDigitString(value) {
+  // Keep digits plus keypad terminators so provider webhooks can signal explicit end-of-entry.
+  return String(value || "").replace(/[^0-9#*]/g, "");
+}
+
+function getVonageDtmfDigits(payload = {}) {
+  const dtmf = payload?.dtmf;
+  const candidates = [
+    typeof dtmf === "string" ? dtmf : null,
+    dtmf?.digits,
+    dtmf?.digit,
+    payload?.digits,
+    payload?.digit,
+    payload?.keypad_digits,
+    payload?.keypad,
+    payload?.key,
+    payload?.value,
+    payload?.input,
+  ];
+  for (const candidate of candidates) {
+    const normalized = normalizeDigitString(candidate);
+    if (normalized) return normalized;
+  }
+  return "";
+}
+
+function clearVonageCallMappings(callSid) {
+  if (!callSid) return;
+  for (const [uuid, mappedCallSid] of vonageCallMap.entries()) {
+    if (String(mappedCallSid) === String(callSid)) {
+      vonageCallMap.delete(uuid);
+    }
+  }
+}
+
 const builtinPersonas = [
   {
     id: "general",
@@ -3212,7 +3967,391 @@ function hasAdminToken(req) {
   return Boolean(provided && provided === token);
 }
 
+function supportsKeypadCaptureProvider(provider) {
+  const normalized = String(provider || "")
+    .trim()
+    .toLowerCase();
+  if (!normalized) return false;
+  if (normalized === "twilio") return true;
+  if (normalized === "vonage") {
+    return config.vonage?.dtmfWebhookEnabled === true;
+  }
+  return false;
+}
+
+function normalizeDigitProfile(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase();
+}
+
+function isKeypadRequiredFlow(collectionProfile, scriptPolicy = {}) {
+  const profile = normalizeDigitProfile(
+    collectionProfile || scriptPolicy?.default_profile,
+  );
+  if (scriptPolicy?.requires_otp) return true;
+  return ["verification", "otp", "pin"].includes(profile);
+}
+
+function normalizeScriptId(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  if (parsed <= 0) return null;
+  return Math.trunc(parsed);
+}
+
+function buildKeypadScopeKeys(collectionProfile, scriptPolicy = {}, scriptId = null) {
+  const keys = [];
+  const normalizedScriptId = normalizeScriptId(scriptId);
+  if (normalizedScriptId) {
+    keys.push({
+      key: `script:${normalizedScriptId}`,
+      scope: "script",
+      value: normalizedScriptId,
+    });
+  }
+  const profile = normalizeDigitProfile(
+    collectionProfile || scriptPolicy?.default_profile,
+  );
+  if (profile) {
+    keys.push({
+      key: `profile:${profile}`,
+      scope: "profile",
+      value: profile,
+    });
+  }
+  return keys;
+}
+
+function pruneExpiredKeypadProviderOverrides(nowMs = Date.now()) {
+  let changed = false;
+  for (const [scopeKey, override] of keypadProviderOverrides.entries()) {
+    const expiresAt = Number(override?.expiresAt || 0);
+    if (!Number.isFinite(expiresAt) || expiresAt <= nowMs) {
+      keypadProviderOverrides.delete(scopeKey);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function serializeKeypadProviderOverrides() {
+  pruneExpiredKeypadProviderOverrides();
+  return {
+    version: 1,
+    updated_at: new Date().toISOString(),
+    overrides: [...keypadProviderOverrides.entries()].map(
+      ([scopeKey, override]) => ({
+        scopeKey,
+        provider: override?.provider || "twilio",
+        expiresAt: Number(override?.expiresAt || 0),
+        createdAt: override?.createdAt || null,
+        reason: override?.reason || null,
+        script_id: override?.script_id || null,
+        collection_profile: override?.collection_profile || null,
+        source_call_sid: override?.source_call_sid || null,
+      }),
+    ),
+  };
+}
+
+function listKeypadProviderOverrides() {
+  const changed = pruneExpiredKeypadProviderOverrides();
+  if (changed) {
+    persistKeypadProviderOverrides().catch(() => {});
+  }
+  return [...keypadProviderOverrides.entries()].map(([scopeKey, override]) => ({
+    scope_key: scopeKey,
+    provider: override?.provider || "twilio",
+    expires_at: override?.expiresAt
+      ? new Date(override.expiresAt).toISOString()
+      : null,
+    created_at: override?.createdAt || null,
+    reason: override?.reason || null,
+    script_id: override?.script_id || null,
+    collection_profile: override?.collection_profile || null,
+    source_call_sid: override?.source_call_sid || null,
+  }));
+}
+
+async function clearKeypadProviderOverrides(params = {}) {
+  const {
+    all = false,
+    scopeKey = null,
+    scope = null,
+    value = null,
+  } = params || {};
+  const normalizedScopeKey = scopeKey ? String(scopeKey).trim() : "";
+  const normalizedScope = scope ? String(scope).trim().toLowerCase() : "";
+  const normalizedValue = value == null ? "" : String(value).trim().toLowerCase();
+
+  let cleared = 0;
+  if (all) {
+    cleared = keypadProviderOverrides.size;
+    keypadProviderOverrides.clear();
+  } else if (normalizedScopeKey) {
+    if (keypadProviderOverrides.delete(normalizedScopeKey)) {
+      cleared = 1;
+    }
+  } else if (normalizedScope && normalizedValue) {
+    const targetKey = `${normalizedScope}:${normalizedValue}`;
+    if (keypadProviderOverrides.delete(targetKey)) {
+      cleared = 1;
+    }
+  }
+
+  await persistKeypadProviderOverrides();
+  return {
+    cleared,
+    remaining: keypadProviderOverrides.size,
+    overrides: listKeypadProviderOverrides(),
+  };
+}
+
+async function loadStoredCallProvider() {
+  if (!db?.getSetting) return;
+  try {
+    const raw = await db.getSetting(CALL_PROVIDER_SETTING_KEY);
+    if (!raw) return;
+    const normalized = String(raw).trim().toLowerCase();
+    if (!SUPPORTED_PROVIDERS.includes(normalized)) {
+      console.warn(
+        `Ignoring invalid stored call provider "${raw}". Supported values: ${SUPPORTED_PROVIDERS.join(", ")}`,
+      );
+      return;
+    }
+    storedProvider = normalized;
+    const readiness = getProviderReadiness();
+    if (readiness[normalized]) {
+      currentProvider = normalized;
+      return;
+    }
+    console.warn(
+      `Stored provider "${normalized}" is not configured/ready in this environment. Keeping active provider "${currentProvider}".`,
+    );
+  } catch (error) {
+    console.error("Failed to load stored call provider:", error);
+  }
+}
+
+async function persistKeypadProviderOverrides() {
+  if (!db?.setSetting) return;
+  try {
+    await db.setSetting(
+      KEYPAD_PROVIDER_OVERRIDE_SETTING_KEY,
+      JSON.stringify(serializeKeypadProviderOverrides()),
+    );
+  } catch (error) {
+    console.error("Failed to persist keypad provider overrides:", error);
+  }
+}
+
+async function loadKeypadProviderOverrides() {
+  keypadProviderOverrides.clear();
+  if (!db?.getSetting) return;
+  try {
+    const raw = await db.getSetting(KEYPAD_PROVIDER_OVERRIDE_SETTING_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    const overrides = Array.isArray(parsed?.overrides) ? parsed.overrides : [];
+    const nowMs = Date.now();
+    for (const item of overrides) {
+      const scopeKey = String(item?.scopeKey || "").trim();
+      const provider = String(item?.provider || "").trim().toLowerCase();
+      const expiresAt = Number(item?.expiresAt || 0);
+      if (!scopeKey || !provider || !Number.isFinite(expiresAt)) continue;
+      if (expiresAt <= nowMs) continue;
+      keypadProviderOverrides.set(scopeKey, {
+        provider,
+        expiresAt,
+        createdAt: item?.createdAt || null,
+        reason: item?.reason || null,
+        script_id: item?.script_id || null,
+        collection_profile: item?.collection_profile || null,
+        source_call_sid: item?.source_call_sid || null,
+      });
+    }
+  } catch (error) {
+    console.error("Failed to load keypad provider overrides:", error);
+  }
+}
+
+function resolveKeypadProviderOverride(
+  collectionProfile,
+  scriptPolicy = {},
+  scriptId = null,
+) {
+  const changed = pruneExpiredKeypadProviderOverrides();
+  if (changed) {
+    persistKeypadProviderOverrides().catch(() => {});
+  }
+  const scopeKeys = buildKeypadScopeKeys(collectionProfile, scriptPolicy, scriptId);
+  for (const scope of scopeKeys) {
+    const override = keypadProviderOverrides.get(scope.key);
+    if (!override) continue;
+    return {
+      ...override,
+      scopeKey: scope.key,
+      scope: scope.scope,
+      scopeValue: scope.value,
+    };
+  }
+  return null;
+}
+
+function clearKeypadDtmfWatchdog(callSid) {
+  if (!callSid) return;
+  const existing = keypadDtmfWatchdogs.get(callSid);
+  if (existing) {
+    clearTimeout(existing);
+    keypadDtmfWatchdogs.delete(callSid);
+  }
+}
+
+function clearKeypadCallState(callSid) {
+  if (!callSid) return;
+  clearKeypadDtmfWatchdog(callSid);
+  keypadDtmfSeen.delete(callSid);
+}
+
+function markKeypadDtmfSeen(callSid, meta = {}) {
+  if (!callSid) return;
+  keypadDtmfSeen.set(callSid, {
+    seenAt: new Date().toISOString(),
+    source: meta?.source || null,
+    digitsLength: Number(meta?.digitsLength || 0) || null,
+  });
+  clearKeypadDtmfWatchdog(callSid);
+}
+
+async function triggerVonageKeypadGuard(callSid, callConfig, timeoutMs) {
+  if (!callSid || !callConfig) return;
+  const scopeKeys = buildKeypadScopeKeys(
+    callConfig.collection_profile,
+    callConfig.script_policy || {},
+    callConfig.script_id,
+  );
+  if (!scopeKeys.length) return;
+
+  const cooldownMs = Number(config.keypadGuard?.providerOverrideCooldownMs) || 1800000;
+  const nowMs = Date.now();
+  const expiresAt = nowMs + cooldownMs;
+  const createdAt = new Date(nowMs).toISOString();
+  const profile =
+    normalizeDigitProfile(
+      callConfig.collection_profile || callConfig.script_policy?.default_profile,
+    ) || null;
+  const scriptId = normalizeScriptId(callConfig.script_id);
+
+  for (const scope of scopeKeys) {
+    keypadProviderOverrides.set(scope.key, {
+      provider: "twilio",
+      expiresAt,
+      createdAt,
+      reason: "vonage_dtmf_timeout",
+      script_id: scriptId,
+      collection_profile: profile,
+      source_call_sid: callSid,
+    });
+  }
+
+  await persistKeypadProviderOverrides();
+
+  const remainingMinutes = Math.max(1, Math.ceil(cooldownMs / 60000));
+  const alertMessage = `⚠️ Provider guard: no keypad DTMF detected on Vonage within ${Math.round(
+    timeoutMs / 1000,
+  )}s for call ${callSid.slice(-6)}. Future keypad flows for ${scopeKeys
+    .map((s) => s.key)
+    .join(", ")} will route to TWILIO for ${remainingMinutes}m.`;
+
+  webhookService.addLiveEvent(callSid, alertMessage, { force: true });
+  if (db?.updateCallState) {
+    await db
+      .updateCallState(callSid, "keypad_provider_override_triggered", {
+        at: createdAt,
+        provider: "vonage",
+        fallback_provider: "twilio",
+        timeout_ms: timeoutMs,
+        override_scope_keys: scopeKeys.map((s) => s.key),
+        override_expires_at: new Date(expiresAt).toISOString(),
+      })
+      .catch(() => {});
+  }
+  db?.addCallMetric?.(callSid, "keypad_dtmf_timeout_ms", timeoutMs, {
+    provider: "vonage",
+    scope_keys: scopeKeys.map((s) => s.key),
+    override_provider: "twilio",
+  }).catch(() => {});
+  db?.logServiceHealth?.("provider_guard", "keypad_timeout", {
+    call_sid: callSid,
+    provider: "vonage",
+    timeout_ms: timeoutMs,
+    override_provider: "twilio",
+    scope_keys: scopeKeys.map((s) => s.key),
+    override_expires_at: new Date(expiresAt).toISOString(),
+  }).catch(() => {});
+
+  const alertChatId = callConfig.user_chat_id || config.telegram?.adminChatId || null;
+  if (alertChatId && webhookService?.sendTelegramMessage) {
+    webhookService
+      .sendTelegramMessage(alertChatId, alertMessage)
+      .catch((error) =>
+        console.error("Failed to send keypad guard alert to Telegram:", error),
+      );
+  }
+}
+
+function scheduleVonageKeypadDtmfWatchdog(callSid, callConfig) {
+  clearKeypadDtmfWatchdog(callSid);
+  if (!callSid || !callConfig) return;
+  if (!config.keypadGuard?.enabled) return;
+  if (String(callConfig.provider || "").toLowerCase() !== "vonage") return;
+  if (!isKeypadRequiredFlow(callConfig.collection_profile, callConfig.script_policy)) {
+    return;
+  }
+  const timeoutMs = Number(config.keypadGuard?.vonageDtmfTimeoutMs) || 12000;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return;
+
+  const timer = setTimeout(() => {
+    keypadDtmfWatchdogs.delete(callSid);
+    if (keypadDtmfSeen.has(callSid)) return;
+    triggerVonageKeypadGuard(callSid, callConfig, timeoutMs).catch((error) => {
+      console.error("Vonage keypad guard trigger failed:", error);
+    });
+  }, timeoutMs);
+  keypadDtmfWatchdogs.set(callSid, timer);
+}
+
 function getProviderReadiness() {
+  const vonageHasCredentials = !!(
+    config.vonage.apiKey &&
+    config.vonage.apiSecret &&
+    config.vonage.applicationId &&
+    config.vonage.privateKey &&
+    config.vonage.voice?.fromNumber
+  );
+  const vonageHasRouting = !!(
+    config.server?.hostname ||
+    config.vonage.voice?.answerUrl ||
+    config.vonage.voice?.eventUrl
+  );
+  const vonageWebhookMode = String(
+    config.vonage?.webhookValidation || "warn",
+  ).toLowerCase();
+  const vonageWebhookReady =
+    vonageWebhookMode !== "strict" ||
+    Boolean(config.vonage?.webhookSignatureSecret);
+  if (
+    vonageHasCredentials &&
+    vonageHasRouting &&
+    !vonageWebhookReady &&
+    !warnedVonageWebhookValidation
+  ) {
+    console.warn(
+      "⚠️ Vonage webhook validation is strict but VONAGE_WEBHOOK_SIGNATURE_SECRET is missing. Vonage callbacks will fail until configured.",
+    );
+    warnedVonageWebhookValidation = true;
+  }
   return {
     twilio: !!(
       config.twilio.accountSid &&
@@ -3220,12 +4359,7 @@ function getProviderReadiness() {
       config.twilio.fromNumber
     ),
     aws: !!(config.aws.connect.instanceId && config.aws.connect.contactFlowId),
-    vonage: !!(
-      config.vonage.apiKey &&
-      config.vonage.apiSecret &&
-      config.vonage.applicationId &&
-      config.vonage.privateKey
-    ),
+    vonage: vonageHasCredentials && vonageHasRouting && vonageWebhookReady,
   };
 }
 
@@ -3308,6 +4442,7 @@ function selectOutboundProvider(preferred) {
 }
 
 let warnedMachineDetection = false;
+let warnedVonageWebhookValidation = false;
 function isMachineDetectionEnabled() {
   const value = String(config.twilio?.machineDetection || "").toLowerCase();
   if (!value) return false;
@@ -3374,7 +4509,12 @@ async function endCallForProvider(callSid) {
   }
 
   if (provider === "vonage") {
-    const callUuid = callConfig?.provider_metadata?.vonage_uuid || callSid;
+    const callUuid = resolveVonageHangupUuid(callSid, callConfig);
+    if (!callUuid) {
+      throw new Error(
+        "Vonage call UUID not available for hangup; ensure event webhook mapping is configured",
+      );
+    }
     const vonageAdapter = getVonageVoiceAdapter();
     await vonageAdapter.hangupCall(callUuid);
     return;
@@ -3782,7 +4922,9 @@ async function startServer(options = {}) {
       smsService.setDb(db);
     }
     emailService = new EmailService({ db, config });
+    await loadStoredCallProvider();
     await refreshInboundDefaultScript(true);
+    await loadKeypadProviderOverrides();
 
     // Start webhook service after database is ready
     console.log("Starting enhanced webhook service...");
@@ -3831,11 +4973,512 @@ async function startServer(options = {}) {
   }
 }
 
+function buildVoiceAgentFunctions(functionSystem = null) {
+  if (!functionSystem || !Array.isArray(functionSystem.functions)) {
+    return [];
+  }
+  return functionSystem.functions
+    .map((tool) => {
+      const fn = tool?.function || {};
+      if (!fn.name) return null;
+      return {
+        name: fn.name,
+        description: fn.description,
+        parameters: fn.parameters,
+      };
+    })
+    .filter(Boolean);
+}
+
+async function requestVoiceAgentFallback(callSid, req, reason = "") {
+  if (!callSid) {
+    throw new Error("Missing callSid for voice-agent fallback");
+  }
+  const host = resolveHost(req) || config.server?.hostname;
+  if (!host) {
+    throw new Error("Server hostname not configured for voice-agent fallback");
+  }
+  const accountSid = config.twilio?.accountSid;
+  const authToken = config.twilio?.authToken;
+  if (!accountSid || !authToken) {
+    throw new Error("Twilio credentials missing for voice-agent fallback");
+  }
+  const attemptCount = (voiceAgentFallbackAttempts.get(callSid) || 0) + 1;
+  voiceAgentFallbackAttempts.set(callSid, attemptCount);
+
+  const redirectUrl = `https://${host}/incoming?voice_agent_fallback=1&va_reason=${encodeURIComponent(reason || "connect_failed")}&va_attempt=${attemptCount}`;
+  const client = twilio(accountSid, authToken);
+  await client.calls(callSid).update({
+    method: "POST",
+    url: redirectUrl,
+  });
+  return { redirectUrl, attemptCount };
+}
+
+async function handleVoiceAgentWebSocket(ws, req) {
+  let streamSid = null;
+  let callSid = null;
+  let callStartTime = null;
+  let callConfig = null;
+  let functionSystem = null;
+  let interactionCount = 0;
+  let streamAuthOk = false;
+  let cleanedUp = false;
+
+  const bridge = new VoiceAgentBridge({
+    apiKey: config.deepgram.apiKey,
+    endpoint: config.deepgram?.voiceAgent?.endpoint,
+    keepAliveMs: config.deepgram?.voiceAgent?.keepAliveMs,
+    listenModel: config.deepgram?.voiceAgent?.listen?.model,
+    thinkProviderType: config.deepgram?.voiceAgent?.think?.providerType,
+    thinkModel: config.deepgram?.voiceAgent?.think?.model,
+    speakModel: config.deepgram?.voiceAgent?.speak?.model,
+  });
+
+  const streamService = new StreamService(ws, {
+    audioTickIntervalMs: liveConsoleAudioTickMs,
+  });
+
+  const cleanup = async (reason = "closed") => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+
+    try {
+      await bridge.close();
+    } catch (_) {}
+
+    if (callSid) {
+      clearFirstMediaWatchdog(callSid);
+      streamFirstMediaSeen.delete(callSid);
+      streamStartTimes.delete(callSid);
+      if (
+        activeStreamConnections.get(callSid)?.streamSid ===
+        (streamSid || activeStreamConnections.get(callSid)?.streamSid)
+      ) {
+        activeStreamConnections.delete(callSid);
+      }
+      if (pendingStreams.has(callSid)) {
+        clearTimeout(pendingStreams.get(callSid));
+        pendingStreams.delete(callSid);
+      }
+      clearSpeechTicks(callSid);
+      clearGptQueue(callSid);
+      clearNormalFlowState(callSid);
+      clearCallEndLock(callSid);
+      clearSilenceTimer(callSid);
+      sttFallbackCalls.delete(callSid);
+      streamTimeoutCalls.delete(callSid);
+      if (digitService) {
+        digitService.clearCallState(callSid);
+      }
+      const activeSession = activeCalls.get(callSid);
+      if (activeSession?.startTime) {
+        await handleCallEnd(callSid, activeSession.startTime);
+      }
+      activeCalls.delete(callSid);
+      streamAuthBypass.delete(callSid);
+      streamStartSeen.delete(callSid);
+      webhookService.addLiveEvent(
+        callSid,
+        `🔌 Voice agent stream ${reason}`,
+        { force: true },
+      );
+    }
+  };
+
+  bridge.on("audio", (base64Audio) => {
+    if (!base64Audio) return;
+    streamService.buffer(null, base64Audio);
+    if (callSid) {
+      webhookService
+        .setLiveCallPhase(callSid, "agent_speaking")
+        .catch(() => {});
+    }
+  });
+
+  bridge.on("conversationText", async ({ role, text }) => {
+    if (!callSid || !text) return;
+    const speaker = role === "ai" ? "ai" : "user";
+    const consoleRole = speaker === "ai" ? "agent" : "user";
+    webhookService.recordTranscriptTurn(callSid, consoleRole, text);
+    if (speaker === "user") {
+      webhookService.setLiveCallPhase(callSid, "user_speaking").catch(() => {});
+    } else {
+      webhookService
+        .setLiveCallPhase(callSid, "agent_responding")
+        .catch(() => {});
+    }
+
+    try {
+      await db.addTranscript({
+        call_sid: callSid,
+        speaker,
+        message: text,
+        interaction_count: interactionCount,
+        personality_used: "voice_agent",
+      });
+      await db.updateCallState(callSid, `${speaker}_spoke`, {
+        message: text,
+        interaction_count: interactionCount,
+        source: "voice_agent",
+      });
+    } catch (error) {
+      console.error("Voice agent transcript save error:", error);
+    }
+    if (speaker === "user") {
+      interactionCount += 1;
+      const session = activeCalls.get(callSid);
+      if (session) {
+        session.interactionCount = interactionCount;
+      }
+    }
+  });
+
+  bridge.on("functionCallRequest", async (request) => {
+    const functionName = request?.name;
+    if (!functionName) return;
+    let args = request?.arguments || {};
+    if (typeof args === "string") {
+      try {
+        args = JSON.parse(args);
+      } catch (_) {
+        args = {};
+      }
+    }
+
+    let responsePayload;
+    try {
+      const fn = functionSystem?.implementations?.[functionName];
+      if (!fn) {
+        throw new Error(`Function ${functionName} is not available`);
+      }
+      responsePayload = await fn(args || {});
+    } catch (error) {
+      responsePayload = { error: error.message || "Function failed" };
+      if (callSid) {
+        webhookService.addLiveEvent(
+          callSid,
+          `⚠️ Function error: ${functionName}`,
+          { force: true },
+        );
+      }
+    }
+    bridge.sendFunctionResponse(request?.id, responsePayload);
+  });
+
+  bridge.on("event", (event) => {
+    if (!callSid) return;
+    const type = String(event?.type || event?.event || "").toLowerCase();
+    if (!type) return;
+    if (type.includes("userstartedspeaking")) {
+      webhookService.setLiveCallPhase(callSid, "user_speaking").catch(() => {});
+      return;
+    }
+    if (type.includes("agentthinking")) {
+      webhookService
+        .setLiveCallPhase(callSid, "agent_responding")
+        .catch(() => {});
+      return;
+    }
+    if (type.includes("agentstartedspeaking")) {
+      webhookService.setLiveCallPhase(callSid, "agent_speaking").catch(() => {});
+    }
+  });
+
+  bridge.on("error", (error) => {
+    console.error("Voice agent bridge error:", error);
+    if (callSid) {
+      webhookService.addLiveEvent(
+        callSid,
+        `⚠️ Voice agent error: ${error.message || "unknown error"}`,
+        { force: true },
+      );
+    }
+  });
+
+  ws.on("message", async (data) => {
+    let msg;
+    try {
+      msg = JSON.parse(data);
+    } catch (_) {
+      return;
+    }
+
+    const event = msg?.event;
+    if (event === "start") {
+      streamSid = msg.start?.streamSid;
+      callSid = msg.start?.callSid;
+      callStartTime = new Date();
+      streamStartTimes.set(callSid, Date.now());
+      if (!callSid) {
+        ws.close();
+        return;
+      }
+
+      const customParams = msg.start?.customParameters || {};
+      const authResult = verifyStreamAuth(callSid, req, customParams);
+      if (!authResult.ok) {
+        if (authResult.reason !== "missing_token") {
+          ws.close();
+          return;
+        }
+        streamAuthBypass.set(callSid, {
+          reason: authResult.reason,
+          at: new Date().toISOString(),
+        });
+      }
+      streamAuthOk =
+        authResult.ok ||
+        authResult.skipped ||
+        authResult.reason === "missing_token";
+
+      const priorStreamSid = streamStartSeen.get(callSid);
+      if (priorStreamSid && priorStreamSid === streamSid) {
+        return;
+      }
+      streamStartSeen.set(callSid, streamSid || "unknown");
+
+      const existingConnection = activeStreamConnections.get(callSid);
+      if (
+        existingConnection &&
+        existingConnection.ws !== ws &&
+        existingConnection.ws.readyState === 1
+      ) {
+        try {
+          existingConnection.ws.close(4000, "Replaced by new stream");
+        } catch (_) {}
+      }
+      activeStreamConnections.set(callSid, {
+        ws,
+        streamSid: streamSid || null,
+        connectedAt: new Date().toISOString(),
+      });
+
+      streamService.setStreamSid(streamSid);
+
+      const streamParams = resolveStreamAuthParams(req, customParams);
+      const fromValue =
+        streamParams.from ||
+        streamParams.From ||
+        customParams.from ||
+        customParams.From;
+      const toValue =
+        streamParams.to ||
+        streamParams.To ||
+        customParams.to ||
+        customParams.To;
+      const directionHint =
+        streamParams.direction ||
+        customParams.direction ||
+        callDirections.get(callSid);
+      const hasDirection = Boolean(String(directionHint || "").trim());
+      const isOutbound = hasDirection
+        ? isOutboundTwilioDirection(directionHint)
+        : false;
+      const defaultInbound = callConfigurations.get(callSid)?.inbound;
+      const isInbound = hasDirection
+        ? !isOutbound
+        : typeof defaultInbound === "boolean"
+          ? defaultInbound
+          : true;
+
+      callConfig = callConfigurations.get(callSid);
+      functionSystem = callFunctionSystems.get(callSid);
+      if (!callConfig && isOutbound) {
+        const hydrated = await hydrateCallConfigFromDb(callSid);
+        callConfig = hydrated?.callConfig || callConfig;
+        functionSystem = hydrated?.functionSystem || functionSystem;
+      }
+      if (!callConfig || !functionSystem) {
+        const setup = ensureCallSetup(
+          callSid,
+          {
+            From: fromValue,
+            To: toValue,
+          },
+          {
+            provider: "twilio",
+            inbound: isInbound,
+          },
+        );
+        callConfig = setup.callConfig || callConfig;
+        functionSystem = setup.functionSystem || functionSystem;
+      }
+      if (callConfig && hasDirection) {
+        callConfig.inbound = isInbound;
+        callConfigurations.set(callSid, callConfig);
+      }
+      if (callSid && hasDirection) {
+        callDirections.set(callSid, isInbound ? "inbound" : "outbound");
+      }
+
+      await ensureCallRecord(
+        callSid,
+        {
+          From: fromValue,
+          To: toValue,
+        },
+        "ws_start_voice_agent",
+        {
+          provider: "twilio",
+          inbound: isInbound,
+        },
+      );
+
+      streamFirstMediaSeen.delete(callSid);
+      scheduleFirstMediaWatchdog(
+        callSid,
+        resolveHost(req) || config.server?.hostname,
+        callConfig,
+      );
+
+      try {
+        await db.updateCallStatus(callSid, "started", {
+          started_at: callStartTime.toISOString(),
+        });
+        await db.updateCallState(callSid, "stream_started", {
+          stream_sid: streamSid,
+          start_time: callStartTime.toISOString(),
+          source: "voice_agent",
+        });
+      } catch (error) {
+        console.error("Voice agent call start DB update error:", error);
+      }
+
+      activeCalls.set(callSid, {
+        startTime: callStartTime,
+        callConfig,
+        functionSystem,
+        voiceAgent: true,
+        interactionCount: 0,
+      });
+
+      const voiceAgentFunctions = buildVoiceAgentFunctions(functionSystem);
+      try {
+        await bridge.connect({
+          callSid,
+          prompt: callConfig?.prompt,
+          firstMessage: callConfig?.first_message,
+          voiceModel: resolveVoiceModel(callConfig),
+          functions: voiceAgentFunctions,
+        });
+        webhookService.addLiveEvent(callSid, "🤖 Voice agent connected", {
+          force: true,
+        });
+      } catch (error) {
+        console.error("Voice agent connect failed, falling back:", error);
+        webhookService.addLiveEvent(
+          callSid,
+          "⚠️ Voice agent unavailable. Switching to legacy audio pipeline…",
+          { force: true },
+        );
+        try {
+          await db.updateCallState(callSid, "voice_agent_connect_failed", {
+            error: error.message || "voice_agent_connect_failed",
+            at: new Date().toISOString(),
+          });
+        } catch (_) {}
+
+        let fallbackResult = null;
+        try {
+          fallbackResult = await requestVoiceAgentFallback(
+            callSid,
+            req,
+            "connect_failed",
+          );
+          webhookService.addLiveEvent(
+            callSid,
+            "↩️ Redirecting call to legacy STT/TTS pipeline",
+            { force: true },
+          );
+          await db.updateCallState(callSid, "voice_agent_fallback_redirected", {
+            redirect_url: fallbackResult.redirectUrl,
+            attempt: fallbackResult.attemptCount,
+            at: new Date().toISOString(),
+          }).catch(() => {});
+        } catch (fallbackError) {
+          console.error("Voice agent fallback redirect failed:", fallbackError);
+          await db.updateCallState(callSid, "voice_agent_fallback_failed", {
+            error: fallbackError.message || "fallback_redirect_failed",
+            at: new Date().toISOString(),
+          }).catch(() => {});
+          throw fallbackError;
+        }
+
+        await cleanup("fallback_redirect");
+        try {
+          ws.close(4001, "Voice agent fallback");
+        } catch (_) {}
+      }
+      return;
+    }
+
+    if (!streamAuthOk) {
+      return;
+    }
+
+    if (event === "media") {
+      if (!callSid) return;
+      const now = Date.now();
+      streamLastMediaAt.set(callSid, now);
+      markStreamMediaSeen(callSid);
+      bridge.sendTwilioAudio(msg?.media?.payload);
+      return;
+    }
+
+    if (event === "dtmf") {
+      const digits = msg?.dtmf?.digits || msg?.dtmf?.digit || "";
+      if (!digits || !callSid) return;
+      webhookService.addLiveEvent(callSid, `🔢 Keypad: ${digits}`, {
+        force: true,
+      });
+      bridge.injectUserMessage(`Caller pressed keypad digits: ${digits}`);
+      return;
+    }
+
+    if (event === "stop") {
+      await cleanup("stopped");
+    }
+  });
+
+  ws.on("error", (error) => {
+    console.error("Voice agent websocket error:", error);
+  });
+
+  ws.on("close", async () => {
+    await cleanup("closed");
+  });
+}
+
 // Enhanced WebSocket connection handler with dynamic functions
 app.ws("/connection", (ws, req) => {
   const ua = req?.headers?.["user-agent"] || "unknown-ua";
   const host = req?.headers?.host || "unknown-host";
   console.log(`New WebSocket connection established (host=${host}, ua=${ua})`);
+  const wsParams = resolveStreamAuthParams(req);
+  const forceLegacyVoice = ["1", "true", "yes"].includes(
+    String(
+      wsParams?.va_legacy ||
+        wsParams?.voice_agent_fallback ||
+        wsParams?.legacy ||
+        "",
+    )
+      .toLowerCase()
+      .trim(),
+  );
+
+  if (config.deepgram?.voiceAgent?.enabled && !forceLegacyVoice) {
+    handleVoiceAgentWebSocket(ws, req).catch((error) => {
+      console.error("Voice agent websocket handler failed:", error);
+      try {
+        ws.close();
+      } catch (_) {}
+    });
+    return;
+  }
+  if (config.deepgram?.voiceAgent?.enabled && forceLegacyVoice) {
+    console.log("Voice agent bypass requested; using legacy pipeline");
+  }
 
   try {
     ws.on("error", (error) => {
@@ -3853,6 +5496,7 @@ app.ws("/connection", (ws, req) => {
     let callStartTime = null;
     let functionSystem = null;
 
+    let gptErrorCount = 0;
     let gptService;
     const streamService = new StreamService(ws, {
       audioTickIntervalMs: liveConsoleAudioTickMs,
@@ -4036,10 +5680,17 @@ app.ws("/connection", (ws, req) => {
           }
 
           if (!callConfig || !functionSystem) {
-            const setup = ensureCallSetup(callSid, {
-              From: fromValue,
-              To: toValue,
-            });
+            const setup = ensureCallSetup(
+              callSid,
+              {
+                From: fromValue,
+                To: toValue,
+              },
+              {
+                provider: "twilio",
+                inbound: isInbound,
+              },
+            );
             callConfig = setup.callConfig || callConfig;
             functionSystem = setup.functionSystem || functionSystem;
           }
@@ -4058,6 +5709,10 @@ app.ws("/connection", (ws, req) => {
               To: toValue,
             },
             "ws_start",
+            {
+              provider: "twilio",
+              inbound: isInbound,
+            },
           );
           streamFirstMediaSeen.delete(callSid);
           scheduleFirstMediaWatchdog(callSid, host, callConfig);
@@ -5047,24 +6702,113 @@ app.ws("/connection", (ws, req) => {
   }
 });
 
-// Vonage websocket media handler (bidirectional PCM µ-law)
+// Vonage websocket media handler (bidirectional PCM stream)
 app.ws("/vonage/stream", async (ws, req) => {
   try {
-    const callSid = req.query?.callSid;
+    const vonageUuid =
+      req.query?.uuid || req.query?.conversation_uuid || req.query?.vonage_uuid;
+    let callSid = req.query?.callSid;
+    if (!callSid && vonageUuid) {
+      callSid = await resolveVonageCallSidFromUuid(vonageUuid);
+    }
     if (!callSid) {
+      console.warn("Vonage websocket missing callSid; closing connection", {
+        uuid: vonageUuid || null,
+      });
       ws.close();
       return;
+    }
+
+    const streamAuth = verifyStreamAuth(callSid, req);
+    if (!streamAuth.ok) {
+      console.warn("Vonage websocket auth failed", {
+        callSid,
+        reason: streamAuth.reason || "invalid",
+      });
+      ws.close();
+      return;
+    }
+
+    if (vonageUuid) {
+      rememberVonageCallMapping(callSid, vonageUuid, "stream_open");
     }
 
     let interactionCount = 0;
-    const callConfig = callConfigurations.get(callSid);
-    const functionSystem = callFunctionSystems.get(callSid);
+    let callConfig = callConfigurations.get(callSid);
+    let functionSystem = callFunctionSystems.get(callSid);
     if (!callConfig) {
+      const hydrated = await hydrateCallConfigFromDb(callSid);
+      callConfig = hydrated?.callConfig || callConfig;
+      functionSystem = hydrated?.functionSystem || functionSystem;
+    }
+    if (!callConfig && callSid) {
+      const callRecord = db?.getCall
+        ? await db.getCall(callSid).catch(() => null)
+        : null;
+      if (callRecord) {
+        const setup = ensureCallSetup(callSid, {
+          From: callRecord.phone_number || null,
+          To: null,
+        }, {
+          provider: "vonage",
+          inbound: callDirections.get(callSid) !== "outbound",
+        });
+        callConfig = setup.callConfig || callConfig;
+        functionSystem = setup.functionSystem || functionSystem;
+      }
+    }
+    if (!callConfig) {
+      console.warn(`Vonage websocket missing call configuration for ${callSid}`);
       ws.close();
       return;
     }
+    if (!functionSystem) {
+      functionSystem = functionEngine.generateAdaptiveFunctionSystem(
+        callConfig?.prompt || DEFAULT_INBOUND_PROMPT,
+        callConfig?.first_message || DEFAULT_INBOUND_FIRST_MESSAGE,
+      );
+      callFunctionSystems.set(callSid, functionSystem);
+    }
+    if (!callConfig.provider_metadata) {
+      callConfig.provider_metadata = {};
+    }
+    if (vonageUuid && callConfig.provider_metadata.vonage_uuid !== vonageUuid) {
+      callConfig.provider_metadata.vonage_uuid = String(vonageUuid);
+    }
+    const directionHint =
+      req.query?.direction ||
+      req.query?.Direction ||
+      callDirections.get(callSid) ||
+      (callConfig.inbound ? "inbound" : "outbound");
+    const isInboundCall = !isOutboundVonageDirection(directionHint);
+    callConfig.provider = "vonage";
+    callConfig.inbound = isInboundCall;
+    callConfigurations.set(callSid, callConfig);
+    callDirections.set(callSid, isInboundCall ? "inbound" : "outbound");
 
-    const ttsService = new TextToSpeechService();
+    const vonageAudioSpec = getVonageWebsocketAudioSpec();
+    const startedAt = new Date().toISOString();
+    if (db?.updateCallStatus) {
+      await db
+        .updateCallStatus(callSid, "started", { started_at: startedAt })
+        .catch(() => {});
+    }
+    if (db?.updateCallState) {
+      await db.updateCallState(callSid, "stream_started", {
+        stream_provider: "vonage",
+        started_at: startedAt,
+        vonage_uuid: vonageUuid || callConfig?.provider_metadata?.vonage_uuid,
+        stream_audio_content_type: vonageAudioSpec.contentType,
+        stream_audio_encoding: vonageAudioSpec.sttEncoding,
+        stream_audio_sample_rate: vonageAudioSpec.sampleRate,
+      })
+        .catch(() => {});
+    }
+
+    const ttsService = new TextToSpeechService({
+      encoding: vonageAudioSpec.ttsEncoding,
+      sampleRate: vonageAudioSpec.sampleRate,
+    });
     ttsService
       .generate(
         { partialResponseIndex: null, partialResponse: "warming up" },
@@ -5073,8 +6817,8 @@ app.ws("/vonage/stream", async (ws, req) => {
       )
       .catch(() => {});
     const transcriptionService = new TranscriptionService({
-      encoding: "mulaw",
-      sampleRate: 8000,
+      encoding: vonageAudioSpec.sttEncoding,
+      sampleRate: vonageAudioSpec.sampleRate,
     });
 
     const handleSttFailure = async (tag, error) => {
@@ -5136,7 +6880,10 @@ app.ws("/vonage/stream", async (ws, req) => {
       ttsService,
       interactionCount: 0,
     });
+    clearKeypadCallState(callSid);
+    scheduleVonageKeypadDtmfWatchdog(callSid, callConfig);
 
+    let gptErrorCount = 0;
     gptService.on("gptreply", async (gptReply, icount) => {
       gptErrorCount = 0;
       const activeSession = activeCalls.get(callSid);
@@ -5363,6 +7110,18 @@ app.ws("/vonage/stream", async (ws, req) => {
       const str = data.toString();
       try {
         const parsed = JSON.parse(str);
+        const wsDigits = getVonageDtmfDigits(parsed || {});
+        if (wsDigits) {
+          handleExternalDtmfInput(callSid, wsDigits, {
+            source: "vonage_ws_dtmf",
+            provider: "vonage",
+            gptService,
+            interactionCount,
+          }).catch((error) => {
+            console.error("Vonage websocket DTMF handling error:", error);
+          });
+          return;
+        }
         if (parsed?.event === "websocket:closed") {
           ws.close();
         }
@@ -5668,6 +7427,8 @@ async function handleCallEnd(callSid, callStartTime) {
     streamStartSeen.delete(callSid);
     streamAuthBypass.delete(callSid);
     streamRetryState.delete(callSid);
+    voiceAgentFallbackAttempts.delete(callSid);
+    clearKeypadCallState(callSid);
     purgeStreamStatusDedupe(callSid);
     purgeCallStatusDedupe(callSid);
     callLifecycle.delete(callSid);
@@ -5850,6 +7611,7 @@ async function handleCallEnd(callSid, callStartTime) {
     });
   } catch (error) {
     console.error("Error handling enhanced adaptive call end:", error);
+    voiceAgentFallbackAttempts.delete(callSid);
 
     // Log error to service health
     try {
@@ -5916,6 +7678,10 @@ async function handleTwilioIncoming(req, res) {
           callSid,
           req.body,
           "incoming_webhook",
+          {
+            provider: "twilio",
+            inbound: true,
+          },
         );
         const chatId = callRecord?.user_chat_id || config.telegram?.adminChatId;
         const callerLookup = callRecord?.phone_number
@@ -6125,12 +7891,27 @@ async function handleTwilioIncoming(req, res) {
     const connect = response.connect();
     const streamParams = new URLSearchParams();
     const streamParameters = {};
+    const inboundFallbackRequested = ["1", "true", "yes"].includes(
+      String(req.query?.voice_agent_fallback || req.query?.va_legacy || "")
+        .toLowerCase()
+        .trim(),
+    );
     if (req.body?.From) streamParams.set("from", String(req.body.From));
     if (req.body?.To) streamParams.set("to", String(req.body.To));
     streamParams.set("direction", directionLabel);
     if (req.body?.From) streamParameters.from = String(req.body.From);
     if (req.body?.To) streamParameters.to = String(req.body.To);
     streamParameters.direction = directionLabel;
+    if (inboundFallbackRequested) {
+      streamParams.set("va_legacy", "1");
+      streamParameters.va_legacy = "1";
+      if (callSid) {
+        db.updateCallState(callSid, "voice_agent_fallback_active", {
+          at: new Date().toISOString(),
+          source: "incoming_redirect",
+        }).catch(() => {});
+      }
+    }
     if (callSid && config.streamAuth?.secret) {
       const timestamp = String(Date.now());
       const token = buildStreamAuthToken(callSid, timestamp);
@@ -6649,45 +8430,262 @@ app.post("/webhook/telegram", async (req, res) => {
   }
 });
 
-const handleVonageAnswer = (req, res) => {
-  const callSid = req.query.callSid;
-  const wsUrl = `wss://${config.server.hostname}/vonage/stream?callSid=${callSid}`;
-
-  res.json([
+function buildVonageUnavailableNcco() {
+  return [
     {
+      action: "talk",
+      text: "We are unable to connect this call right now. Please try again shortly.",
+    },
+    { action: "hangup" },
+  ];
+}
+
+const handleVonageAnswer = async (req, res) => {
+  if (!requireValidVonageWebhook(req, res, "/webhook/vonage/answer")) {
+    return;
+  }
+  try {
+    const payload = getVonageCallPayload(req);
+    const resolvedCallSid = await resolveVonageCallSid(req, payload);
+    let callSid = resolvedCallSid;
+    const vonageUuid =
+      req.query?.uuid || req.query?.conversation_uuid || req.query?.vonage_uuid;
+    let synthesizedInbound = false;
+    if (!callSid && vonageUuid) {
+      // Inbound Vonage callbacks do not include our internal callSid.
+      callSid = buildVonageInboundCallSid(vonageUuid);
+      synthesizedInbound = true;
+    }
+    const existingCallConfig = callSid ? callConfigurations.get(callSid) : null;
+    let isInbound;
+    if (typeof existingCallConfig?.inbound === "boolean") {
+      isInbound = existingCallConfig.inbound;
+    } else if (synthesizedInbound || String(callSid || "").startsWith("vonage-in-")) {
+      isInbound = true;
+    } else if (payload.direction) {
+      isInbound = !isOutboundVonageDirection(payload.direction);
+    } else {
+      // If callSid is known but no direction hint exists, default to outbound.
+      isInbound = false;
+    }
+
+    if (callSid && vonageUuid) {
+      rememberVonageCallMapping(callSid, vonageUuid, "answer");
+    }
+    if (callSid) {
+      if (isInbound) {
+        await refreshInboundDefaultScript();
+      }
+      let setup =
+        existingCallConfig && callFunctionSystems.get(callSid)
+          ? {
+              callConfig: existingCallConfig,
+              functionSystem: callFunctionSystems.get(callSid),
+            }
+          : null;
+      if (!setup && !isInbound) {
+        const hydrated = await hydrateCallConfigFromDb(callSid);
+        if (hydrated?.callConfig && hydrated?.functionSystem) {
+          setup = hydrated;
+        }
+      }
+      if (!setup) {
+        setup = ensureCallSetup(callSid, payload, {
+          provider: "vonage",
+          inbound: isInbound,
+        });
+      }
+      if (setup?.callConfig) {
+        if (!setup.callConfig.provider_metadata) {
+          setup.callConfig.provider_metadata = {};
+        }
+        setup.callConfig.provider = "vonage";
+        setup.callConfig.inbound = isInbound;
+        if (vonageUuid) {
+          setup.callConfig.provider_metadata.vonage_uuid = String(vonageUuid);
+        }
+        callConfigurations.set(callSid, setup.callConfig);
+      }
+      callDirections.set(callSid, isInbound ? "inbound" : "outbound");
+
+      if (isInbound) {
+        const callRecord = await ensureCallRecord(
+          callSid,
+          payload,
+          "vonage_answer",
+          {
+            provider: "vonage",
+            inbound: true,
+          },
+        );
+        const chatId = callRecord?.user_chat_id || config.telegram?.adminChatId;
+        const callerLookup = callRecord?.phone_number
+          ? normalizePhoneForFlag(callRecord.phone_number) || callRecord.phone_number
+          : null;
+        let callerFlag = null;
+        if (callerLookup && db?.getCallerFlag) {
+          callerFlag = await db.getCallerFlag(callerLookup).catch(() => null);
+        }
+        if (callerFlag?.status === "blocked") {
+          if (db?.updateCallState) {
+            await db
+              .updateCallState(callSid, "caller_blocked", {
+                at: new Date().toISOString(),
+                phone_number: callerLookup || callRecord?.phone_number || null,
+                status: callerFlag.status,
+                note: callerFlag.note || null,
+                provider: "vonage",
+              })
+              .catch(() => {});
+          }
+          return res.json(
+            buildVonageTalkHangupNcco("We cannot take your call at this time."),
+          );
+        }
+        if (callerFlag?.status !== "allowed") {
+          const rateLimit = shouldRateLimitInbound(req, payload || {});
+          if (rateLimit.limited) {
+            if (db?.updateCallState) {
+              await db.updateCallState(callSid, "inbound_rate_limited", {
+                at: new Date().toISOString(),
+                key: rateLimit.key,
+                count: rateLimit.count,
+                reset_at: rateLimit.resetAt,
+                provider: "vonage",
+              })
+                .catch(() => {});
+            }
+            return res.json(
+              buildVonageTalkHangupNcco(
+                "We are experiencing high call volume. Please try again later.",
+              ),
+            );
+          }
+        }
+        if (chatId) {
+          webhookService
+            .sendCallStatusUpdate(callSid, "ringing", chatId, {
+              status_source: "vonage_inbound",
+            })
+            .catch(() => {});
+          webhookService.setInboundGate(callSid, "answered", { chatId });
+        }
+      }
+    }
+
+    const wsUrl = callSid
+      ? buildVonageWebsocketUrl(req, callSid, {
+          uuid: vonageUuid || undefined,
+          direction: isInbound ? "inbound" : "outbound",
+          from: payload.from || undefined,
+          to: payload.to || undefined,
+        })
+      : "";
+    if (!callSid || !wsUrl) {
+      console.warn("Vonage answer callback missing callSid/host", {
+        callSid: callSid || null,
+        uuid: vonageUuid || null,
+        host: resolveHost(req) || null,
+      });
+      return res.json(buildVonageUnavailableNcco());
+    }
+
+    const connectAction = {
       action: "connect",
       endpoint: [
         {
           type: "websocket",
           uri: wsUrl,
-          "content-type": "audio/pcmu;rate=8000",
+          "content-type": getVonageWebsocketContentType(),
         },
       ],
-    },
-  ]);
+    };
+    const eventUrl = buildVonageEventWebhookUrl(req, callSid, {
+      uuid: vonageUuid || undefined,
+      direction: isInbound ? "inbound" : "outbound",
+    });
+    if (eventUrl) {
+      // Vonage connect action supports explicit event URL/method for action callbacks.
+      connectAction.eventUrl = [eventUrl];
+      connectAction.eventMethod = "POST";
+    }
+
+    return res.json([connectAction]);
+  } catch (error) {
+    console.error("Vonage answer callback error:", error);
+    return res.json(buildVonageUnavailableNcco());
+  }
 };
 
 const handleVonageEvent = async (req, res) => {
+  if (!requireValidVonageWebhook(req, res, "/webhook/vonage/event")) {
+    return;
+  }
   try {
-    const { uuid, status, duration } = req.body || {};
-    const callSid =
-      req.query.callSid || (uuid ? vonageCallMap.get(uuid) : null) || uuid;
+    const payload = req.body || {};
+    const normalizedPayload = getVonageCallPayload(req, payload);
+    const { uuid, status } = payload;
+    const dtmfDigits = getVonageDtmfDigits(payload);
+    const durationRaw =
+      payload.duration ||
+      payload.conversation_duration ||
+      payload.usage_duration ||
+      payload.call_duration;
+    let callSid = await resolveVonageCallSid(req, payload);
+    if (!callSid && uuid && !isOutboundVonageDirection(normalizedPayload.direction)) {
+      // Accept inbound events even when Vonage does not provide a custom callSid.
+      callSid = buildVonageInboundCallSid(uuid);
+      if (callSid) {
+        const existingConfig = callConfigurations.get(callSid);
+        if (!existingConfig) {
+          ensureCallSetup(callSid, normalizedPayload, {
+            provider: "vonage",
+            inbound: true,
+          });
+        }
+      }
+    }
+    if (callSid && uuid) {
+      rememberVonageCallMapping(callSid, uuid, "event");
+    }
+
+    if (callSid && dtmfDigits) {
+      const existingConfig = callConfigurations.get(callSid);
+      if (!existingConfig) {
+        ensureCallSetup(callSid, normalizedPayload, {
+          provider: "vonage",
+          inbound: callDirections.get(callSid) !== "outbound",
+        });
+      }
+      await handleExternalDtmfInput(callSid, dtmfDigits, {
+        source: "vonage_webhook_dtmf",
+        provider: "vonage",
+      });
+    } else if (dtmfDigits && !callSid) {
+      console.warn("Vonage DTMF event received without resolvable callSid", {
+        uuid: uuid || null,
+        digits_length: dtmfDigits.length,
+      });
+    }
 
     const statusMap = {
       started: { status: "initiated", notification: "call_initiated" },
       ringing: { status: "ringing", notification: "call_ringing" },
       answered: { status: "answered", notification: "call_answered" },
       completed: { status: "completed", notification: "call_completed" },
+      rejected: { status: "canceled", notification: "call_canceled" },
       busy: { status: "busy", notification: "call_busy" },
       failed: { status: "failed", notification: "call_failed" },
+      unanswered: { status: "no-answer", notification: "call_no_answer" },
       timeout: { status: "no-answer", notification: "call_no_answer" },
       cancelled: { status: "canceled", notification: "call_canceled" },
     };
 
     const mapped = statusMap[String(status || "").toLowerCase()];
     if (callSid && mapped) {
+      const parsedDuration = parseInt(durationRaw, 10);
       await recordCallStatus(callSid, mapped.status, mapped.notification, {
-        duration: duration ? parseInt(duration, 10) : undefined,
+        duration: Number.isFinite(parsedDuration) ? parsedDuration : undefined,
       });
       if (mapped.status === "completed") {
         const session = activeCalls.get(callSid);
@@ -6695,7 +8693,15 @@ const handleVonageEvent = async (req, res) => {
           await handleCallEnd(callSid, session.startTime);
         }
         activeCalls.delete(callSid);
+        clearVonageCallMappings(callSid);
       }
+    }
+
+    if (!callSid) {
+      console.warn("Vonage event callback could not resolve internal callSid", {
+        uuid: uuid || null,
+        status: status || null,
+      });
     }
 
     res.status(200).send("OK");
@@ -6811,6 +8817,7 @@ app.post("/aws/transcripts", async (req, res) => {
 // Provider status/update endpoints (admin only)
 app.get("/admin/provider", requireAdminToken, async (req, res) => {
   const readiness = getProviderReadiness();
+  pruneExpiredKeypadProviderOverrides();
 
   res.json({
     provider: currentProvider,
@@ -6819,6 +8826,9 @@ app.get("/admin/provider", requireAdminToken, async (req, res) => {
     twilio_ready: readiness.twilio,
     aws_ready: readiness.aws,
     vonage_ready: readiness.vonage,
+    vonage_dtmf_ready: config.vonage?.dtmfWebhookEnabled === true,
+    keypad_guard_enabled: config.keypadGuard?.enabled === true,
+    keypad_override_count: keypadProviderOverrides.size,
   });
 });
 
@@ -6840,8 +8850,74 @@ app.post("/admin/provider", requireAdminToken, async (req, res) => {
   const changed = normalized !== currentProvider;
   currentProvider = normalized;
   storedProvider = normalized;
+  if (db?.setSetting) {
+    await db
+      .setSetting(CALL_PROVIDER_SETTING_KEY, normalized)
+      .catch((error) =>
+        console.error("Failed to persist selected call provider:", error),
+      );
+  }
   return res.json({ success: true, provider: currentProvider, changed });
 });
+
+app.get("/admin/provider/keypad-overrides", requireAdminToken, async (req, res) => {
+  try {
+    const overrides = listKeypadProviderOverrides();
+    return res.json({
+      success: true,
+      total: overrides.length,
+      overrides,
+    });
+  } catch (error) {
+    console.error("Failed to list keypad provider overrides:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to list keypad provider overrides",
+    });
+  }
+});
+
+app.post(
+  "/admin/provider/keypad-overrides/clear",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const body = req.body || {};
+      const clearAll = body.all === true || String(body.all).toLowerCase() === "true";
+      const scopeKey = body.scope_key || body.scopeKey || null;
+      const scope = body.scope || null;
+      const value = body.value || null;
+
+      if (!clearAll && !scopeKey && !(scope && value)) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Provide one of: all=true, scope_key, or scope+value to clear keypad overrides",
+        });
+      }
+
+      const result = await clearKeypadProviderOverrides({
+        all: clearAll,
+        scopeKey,
+        scope,
+        value,
+      });
+
+      return res.json({
+        success: true,
+        cleared: result.cleared,
+        remaining: result.remaining,
+        overrides: result.overrides,
+      });
+    } catch (error) {
+      console.error("Failed to clear keypad provider overrides:", error);
+      return res.status(500).json({
+        success: false,
+        error: "Failed to clear keypad provider overrides",
+      });
+    }
+  },
+);
 
 // Personas list for bot selection
 app.get("/api/personas", async (req, res) => {
@@ -7261,16 +9337,77 @@ async function placeOutboundCall(payload, hostOverride = null) {
     `Generated ${functionSystem.functions.length} functions for ${functionSystem.context.industry} industry`,
   );
 
+  let scriptPolicy = {};
+  if (script_id) {
+    try {
+      const tpl = await db.getCallTemplateById(Number(script_id));
+      if (tpl) {
+        scriptPolicy = {
+          requires_otp: !!tpl.requires_otp,
+          default_profile: tpl.default_profile || null,
+          expected_length: tpl.expected_length || null,
+          allow_terminator: !!tpl.allow_terminator,
+          terminator_char: tpl.terminator_char || null,
+        };
+      }
+    } catch (err) {
+      console.error("Script metadata load error:", err);
+    }
+  }
+
   let callId;
   let callStatus = "queued";
   let providerMetadata = {};
   let selectedProvider = null;
+  const keypadRequired = isKeypadRequiredFlow(collection_profile, scriptPolicy);
+  const keypadRequiredReason = keypadRequired
+    ? `profile=${
+        normalizeDigitProfile(collection_profile) ||
+        normalizeDigitProfile(scriptPolicy?.default_profile) ||
+        "unknown"
+      }, script_requires_otp=${scriptPolicy?.requires_otp ? "true" : "false"}`
+    : null;
+  const keypadOverride = keypadRequired
+    ? resolveKeypadProviderOverride(collection_profile, scriptPolicy, script_id)
+    : null;
 
   const readiness = getProviderReadiness();
-  const orderedProviders = getProviderOrder(currentProvider);
-  const availableProviders = orderedProviders.filter(
+  const preferredProvider = keypadOverride?.provider || currentProvider;
+  const orderedProviders = getProviderOrder(preferredProvider);
+  let availableProviders = orderedProviders.filter(
     (provider) => readiness[provider],
   );
+  if (keypadOverride && !availableProviders.includes(preferredProvider)) {
+    console.warn(
+      `Provider guard override for ${keypadOverride.scopeKey} requested ${preferredProvider}, but provider is unavailable. Falling back to available keypad-capable providers.`,
+    );
+  } else if (keypadOverride) {
+    console.log(
+      `Provider guard override active for ${keypadOverride.scopeKey}: preferring ${preferredProvider} until ${new Date(
+        keypadOverride.expiresAt,
+      ).toISOString()}`,
+    );
+  }
+  if (keypadRequired) {
+    const keypadProviders = availableProviders.filter((provider) =>
+      supportsKeypadCaptureProvider(provider),
+    );
+    if (!keypadProviders.length) {
+      throw new Error(
+        "This call requires keypad digit capture, but no keypad-capable provider is configured. Configure Twilio or enable VONAGE_DTMF_WEBHOOK_ENABLED=true.",
+      );
+    }
+    if (
+      keypadProviders.length !== availableProviders.length &&
+      !keypadProviderGuardWarnings.has(currentProvider)
+    ) {
+      console.warn(
+        `Provider guard: restricting outbound call providers for keypad flow (${keypadRequiredReason || "digit_capture"}) to ${keypadProviders.join(", ")}`,
+      );
+      keypadProviderGuardWarnings.add(currentProvider);
+    }
+    availableProviders = keypadProviders;
+  }
   if (!availableProviders.length) {
     throw new Error("No outbound provider configured");
   }
@@ -7347,22 +9484,50 @@ async function placeOutboundCall(payload, hostOverride = null) {
       } else if (provider === "vonage") {
         const vonageAdapter = getVonageVoiceAdapter();
         callId = uuidv4();
-        const answerUrl =
-          config.vonage.voice.answerUrl ||
-          `https://${host}/webhook/vonage/answer?callSid=${callId}`;
-        const eventUrl =
-          config.vonage.voice.eventUrl ||
-          `https://${host}/webhook/vonage/event?callSid=${callId}`;
+        const webhookReq = reqForHost(host);
+        const answerUrl = buildVonageAnswerWebhookUrl(webhookReq, callId);
+        const eventUrl = buildVonageEventWebhookUrl(webhookReq, callId);
+
+        const wsUrl = host
+          ? buildVonageWebsocketUrl(webhookReq, callId, {
+              direction: "outbound",
+            })
+          : "";
+        const ncco = wsUrl
+          ? [
+              {
+                action: "connect",
+                endpoint: [
+                  {
+                    type: "websocket",
+                    uri: wsUrl,
+                    "content-type": getVonageWebsocketContentType(),
+                  },
+                ],
+              },
+            ]
+          : null;
+
+        if (!ncco && !answerUrl) {
+          throw new Error(
+            "Vonage requires a public SERVER hostname or VONAGE_ANSWER_URL",
+          );
+        }
         const response = await vonageAdapter.createOutboundCall({
           to: number,
           callSid: callId,
           answerUrl,
           eventUrl,
+          ncco: ncco || undefined,
         });
         const vonageUuid = response?.uuid;
-        providerMetadata = { vonage_uuid: vonageUuid };
+        providerMetadata = {
+          vonage_uuid: vonageUuid || null,
+          answer_url: answerUrl || null,
+          event_url: eventUrl || null,
+        };
         if (vonageUuid) {
-          vonageCallMap.set(vonageUuid, callId);
+          rememberVonageCallMapping(callId, vonageUuid, "outbound_create");
         }
         callStatus = response?.status || "queued";
       } else {
@@ -7384,23 +9549,18 @@ async function placeOutboundCall(payload, hostOverride = null) {
   if (!selectedProvider) {
     throw lastError || new Error("Failed to place outbound call");
   }
-
-  let scriptPolicy = {};
-  if (script_id) {
-    try {
-      const tpl = await db.getCallTemplateById(Number(script_id));
-      if (tpl) {
-        scriptPolicy = {
-          requires_otp: !!tpl.requires_otp,
-          default_profile: tpl.default_profile || null,
-          expected_length: tpl.expected_length || null,
-          allow_terminator: !!tpl.allow_terminator,
-          terminator_char: tpl.terminator_char || null,
-        };
-      }
-    } catch (err) {
-      console.error("Script metadata load error:", err);
-    }
+  if (keypadOverride) {
+    providerMetadata = {
+      ...providerMetadata,
+      provider_guard_override: {
+        scope_key: keypadOverride.scopeKey,
+        provider: keypadOverride.provider,
+        expires_at: keypadOverride.expiresAt
+          ? new Date(keypadOverride.expiresAt).toISOString()
+          : null,
+        reason: keypadOverride.reason || "vonage_dtmf_timeout",
+      },
+    };
   }
 
   const createdAt = new Date().toISOString();
@@ -7592,7 +9752,12 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
   let call = await db.getCall(CallSid);
   if (!call) {
     console.warn(`Webhook received for unknown call: ${CallSid}`);
-    call = await ensureCallRecord(CallSid, payload, "status_webhook");
+    call = await ensureCallRecord(CallSid, payload, "status_webhook", {
+      provider: "twilio",
+      inbound: !isOutboundTwilioDirection(
+        payload?.Direction || payload?.direction,
+      ),
+    });
     if (!call) {
       return { ok: false, error: "call_not_found", callSid: CallSid };
     }
@@ -8240,6 +10405,16 @@ app.get("/health", async (req, res) => {
       },
       {},
     );
+    pruneExpiredKeypadProviderOverrides();
+    const keypadOverrideSummary = [...keypadProviderOverrides.entries()].map(
+      ([scopeKey, override]) => ({
+        scope_key: scopeKey,
+        provider: override?.provider || null,
+        expires_at: override?.expiresAt
+          ? new Date(override.expiresAt).toISOString()
+          : null,
+      }),
+    );
 
     // Check service health logs
     const recentHealthLogs = await new Promise((resolve, reject) => {
@@ -8278,6 +10453,15 @@ app.get("/health", async (req, res) => {
               : "N/A",
         },
         provider_failover: providerHealthSummary,
+        keypad_guard: {
+          enabled: config.keypadGuard?.enabled === true,
+          active_overrides: keypadOverrideSummary.length,
+          overrides: keypadOverrideSummary,
+        },
+        voice_agent: {
+          enabled: Boolean(config.deepgram?.voiceAgent?.enabled),
+          endpoint: config.deepgram?.voiceAgent?.endpoint || null,
+        },
       },
       active_calls: callConfigurations.size,
       adaptation_engine: {
@@ -9798,6 +11982,13 @@ process.on("SIGINT", async () => {
     callConfigurations.clear();
     callFunctionSystems.clear();
     callDirections.clear();
+    for (const timer of keypadDtmfWatchdogs.values()) {
+      clearTimeout(timer);
+    }
+    keypadDtmfWatchdogs.clear();
+    keypadDtmfSeen.clear();
+    keypadProviderOverrides.clear();
+    keypadProviderGuardWarnings.clear();
 
     // Log successful shutdown
     await db.logServiceHealth("system", "shutdown_completed", {
@@ -9829,6 +12020,13 @@ process.on("SIGTERM", async () => {
     callConfigurations.clear();
     callFunctionSystems.clear();
     callDirections.clear();
+    for (const timer of keypadDtmfWatchdogs.values()) {
+      clearTimeout(timer);
+    }
+    keypadDtmfWatchdogs.clear();
+    keypadDtmfSeen.clear();
+    keypadProviderOverrides.clear();
+    keypadProviderGuardWarnings.clear();
 
     // Log successful shutdown
     await db.logServiceHealth("system", "shutdown_completed", {

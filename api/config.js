@@ -67,6 +67,23 @@ const recordingEnabled =
 const transferNumber = readEnv("TRANSFER_NUMBER");
 const defaultSmsBusinessId = readEnv("DEFAULT_SMS_BUSINESS_ID") || null;
 const deepgramModel = readEnv("DEEPGRAM_MODEL") || "nova-2";
+const deepgramVoiceAgentEnabled =
+  String(readEnv("USE_DEEPGRAM_VOICE_AGENT") || "false").toLowerCase() ===
+  "true";
+const deepgramVoiceAgentEndpoint =
+  readEnv("DEEPGRAM_VOICE_AGENT_ENDPOINT") ||
+  "wss://agent.deepgram.com/v1/agent/converse";
+const deepgramVoiceAgentThinkProviderType =
+  readEnv("DEEPGRAM_VOICE_AGENT_THINK_PROVIDER") || "open_ai";
+const deepgramVoiceAgentThinkModel =
+  readEnv("DEEPGRAM_VOICE_AGENT_THINK_MODEL") || "gpt-4o-mini";
+const deepgramVoiceAgentListenModel =
+  readEnv("DEEPGRAM_VOICE_AGENT_LISTEN_MODEL") || "nova-3";
+const deepgramVoiceAgentSpeakModel =
+  readEnv("DEEPGRAM_VOICE_AGENT_SPEAK_MODEL") || null;
+const deepgramVoiceAgentKeepAliveMs = Number(
+  readEnv("DEEPGRAM_VOICE_AGENT_KEEPALIVE_MS") || "15000",
+);
 const twilioGatherFallback =
   String(readEnv("TWILIO_GATHER_FALLBACK") || "true").toLowerCase() === "true";
 const twilioMachineDetection = readEnv("TWILIO_MACHINE_DETECTION") || "Enable";
@@ -90,6 +107,28 @@ const twilioWebhookValidation = twilioWebhookValidationModes.has(
   : isProduction
     ? "strict"
     : "warn";
+const vonageWebhookValidationRaw = (
+  readEnv("VONAGE_WEBHOOK_VALIDATION") || (isProduction ? "strict" : "warn")
+).toLowerCase();
+const vonageWebhookValidationModes = new Set(["strict", "warn", "off"]);
+const vonageWebhookValidation = vonageWebhookValidationModes.has(
+  vonageWebhookValidationRaw,
+)
+  ? vonageWebhookValidationRaw
+  : isProduction
+    ? "strict"
+    : "warn";
+const vonageWebhookSignatureSecret =
+  readEnv("VONAGE_WEBHOOK_SIGNATURE_SECRET") || readEnv("VONAGE_SIGNATURE_SECRET");
+const vonageWebhookMaxSkewMs = Number(
+  readEnv("VONAGE_WEBHOOK_MAX_SKEW_MS") || "300000",
+);
+const vonageWebhookRequirePayloadHash =
+  String(readEnv("VONAGE_WEBHOOK_REQUIRE_PAYLOAD_HASH") || "false").toLowerCase() ===
+  "true";
+const vonageDtmfWebhookEnabled =
+  String(readEnv("VONAGE_DTMF_WEBHOOK_ENABLED") || "false").toLowerCase() ===
+  "true";
 
 const callProvider = ensure("CALL_PROVIDER", "twilio").toLowerCase();
 const awsRegion = ensure("AWS_REGION", "us-east-1");
@@ -173,6 +212,13 @@ const providerFailoverWindowMs =
   Number(readEnv("PROVIDER_ERROR_WINDOW_S") || "120") * 1000;
 const providerFailoverCooldownMs =
   Number(readEnv("PROVIDER_COOLDOWN_S") || "300") * 1000;
+const keypadGuardEnabled =
+  String(readEnv("KEYPAD_GUARD_ENABLED") || "true").toLowerCase() === "true";
+const keypadVonageDtmfTimeoutMs = Number(
+  readEnv("KEYPAD_VONAGE_DTMF_TIMEOUT_MS") || "12000",
+);
+const keypadProviderOverrideCooldownMs =
+  Number(readEnv("KEYPAD_PROVIDER_OVERRIDE_COOLDOWN_S") || "1800") * 1000;
 const callJobIntervalMs = Number(
   readEnv("CALL_JOB_PROCESSOR_INTERVAL_MS") || "5000",
 );
@@ -216,6 +262,8 @@ function loadPrivateKey(rawValue) {
 }
 
 const vonagePrivateKey = loadPrivateKey(readEnv("VONAGE_PRIVATE_KEY"));
+const vonageVoiceWebsocketContentType =
+  readEnv("VONAGE_WEBSOCKET_CONTENT_TYPE") || "audio/l16;rate=16000";
 const serverHostname = normalizeHostname(ensure("SERVER", ""));
 const liveConsoleAudioTickMs = Number(
   readEnv("LIVE_CONSOLE_AUDIO_TICK_MS") || "160",
@@ -344,7 +392,15 @@ module.exports = {
       fromNumber: readEnv("VONAGE_VOICE_FROM_NUMBER"),
       answerUrl: readEnv("VONAGE_ANSWER_URL"),
       eventUrl: readEnv("VONAGE_EVENT_URL"),
+      websocketContentType: vonageVoiceWebsocketContentType,
     },
+    webhookValidation: vonageWebhookValidation,
+    webhookSignatureSecret: vonageWebhookSignatureSecret,
+    webhookMaxSkewMs: Number.isFinite(vonageWebhookMaxSkewMs)
+      ? vonageWebhookMaxSkewMs
+      : 300000,
+    webhookRequirePayloadHash: vonageWebhookRequirePayloadHash,
+    dtmfWebhookEnabled: vonageDtmfWebhookEnabled,
     sms: {
       fromNumber: readEnv("VONAGE_SMS_FROM_NUMBER"),
     },
@@ -371,6 +427,23 @@ module.exports = {
     apiKey: ensure("DEEPGRAM_API_KEY"),
     voiceModel: ensure("VOICE_MODEL", "aura-asteria-en"),
     model: deepgramModel,
+    voiceAgent: {
+      enabled: deepgramVoiceAgentEnabled,
+      endpoint: deepgramVoiceAgentEndpoint,
+      keepAliveMs: Number.isFinite(deepgramVoiceAgentKeepAliveMs)
+        ? deepgramVoiceAgentKeepAliveMs
+        : 15000,
+      think: {
+        providerType: deepgramVoiceAgentThinkProviderType,
+        model: deepgramVoiceAgentThinkModel,
+      },
+      listen: {
+        model: deepgramVoiceAgentListenModel,
+      },
+      speak: {
+        model: deepgramVoiceAgentSpeakModel,
+      },
+    },
   },
   server: {
     port: Number(ensure("PORT", "3000")),
@@ -482,6 +555,15 @@ module.exports = {
     errorThreshold: providerFailoverThreshold,
     errorWindowMs: providerFailoverWindowMs,
     cooldownMs: providerFailoverCooldownMs,
+  },
+  keypadGuard: {
+    enabled: keypadGuardEnabled,
+    vonageDtmfTimeoutMs: Number.isFinite(keypadVonageDtmfTimeoutMs)
+      ? keypadVonageDtmfTimeoutMs
+      : 12000,
+    providerOverrideCooldownMs: Number.isFinite(keypadProviderOverrideCooldownMs)
+      ? keypadProviderOverrideCooldownMs
+      : 1800000,
   },
   callJobs: {
     intervalMs: callJobIntervalMs,
