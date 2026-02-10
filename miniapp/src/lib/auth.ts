@@ -389,7 +389,7 @@ export async function authenticate(initData?: string): Promise<AuthSession> {
       tenant_id?: string | null;
     }>("/webapp/auth", {
       method: "POST",
-      body: { initData: rawInitData },
+      headers: { Authorization: `tma ${rawInitData}` },
       auth: false,
     });
     const resolvedToken = response.accessToken ?? response.token ?? "";
