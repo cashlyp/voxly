@@ -131,7 +131,7 @@ Open the dev URL in Telegram (Mini App URL) or a browser:
 ### Configure API base URL
 Set the Mini App API base and socket base at build time:
 ```
-VITE_API_BASE=https://api.example.com/template/api
+VITE_API_BASE=https://api.example.com
 VITE_SOCKET_URL=https://api.example.com
 ```
 

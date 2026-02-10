@@ -194,7 +194,7 @@ Live Miniapp
 ### Development (Local)
 ```dotenv
 # miniapp/.env.local
-VITE_API_BASE=https://your-prod-host.example.com/template/api
+VITE_API_BASE=https://your-prod-host.example.com
 VITE_SOCKET_URL=https://your-prod-host.example.com
 VITE_BASE=/
 ```

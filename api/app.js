@@ -3011,6 +3011,9 @@ function buildInboundHoldTwiml(hostname) {
 function shouldBypassHmac(req) {
   const path = req.path || "";
   if (!path) return false;
+  if (req.method === "OPTIONS") {
+    return true;
+  }
   if (
     req.method === "GET" &&
     (path === "/" || path === "/favicon.ico" || path === "/health")
@@ -3089,7 +3092,7 @@ app.set("trust proxy", 1);
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(globalCorsHeaders);
+app.use("/webapp", globalCorsHeaders);
 
 const apiLimiter = rateLimit({
   windowMs: config.server?.rateLimit?.windowMs || 60000,
@@ -3138,6 +3141,7 @@ function globalCorsHeaders(req, res, next) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader("Access-Control-Max-Age", "600");
     res.setHeader(
       "Access-Control-Allow-Headers",
       "Authorization, Content-Type, Idempotency-Key, X-Request-Id, X-Telegram-Init-Data, X-Telegram-Initdata, X-Telegram-Init",
@@ -3149,6 +3153,19 @@ function globalCorsHeaders(req, res, next) {
     if (req.method === "OPTIONS") {
       return res.status(204).end();
     }
+  }
+  return next();
+}
+
+function requireJsonContent(req, res, next) {
+  if (req.method !== "POST") return next();
+  const contentType = String(req.headers["content-type"] || "").toLowerCase();
+  if (!contentType.includes("application/json")) {
+    return res.status(415).json({
+      ok: false,
+      error: "unsupported_media_type",
+      message: "Content-Type must be application/json.",
+    });
   }
   return next();
 }
@@ -9632,6 +9649,7 @@ app.post(
 app.post(
   "/webapp/auth",
   webappAuthLimiter,
+  requireJsonContent,
   requireWebappTmaAuth,
   async (req, res) => {
     try {
