@@ -63,7 +63,8 @@ jobs:
           VERCEL_SCOPE: ${{ secrets.VERCEL_SCOPE }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-          VITE_API_URL: ${{ secrets.MINIAPP_API_URL }}
+          VITE_API_BASE: ${{ secrets.MINIAPP_API_BASE }}
+          VITE_SOCKET_URL: ${{ secrets.MINIAPP_SOCKET_URL }}
           VITE_BASE: /
         run: |
           set -e

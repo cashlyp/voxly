@@ -42,25 +42,30 @@ export function setAuthRefreshProvider(provider: () => Promise<void>) {
   authRefreshProvider = provider;
 }
 
-const API_BASE = String(import.meta.env.VITE_API_URL ?? "").trim();
+const API_BASE = String(import.meta.env.VITE_API_BASE ?? "").trim();
+const SOCKET_BASE = String(import.meta.env.VITE_SOCKET_URL ?? "").trim();
 const DEFAULT_TIMEOUT_MS = 8000;
 const DEFAULT_RETRIES = 2;
 
 // Validate API base is configured in production
 if (API_BASE === "" && typeof window !== "undefined" && import.meta.env.PROD) {
   console.error(
-    "❌ CRITICAL: VITE_API_URL environment variable is not set. API communication will fail.",
+    "❌ CRITICAL: VITE_API_BASE environment variable is not set. API communication will fail.",
   );
 }
 
 if (API_BASE === "" && typeof window !== "undefined" && import.meta.env.DEV) {
   console.warn(
-    "⚠️  VITE_API_URL environment variable is not set. API communication may fail.",
+    "⚠️  VITE_API_BASE environment variable is not set. API communication may fail.",
   );
 }
 
 export function getApiBase() {
   return API_BASE;
+}
+
+export function getSocketBase() {
+  return SOCKET_BASE;
 }
 
 export type ApiPingResponse = {
@@ -91,7 +96,7 @@ function buildUrl(path: string): string {
       status: 0,
       code: "no_api_base",
       message:
-        "API URL is not configured. Set VITE_API_URL environment variable.",
+        "API URL is not configured. Set VITE_API_BASE environment variable.",
       retryable: false,
     });
   }

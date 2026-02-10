@@ -39,7 +39,7 @@ logs
 *.njsproj
 *.sln
 *.sw?
-
+.cache/
 #
 # Local databases or data files
 api/db/data.db

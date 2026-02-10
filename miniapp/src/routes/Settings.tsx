@@ -117,7 +117,7 @@ export function Settings() {
     try {
       if (!apiBase) {
         setLastError({
-          message: "API URL not configured. Set VITE_API_URL.",
+          message: "API URL not configured. Set VITE_API_BASE.",
         });
         return;
       }

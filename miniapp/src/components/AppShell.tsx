@@ -313,7 +313,7 @@ function describeApiConnectivityError(error: unknown) {
   if (error instanceof ApiError) {
     if (error.code === "no_api_base") {
       return {
-        message: "API URL not configured. Set VITE_API_URL in your environment.",
+        message: "API URL not configured. Set VITE_API_BASE in your environment.",
         status: 0,
         code: error.code,
       };
@@ -366,7 +366,7 @@ function RouteRenderer({
     return (
       <ApiUnavailable
         title="API URL not configured"
-        description="Set VITE_API_URL for this Mini App."
+        description="Set VITE_API_BASE for this Mini App."
         onRetry={onRetry}
       />
     );
@@ -835,7 +835,7 @@ export function AppShell() {
     if (apiConnectivity.state === "missing") {
       return {
         header: "API URL not configured",
-        body: "Set VITE_API_URL for this Mini App.",
+        body: "Set VITE_API_BASE for this Mini App.",
       };
     }
     if (apiConnectivity.state === "error") {

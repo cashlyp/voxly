@@ -270,7 +270,7 @@ function describeAuthError(error: unknown) {
   if (error instanceof ApiError) {
     if (error.code === "no_api_base") {
       return new AuthError(
-        "API URL not configured. Set VITE_API_URL in the Mini App environment.",
+        "API URL not configured. Set VITE_API_BASE in the Mini App environment.",
         "offline",
         0,
         error.code,

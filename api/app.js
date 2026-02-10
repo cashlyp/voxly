@@ -3089,6 +3089,7 @@ app.set("trust proxy", 1);
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use(globalCorsHeaders);
 
 const apiLimiter = rateLimit({
   windowMs: config.server?.rateLimit?.windowMs || 60000,
@@ -3131,7 +3132,7 @@ function miniappSecurityHeaders(req, res, next) {
   return next();
 }
 
-function miniappCorsHeaders(req, res, next) {
+function globalCorsHeaders(req, res, next) {
   const origin = resolveMiniappOrigin(req);
   if (origin && isMiniappOriginAllowed(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
@@ -3266,7 +3267,6 @@ app.use(
   "/miniapp",
   miniappLimiter,
   miniappSecurityHeaders,
-  miniappCorsHeaders,
   requireMiniappOrigin,
   requireMiniappInitData,
   miniappRequestLogger,
@@ -3275,7 +3275,6 @@ app.use(
   "/webapp",
   webappLimiter,
   miniappSecurityHeaders,
-  miniappCorsHeaders,
   requireMiniappOrigin,
   webappRequestLogger,
 );

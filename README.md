@@ -129,10 +129,10 @@ Open the dev URL in Telegram (Mini App URL) or a browser:
 > Note: Telegram requires HTTPS. Use a tunnel (ngrok, Cloudflared, etc.) for device testing.
 
 ### Configure API base URL
-By default the UI calls the API on `window.location.origin` (same host).
-Override the API base with a build-time env:
+Set the Mini App API base and socket base at build time:
 ```
-VITE_API_URL=https://api.example.com
+VITE_API_BASE=https://api.example.com/template/api
+VITE_SOCKET_URL=https://api.example.com
 ```
 
 ### API endpoints used
