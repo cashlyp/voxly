@@ -39,7 +39,7 @@ A comprehensive Telegram bot system for making AI-powered voice calls using Twil
 - Twilio mode keeps the original Media Streams flow; AWS mode routes through Connect/Kinesis per `aws-migration.md`; Vonage mode uses the Vonage Voice API and WebSocket streaming.
 - Each provider has matching SMS adapters (Twilio SMS, AWS Pinpoint, Vonage SMS) so outbound texts follow the active backbone.
 - When Twilio is selected but credentials are missing, the API now fails fast with a targeted message pointing to the relevant `.env` entries and the `npm run setup --prefix api` helper.
-- Deepgram Voice Agent is now the default path (`USE_DEEPGRAM_VOICE_AGENT=true`) and automatically falls back to the legacy STT+GPT+TTS pipeline when Voice Agent is unavailable or bypassed.
+- Deepgram Voice Agent is now the default path (`USE_DEEPGRAM_VOICE_AGENT=true`) for Twilio and Vonage streams, and automatically falls back to the legacy STT+GPT+TTS pipeline when Voice Agent is unavailable, bypassed, or when keypad-required capture flows need the legacy digit path.
 
 ### Vonage Signed Callbacks (Recommended for production)
 
@@ -54,7 +54,9 @@ A comprehensive Telegram bot system for making AI-powered voice calls using Twil
   - `VONAGE_WEBSOCKET_CONTENT_TYPE=audio/l16;rate=8000` (fallback for narrowband)
 - For keypad digit capture over Vonage, enable webhook DTMF ingestion:
   - `VONAGE_DTMF_WEBHOOK_ENABLED=true`
-  - Configure your Vonage Voice app event callback to deliver DTMF events to `POST /webhook/vonage/event`
+  - Configure your Vonage Voice app callbacks to:
+    - Answer URL: `GET /answer`
+    - Event URL: `POST /event`
 - If `VONAGE_DTMF_WEBHOOK_ENABLED=false`, keypad-critical flows (OTP/PIN verification profiles) are automatically routed away from Vonage to prevent silent digit-capture failures.
 - Provider guard tuning for production:
   - `KEYPAD_GUARD_ENABLED=true`

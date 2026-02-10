@@ -94,7 +94,7 @@ async function runCheck(name, fn, options = {}) {
 async function checkVonageInboundAnswer() {
   const inboundUuid = "inbound-uuid-001";
   const res = await request(app)
-    .get("/webhook/vonage/answer")
+    .get("/answer")
     .query({
       uuid: inboundUuid,
       from: "+14155550123",
@@ -118,7 +118,7 @@ async function checkVonageInboundAnswer() {
   if (!eventUri) {
     throw new Error("No event URL returned for Vonage inbound answer");
   }
-  if (!eventUri.includes("/webhook/vonage/event")) {
+  if (!eventUri.includes("/event")) {
     throw new Error(`Unexpected inbound event URL: ${eventUri}`);
   }
   if (!eventUri.includes("callSid=vonage-in-inbound-uuid-001")) {
@@ -132,7 +132,7 @@ async function checkVonageInboundAnswer() {
 
 async function checkVonageOutboundAnswer() {
   const res = await request(app)
-    .get("/webhook/vonage/answer")
+    .get("/answer")
     .query({
       callSid: "test-outbound-call-001",
       uuid: "outbound-uuid-001",
@@ -155,7 +155,7 @@ async function checkVonageOutboundAnswer() {
   if (!eventUri) {
     throw new Error("No event URL returned for Vonage outbound answer");
   }
-  if (!eventUri.includes("/webhook/vonage/event")) {
+  if (!eventUri.includes("/event")) {
     throw new Error(`Unexpected outbound event URL: ${eventUri}`);
   }
   if (!eventUri.includes("callSid=test-outbound-call-001")) {
@@ -186,7 +186,7 @@ async function checkTwilioIncomingTwiml() {
 
 async function checkVonageDtmfWebhook() {
   const res = await request(app)
-    .post("/webhook/vonage/event")
+    .post("/event")
     .send({
       callSid: "test-vonage-dtmf-001",
       uuid: "test-vonage-dtmf-uuid-001",

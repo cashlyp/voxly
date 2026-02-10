@@ -34,6 +34,26 @@ function asRole(value) {
   return "user";
 }
 
+function normalizeAgentAudioEncoding(value, fallback = "mulaw") {
+  const raw = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (!raw) return fallback;
+  if (["mulaw", "mu-law", "pcm_mulaw", "audio/pcmu", "pcmu"].includes(raw)) {
+    return "mulaw";
+  }
+  if (["linear16", "l16", "pcm16", "audio/l16"].includes(raw)) {
+    return "linear16";
+  }
+  return fallback;
+}
+
+function asPositiveSampleRate(value, fallback = 8000) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.round(parsed);
+}
+
 function attachSocketListener(socket, event, handler) {
   if (!socket || typeof handler !== "function") return;
   if (typeof socket.on === "function") {
@@ -189,17 +209,30 @@ class VoiceAgentBridge extends EventEmitter {
     const thinkModel = session.thinkModel || this.thinkModel;
     const speakModel =
       session.voiceModel || session.speakModel || this.speakModel || "aura-2-thalia-en";
+    const inputEncoding = normalizeAgentAudioEncoding(
+      session.inputEncoding,
+      "mulaw",
+    );
+    const inputSampleRate = asPositiveSampleRate(session.inputSampleRate, 8000);
+    const outputEncoding = normalizeAgentAudioEncoding(
+      session.outputEncoding,
+      inputEncoding,
+    );
+    const outputSampleRate = asPositiveSampleRate(
+      session.outputSampleRate,
+      inputSampleRate,
+    );
 
     const settings = {
       type: "Settings",
       audio: {
         input: {
-          encoding: "mulaw",
-          sample_rate: 8000,
+          encoding: inputEncoding,
+          sample_rate: inputSampleRate,
         },
         output: {
-          encoding: "mulaw",
-          sample_rate: 8000,
+          encoding: outputEncoding,
+          sample_rate: outputSampleRate,
           container: "none",
         },
       },

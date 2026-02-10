@@ -2267,7 +2267,7 @@ function getVonageWebsocketContentType() {
 
 function buildVonageAnswerWebhookUrl(req, callSid, extraParams = {}) {
   const host = resolveHost(req) || config.server?.hostname;
-  const defaultBase = host ? `https://${host}/webhook/vonage/answer` : "";
+  const defaultBase = host ? `https://${host}/answer` : "";
   const baseUrl = config.vonage?.voice?.answerUrl || defaultBase;
   return appendQueryParamsToUrl(baseUrl, {
     callSid: callSid || undefined,
@@ -2277,7 +2277,7 @@ function buildVonageAnswerWebhookUrl(req, callSid, extraParams = {}) {
 
 function buildVonageEventWebhookUrl(req, callSid, extraParams = {}) {
   const host = resolveHost(req) || config.server?.hostname;
-  const defaultBase = host ? `https://${host}/webhook/vonage/event` : "";
+  const defaultBase = host ? `https://${host}/event` : "";
   const baseUrl = config.vonage?.voice?.eventUrl || defaultBase;
   return appendQueryParamsToUrl(baseUrl, {
     callSid: callSid || undefined,
@@ -5086,6 +5086,259 @@ async function requestVoiceAgentFallback(callSid, req, reason = "") {
   return { redirectUrl, attemptCount };
 }
 
+async function tryStartVonageVoiceAgentSession(options = {}) {
+  const {
+    ws,
+    req,
+    callSid,
+    callConfig,
+    functionSystem,
+    vonageUuid = null,
+    vonageAudioSpec = null,
+  } = options;
+  if (!ws || !callSid || !callConfig || !functionSystem || !vonageAudioSpec) {
+    return { started: false, reason: "invalid_context" };
+  }
+
+  const bridge = new VoiceAgentBridge({
+    apiKey: config.deepgram.apiKey,
+    endpoint: config.deepgram?.voiceAgent?.endpoint,
+    keepAliveMs: config.deepgram?.voiceAgent?.keepAliveMs,
+    listenModel: config.deepgram?.voiceAgent?.listen?.model,
+    thinkProviderType: config.deepgram?.voiceAgent?.think?.providerType,
+    thinkModel: config.deepgram?.voiceAgent?.think?.model,
+    speakModel: config.deepgram?.voiceAgent?.speak?.model,
+  });
+  const voiceAgentFunctions = buildVoiceAgentFunctions(functionSystem);
+
+  try {
+    await bridge.connect({
+      callSid,
+      prompt: callConfig?.prompt,
+      firstMessage: callConfig?.first_message,
+      voiceModel: resolveVoiceModel(callConfig),
+      functions: voiceAgentFunctions,
+      inputEncoding: vonageAudioSpec.sttEncoding,
+      inputSampleRate: vonageAudioSpec.sampleRate,
+      outputEncoding: vonageAudioSpec.ttsEncoding,
+      outputSampleRate: vonageAudioSpec.sampleRate,
+    });
+  } catch (error) {
+    try {
+      await bridge.close();
+    } catch (_) {}
+    return { started: false, reason: "connect_failed", error };
+  }
+
+  let interactionCount = 0;
+  let cleanedUp = false;
+  const cleanup = async (reason = "closed") => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+
+    try {
+      await bridge.close();
+    } catch (_) {}
+
+    clearSpeechTicks(callSid);
+    clearGptQueue(callSid);
+    clearNormalFlowState(callSid);
+    clearCallEndLock(callSid);
+    clearSilenceTimer(callSid);
+    sttFallbackCalls.delete(callSid);
+    streamTimeoutCalls.delete(callSid);
+    clearKeypadCallState(callSid);
+    if (digitService) {
+      digitService.clearCallState(callSid);
+    }
+    const activeSession = activeCalls.get(callSid);
+    if (activeSession?.startTime) {
+      await handleCallEnd(callSid, activeSession.startTime);
+    }
+    activeCalls.delete(callSid);
+    webhookService.addLiveEvent(callSid, `🔌 Voice agent stream ${reason}`, {
+      force: true,
+    });
+  };
+
+  activeCalls.set(callSid, {
+    startTime: new Date(),
+    callConfig,
+    functionSystem,
+    voiceAgent: true,
+    interactionCount: 0,
+  });
+  clearKeypadCallState(callSid);
+  scheduleSilenceTimer(callSid);
+
+  if (db?.updateCallState) {
+    await db
+      .updateCallState(callSid, "voice_agent_connected", {
+        at: new Date().toISOString(),
+        provider: "vonage",
+        source: "voice_agent",
+        vonage_uuid: vonageUuid || callConfig?.provider_metadata?.vonage_uuid || null,
+        stream_audio_encoding: vonageAudioSpec.sttEncoding,
+        stream_audio_sample_rate: vonageAudioSpec.sampleRate,
+      })
+      .catch(() => {});
+  }
+
+  bridge.on("audio", (base64Audio) => {
+    if (!base64Audio) return;
+    try {
+      const buffer = Buffer.from(base64Audio, "base64");
+      ws.send(buffer);
+      const level = estimateAudioLevelFromBase64(base64Audio);
+      webhookService
+        .setLiveCallPhase(callSid, "agent_speaking", { level })
+        .catch(() => {});
+      scheduleSpeechTicksFromAudio(callSid, "agent_speaking", base64Audio);
+    } catch (error) {
+      console.error("Vonage voice agent audio send error:", error);
+    }
+  });
+
+  bridge.on("conversationText", async ({ role, text }) => {
+    if (!callSid || !text) return;
+    const speaker = role === "ai" ? "ai" : "user";
+    const consoleRole = speaker === "ai" ? "agent" : "user";
+    webhookService.recordTranscriptTurn(callSid, consoleRole, text);
+    if (speaker === "user") {
+      webhookService.setLiveCallPhase(callSid, "user_speaking").catch(() => {});
+    } else {
+      webhookService
+        .setLiveCallPhase(callSid, "agent_responding")
+        .catch(() => {});
+    }
+
+    try {
+      await db.addTranscript({
+        call_sid: callSid,
+        speaker,
+        message: text,
+        interaction_count: interactionCount,
+        personality_used: "voice_agent",
+      });
+      await db.updateCallState(callSid, `${speaker}_spoke`, {
+        message: text,
+        interaction_count: interactionCount,
+        source: "voice_agent",
+        provider: "vonage",
+      });
+    } catch (error) {
+      console.error("Vonage voice agent transcript save error:", error);
+    }
+
+    if (speaker === "user") {
+      interactionCount += 1;
+      const session = activeCalls.get(callSid);
+      if (session) {
+        session.interactionCount = interactionCount;
+      }
+    }
+  });
+
+  bridge.on("functionCallRequest", async (request) => {
+    const functionName = request?.name;
+    if (!functionName) return;
+    let args = request?.arguments || {};
+    if (typeof args === "string") {
+      try {
+        args = JSON.parse(args);
+      } catch (_) {
+        args = {};
+      }
+    }
+
+    let responsePayload;
+    try {
+      const fn = functionSystem?.implementations?.[functionName];
+      if (!fn) {
+        throw new Error(`Function ${functionName} is not available`);
+      }
+      responsePayload = await fn(args || {});
+    } catch (error) {
+      responsePayload = { error: error.message || "Function failed" };
+      webhookService.addLiveEvent(
+        callSid,
+        `⚠️ Function error: ${functionName}`,
+        { force: true },
+      );
+    }
+    bridge.sendFunctionResponse(request?.id, responsePayload);
+  });
+
+  bridge.on("event", (event) => {
+    if (!callSid) return;
+    const type = String(event?.type || event?.event || "").toLowerCase();
+    if (!type) return;
+    if (type.includes("userstartedspeaking")) {
+      webhookService.setLiveCallPhase(callSid, "user_speaking").catch(() => {});
+      return;
+    }
+    if (type.includes("agentthinking")) {
+      webhookService
+        .setLiveCallPhase(callSid, "agent_responding")
+        .catch(() => {});
+      return;
+    }
+    if (type.includes("agentstartedspeaking")) {
+      webhookService.setLiveCallPhase(callSid, "agent_speaking").catch(() => {});
+    }
+  });
+
+  bridge.on("error", (error) => {
+    console.error("Vonage voice agent bridge error:", error);
+    webhookService.addLiveEvent(
+      callSid,
+      `⚠️ Voice agent error: ${error.message || "unknown error"}`,
+      { force: true },
+    );
+  });
+
+  ws.on("message", (data) => {
+    if (!data) return;
+    if (Buffer.isBuffer(data)) {
+      markStreamMediaSeen(callSid);
+      streamLastMediaAt.set(callSid, Date.now());
+      bridge.sendTwilioAudio(data.toString("base64"));
+      return;
+    }
+    const text = data.toString();
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return;
+    }
+    const wsDigits = getVonageDtmfDigits(parsed || {});
+    if (wsDigits) {
+      webhookService.addLiveEvent(callSid, `🔢 Keypad: ${wsDigits}`, {
+        force: true,
+      });
+      bridge.injectUserMessage(`Caller pressed keypad digits: ${wsDigits}`);
+      return;
+    }
+    if (parsed?.event === "websocket:closed") {
+      ws.close();
+    }
+  });
+
+  ws.on("error", (error) => {
+    console.error("Vonage voice agent websocket error:", error);
+  });
+
+  ws.on("close", async () => {
+    await cleanup("closed");
+  });
+
+  webhookService.addLiveEvent(callSid, "🤖 Voice agent connected", {
+    force: true,
+  });
+  return { started: true };
+}
+
 async function handleVoiceAgentWebSocket(ws, req) {
   let streamSid = null;
   let callSid = null;
@@ -6882,6 +7135,54 @@ app.ws("/vonage/stream", async (ws, req) => {
       })
         .catch(() => {});
     }
+    const voiceAgentMode = resolveVoiceAgentExecutionMode();
+    const keypadRequiredFlow = isKeypadRequiredFlow(
+      callConfig?.collection_profile,
+      callConfig?.script_policy,
+    );
+    if (voiceAgentMode.enabled && !keypadRequiredFlow) {
+      const voiceAgentStart = await tryStartVonageVoiceAgentSession({
+        ws,
+        req,
+        callSid,
+        callConfig,
+        functionSystem,
+        vonageUuid,
+        vonageAudioSpec,
+      });
+      if (voiceAgentStart?.started) {
+        return;
+      }
+      const fallbackReason =
+        voiceAgentStart?.error?.message ||
+        voiceAgentStart?.reason ||
+        voiceAgentMode.reason;
+      console.warn(
+        `Vonage voice agent unavailable for ${callSid}; using legacy STT+GPT+TTS (${fallbackReason})`,
+      );
+      webhookService.addLiveEvent(
+        callSid,
+        "⚠️ Voice agent unavailable. Using legacy STT+GPT+TTS pipeline…",
+        { force: true },
+      );
+      if (db?.updateCallState) {
+        await db
+          .updateCallState(callSid, "voice_agent_connect_failed", {
+            at: new Date().toISOString(),
+            provider: "vonage",
+            error: fallbackReason,
+          })
+          .catch(() => {});
+      }
+    } else if (keypadRequiredFlow && voiceAgentMode.enabled) {
+      console.log(
+        `Vonage voice agent bypassed for keypad-required flow on ${callSid}; using legacy STT+GPT+TTS`,
+      );
+    } else if (voiceAgentMode.requested && !voiceAgentMode.enabled) {
+      console.log(
+        `Vonage voice agent unavailable (${voiceAgentMode.reason}); using legacy STT+GPT+TTS pipeline`,
+      );
+    }
 
     const ttsService = new TextToSpeechService({
       encoding: vonageAudioSpec.ttsEncoding,
@@ -8519,7 +8820,7 @@ function buildVonageUnavailableNcco() {
 }
 
 const handleVonageAnswer = async (req, res) => {
-  if (!requireValidVonageWebhook(req, res, "/webhook/vonage/answer")) {
+  if (!requireValidVonageWebhook(req, res, req.path || "/answer")) {
     return;
   }
   try {
@@ -8696,7 +8997,7 @@ const handleVonageAnswer = async (req, res) => {
 };
 
 const handleVonageEvent = async (req, res) => {
-  if (!requireValidVonageWebhook(req, res, "/webhook/vonage/event")) {
+  if (!requireValidVonageWebhook(req, res, req.path || "/event")) {
     return;
   }
   try {
