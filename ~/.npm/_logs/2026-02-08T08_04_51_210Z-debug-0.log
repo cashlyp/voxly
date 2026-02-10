@@ -1,0 +1,18 @@
+0 verbose cli /usr/local/share/nvm/versions/node/v24.11.1/bin/node /usr/local/share/nvm/versions/node/v24.11.1/lib/node_modules/npm/bin/npm-cli.js
+1 info using npm@11.9.0
+2 info using node@v24.11.1
+3 silly config load:file:/usr/local/share/nvm/versions/node/v24.11.1/lib/node_modules/npm/npmrc
+4 silly config load:file:/workspaces/voxly/.npmrc
+5 silly config load:file:/workspaces/voxly/~/.npmrc
+6 silly config load:file:/usr/local/share/nvm/versions/node/v24.11.1/etc/npmrc
+7 verbose title npm exec vercel env pull .env.vercel.preview --environment preview --yes --token 1QHs8uspIiGgbynaQj7Tbk2y --cwd /workspaces/voxly/miniapp
+8 verbose argv "exec" "--" "vercel" "env" "pull" ".env.vercel.preview" "--environment" "preview" "--yes" "--token" "1QHs8uspIiGgbynaQj7Tbk2y" "--cwd" "/workspaces/voxly/miniapp"
+9 verbose logfile logs-max:10 dir:/workspaces/voxly/~/.npm/_logs/2026-02-08T08_04_51_210Z-
+10 verbose logfile /workspaces/voxly/~/.npm/_logs/2026-02-08T08_04_51_210Z-debug-0.log
+11 silly logfile done cleaning log files
+12 verbose cwd /workspaces/voxly
+13 verbose os Linux 6.8.0-1030-azure
+14 verbose node v24.11.1
+15 verbose npm  v11.9.0
+16 verbose exit 0
+17 info ok

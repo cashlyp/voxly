@@ -197,7 +197,7 @@ async function authAs(userId) {
   const initData = buildInitData(userId);
   const response = await requestServer()
     .post('/webapp/auth')
-    .send({ initData });
+    .set('Authorization', `tma ${initData}`);
   return response;
 }
 
@@ -245,7 +245,7 @@ describe('Webapp auth and roles', () => {
     const initData = buildInitData(1111, expired);
     const response = await requestServer()
       .post('/webapp/auth')
-      .send({ initData });
+      .set('Authorization', `tma ${initData}`);
     expect(response.status).toBe(401);
     expect(response.body.error).toBe('expired_init_data');
   });
@@ -400,7 +400,7 @@ describe('Origin allowlist (production)', () => {
       const response = await request(prodServer)
         .post('/webapp/auth')
         .set('Origin', 'https://example.com')
-        .send({ initData });
+        .set('Authorization', `tma ${initData}`);
       await new Promise((resolve) => prodServer.close(resolve));
       expect(response.status).toBe(403);
       expect(response.body.error).toBe('origin_not_allowed');

@@ -365,6 +365,14 @@ function resolveMiniappInitData(req) {
   return "";
 }
 
+function resolveWebappInitDataFromAuth(req) {
+  const auth = String(req.headers.authorization || "");
+  if (auth.toLowerCase().startsWith("tma ")) {
+    return auth.slice(4).trim();
+  }
+  return "";
+}
+
 function verifyTelegramInitData(
   raw,
   maxAgeSeconds = MINIAPP_INITDATA_MAX_AGE_S,
@@ -872,6 +880,30 @@ function webappErrorMessage(code) {
 
 function requireWebappInitData(req, res, next) {
   const raw = resolveMiniappInitData(req);
+  if (!raw) {
+    return res.status(401).json({
+      ok: false,
+      error: "missing_initdata",
+      message: webappErrorMessage("missing_initdata"),
+    });
+  }
+  const verified = verifyTelegramInitData(raw, WEBAPP_INITDATA_MAX_AGE_S);
+  if (!verified.ok) {
+    const code = verified.reason || "invalid_initdata";
+    return res.status(401).json({
+      ok: false,
+      error: code,
+      message: webappErrorMessage(code),
+    });
+  }
+  req.miniappInitData = raw;
+  req.miniappInitUser = verified.user;
+  req.miniappInitParams = verified.params;
+  return next();
+}
+
+function requireWebappTmaAuth(req, res, next) {
+  const raw = resolveWebappInitDataFromAuth(req);
   if (!raw) {
     return res.status(401).json({
       ok: false,
@@ -9601,7 +9633,7 @@ app.post(
 app.post(
   "/webapp/auth",
   webappAuthLimiter,
-  requireWebappInitData,
+  requireWebappTmaAuth,
   async (req, res) => {
     try {
       const user = req.miniappInitUser;
