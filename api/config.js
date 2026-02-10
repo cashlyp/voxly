@@ -163,51 +163,6 @@ const inboundCallbackDelayMinutes = Number(
   readEnv("INBOUND_CALLBACK_DELAY_MIN") || "15",
 );
 
-const miniappOriginSeeds = [
-  readEnv("MINIAPP_ALLOWED_ORIGINS"),
-  readEnv("MINI_APP_URL"),
-  readEnv("MINIAPP_PUBLIC_URL"),
-  readEnv("MINIAPP_URL"),
-]
-  .filter(Boolean)
-  .join(",");
-const miniappAllowedOrigins = Array.from(
-  new Set([...parseList(miniappOriginSeeds), ...corsOrigins]),
-);
-const miniappPublicUrl =
-  readEnv("MINIAPP_PUBLIC_URL") ||
-  readEnv("MINIAPP_URL") ||
-  readEnv("MINI_APP_URL");
-const miniappBotUsernameRaw =
-  readEnv("MINIAPP_BOT_USERNAME") || readEnv("TELEGRAM_BOT_USERNAME");
-const miniappBotUsername = miniappBotUsernameRaw
-  ? miniappBotUsernameRaw.replace(/^@/, "")
-  : "";
-const miniappSessionTtlMs = Number(
-  readEnv("MINIAPP_SESSION_TTL_MS") || "3600000",
-);
-const miniappRefreshTtlMs = Number(
-  readEnv("MINIAPP_REFRESH_TTL_MS") || String(7 * 24 * 60 * 60 * 1000),
-);
-const miniappRateLimitWindowMs = Number(
-  readEnv("MINIAPP_RATE_LIMIT_WINDOW_MS") || "60000",
-);
-const miniappRateLimitMax = Number(readEnv("MINIAPP_RATE_LIMIT_MAX") || "120");
-const miniappBrandName = readEnv("MINIAPP_BRAND_NAME") || "VOICEDNUT";
-const miniappThemeRaw = parseJsonObject(
-  readEnv("MINIAPP_THEME_JSON"),
-  "MINIAPP_THEME_JSON",
-);
-const miniappTheme =
-  miniappThemeRaw && Object.keys(miniappThemeRaw).length
-    ? miniappThemeRaw
-    : null;
-const miniappJwtSecret =
-  readEnv("WEB_APP_SECRET") || readEnv("MINIAPP_JWT_SECRET") || apiSecret;
-const miniappJwtTtlSeconds = Number(readEnv("MINIAPP_JWT_TTL_S") || "900");
-const miniappInitDataMaxAgeS = Number(
-  readEnv("MINIAPP_INITDATA_MAX_AGE_S") || "120",
-);
 const providerFailoverEnabled =
   String(readEnv("PROVIDER_FAILOVER_ENABLED") || "true").toLowerCase() ===
   "true";
@@ -403,22 +358,6 @@ module.exports = {
     operatorUserIds: telegramOperatorUserIds,
     viewerChatIds: telegramViewerChatIds,
     viewerUserIds: telegramViewerUserIds,
-  },
-  miniapp: {
-    allowedOrigins: miniappAllowedOrigins,
-    sessionTtlMs: miniappSessionTtlMs,
-    refreshTtlMs: miniappRefreshTtlMs,
-    jwtSecret: miniappJwtSecret,
-    jwtTtlSeconds: miniappJwtTtlSeconds,
-    initDataMaxAgeS: miniappInitDataMaxAgeS,
-    rateLimit: {
-      windowMs: miniappRateLimitWindowMs,
-      max: miniappRateLimitMax,
-    },
-    brandName: miniappBrandName,
-    theme: miniappTheme,
-    publicUrl: miniappPublicUrl,
-    botUsername: miniappBotUsername,
   },
   openRouter: {
     apiKey: ensure("OPENROUTER_API_KEY"),

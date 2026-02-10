@@ -5,18 +5,6 @@ const { cancelActiveFlow, resetSession } = require('../utils/sessionState');
 const { escapeHtml, renderMenu } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 
-function addMiniappButton(kb) {
-    if (!config.miniappUrl) return kb;
-    kb.row();
-    const buttonLabel = '🖥️ VOICEDNUT ✅ mini app';
-    if (typeof kb.webApp === 'function') {
-        kb.webApp(buttonLabel, config.miniappUrl);
-    } else {
-        kb.url(buttonLabel, config.miniappUrl);
-    }
-    return kb;
-}
-
 async function handleMenu(ctx) {
     try {
         await cancelActiveFlow(ctx, 'command:/menu');
@@ -33,7 +21,6 @@ async function handleMenu(ctx) {
             .text(access.user ? '📜 Call Log' : '🔒 Call Log', buildCallbackData(ctx, 'CALLLOG'));
 
         if (access.user) {
-            addMiniappButton(kb);
             kb.row()
                 .text('📚 Guide', buildCallbackData(ctx, 'GUIDE'))
                 .text('ℹ️ Help', buildCallbackData(ctx, 'HELP'));

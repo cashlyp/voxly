@@ -14,8 +14,7 @@ async function handleHelp(ctx) {
 
         const callList = [
             '📞 /call — launch a fresh voice session (requires access)',
-            '📜 /calllog — browse recent calls, search, and events',
-            '🖥️ /miniapp — open the live admin console'
+            '📜 /calllog — browse recent calls, search, and events'
         ];
 
         const smsList = [
@@ -112,16 +111,6 @@ async function handleHelp(ctx) {
                     .row()
                     .text('📧 Email', buildCallbackData(ctx, 'EMAIL'))
                     .text('📋 Menu', buildCallbackData(ctx, 'MENU'));
-
-                if (config.miniappUrl && isAuthorized) {
-                    const buttonLabel = '🖥️ VOICEDNUT ✅ mini app';
-                    keyboard.row();
-                    if (typeof keyboard.webApp === 'function') {
-                        keyboard.webApp(buttonLabel, config.miniappUrl);
-                    } else {
-                        keyboard.url(buttonLabel, config.miniappUrl);
-                    }
-                }
 
                 keyboard.row()
                     .text('📚 Guide', buildCallbackData(ctx, 'GUIDE'))

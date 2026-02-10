@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - main
-    paths-ignore:
-      - 'miniapp/**'
 
 jobs:
   deploy:
@@ -29,7 +27,7 @@ jobs:
             # Navigate to project root
             cd /home/ubuntu/voicednut
 
-            # Keep only api + bot checked out on EC2 (avoid deploying miniapp assets)
+            # Keep only api + bot checked out on EC2
             git fetch origin main
             git sparse-checkout init --cone
             git sparse-checkout set api bot

@@ -128,7 +128,6 @@ class EnhancedWebhookService {
     this.transcriptRetryMs = 3000;
     this.transcriptMaxWaitMs = 10 * 60 * 1000;
     this.terminalStatusSent = new Map();
-    this.miniappEventSink = null;
   }
 
   normalizeStatus(value) {
@@ -168,19 +167,6 @@ class EnhancedWebhookService {
     return this.inboundGate.get(callSid) || null;
   }
 
-  setMiniappEventSink(fn) {
-    this.miniappEventSink = typeof fn === 'function' ? fn : null;
-  }
-
-  emitMiniappEvent(type, callSid, payload = {}) {
-    if (!this.miniappEventSink || !callSid) return;
-    try {
-      this.miniappEventSink(type, callSid, payload);
-    } catch (error) {
-      console.error('Miniapp event sink error:', error);
-    }
-  }
-
   setInboundGate(callSid, status, data = {}) {
     if (!callSid) return null;
     const existing = this.inboundGate.get(callSid) || {};
@@ -192,11 +178,6 @@ class EnhancedWebhookService {
     if (data.chatId) next.chatId = data.chatId;
     if (data.messageId) next.messageId = data.messageId;
     this.inboundGate.set(callSid, next);
-    this.emitMiniappEvent('call.inbound_gate', callSid, {
-      status,
-      chat_id: next.chatId || null,
-      updated_at: next.updatedAt
-    });
     return next;
   }
 
@@ -653,10 +634,6 @@ class EnhancedWebhookService {
         this.scheduleDeferredTerminalStatus(call_sid, adjustedStatus, telegram_chat_id, additionalData);
         console.log(`⏳ Deferring terminal status ${adjustedStatus} for call ${call_sid} (recent activity)`);
         return true;
-      }
-
-      if (callMeta?.inbound && inboundGateStatus === 'pending' && !this.isTerminalStatus(adjustedStatus)) {
-        message = `${message}\n\n👉 Answer in the Mini App to start the call.`;
       }
 
       // Check if we should send this status
@@ -1485,7 +1462,6 @@ class EnhancedWebhookService {
     entry.lastMessageText = text;
     entry.lastMarkup = JSON.stringify(initialMarkup || {});
     this.liveConsoleByCallSid.set(callSid, entry);
-    this.emitMiniappEvent('call.console.opened', callSid, this.getLiveConsoleSnapshot(callSid));
     return entry;
   }
 
@@ -1785,18 +1761,6 @@ class EnhancedWebhookService {
         inline_keyboard: [[{ text: `⏳ ${entry.actionLock}`, callback_data: 'noop' }]]
       };
     }
-    const miniappUrlBase = config.miniapp?.publicUrl;
-    const miniappBotUsername = config.miniapp?.botUsername;
-    const miniappUrl = (() => {
-      if (miniappUrlBase) {
-        const joiner = miniappUrlBase.includes('?') ? '&' : '?';
-        return `${miniappUrlBase}${joiner}call=${encodeURIComponent(callSid)}`;
-      }
-      if (miniappBotUsername) {
-        return `https://t.me/${miniappBotUsername}?startapp=${encodeURIComponent(`call_${callSid}`)}`;
-      }
-      return null;
-    })();
     const compactLabel = entry?.compact ? '🧭 Full view' : '🧭 Compact view';
     const privacyLabel = entry?.redactPreview ? '🔓 Reveal' : '🔒 Hide';
     if (entry?.inbound) {
@@ -1804,9 +1768,7 @@ class EnhancedWebhookService {
       const isTerminal = this.isTerminalStatus(entry?.statusKey);
       if (gateStatus !== 'answered' && !isTerminal) {
         return {
-          inline_keyboard: [
-            ...(miniappUrl ? [[{ text: '🖥️ Answer in Mini App', url: miniappUrl }]] : [])
-          ]
+          inline_keyboard: []
         };
       }
       if (!entry.actionsExpanded) {
@@ -1815,8 +1777,7 @@ class EnhancedWebhookService {
             [
               { text: '⚙️ Actions', callback_data: `lc:actions:${callSid}` },
               { text: compactLabel, callback_data: `lc:compact:${callSid}` }
-            ],
-            ...(miniappUrl ? [[{ text: '🖥️ Mini App', url: miniappUrl }]] : [])
+            ]
           ]
         };
       }
@@ -1840,8 +1801,7 @@ class EnhancedWebhookService {
           [
             { text: '🔽 Hide actions', callback_data: `lc:actions:${callSid}` },
             { text: compactLabel, callback_data: `lc:compact:${callSid}` }
-          ],
-          ...(miniappUrl ? [[{ text: '🖥️ Mini App', url: miniappUrl }]] : [])
+          ]
         ]
       };
     }
@@ -1854,8 +1814,7 @@ class EnhancedWebhookService {
         ],
         [
           { text: compactLabel, callback_data: `lc:compact:${callSid}` }
-        ],
-        ...(miniappUrl ? [[{ text: '🖥️ Mini App', url: miniappUrl }]] : [])
+        ]
       ]
     };
   }
@@ -1890,11 +1849,6 @@ class EnhancedWebhookService {
     }
 
     this.queueLiveConsoleUpdate(callSid, { force: ['completed', 'failed', 'no-answer', 'busy', 'canceled', 'voicemail'].includes(status) });
-    this.emitMiniappEvent('call.status', callSid, {
-      status: entry.statusKey,
-      label: entry.status,
-      source: statusSource || entry.statusSource || null
-    });
   }
 
   toggleConsoleCompact(callSid) {
@@ -1979,16 +1933,6 @@ class EnhancedWebhookService {
       this.addLiveEvent(callSid, phaseEvent, { force: !!options.force });
     }
     this.queueLiveConsoleUpdate(callSid, { force: !!options.force });
-    this.emitMiniappEvent('call.phase', callSid, {
-      phase: phaseKey,
-      label: phase,
-      metrics: {
-        latencyMs: entry.latencyMs,
-        jitterMs: entry.jitterMs,
-        packetLossPct: entry.packetLossPct,
-        asrConfidence: entry.asrConfidence
-      }
-    });
     return true;
   }
 
@@ -2016,7 +1960,6 @@ class EnhancedWebhookService {
       entry.lastEvents.splice(0, entry.lastEvents.length - maxEvents);
     }
     this.queueLiveConsoleUpdate(callSid, { force: !!options.force });
-    this.emitMiniappEvent('call.console.event', callSid, { line });
   }
 
   getLiveConsoleSnapshot(callSid) {
@@ -2064,10 +2007,6 @@ class EnhancedWebhookService {
       entry.previewTurns.agent = cleaned;
     }
     this.queueLiveConsoleUpdate(callSid);
-    this.emitMiniappEvent('transcript.partial', callSid, {
-      speaker,
-      message: cleaned
-    });
   }
 
   queueLiveConsoleUpdate(callSid, options = {}) {
@@ -2177,7 +2116,7 @@ class EnhancedWebhookService {
     const gateStatus = entry.inbound ? this.getInboundGate(entry.callSid)?.status : null;
     const gatePending = !gateStatus || gateStatus === 'pending';
     const gateLine = entry.inbound && gatePending && !this.isTerminalStatus(entry.statusKey)
-      ? '🖥️ Answer/Decline in Mini App'
+      ? '⏳ Awaiting admin decision'
       : null;
     const flagLine = entry.inbound ? this.formatCallerFlagLine(entry) : null;
     const previewUser = this.applyPreviewRedaction(entry, entry.previewTurns.user || '—');
