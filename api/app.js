@@ -5044,12 +5044,21 @@ function resolveVoiceAgentExecutionMode() {
 }
 
 function logStartupRuntimeProfile(voiceAgentMode) {
+  const envDefaultProvider = String(
+    config.platform?.provider || "twilio",
+  ).toLowerCase();
+  const storedDefaultProvider = storedProvider
+    ? String(storedProvider).toLowerCase()
+    : null;
+  const activeProvider = String(currentProvider || "twilio").toLowerCase();
   const payload = {
     type: "startup_runtime_profile",
     timestamp: new Date().toISOString(),
     provider: {
-      default: String(storedProvider || currentProvider || "twilio").toLowerCase(),
-      active: String(currentProvider || "twilio").toLowerCase(),
+      env_default: envDefaultProvider,
+      stored_default: storedDefaultProvider,
+      effective_default: storedDefaultProvider || envDefaultProvider,
+      active: activeProvider,
     },
     voice_agent: {
       requested: Boolean(voiceAgentMode?.requested),
@@ -5242,6 +5251,9 @@ async function tryStartVonageVoiceAgentSession(options = {}) {
   bridge.on("functionCallRequest", async (request) => {
     const functionName = request?.name;
     if (!functionName) return;
+    if (request?.clientSide === false) {
+      return;
+    }
     let args = request?.arguments || {};
     if (typeof args === "string") {
       try {
@@ -5266,7 +5278,7 @@ async function tryStartVonageVoiceAgentSession(options = {}) {
         { force: true },
       );
     }
-    bridge.sendFunctionResponse(request?.id, responsePayload);
+    bridge.sendFunctionResponse(request?.id, responsePayload, functionName);
   });
 
   bridge.on("event", (event) => {
@@ -5461,6 +5473,9 @@ async function handleVoiceAgentWebSocket(ws, req) {
   bridge.on("functionCallRequest", async (request) => {
     const functionName = request?.name;
     if (!functionName) return;
+    if (request?.clientSide === false) {
+      return;
+    }
     let args = request?.arguments || {};
     if (typeof args === "string") {
       try {
@@ -5487,7 +5502,7 @@ async function handleVoiceAgentWebSocket(ws, req) {
         );
       }
     }
-    bridge.sendFunctionResponse(request?.id, responsePayload);
+    bridge.sendFunctionResponse(request?.id, responsePayload, functionName);
   });
 
   bridge.on("event", (event) => {

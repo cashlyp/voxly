@@ -82,7 +82,7 @@ const deepgramVoiceAgentListenModel =
 const deepgramVoiceAgentSpeakModel =
   readEnv("DEEPGRAM_VOICE_AGENT_SPEAK_MODEL") || null;
 const deepgramVoiceAgentKeepAliveMs = Number(
-  readEnv("DEEPGRAM_VOICE_AGENT_KEEPALIVE_MS") || "15000",
+  readEnv("DEEPGRAM_VOICE_AGENT_KEEPALIVE_MS") || "8000",
 );
 const twilioGatherFallback =
   String(readEnv("TWILIO_GATHER_FALLBACK") || "true").toLowerCase() === "true";

@@ -10,7 +10,10 @@ if (!WebSocketCtor) {
 }
 
 const DEFAULT_ENDPOINT = "wss://agent.deepgram.com/v1/agent/converse";
-const DEFAULT_KEEPALIVE_MS = 15000;
+const DEFAULT_KEEPALIVE_MS = 8000;
+const WELCOME_FALLBACK_SEND_SETTINGS_MS = 1500;
+const SETTINGS_APPLIED_TIMEOUT_MS = 10000;
+const MAX_BUFFERED_AUDIO_FRAMES = 200;
 
 function toAudioBase64(value) {
   if (!value) return null;
@@ -122,6 +125,21 @@ function normalizeMessageData(value) {
   return value;
 }
 
+function readMessageType(payload) {
+  if (payload == null) return "";
+  if (Buffer.isBuffer(payload)) return "";
+  if (typeof payload !== "string") return "";
+  if (!looksLikeJson(payload)) return "";
+  try {
+    const parsed = JSON.parse(payload);
+    return String(parsed?.type || parsed?.event || parsed?.kind || "")
+      .trim()
+      .toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
 class VoiceAgentBridge extends EventEmitter {
   constructor(options = {}) {
     super();
@@ -136,6 +154,8 @@ class VoiceAgentBridge extends EventEmitter {
     this.speakModel = options.speakModel || null;
     this.ws = null;
     this.keepAliveTimer = null;
+    this.settingsApplied = false;
+    this.pendingAudioFrames = [];
   }
 
   isOpen() {
@@ -149,9 +169,11 @@ class VoiceAgentBridge extends EventEmitter {
     if (!this.apiKey) {
       throw new Error("DEEPGRAM_API_KEY is required for Voice Agent bridge");
     }
-    if (this.isOpen()) return;
+    if (this.isOpen() && this.settingsApplied) return;
 
     await this.close();
+    this.settingsApplied = false;
+    this.pendingAudioFrames = [];
 
     await new Promise((resolve, reject) => {
       const headers = {
@@ -160,19 +182,47 @@ class VoiceAgentBridge extends EventEmitter {
       this.ws = new WebSocketCtor(this.endpoint, { headers });
 
       let settled = false;
+      let settingsSent = false;
+      let settingsApplied = false;
+      let settingsAckTimer = null;
+      let welcomeFallbackTimer = null;
       const settle = (err) => {
         if (settled) return;
         settled = true;
+        if (welcomeFallbackTimer) {
+          clearTimeout(welcomeFallbackTimer);
+          welcomeFallbackTimer = null;
+        }
+        if (settingsAckTimer) {
+          clearTimeout(settingsAckTimer);
+          settingsAckTimer = null;
+        }
+        if (err) {
+          this.settingsApplied = false;
+        }
         if (err) reject(err);
         else resolve();
+      };
+      const sendSettingsOnce = () => {
+        if (settingsSent) return;
+        settingsSent = true;
+        this.sendSettings(session);
+        settingsAckTimer = setTimeout(() => {
+          if (settingsApplied) return;
+          settle(
+            new Error(
+              "Voice Agent SettingsApplied timeout: agent did not confirm configuration",
+            ),
+          );
+        }, SETTINGS_APPLIED_TIMEOUT_MS);
       };
 
       attachSocketListener(this.ws, "open", () => {
         try {
-          this.sendSettings(session);
-          this.startKeepAlive();
-          this.emit("ready");
-          settle();
+          // Docs recommend waiting for Welcome before sending Settings.
+          welcomeFallbackTimer = setTimeout(() => {
+            sendSettingsOnce();
+          }, WELCOME_FALLBACK_SEND_SETTINGS_MS);
         } catch (error) {
           settle(error);
         }
@@ -181,6 +231,22 @@ class VoiceAgentBridge extends EventEmitter {
       attachSocketListener(this.ws, "message", async (message) => {
         try {
           const normalized = await normalizeMessageData(message);
+          const rawText = Buffer.isBuffer(normalized)
+            ? normalized.toString("utf8")
+            : typeof normalized === "string"
+              ? normalized
+              : "";
+          const type = readMessageType(rawText);
+          if (type === "welcome") {
+            sendSettingsOnce();
+          } else if (type === "settingsapplied") {
+            settingsApplied = true;
+            this.settingsApplied = true;
+            this.startKeepAlive();
+            this.flushPendingAudio();
+            this.emit("ready");
+            settle();
+          }
           this.handleAgentMessage(normalized);
         } catch (error) {
           this.emit("error", error);
@@ -194,7 +260,16 @@ class VoiceAgentBridge extends EventEmitter {
 
       attachSocketListener(this.ws, "close", (code, reason) => {
         this.stopKeepAlive();
-        this.emit("close", { code, reason: reason ? reason.toString() : "" });
+        this.settingsApplied = false;
+        const closeReason = reason ? reason.toString() : "";
+        if (!settled) {
+          settle(
+            new Error(
+              `Voice Agent socket closed before ready (code=${code || "unknown"}, reason=${closeReason || "none"})`,
+            ),
+          );
+        }
+        this.emit("close", { code, reason: closeReason });
       });
     });
   }
@@ -288,20 +363,56 @@ class VoiceAgentBridge extends EventEmitter {
   }
 
   sendTwilioAudio(base64Audio) {
-    if (!this.isOpen()) return;
     if (!base64Audio) return;
+    if (!this.settingsApplied || !this.isOpen()) {
+      this.bufferPendingAudio(base64Audio);
+      return;
+    }
+    if (this.pendingAudioFrames.length) {
+      this.flushPendingAudio();
+    }
     const audio = Buffer.from(base64Audio, "base64");
     this.ws.send(audio);
   }
 
-  sendFunctionResponse(callId, result) {
-    const response =
-      typeof result === "string" ? result : JSON.stringify(result || {});
-    this.sendJson({
-      type: "FunctionCallResponse",
-      function_call_id: callId,
-      output: response,
+  bufferPendingAudio(base64Audio) {
+    if (!base64Audio) return;
+    this.pendingAudioFrames.push(base64Audio);
+    if (this.pendingAudioFrames.length > MAX_BUFFERED_AUDIO_FRAMES) {
+      this.pendingAudioFrames.splice(
+        0,
+        this.pendingAudioFrames.length - MAX_BUFFERED_AUDIO_FRAMES,
+      );
+    }
+  }
+
+  flushPendingAudio() {
+    if (!this.settingsApplied || !this.isOpen()) return;
+    if (!this.pendingAudioFrames.length) return;
+    const frames = this.pendingAudioFrames.splice(0);
+    frames.forEach((base64Audio) => {
+      if (!base64Audio) return;
+      const audio = Buffer.from(base64Audio, "base64");
+      this.ws.send(audio);
     });
+  }
+
+  sendFunctionResponse(callId, result, functionName = null) {
+    this.sendFunctionResponseNamed(callId, functionName, result);
+  }
+
+  sendFunctionResponseNamed(callId, functionName, result) {
+    const responseContent =
+      typeof result === "string" ? result : JSON.stringify(result || {});
+    const payload = {
+      type: "FunctionCallResponse",
+      id: callId || undefined,
+      content: responseContent,
+    };
+    if (functionName) {
+      payload.name = String(functionName);
+    }
+    this.sendJson(payload);
   }
 
   updatePrompt(prompt) {
@@ -324,7 +435,7 @@ class VoiceAgentBridge extends EventEmitter {
 
   injectUserMessage(text) {
     if (!text) return;
-    this.sendJson({ type: "InjectUserMessage", text: String(text) });
+    this.sendJson({ type: "InjectUserMessage", content: String(text) });
   }
 
   extractAudioFromJson(message) {
@@ -372,16 +483,20 @@ class VoiceAgentBridge extends EventEmitter {
     }
 
     if (normalizedType.includes("functioncallrequest")) {
-      const callId =
-        parsed?.function_call_id || parsed?.id || parsed?.call_id || null;
-      const functionName =
-        parsed?.function_name || parsed?.name || parsed?.function?.name || "";
-      const argumentsRaw =
-        parsed?.arguments || parsed?.args || parsed?.function?.arguments || {};
-      this.emit("functionCallRequest", {
-        id: callId,
-        name: functionName,
-        arguments: argumentsRaw,
+      const calls = Array.isArray(parsed?.functions)
+        ? parsed.functions
+        : [parsed?.function || parsed].filter(Boolean);
+      calls.forEach((fn) => {
+        const callId = fn?.id || fn?.function_call_id || fn?.call_id || null;
+        const functionName = fn?.name || fn?.function_name || "";
+        const argumentsRaw =
+          fn?.arguments || fn?.args || fn?.function?.arguments || {};
+        this.emit("functionCallRequest", {
+          id: callId,
+          name: functionName,
+          arguments: argumentsRaw,
+          clientSide: fn?.client_side !== false,
+        });
       });
       return;
     }
@@ -407,6 +522,8 @@ class VoiceAgentBridge extends EventEmitter {
 
   async close() {
     this.stopKeepAlive();
+    this.settingsApplied = false;
+    this.pendingAudioFrames = [];
     if (!this.ws) return;
     const socket = this.ws;
     this.ws = null;
