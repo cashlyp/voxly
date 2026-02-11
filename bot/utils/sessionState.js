@@ -88,6 +88,22 @@ function generateOpId() {
 function startOperation(ctx, command, metadata = {}) {
   ensureSession(ctx);
   ctx.session.meta.expiredConversation = null;
+  const existingOp = ctx.session.currentOp;
+  if (
+    existingOp &&
+    existingOp.command === command &&
+    typeof existingOp.id === 'string' &&
+    existingOp.id.length > 0
+  ) {
+    existingOp.token = existingOp.token || existingOp.id.replace(/-/g, '').slice(0, 8);
+    existingOp.metadata = {
+      ...(existingOp.metadata || {}),
+      ...(metadata || {})
+    };
+    ctx.session.currentOp = existingOp;
+    ctx.session.lastCommand = command;
+    return existingOp.id;
+  }
   const opId = generateOpId();
   const opToken = opId.replace(/-/g, '').slice(0, 8);
   ctx.session.currentOp = {
