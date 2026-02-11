@@ -2504,29 +2504,27 @@ function buildTwilioStreamTwiml(hostname, options = {}) {
   const response = new VoiceResponse();
   const connect = response.connect();
   const host = hostname || config.server.hostname;
-  const params = new URLSearchParams();
   const streamParameters = {};
-  if (options.from) params.set("from", String(options.from));
-  if (options.to) params.set("to", String(options.to));
   if (options.from) streamParameters.from = String(options.from);
   if (options.to) streamParameters.to = String(options.to);
   if (options.callSid && config.streamAuth?.secret) {
     const timestamp = String(Date.now());
     const token = buildStreamAuthToken(options.callSid, timestamp);
     if (token) {
-      params.set("token", token);
-      params.set("ts", timestamp);
       streamParameters.token = token;
       streamParameters.ts = timestamp;
     }
   }
-  const query = params.toString();
-  const url = `wss://${host}/connection${query ? `?${query}` : ""}`;
-  const streamOptions = { url, track: TWILIO_STREAM_TRACK };
-  if (Object.keys(streamParameters).length) {
-    streamOptions.parameters = streamParameters;
+  const streamNode = connect.stream({
+    url: `wss://${host}/connection`,
+    track: TWILIO_STREAM_TRACK,
+  });
+  for (const [name, value] of Object.entries(streamParameters)) {
+    if (value === undefined || value === null || value === "") continue;
+    if (typeof streamNode?.parameter === "function") {
+      streamNode.parameter({ name, value: String(value) });
+    }
   }
-  connect.stream(streamOptions);
   return response.toString();
 }
 
@@ -7875,11 +7873,7 @@ async function handleTwilioIncoming(req, res) {
       }
     }
     const connect = response.connect();
-    const streamParams = new URLSearchParams();
     const streamParameters = {};
-    if (req.body?.From) streamParams.set("from", String(req.body.From));
-    if (req.body?.To) streamParams.set("to", String(req.body.To));
-    streamParams.set("direction", directionLabel);
     if (req.body?.From) streamParameters.from = String(req.body.From);
     if (req.body?.To) streamParameters.to = String(req.body.To);
     streamParameters.direction = directionLabel;
@@ -7887,26 +7881,24 @@ async function handleTwilioIncoming(req, res) {
       const timestamp = String(Date.now());
       const token = buildStreamAuthToken(callSid, timestamp);
       if (token) {
-        streamParams.set("token", token);
-        streamParams.set("ts", timestamp);
         streamParameters.token = token;
         streamParameters.ts = timestamp;
       }
     }
-    const streamQuery = streamParams.toString();
-    const streamUrl = `wss://${host}/connection${streamQuery ? `?${streamQuery}` : ""}`;
     // Request both audio + DTMF events from Twilio Media Streams
-    const streamOptions = {
-      url: streamUrl,
+    const streamNode = connect.stream({
+      url: `wss://${host}/connection`,
       track: TWILIO_STREAM_TRACK,
       statusCallback: `https://${host}/webhook/twilio-stream`,
       statusCallbackMethod: "POST",
       statusCallbackEvent: ["start", "end"],
-    };
-    if (Object.keys(streamParameters).length) {
-      streamOptions.parameters = streamParameters;
+    });
+    for (const [name, value] of Object.entries(streamParameters)) {
+      if (value === undefined || value === null || value === "") continue;
+      if (typeof streamNode?.parameter === "function") {
+        streamNode.parameter({ name, value: String(value) });
+      }
     }
-    connect.stream(streamOptions);
 
     res.type("text/xml");
     res.end(response.toString());
