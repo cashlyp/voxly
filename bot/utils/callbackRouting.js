@@ -10,7 +10,7 @@ function parseCallbackAction(action) {
   return { prefix, opId: null, value: parts.slice(1).join(":") };
 }
 
-function resolveConversationFromPrefix(prefix) {
+function resolveConversationFromPrefix(prefix, currentCommand = null) {
   if (!prefix) return null;
   if (prefix === "call-script-fallback") return "call-conversation";
   if (prefix.startsWith("call-script-")) return "scripts-conversation";
@@ -18,7 +18,14 @@ function resolveConversationFromPrefix(prefix) {
   if (prefix.startsWith("sms-script-")) return "scripts-conversation";
   if (prefix.startsWith("inbound-default")) return "scripts-conversation";
   if (prefix === "sms-script") return "sms-conversation";
-  if (prefix.startsWith("script-") || prefix === "confirm") {
+  if (prefix === "confirm") {
+    if (typeof currentCommand === "string") {
+      if (currentCommand.startsWith("email")) return "email-conversation";
+      if (currentCommand.startsWith("scripts")) return "scripts-conversation";
+    }
+    return "scripts-conversation";
+  }
+  if (prefix.startsWith("script-")) {
     return "scripts-conversation";
   }
   if (prefix.startsWith("email-template-")) {

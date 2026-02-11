@@ -408,7 +408,9 @@ async function askOptionWithButtons(
     });
 
     const callbackData = selectionCtx.callbackQuery?.data || '';
-    const validation = validateCallback(selectionCtx, callbackData);
+    // Validate against the parent conversation context so we preserve
+    // the active operation token/currentOp in session state.
+    const validation = validateCallback(ctx, callbackData);
     if (validation.status !== 'ok') {
       await selectionCtx.answerCallbackQuery({
         text: '⌛ This menu expired. Use /menu to start again.',

@@ -127,6 +127,12 @@ function wrapConversation(handler, name) {
         "❌ An error occurred during the conversation. Please try again.";
       const message = error?.userMessage || fallback;
       await ctx.reply(message);
+    } finally {
+      // Conversation handlers can return early without clearing operation state.
+      // Keep callback routing deterministic by ending any leftover op after exit.
+      if (ctx.session?.currentOp) {
+        ctx.session.currentOp = null;
+      }
     }
   }, name);
 }
@@ -586,6 +592,26 @@ function getTelegramAccountName(from = {}) {
 
 async function reopenFreshMenu(ctx, action = "") {
   const normalized = String(action || "").toUpperCase();
+  if (
+    normalized === "SCRIPTS" ||
+    normalized.startsWith("SCRIPT-") ||
+    normalized.startsWith("CALL-SCRIPT") ||
+    normalized.startsWith("SMS-SCRIPT") ||
+    normalized.startsWith("INBOUND-DEFAULT")
+  ) {
+    await cancelActiveFlow(ctx, "reopen:scripts");
+    resetSession(ctx);
+    startOperation(ctx, "scripts");
+    await ctx.conversation.enter("scripts-conversation");
+    return;
+  }
+  if (normalized === "PERSONA" || normalized.startsWith("PERSONA-")) {
+    await cancelActiveFlow(ctx, "reopen:persona");
+    resetSession(ctx);
+    startOperation(ctx, "persona");
+    await ctx.conversation.enter("persona-conversation");
+    return;
+  }
   if (isProviderAction(action)) {
     await handleProviderCallbackAction(ctx, PROVIDER_ACTIONS.HOME);
     return;
@@ -815,6 +841,7 @@ bot.on("callback_query:data", async (ctx) => {
     if (parsedCallback) {
       const conversationTarget = resolveConversationFromPrefix(
         parsedCallback.prefix,
+        ctx.session?.currentOp?.command || null,
       );
       if (conversationTarget) {
         const currentOpId = ctx.session?.currentOp?.id;
@@ -849,12 +876,10 @@ bot.on("callback_query:data", async (ctx) => {
     const menuMessageId = ctx.callbackQuery?.message?.message_id;
     const menuChatId = ctx.callbackQuery?.message?.chat?.id;
     const latestMenuId = getLatestMenuMessageId(ctx, menuChatId);
-    const rawParsed = parseCallbackData(rawAction);
     if (
       !isMenuExemptAction &&
       menuMessageId &&
-      !latestMenuId &&
-      !rawParsed.signed
+      !latestMenuId
     ) {
       const orphanMenuKey = `orphan_menu:${menuMessageId}`;
       const firstOrphanNotice = !isDuplicateAction(
@@ -868,7 +893,7 @@ bot.on("callback_query:data", async (ctx) => {
         await clearMenuMessages(ctx);
         await reopenFreshMenu(ctx, action);
       }
-      finishMetric("stale", { reason: "orphan_unsigned_menu" });
+      finishMetric("stale", { reason: "orphan_menu" });
       return;
     }
     if (!isMenuExemptAction && isLatestMenuExpired(ctx, menuChatId)) {

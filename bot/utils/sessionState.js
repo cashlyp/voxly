@@ -154,6 +154,8 @@ function resetSession(ctx) {
   ctx.session.pendingControllers = [];
   ctx.session.flow = null;
   ctx.session.errors = [];
+  ctx.session.callDetailsCache = {};
+  ctx.session.callDetailsKeys = [];
 }
 
 function ensureOperationActive(ctx, opId) {

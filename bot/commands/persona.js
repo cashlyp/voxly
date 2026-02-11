@@ -151,37 +151,39 @@ async function promptForText(conversation, ctx, message, options = {}) {
   hints.push('Type cancel to abort');
 
   const promptText = hints.length ? `${message} (${hints.join(' | ')})` : message;
-  await styledSection(ctx, '📝 Provide Input', [promptText]);
 
-  const update = await conversation.wait();
-  safeEnsureActive();
+  while (true) {
+    await styledSection(ctx, '📝 Provide Input', [promptText]);
 
-  const text = update?.message?.text?.trim();
-  if (text) {
-    await guardAgainstCommandInterrupt(ctx, text);
-  }
+    const update = await conversation.wait();
+    safeEnsureActive();
+
+    const text = update?.message?.text?.trim();
+    if (text) {
+      await guardAgainstCommandInterrupt(ctx, text);
+    }
     if (!text) {
       if (required) {
         await styledAlert(ctx, 'Please provide a response or type cancel.');
-        return promptForText(conversation, ctx, message, options);
+        continue;
       }
       return '';
     }
 
-  const lower = text.toLowerCase();
-  if (CANCEL_KEYWORDS.has(lower)) {
-    throw new OperationCancelledError('Persona flow cancelled by user');
-  }
+    const lower = text.toLowerCase();
+    if (CANCEL_KEYWORDS.has(lower)) {
+      throw new OperationCancelledError('Persona flow cancelled by user');
+    }
 
-  if (allowSkip && lower === 'skip') {
-    return undefined;
-  }
+    if (allowSkip && lower === 'skip') {
+      return undefined;
+    }
 
-  try {
-    return parser(text);
-  } catch (error) {
-    await styledAlert(ctx, error.message || 'Invalid value supplied.');
-    return promptForText(conversation, ctx, message, options);
+    try {
+      return parser(text);
+    } catch (error) {
+      await styledAlert(ctx, error.message || 'Invalid value supplied.');
+    }
   }
 }
 
