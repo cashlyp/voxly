@@ -36,8 +36,8 @@ async function smsAlert(ctx, text) {
 function isSessionCancellationError(error) {
     if (!error) return false;
     if (error instanceof OperationCancelledError) return true;
-    const message = String(error.message || '');
-    return /timed out due to inactivity/i.test(message) || /menu expired/i.test(message);
+    const name = String(error.name || '');
+    return name === 'AbortError' || name === 'CanceledError';
 }
 
 async function replyApiError(ctx, error, fallback) {

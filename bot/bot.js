@@ -25,8 +25,6 @@ const config = require("./config");
 const { attachHmacAuth } = require("./utils/apiAuth");
 const {
   clearMenuMessages,
-  getLatestMenuMessageId,
-  isLatestMenuExpired,
   renderMenu,
 } = require("./utils/ui");
 const {
@@ -40,10 +38,7 @@ const {
 const {
   parseCallbackAction,
   resolveConversationFromPrefix,
-  isConversationCallbackStale,
-  buildStaleConversationKey,
 } = require("./utils/callbackRouting");
-const { handleInvalidCallback } = require("./utils/callbackRecovery");
 const { normalizeReply, logCommandError } = require("./utils/ui");
 const {
   getAccessProfile,
@@ -584,89 +579,6 @@ function getTelegramAccountName(from = {}) {
   return "Unknown";
 }
 
-async function reopenFreshMenu(ctx, action = "") {
-  const normalized = String(action || "").toUpperCase();
-  if (
-    normalized === "SCRIPTS" ||
-    normalized.startsWith("SCRIPT-") ||
-    normalized.startsWith("CALL-SCRIPT") ||
-    normalized.startsWith("SMS-SCRIPT") ||
-    normalized.startsWith("INBOUND-DEFAULT")
-  ) {
-    await cancelActiveFlow(ctx, "reopen:scripts");
-    resetSession(ctx);
-    startOperation(ctx, "scripts");
-    await ctx.conversation.enter("scripts-conversation");
-    return;
-  }
-  if (normalized === "PERSONA" || normalized.startsWith("PERSONA-")) {
-    await cancelActiveFlow(ctx, "reopen:persona");
-    resetSession(ctx);
-    startOperation(ctx, "persona");
-    await ctx.conversation.enter("persona-conversation");
-    return;
-  }
-  if (isProviderAction(action)) {
-    await handleProviderCallbackAction(ctx, PROVIDER_ACTIONS.HOME);
-    return;
-  }
-  if (normalized.startsWith("CALLER_FLAGS")) {
-    await renderCallerFlagsMenu(ctx);
-    return;
-  }
-  if (
-    normalized.startsWith("USERS") ||
-    normalized === "ADDUSER" ||
-    normalized === "PROMOTE" ||
-    normalized === "REMOVE"
-  ) {
-    await renderUsersMenu(ctx);
-    return;
-  }
-  if (normalized.startsWith("CALLLOG")) {
-    await renderCalllogMenu(ctx);
-    return;
-  }
-  if (normalized.startsWith("BULK_SMS")) {
-    await renderBulkSmsMenu(ctx);
-    return;
-  }
-  if (normalized.startsWith("SMS")) {
-    await renderSmsMenu(ctx);
-    return;
-  }
-  if (normalized.startsWith("BULK_EMAIL")) {
-    await renderBulkEmailMenu(ctx);
-    return;
-  }
-  if (normalized.startsWith("EMAIL")) {
-    await renderEmailMenu(ctx);
-    return;
-  }
-  await handleMenu(ctx);
-}
-
-async function reopenConversationFromStaleCallback(ctx, conversationTarget, action = "") {
-  if (conversationTarget === "call-conversation") {
-    await cancelActiveFlow(ctx, `stale_callback:${action}`);
-    resetSession(ctx);
-    await clearMenuMessages(ctx);
-    startOperation(ctx, "call");
-    await ctx.conversation.enter("call-conversation");
-    return true;
-  }
-  if (conversationTarget === "scripts-conversation") {
-    await cancelActiveFlow(ctx, `stale_callback:${action}`);
-    resetSession(ctx);
-    await clearMenuMessages(ctx);
-    startOperation(ctx, "scripts");
-    await ctx.conversation.enter("scripts-conversation");
-    return true;
-  }
-  await reopenFreshMenu(ctx, action);
-  return false;
-}
-
 // Start command handler
 bot.command("start", async (ctx) => {
   try {
@@ -779,15 +691,6 @@ bot.command("cancel", async (ctx) => {
 // Enhanced callback query handler
 bot.on("callback_query:data", async (ctx) => {
   const rawAction = ctx.callbackQuery.data;
-  const rawParsedAction = parseCallbackData(rawAction);
-  const resolvedRawAction = rawParsedAction.action || rawAction;
-  const rawParsedCallback = parseCallbackAction(resolvedRawAction);
-  const rawConversationTarget = rawParsedCallback
-    ? resolveConversationFromPrefix(
-        rawParsedCallback.prefix,
-        ctx.session?.currentOp?.command || null,
-      )
-    : null;
   const metric = startActionMetric(ctx, "callback", { raw_action: rawAction });
   const finishMetric = (status, extra = {}) => {
     finishActionMetric(metric, status, extra);
@@ -816,46 +719,12 @@ bot.on("callback_query:data", async (ctx) => {
       ? { status: "ok", action: rawAction }
       : validateCallback(ctx, rawAction);
     if (validation.status !== "ok") {
-      if (rawConversationTarget) {
-        const staleConversationKey = buildStaleConversationKey(
-          rawConversationTarget,
-          rawParsedCallback?.opId || validation.action || resolvedRawAction,
-        );
-        const firstStaleConversationNotice = !isDuplicateAction(
-          ctx,
-          staleConversationKey,
-          60 * 60 * 1000,
-        );
-        await clearCallbackMessageMarkup(ctx);
-        if (firstStaleConversationNotice) {
-          await ctx.reply("⌛ This menu expired. Reopening the menu so you can continue.");
-          await reopenConversationFromStaleCallback(
-            ctx,
-            rawConversationTarget,
-            validation.action || resolvedRawAction,
-          );
-        }
-        finishMetric(validation.status, {
-          reason: validation.reason || null,
-          conversation: rawConversationTarget,
-        });
-        return;
-      }
-      const recovery = await handleInvalidCallback({
-        ctx,
-        rawAction,
-        validation,
-        parseCallbackData,
-        isDuplicateAction,
-        safeAnswerCallback,
-        clearCallbackMessageMarkup,
-        clearMenuMessages,
-        isProviderAction,
-        handleProviderCallbackAction,
-        reopenFreshMenu,
-        providerHomeAction: PROVIDER_ACTIONS.HOME,
+      await clearCallbackMessageMarkup(ctx);
+      await safeAnswerCallback(ctx, {
+        text: "⚠️ Action no longer valid.",
+        show_alert: false,
       });
-      finishMetric(recovery.metricStatus, recovery.metricExtra || {});
+      finishMetric("invalid", { reason: validation.reason || null });
       return;
     }
 
@@ -894,99 +763,7 @@ bot.on("callback_query:data", async (ctx) => {
         )
       : null;
     if (parsedCallback && conversationTarget) {
-        const currentOpId = ctx.session?.currentOp?.id;
-        if (isConversationCallbackStale(parsedCallback, currentOpId)) {
-          const staleConversationKey = buildStaleConversationKey(
-            conversationTarget,
-            parsedCallback.opId,
-          );
-          const firstStaleConversationNotice = !isDuplicateAction(
-            ctx,
-            staleConversationKey,
-            60 * 60 * 1000,
-          );
-          await clearCallbackMessageMarkup(ctx);
-          if (firstStaleConversationNotice) {
-            await ctx.reply("⌛ This menu expired. Reopening the menu so you can continue.");
-            await reopenConversationFromStaleCallback(ctx, conversationTarget, action);
-          }
-          finishMetric("stale");
-          return;
-        }
-        finishMetric("routed");
-        return;
-    }
-
-    const isMenuExemptAction = menuExemptPrefixes.some((prefix) =>
-      action.startsWith(prefix),
-    );
-    const menuMessageId = ctx.callbackQuery?.message?.message_id;
-    const menuChatId = ctx.callbackQuery?.message?.chat?.id;
-    const latestMenuId = getLatestMenuMessageId(ctx, menuChatId);
-    if (
-      !isMenuExemptAction &&
-      menuMessageId &&
-      !latestMenuId
-    ) {
-      const orphanMenuKey = `orphan_menu:${menuMessageId}`;
-      const firstOrphanNotice = !isDuplicateAction(
-        ctx,
-        orphanMenuKey,
-        60 * 60 * 1000,
-      );
-      await clearCallbackMessageMarkup(ctx);
-      if (firstOrphanNotice) {
-        if (conversationTarget) {
-          await ctx.reply("⌛ This menu expired. Reopening the menu so you can continue.");
-          await reopenConversationFromStaleCallback(ctx, conversationTarget, action);
-        } else {
-          await ctx.reply("⌛ This menu expired. Use /menu to start again.");
-        }
-      }
-      finishMetric("stale", { reason: "orphan_menu" });
-      return;
-    }
-    if (!isMenuExemptAction && isLatestMenuExpired(ctx, menuChatId)) {
-      const expiredMenuKey = `expired_menu:${menuMessageId || "unknown"}`;
-      const firstExpiredNotice = !isDuplicateAction(
-        ctx,
-        expiredMenuKey,
-        60 * 60 * 1000,
-      );
-      await clearCallbackMessageMarkup(ctx);
-      if (firstExpiredNotice) {
-        if (conversationTarget) {
-          await ctx.reply("⌛ This menu expired. Reopening the menu so you can continue.");
-          await reopenConversationFromStaleCallback(ctx, conversationTarget, action);
-        } else {
-          await ctx.reply("⌛ This menu expired. Use /menu to start again.");
-        }
-      }
-      finishMetric("expired");
-      return;
-    }
-    if (
-      !isMenuExemptAction &&
-      menuMessageId &&
-      latestMenuId &&
-      menuMessageId !== latestMenuId
-    ) {
-      const staleMenuKey = `stale_latest_menu:${menuMessageId}`;
-      const firstStaleMenuNotice = !isDuplicateAction(
-        ctx,
-        staleMenuKey,
-        60 * 60 * 1000,
-      );
-      await clearCallbackMessageMarkup(ctx);
-      if (firstStaleMenuNotice) {
-        if (conversationTarget) {
-          await ctx.reply("⌛ This menu expired. Reopening the menu so you can continue.");
-          await reopenConversationFromStaleCallback(ctx, conversationTarget, action);
-        } else {
-          await ctx.reply("⌛ This menu expired. Use /menu to start again.");
-        }
-      }
-      finishMetric("stale");
+      finishMetric("routed");
       return;
     }
 
@@ -1258,21 +1035,8 @@ bot.on("callback_query:data", async (ctx) => {
 
       default:
         if (action.includes(":")) {
-          const staleUnknownKey = `stale_unknown:${action}|${
-            ctx.callbackQuery?.message?.message_id || "unknown"
-          }`;
-          const firstStaleUnknownNotice = !isDuplicateAction(
-            ctx,
-            staleUnknownKey,
-            60 * 60 * 1000,
-          );
-          console.log(`Stale callback action: ${action}`);
-          if (firstStaleUnknownNotice) {
-            await ctx.reply(
-              "⚠️ That menu is no longer active. Use /menu to start again.",
-            );
-          }
-          finishMetric("stale");
+          console.log(`Unknown namespaced callback action: ${action}`);
+          finishMetric("invalid", { reason: "unknown_namespaced_action" });
         } else {
           console.log(`Unknown callback action: ${action}`);
           await ctx.reply("❌ Unknown action. Please try again.");

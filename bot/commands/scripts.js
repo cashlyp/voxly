@@ -98,11 +98,8 @@ async function scriptsApiRequest(options) {
 }
 
 function formatScriptsApiError(error, action) {
-  if (
-    error instanceof OperationCancelledError ||
-    /timed out due to inactivity/i.test(error?.message || '')
-  ) {
-    return '⌛ Session expired. Use /menu to start again.';
+  if (error instanceof OperationCancelledError) {
+    return '⚠️ Operation cancelled.';
   }
 
   const baseHelp = 'Ensure the scripts service is reachable or update SCRIPTS_API_URL.';
@@ -156,8 +153,8 @@ function formatScriptsApiError(error, action) {
 function isSessionCancellationError(error) {
   if (!error) return false;
   if (error instanceof OperationCancelledError) return true;
-  const message = String(error.message || '');
-  return /timed out due to inactivity/i.test(message) || /menu expired/i.test(message);
+  const name = String(error.name || '');
+  return name === 'AbortError' || name === 'CanceledError';
 }
 
 const CANCEL_KEYWORDS = new Set(['cancel', 'exit', 'quit']);
@@ -2175,7 +2172,7 @@ async function listSmsScriptsFlow(conversation, ctx, ensureActive) {
     );
 
     if (!selection || !selection.id) {
-      await ctx.reply('⌛ Session expired. Use /menu to start again.');
+      await ctx.reply('⚠️ Unable to process that selection. Use /scripts to try again.');
       return;
     }
 
@@ -2282,7 +2279,7 @@ async function scriptsFlow(conversation, ctx) {
       );
 
       if (!selection || !selection.id) {
-        await ctx.reply('⌛ Session expired. Use /menu to start again.');
+        await ctx.reply('⚠️ Unable to process that selection. Use /scripts to try again.');
         return;
       }
 
@@ -2307,9 +2304,6 @@ async function scriptsFlow(conversation, ctx) {
     await ctx.reply('✅ Script designer closed.');
   } catch (error) {
     if (error instanceof OperationCancelledError) {
-      if (/menu expired before selection/i.test(error.message || '')) {
-        return;
-      }
       console.log('Scripts flow cancelled:', error.message);
       return;
     }

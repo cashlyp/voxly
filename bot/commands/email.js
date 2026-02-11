@@ -50,8 +50,8 @@ async function safeReplyMarkdown(ctx, text, options = {}) {
 async function replyApiError(ctx, error, fallback) {
   if (
     error instanceof OperationCancelledError ||
-    /timed out due to inactivity/i.test(String(error?.message || '')) ||
-    /menu expired/i.test(String(error?.message || ''))
+    String(error?.name || '') === 'AbortError' ||
+    String(error?.name || '') === 'CanceledError'
   ) {
     return;
   }

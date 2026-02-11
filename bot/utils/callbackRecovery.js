@@ -39,9 +39,7 @@ async function handleInvalidCallback({
       !isDuplicateAction(ctx, staleNoticeKey, NOTICE_TTL_MS);
 
     await safeAnswerCallback(ctx, {
-      text: firstExpiredNotice
-        ? "⌛ This menu expired. Use /menu to start again."
-        : "⌛ Session expired. Use /menu to start again.",
+      text: "⚠️ Action no longer valid.",
       show_alert: false,
     });
     await clearCallbackMessageMarkup(ctx);
@@ -53,17 +51,14 @@ async function handleInvalidCallback({
       };
     }
 
-    return { handled: true, metricStatus: "expired_callback" };
+    return { handled: true, metricStatus: "invalid_callback" };
   }
 
   const staleMenuKey = `stale_menu:${validation.status}:${
     ctx.callbackQuery?.message?.message_id || "unknown"
   }`;
   const firstStaleNotice = !isDuplicateAction(ctx, staleMenuKey, NOTICE_TTL_MS);
-  const message =
-    validation.status === "expired" || validation.status === "stale"
-      ? "⌛ This menu expired. Use /menu to start again."
-      : "⚠️ This menu is no longer active.";
+  const message = "⚠️ Action no longer valid.";
 
   await safeAnswerCallback(ctx, { text: message, show_alert: false });
   await clearCallbackMessageMarkup(ctx);

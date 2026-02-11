@@ -128,37 +128,17 @@ function extractLegacyOpToken(rawAction) {
 
 function validateCallback(ctx, rawAction, options = {}) {
   ensureSession(ctx);
-  const ttlMs = Number.isFinite(options.ttlMs) ? options.ttlMs : DEFAULT_CALLBACK_TTL_MS;
+  void options;
   const parsed = parseCallbackData(rawAction);
-  const now = Date.now();
 
   if (parsed.signed) {
     if (!parsed.valid) {
       return { status: 'invalid', reason: parsed.reason, action: parsed.action };
     }
-    if (parsed.timestamp && now - parsed.timestamp > ttlMs) {
-      return { status: 'expired', reason: 'ttl', action: parsed.action };
-    }
-    const currentToken = ctx.session?.currentOp?.token;
-    const expiredToken = ctx.session?.meta?.expiredConversation?.token;
-    if (parsed.token && currentToken && parsed.token !== currentToken) {
-      return { status: 'stale', reason: 'token_mismatch', action: parsed.action };
-    }
-    if (parsed.token && !currentToken && expiredToken && parsed.token === expiredToken) {
-      return { status: 'expired', reason: 'token_expired', action: parsed.action };
-    }
     return { status: 'ok', action: parsed.action };
   }
 
-  const legacyToken = extractLegacyOpToken(rawAction);
-  const currentToken = ctx.session?.currentOp?.token;
-  if (legacyToken && currentToken && legacyToken !== currentToken) {
-    return { status: 'stale', reason: 'token_mismatch', action: parsed.action };
-  }
-  const startedAt = ctx.session?.currentOp?.startedAt;
-  if (startedAt && now - startedAt > ttlMs) {
-    return { status: 'expired', reason: 'ttl', action: parsed.action };
-  }
+  void extractLegacyOpToken(rawAction);
   return { status: 'ok', action: parsed.action };
 }
 
