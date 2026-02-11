@@ -91,7 +91,6 @@ A comprehensive Telegram bot system for making AI-powered voice calls using Twil
 ### Queue/Worker Hardening (Recommended for production)
 
 - `CALL_JOB_TIMEOUT_MS` bounds each outbound job execution to avoid stalled workers.
-- `CALL_JOB_STALE_LOCK_MS` reclaims `running` jobs that were abandoned after a crash/restart.
 - `CALL_JOB_DLQ_ALERT_THRESHOLD` raises service-health alerts when open call-job DLQ entries exceed a threshold.
 - `CALL_JOB_DLQ_MAX_REPLAYS` caps manual replay attempts per call-job DLQ entry.
 - `WEBHOOK_TELEGRAM_TIMEOUT_MS` bounds Telegram notification API calls.

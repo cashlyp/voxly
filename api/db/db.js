@@ -1464,37 +1464,6 @@ class EnhancedDatabase {
         return claimed;
     }
 
-    async reclaimStaleRunningCallJobs(staleAfterMs = 300000) {
-        const nowMs = Date.now();
-        const thresholdMs = Math.max(1000, Number(staleAfterMs) || 300000);
-        const now = new Date(nowMs).toISOString();
-        const staleBefore = new Date(nowMs - thresholdMs).toISOString();
-        const reclaimReason = 'reclaimed_stale_lock';
-        return new Promise((resolve, reject) => {
-            const sql = `
-                UPDATE call_jobs
-                SET status = 'pending',
-                    locked_at = NULL,
-                    updated_at = ?,
-                    run_at = CASE WHEN run_at > ? THEN run_at ELSE ? END,
-                    last_error = COALESCE(last_error, ?)
-                WHERE status = 'running'
-                  AND (
-                    (locked_at IS NOT NULL AND locked_at <= ?)
-                    OR
-                    (locked_at IS NULL AND updated_at <= ?)
-                  )
-            `;
-            this.db.run(sql, [now, now, now, reclaimReason, staleBefore, staleBefore], function(err) {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(this.changes || 0);
-                }
-            });
-        });
-    }
-
     async rescheduleCallJob(job_id, run_at, error = null) {
         const updatedAt = new Date().toISOString();
         return new Promise((resolve, reject) => {

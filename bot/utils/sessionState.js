@@ -46,7 +46,6 @@ const initialSessionState = () => ({
   pendingControllers: [],
   meta: {},
   flow: null,
-  timeoutNotified: false,
   errors: [],
   menuMessages: [],
   actionHistory: {}
@@ -60,7 +59,6 @@ function ensureSession(ctx) {
     ctx.session.pendingControllers = ctx.session.pendingControllers || [];
     ctx.session.meta = ctx.session.meta || {};
     ctx.session.flow = ctx.session.flow || null;
-    ctx.session.timeoutNotified = ctx.session.timeoutNotified === true;
     ctx.session.errors = Array.isArray(ctx.session.errors) ? ctx.session.errors : [];
     ctx.session.menuMessages = Array.isArray(ctx.session.menuMessages) ? ctx.session.menuMessages : [];
     ctx.session.actionHistory =

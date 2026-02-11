@@ -8,9 +8,6 @@ async function handleMenu(ctx) {
     try {
         await cancelActiveFlow(ctx, 'command:/menu');
         resetSession(ctx);
-        if (ctx.session && typeof ctx.session === 'object') {
-            ctx.session.timeoutNotified = false;
-        }
 
         const access = await getAccessProfile(ctx);
         const isOwner = access.isAdmin;

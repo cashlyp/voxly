@@ -42,7 +42,6 @@ Keep the Twilio credentials in place if you want a rapid rollback path—switchi
 ## Worker Reliability Controls
 
 - `CALL_JOB_TIMEOUT_MS` limits each call job execution window.
-- `CALL_JOB_STALE_LOCK_MS` reclaims stale `running` call jobs during processor loops.
 - `CALL_JOB_DLQ_ALERT_THRESHOLD` emits health alerts when open call-job DLQ entries exceed the threshold.
 - `CALL_JOB_DLQ_MAX_REPLAYS` limits replay attempts for a single call-job DLQ entry.
 - `WEBHOOK_TELEGRAM_TIMEOUT_MS` sets Telegram send/edit timeout for notification delivery.
