@@ -1,10 +1,12 @@
+const OP_ID_SEGMENT_PATTERN = /^[0-9a-zA-Z-]{8,}$/;
+
 function parseCallbackAction(action) {
   if (!action || !action.includes(":")) {
     return null;
   }
   const parts = action.split(":");
   const prefix = parts[0];
-  if (parts.length >= 3 && /^[0-9a-fA-F-]{8,}$/.test(parts[1])) {
+  if (parts.length >= 3 && OP_ID_SEGMENT_PATTERN.test(parts[1])) {
     return { prefix, opId: parts[1], value: parts.slice(2).join(":") };
   }
   return { prefix, opId: null, value: parts.slice(1).join(":") };

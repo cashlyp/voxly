@@ -13,11 +13,11 @@ async function handleInvalidCallback({
   isDuplicateAction,
   safeAnswerCallback,
   clearCallbackMessageMarkup,
-  clearMenuMessages,
-  isProviderAction,
-  handleProviderCallbackAction,
-  reopenFreshMenu,
-  providerHomeAction,
+  clearMenuMessages: _clearMenuMessages,
+  isProviderAction: _isProviderAction,
+  handleProviderCallbackAction: _handleProviderCallbackAction,
+  reopenFreshMenu: _reopenFreshMenu,
+  providerHomeAction: _providerHomeAction,
 }) {
   const staleAction = validation.action || rawAction || "";
   const signed = parseCallbackData(rawAction);
@@ -60,22 +60,20 @@ async function handleInvalidCallback({
     ctx.callbackQuery?.message?.message_id || "unknown"
   }`;
   const firstStaleNotice = !isDuplicateAction(ctx, staleMenuKey, NOTICE_TTL_MS);
-  const shouldReopenProvider = isProviderAction(staleAction);
   const message =
-    validation.status === "expired"
-      ? "⌛ This menu expired. Opening the latest view…"
+    validation.status === "expired" || validation.status === "stale"
+      ? "⌛ This menu expired. Use /menu to start again."
       : "⚠️ This menu is no longer active.";
 
   await safeAnswerCallback(ctx, { text: message, show_alert: false });
   await clearCallbackMessageMarkup(ctx);
 
-  if (firstStaleNotice) {
-    await clearMenuMessages(ctx);
-    if (shouldReopenProvider) {
-      await handleProviderCallbackAction(ctx, providerHomeAction);
-    } else {
-      await reopenFreshMenu(ctx, staleAction);
-    }
+  if (!firstStaleNotice) {
+    return {
+      handled: true,
+      metricStatus: validation.status,
+      metricExtra: { reason: validation.reason },
+    };
   }
 
   return {

@@ -698,7 +698,7 @@ async function callFlow(conversation, ctx) {
     }
   } catch (error) {
     if (error instanceof OperationCancelledError || error?.name === 'AbortError' || error?.name === 'CanceledError') {
-      console.log('Call flow cancelled');
+      console.log(`Call flow cancelled: ${error?.message || error?.name || 'cancelled'}`);
       return;
     }
 

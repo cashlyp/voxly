@@ -2,7 +2,12 @@ const { InlineKeyboard } = require('grammy');
 const config = require('../config');
 const httpClient = require('./httpClient');
 const { ensureOperationActive, getCurrentOpId, OperationCancelledError } = require('./sessionState');
-const { sendMenu, clearMenuMessages } = require('./ui');
+const {
+  sendMenu,
+  clearMenuMessages,
+  getLatestMenuMessageId,
+  isLatestMenuExpired
+} = require('./ui');
 const {
   buildCallbackData,
   matchesCallbackPrefix,
@@ -397,6 +402,7 @@ async function askOptionWithButtons(
 
   const message = await sendMenu(ctx, prompt, { parse_mode: 'Markdown', reply_markup: keyboard });
   let selectionCtx;
+  let resolvedSelectionAction = null;
   while (true) {
     selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {
       const callbackData = callbackCtx.callbackQuery?.data || '';
@@ -408,21 +414,36 @@ async function askOptionWithButtons(
     });
 
     const callbackData = selectionCtx.callbackQuery?.data || '';
-    // Validate against the parent conversation context so we preserve
-    // the active operation token/currentOp in session state.
     const validation = validateCallback(ctx, callbackData);
     if (validation.status !== 'ok') {
-      await selectionCtx.answerCallbackQuery({
-        text: '⌛ This menu expired. Use /menu to start again.',
-        show_alert: false
-      }).catch(() => {});
-      try {
-        await ctx.api.editMessageReplyMarkup(message.chat.id, message.message_id);
-      } catch (_) {
-        // Ignore edit errors for stale/non-editable messages.
+      const callbackChatId = selectionCtx.callbackQuery?.message?.chat?.id || message.chat.id;
+      const callbackMessageId = selectionCtx.callbackQuery?.message?.message_id || message.message_id;
+      const latestMenuId = getLatestMenuMessageId(ctx, callbackChatId);
+      const expiredMenu =
+        validation.status === 'expired' ||
+        validation.status === 'stale' ||
+        !latestMenuId ||
+        latestMenuId !== callbackMessageId ||
+        isLatestMenuExpired(ctx, callbackChatId);
+
+      await selectionCtx
+        .answerCallbackQuery({
+          text: '⌛ This menu expired. Use /menu to start again.',
+          show_alert: false
+        })
+        .catch(() => {});
+
+      if (expiredMenu) {
+        try {
+          await ctx.api.editMessageReplyMarkup(message.chat.id, message.message_id);
+        } catch (_) {
+          // Ignore edit errors for stale/non-editable messages.
+        }
+        throw new OperationCancelledError('Menu expired before selection');
       }
-      throw new OperationCancelledError('Menu expired before selection');
+      continue;
     }
+    resolvedSelectionAction = validation.action || parseCallbackData(callbackData).action || callbackData;
 
     const callbackId = selectionCtx.callbackQuery?.id;
     if (callbackId && isDuplicateAction(ctx, `convcbid:${callbackId}`, 60 * 60 * 1000)) {
@@ -447,7 +468,10 @@ async function askOptionWithButtons(
   }
   await clearMenuMessages(ctx);
 
-  const selectionAction = parseCallbackData(selectionCtx.callbackQuery.data).action || selectionCtx.callbackQuery.data;
+  const selectionAction =
+    resolvedSelectionAction ||
+    parseCallbackData(selectionCtx.callbackQuery.data).action ||
+    selectionCtx.callbackQuery.data;
   const parts = selectionAction.split(':');
   const selectedId = opId ? parts.slice(2).join(':') : parts.slice(1).join(':');
   const selectedOption = options.find((option) => option.id === selectedId);

@@ -849,12 +849,9 @@ bot.on("callback_query:data", async (ctx) => {
             staleConversationKey,
             60 * 60 * 1000,
           );
-          await cancelActiveFlow(ctx, `stale_callback:${action}`);
-          resetSession(ctx);
           await clearCallbackMessageMarkup(ctx);
           if (firstStaleConversationNotice) {
-            await ctx.reply("⌛ This menu expired. Opening a fresh one…");
-            await reopenFreshMenu(ctx, action);
+            await ctx.reply("⌛ This menu expired. Use /menu to start again.");
           }
           finishMetric("stale");
           return;
@@ -883,19 +880,21 @@ bot.on("callback_query:data", async (ctx) => {
       );
       await clearCallbackMessageMarkup(ctx);
       if (firstOrphanNotice) {
-        await ctx.reply("⌛ This menu expired. Opening the latest view…");
-        await clearMenuMessages(ctx);
-        await reopenFreshMenu(ctx, action);
+        await ctx.reply("⌛ This menu expired. Use /menu to start again.");
       }
       finishMetric("stale", { reason: "orphan_menu" });
       return;
     }
     if (!isMenuExemptAction && isLatestMenuExpired(ctx, menuChatId)) {
-      await clearMenuMessages(ctx);
-      if (isProviderAction(action)) {
-        await handleProviderCallbackAction(ctx, PROVIDER_ACTIONS.HOME);
-      } else {
-        await handleMenu(ctx);
+      const expiredMenuKey = `expired_menu:${menuMessageId || "unknown"}`;
+      const firstExpiredNotice = !isDuplicateAction(
+        ctx,
+        expiredMenuKey,
+        60 * 60 * 1000,
+      );
+      await clearCallbackMessageMarkup(ctx);
+      if (firstExpiredNotice) {
+        await ctx.reply("⌛ This menu expired. Use /menu to start again.");
       }
       finishMetric("expired");
       return;
@@ -906,11 +905,15 @@ bot.on("callback_query:data", async (ctx) => {
       latestMenuId &&
       menuMessageId !== latestMenuId
     ) {
-      await clearMenuMessages(ctx);
-      if (isProviderAction(action)) {
-        await handleProviderCallbackAction(ctx, PROVIDER_ACTIONS.HOME);
-      } else {
-        await handleMenu(ctx);
+      const staleMenuKey = `stale_latest_menu:${menuMessageId}`;
+      const firstStaleMenuNotice = !isDuplicateAction(
+        ctx,
+        staleMenuKey,
+        60 * 60 * 1000,
+      );
+      await clearCallbackMessageMarkup(ctx);
+      if (firstStaleMenuNotice) {
+        await ctx.reply("⌛ This menu expired. Use /menu to start again.");
       }
       finishMetric("stale");
       return;

@@ -1934,9 +1934,13 @@ async function deleteSmsScriptFlow(conversation, ctx, script) {
   }
 }
 
-async function showSmsScriptVersions(conversation, ctx, script) {
+async function showSmsScriptVersions(conversation, ctx, script, ensureActive) {
+  const safeEnsureActive = typeof ensureActive === 'function'
+    ? ensureActive
+    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
   try {
     const versions = await listScriptVersions(script.name, 'sms', 8);
+    safeEnsureActive();
     if (!versions.length) {
       await ctx.reply('ℹ️ No saved versions yet. Versions are stored on edit/delete.');
       return;
@@ -1955,7 +1959,7 @@ async function showSmsScriptVersions(conversation, ctx, script) {
       ctx,
       'Select a version to restore.',
       options,
-      { prefix: 'sms-script-version', columns: 2 }
+      { prefix: 'sms-script-version', columns: 2, ensureActive: safeEnsureActive }
     );
     if (!selection || selection.id === 'back') return;
     const versionNumber = Number(selection.id);
@@ -1964,20 +1968,23 @@ async function showSmsScriptVersions(conversation, ctx, script) {
       return;
     }
     const version = await getScriptVersion(script.name, 'sms', versionNumber);
+    safeEnsureActive();
     if (!version || !version.payload) {
       await ctx.reply('❌ Version payload not found.');
       return;
     }
-    const confirmRestore = await confirm(conversation, ctx, `Restore version v${versionNumber}?`);
+    const confirmRestore = await confirm(conversation, ctx, `Restore version v${versionNumber}?`, safeEnsureActive);
     if (!confirmRestore) {
       await ctx.reply('Restore cancelled.');
       return;
     }
     await storeScriptVersionSnapshot(script, 'sms', ctx);
     const updated = await updateSmsScript(script.name, stripUndefined(version.payload));
+    safeEnsureActive();
     await ctx.reply(`✅ SMS script restored to v${versionNumber}.`, { parse_mode: 'Markdown' });
     try {
       script = await fetchSmsScriptByName(script.name, { detailed: true });
+      safeEnsureActive();
     } catch (_) {}
   } catch (error) {
     if (isSessionCancellationError(error)) {
@@ -2044,9 +2051,13 @@ async function previewSmsScript(conversation, ctx, script) {
   }
 }
 
-async function showSmsScriptDetail(conversation, ctx, script) {
+async function showSmsScriptDetail(conversation, ctx, script, ensureActive) {
+  const safeEnsureActive = typeof ensureActive === 'function'
+    ? ensureActive
+    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
   let viewing = true;
   while (viewing) {
+    safeEnsureActive();
     const summary = formatSmsScriptSummary(script);
     await ctx.reply(summary, { parse_mode: 'Markdown' });
 
@@ -2068,17 +2079,18 @@ async function showSmsScriptDetail(conversation, ctx, script) {
       ctx,
       'Choose an action for this SMS script.',
       actions,
-      { prefix: 'sms-script-action', columns: 2 }
+      { prefix: 'sms-script-action', columns: 2, ensureActive: safeEnsureActive }
     );
 
     switch (action.id) {
       case 'preview':
-        await previewSmsScript(conversation, ctx, script);
+        await previewSmsScript(conversation, ctx, script, safeEnsureActive);
         break;
       case 'edit':
-        await editSmsScriptFlow(conversation, ctx, script);
+        await editSmsScriptFlow(conversation, ctx, script, safeEnsureActive);
         try {
           script = await fetchSmsScriptByName(script.name, { detailed: true });
+          safeEnsureActive();
         } catch (error) {
           console.error('Failed to refresh SMS script after edit:', error);
           await ctx.reply(formatScriptsApiError(error, 'Failed to refresh script details'));
@@ -2086,13 +2098,13 @@ async function showSmsScriptDetail(conversation, ctx, script) {
         }
         break;
       case 'clone':
-        await cloneSmsScriptFlow(conversation, ctx, script);
+        await cloneSmsScriptFlow(conversation, ctx, script, safeEnsureActive);
         break;
       case 'versions':
-        await showSmsScriptVersions(conversation, ctx, script);
+        await showSmsScriptVersions(conversation, ctx, script, safeEnsureActive);
         break;
       case 'delete':
-        await deleteSmsScriptFlow(conversation, ctx, script);
+        await deleteSmsScriptFlow(conversation, ctx, script, safeEnsureActive);
         viewing = false;
         break;
       case 'back':
@@ -2104,9 +2116,13 @@ async function showSmsScriptDetail(conversation, ctx, script) {
   }
 }
 
-async function listSmsScriptsFlow(conversation, ctx) {
+async function listSmsScriptsFlow(conversation, ctx, ensureActive) {
+  const safeEnsureActive = typeof ensureActive === 'function'
+    ? ensureActive
+    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
   try {
     const scripts = await fetchSmsScripts();
+    safeEnsureActive();
     if (!scripts.length) {
       await ctx.reply('ℹ️ No SMS scripts found. Use the create action to add one.');
       return;
@@ -2150,7 +2166,12 @@ async function listSmsScriptsFlow(conversation, ctx) {
       ctx,
       'Choose an SMS script to manage.',
       options,
-      { prefix: 'sms-script-select', columns: 1, formatLabel: (option) => option.label }
+      {
+        prefix: 'sms-script-select',
+        columns: 1,
+        formatLabel: (option) => option.label,
+        ensureActive: safeEnsureActive
+      }
     );
 
     if (!selection || !selection.id) {
@@ -2164,12 +2185,13 @@ async function listSmsScriptsFlow(conversation, ctx) {
 
     try {
       const script = await fetchSmsScriptByName(selection.id, { detailed: true });
+      safeEnsureActive();
       if (!script) {
         await ctx.reply('❌ Script not found.');
         return;
       }
 
-      await showSmsScriptDetail(conversation, ctx, script);
+      await showSmsScriptDetail(conversation, ctx, script, safeEnsureActive);
     } catch (error) {
       if (error instanceof OperationCancelledError) {
         throw error;
@@ -2186,9 +2208,13 @@ async function listSmsScriptsFlow(conversation, ctx) {
   }
 }
 
-async function smsScriptsMenu(conversation, ctx) {
+async function smsScriptsMenu(conversation, ctx, ensureActive) {
+  const safeEnsureActive = typeof ensureActive === 'function'
+    ? ensureActive
+    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
   let open = true;
   while (open) {
+    safeEnsureActive();
     const action = await askOptionWithButtons(
       conversation,
       ctx,
@@ -2198,15 +2224,15 @@ async function smsScriptsMenu(conversation, ctx) {
         { id: 'create', label: '➕ Create script' },
         { id: 'back', label: '⬅️ Back' }
       ],
-      { prefix: 'sms-script-main', columns: 1 }
+      { prefix: 'sms-script-main', columns: 1, ensureActive: safeEnsureActive }
     );
 
     switch (action.id) {
       case 'list':
-        await listSmsScriptsFlow(conversation, ctx);
+        await listSmsScriptsFlow(conversation, ctx, safeEnsureActive);
         break;
       case 'create':
-        await createSmsScriptFlow(conversation, ctx);
+        await createSmsScriptFlow(conversation, ctx, safeEnsureActive);
         break;
       case 'back':
         open = false;

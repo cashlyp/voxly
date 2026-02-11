@@ -5,6 +5,7 @@ const { ensureSession } = require('./sessionState');
 const DEFAULT_CALLBACK_TTL_MS = 15 * 60 * 1000;
 const DEFAULT_DEDUPE_TTL_MS = 8000;
 const SIGN_PREFIX = 'cb';
+const LEGACY_OP_TOKEN_PATTERN = /^[0-9a-zA-Z-]{8,}$/;
 const MENU_ACTION_LOG_INTERVAL = 25;
 const MENU_ACTIONS = new Set([
   'CALL',
@@ -119,7 +120,7 @@ function extractLegacyOpToken(rawAction) {
     return null;
   }
   const candidate = parts[1];
-  if (/^[0-9a-fA-F-]{8,}$/.test(candidate)) {
+  if (LEGACY_OP_TOKEN_PATTERN.test(candidate)) {
     return candidate.replace(/-/g, '').slice(0, 8);
   }
   return null;
