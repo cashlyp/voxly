@@ -7,7 +7,6 @@ const {
   buildCallbackData,
   matchesCallbackPrefix,
   parseCallbackData,
-  validateCallback,
   isDuplicateAction
 } = require('./actions');
 
@@ -410,8 +409,7 @@ async function askOptionWithButtons(
 
     const callbackData = selectionCtx.callbackQuery?.data || '';
     const parsedCallbackData = parseCallbackData(callbackData);
-    const validation = validateCallback(ctx, callbackData);
-    if (validation.status === 'invalid') {
+    if (parsedCallbackData.signed && !parsedCallbackData.valid) {
       await selectionCtx
         .answerCallbackQuery({
           text: '⚠️ Action no longer valid.',
@@ -421,9 +419,19 @@ async function askOptionWithButtons(
       continue;
     }
 
-    const selectionAction = validation.action || parsedCallbackData.action || callbackData;
+    const selectionAction = parsedCallbackData.action || callbackData;
     const selectionPrefix = `${prefixKey}:`;
-    if (!selectionAction.startsWith(selectionPrefix)) {
+    let selectedId = null;
+    if (selectionAction.startsWith(selectionPrefix)) {
+      selectedId = selectionAction.slice(selectionPrefix.length);
+    } else {
+      const fallbackPrefix = `${basePrefix}:`;
+      if (selectionAction.startsWith(fallbackPrefix)) {
+        const actionParts = selectionAction.split(':');
+        selectedId = actionParts[actionParts.length - 1] || null;
+      }
+    }
+    if (!selectedId) {
       await selectionCtx
         .answerCallbackQuery({
           text: '⚠️ Action no longer valid.',
@@ -432,8 +440,7 @@ async function askOptionWithButtons(
         .catch(() => {});
       continue;
     }
-    const selectedId = selectionAction.slice(selectionPrefix.length);
-    selectedOption = options.find((option) => option.id === selectedId);
+    selectedOption = options.find((option) => String(option.id) === String(selectedId));
     if (!selectedOption) {
       await selectionCtx
         .answerCallbackQuery({
