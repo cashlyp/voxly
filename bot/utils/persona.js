@@ -409,8 +409,9 @@ async function askOptionWithButtons(
     });
 
     const callbackData = selectionCtx.callbackQuery?.data || '';
+    const parsedCallbackData = parseCallbackData(callbackData);
     const validation = validateCallback(ctx, callbackData);
-    if (validation.status !== 'ok') {
+    if (validation.status === 'invalid') {
       await selectionCtx
         .answerCallbackQuery({
           text: '⚠️ Action no longer valid.',
@@ -420,7 +421,7 @@ async function askOptionWithButtons(
       continue;
     }
 
-    const selectionAction = validation.action || parseCallbackData(callbackData).action || callbackData;
+    const selectionAction = validation.action || parsedCallbackData.action || callbackData;
     const selectionPrefix = `${prefixKey}:`;
     if (!selectionAction.startsWith(selectionPrefix)) {
       await selectionCtx

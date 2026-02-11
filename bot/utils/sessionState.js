@@ -95,7 +95,9 @@ function startOperation(ctx, command, metadata = {}) {
     typeof existingOp.id === 'string' &&
     existingOp.id.length > 0
   ) {
+    const now = Date.now();
     existingOp.token = existingOp.token || existingOp.id.replace(/-/g, '').slice(0, 8);
+    existingOp.startedAt = now;
     existingOp.metadata = {
       ...(existingOp.metadata || {}),
       ...(metadata || {})
