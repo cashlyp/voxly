@@ -415,34 +415,30 @@ async function askOptionWithButtons(
 
     const callbackData = selectionCtx.callbackQuery?.data || '';
     const validation = validateCallback(ctx, callbackData);
-    if (validation.status !== 'ok') {
-      const callbackChatId = selectionCtx.callbackQuery?.message?.chat?.id || message.chat.id;
-      const callbackMessageId = selectionCtx.callbackQuery?.message?.message_id || message.message_id;
-      const latestMenuId = getLatestMenuMessageId(ctx, callbackChatId);
-      const expiredMenu =
-        validation.status === 'expired' ||
-        validation.status === 'stale' ||
-        !latestMenuId ||
-        latestMenuId !== callbackMessageId ||
-        isLatestMenuExpired(ctx, callbackChatId);
+    const callbackChatId = selectionCtx.callbackQuery?.message?.chat?.id || message.chat.id;
+    const callbackMessageId = selectionCtx.callbackQuery?.message?.message_id || message.message_id;
+    const latestMenuId = getLatestMenuMessageId(ctx, callbackChatId);
+    const expiredMenu =
+      validation.status === 'expired' ||
+      !latestMenuId ||
+      latestMenuId !== callbackMessageId ||
+      isLatestMenuExpired(ctx, callbackChatId);
 
+    if (validation.status !== 'ok' && expiredMenu) {
       await selectionCtx
         .answerCallbackQuery({
           text: '⌛ This menu expired. Use /menu to start again.',
           show_alert: false
         })
         .catch(() => {});
-
-      if (expiredMenu) {
-        try {
-          await ctx.api.editMessageReplyMarkup(message.chat.id, message.message_id);
-        } catch (_) {
-          // Ignore edit errors for stale/non-editable messages.
-        }
-        throw new OperationCancelledError('Menu expired before selection');
+      try {
+        await ctx.api.editMessageReplyMarkup(message.chat.id, message.message_id);
+      } catch (_) {
+        // Ignore edit errors for stale/non-editable messages.
       }
-      continue;
+      throw new OperationCancelledError('Menu expired before selection');
     }
+
     resolvedSelectionAction = validation.action || parseCallbackData(callbackData).action || callbackData;
 
     const callbackId = selectionCtx.callbackQuery?.id;
