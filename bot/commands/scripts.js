@@ -2307,6 +2307,9 @@ async function scriptsFlow(conversation, ctx) {
     await ctx.reply('✅ Script designer closed.');
   } catch (error) {
     if (error instanceof OperationCancelledError) {
+      if (/menu expired before selection/i.test(error.message || '')) {
+        return;
+      }
       console.log('Scripts flow cancelled:', error.message);
       return;
     }

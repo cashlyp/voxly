@@ -698,7 +698,11 @@ async function callFlow(conversation, ctx) {
     }
   } catch (error) {
     if (error instanceof OperationCancelledError || error?.name === 'AbortError' || error?.name === 'CanceledError') {
-      console.log(`Call flow cancelled: ${error?.message || error?.name || 'cancelled'}`);
+      const reason = error?.message || error?.name || 'cancelled';
+      if (/menu expired before selection/i.test(reason)) {
+        return;
+      }
+      console.log(`Call flow cancelled: ${reason}`);
       return;
     }
 

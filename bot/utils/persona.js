@@ -419,7 +419,6 @@ async function askOptionWithButtons(
     const callbackMessageId = selectionCtx.callbackQuery?.message?.message_id || message.message_id;
     const latestMenuId = getLatestMenuMessageId(ctx, callbackChatId);
     const expiredMenu =
-      validation.status === 'expired' ||
       !latestMenuId ||
       latestMenuId !== callbackMessageId ||
       isLatestMenuExpired(ctx, callbackChatId);

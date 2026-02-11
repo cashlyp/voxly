@@ -646,6 +646,27 @@ async function reopenFreshMenu(ctx, action = "") {
   await handleMenu(ctx);
 }
 
+async function reopenConversationFromStaleCallback(ctx, conversationTarget, action = "") {
+  if (conversationTarget === "call-conversation") {
+    await cancelActiveFlow(ctx, `stale_callback:${action}`);
+    resetSession(ctx);
+    await clearMenuMessages(ctx);
+    startOperation(ctx, "call");
+    await ctx.conversation.enter("call-conversation");
+    return true;
+  }
+  if (conversationTarget === "scripts-conversation") {
+    await cancelActiveFlow(ctx, `stale_callback:${action}`);
+    resetSession(ctx);
+    await clearMenuMessages(ctx);
+    startOperation(ctx, "scripts");
+    await ctx.conversation.enter("scripts-conversation");
+    return true;
+  }
+  await reopenFreshMenu(ctx, action);
+  return false;
+}
+
 // Start command handler
 bot.command("start", async (ctx) => {
   try {
@@ -758,6 +779,15 @@ bot.command("cancel", async (ctx) => {
 // Enhanced callback query handler
 bot.on("callback_query:data", async (ctx) => {
   const rawAction = ctx.callbackQuery.data;
+  const rawParsedAction = parseCallbackData(rawAction);
+  const resolvedRawAction = rawParsedAction.action || rawAction;
+  const rawParsedCallback = parseCallbackAction(resolvedRawAction);
+  const rawConversationTarget = rawParsedCallback
+    ? resolveConversationFromPrefix(
+        rawParsedCallback.prefix,
+        ctx.session?.currentOp?.command || null,
+      )
+    : null;
   const metric = startActionMetric(ctx, "callback", { raw_action: rawAction });
   const finishMetric = (status, extra = {}) => {
     finishActionMetric(metric, status, extra);
@@ -786,6 +816,31 @@ bot.on("callback_query:data", async (ctx) => {
       ? { status: "ok", action: rawAction }
       : validateCallback(ctx, rawAction);
     if (validation.status !== "ok") {
+      if (rawConversationTarget) {
+        const staleConversationKey = buildStaleConversationKey(
+          rawConversationTarget,
+          rawParsedCallback?.opId || validation.action || resolvedRawAction,
+        );
+        const firstStaleConversationNotice = !isDuplicateAction(
+          ctx,
+          staleConversationKey,
+          60 * 60 * 1000,
+        );
+        await clearCallbackMessageMarkup(ctx);
+        if (firstStaleConversationNotice) {
+          await ctx.reply("⌛ This menu expired. Reopening the menu so you can continue.");
+          await reopenConversationFromStaleCallback(
+            ctx,
+            rawConversationTarget,
+            validation.action || resolvedRawAction,
+          );
+        }
+        finishMetric(validation.status, {
+          reason: validation.reason || null,
+          conversation: rawConversationTarget,
+        });
+        return;
+      }
       const recovery = await handleInvalidCallback({
         ctx,
         rawAction,
@@ -832,12 +887,13 @@ bot.on("callback_query:data", async (ctx) => {
     }
 
     const parsedCallback = parseCallbackAction(action);
-    if (parsedCallback) {
-      const conversationTarget = resolveConversationFromPrefix(
-        parsedCallback.prefix,
-        ctx.session?.currentOp?.command || null,
-      );
-      if (conversationTarget) {
+    const conversationTarget = parsedCallback
+      ? resolveConversationFromPrefix(
+          parsedCallback.prefix,
+          ctx.session?.currentOp?.command || null,
+        )
+      : null;
+    if (parsedCallback && conversationTarget) {
         const currentOpId = ctx.session?.currentOp?.id;
         if (isConversationCallbackStale(parsedCallback, currentOpId)) {
           const staleConversationKey = buildStaleConversationKey(
@@ -851,14 +907,14 @@ bot.on("callback_query:data", async (ctx) => {
           );
           await clearCallbackMessageMarkup(ctx);
           if (firstStaleConversationNotice) {
-            await ctx.reply("⌛ This menu expired. Use /menu to start again.");
+            await ctx.reply("⌛ This menu expired. Reopening the menu so you can continue.");
+            await reopenConversationFromStaleCallback(ctx, conversationTarget, action);
           }
           finishMetric("stale");
           return;
         }
         finishMetric("routed");
         return;
-      }
     }
 
     const isMenuExemptAction = menuExemptPrefixes.some((prefix) =>
@@ -880,7 +936,12 @@ bot.on("callback_query:data", async (ctx) => {
       );
       await clearCallbackMessageMarkup(ctx);
       if (firstOrphanNotice) {
-        await ctx.reply("⌛ This menu expired. Use /menu to start again.");
+        if (conversationTarget) {
+          await ctx.reply("⌛ This menu expired. Reopening the menu so you can continue.");
+          await reopenConversationFromStaleCallback(ctx, conversationTarget, action);
+        } else {
+          await ctx.reply("⌛ This menu expired. Use /menu to start again.");
+        }
       }
       finishMetric("stale", { reason: "orphan_menu" });
       return;
@@ -894,7 +955,12 @@ bot.on("callback_query:data", async (ctx) => {
       );
       await clearCallbackMessageMarkup(ctx);
       if (firstExpiredNotice) {
-        await ctx.reply("⌛ This menu expired. Use /menu to start again.");
+        if (conversationTarget) {
+          await ctx.reply("⌛ This menu expired. Reopening the menu so you can continue.");
+          await reopenConversationFromStaleCallback(ctx, conversationTarget, action);
+        } else {
+          await ctx.reply("⌛ This menu expired. Use /menu to start again.");
+        }
       }
       finishMetric("expired");
       return;
@@ -913,7 +979,12 @@ bot.on("callback_query:data", async (ctx) => {
       );
       await clearCallbackMessageMarkup(ctx);
       if (firstStaleMenuNotice) {
-        await ctx.reply("⌛ This menu expired. Use /menu to start again.");
+        if (conversationTarget) {
+          await ctx.reply("⌛ This menu expired. Reopening the menu so you can continue.");
+          await reopenConversationFromStaleCallback(ctx, conversationTarget, action);
+        } else {
+          await ctx.reply("⌛ This menu expired. Use /menu to start again.");
+        }
       }
       finishMetric("stale");
       return;
