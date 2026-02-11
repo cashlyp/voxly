@@ -90,11 +90,19 @@ async function waitWithConversationTimeout(waitFactory, ctx, conversationName) {
       error instanceof OperationCancelledError &&
       /timed out due to inactivity/i.test(error.message || "")
     ) {
+      ensureSession(ctx);
+      const alreadyNotified = ctx.session.timeoutNotified === true;
+      ctx.session.timeoutNotified = true;
+      try {
+        await cancelActiveFlow(ctx, `timeout:${conversationName}`);
+      } catch (_) {}
       try {
         await clearMenuMessages(ctx);
       } catch (_) {}
       resetSession(ctx);
-      await ctx.reply("⌛ Session timed out due to inactivity. Use /menu to start again.");
+      if (!alreadyNotified) {
+        await ctx.reply("⌛ Session timed out due to inactivity. Use /menu to start again.");
+      }
     }
     throw error;
   } finally {
@@ -581,6 +589,8 @@ function resolveConversationFromPrefix(prefix) {
 // Start command handler
 bot.command("start", async (ctx) => {
   try {
+    ensureSession(ctx);
+    ctx.session.timeoutNotified = false;
     expireInactiveUsers();
 
     const access = await getAccessProfile(ctx);

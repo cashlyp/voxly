@@ -118,6 +118,18 @@ class VonageVoiceAdapter {
     }
     await this.client.voice.updateCall(callUuid, { action: "hangup" });
   }
+
+  async transferCallWithURL(callUuid, url) {
+    if (!callUuid) {
+      throw new Error("VonageVoiceAdapter.transferCallWithURL requires call UUID");
+    }
+    if (!isValidHttpsUrl(url)) {
+      throw new Error(
+        "VonageVoiceAdapter.transferCallWithURL requires a valid HTTPS URL",
+      );
+    }
+    await this.client.voice.transferCallWithURL(callUuid, url);
+  }
 }
 
 module.exports = VonageVoiceAdapter;

@@ -99,6 +99,38 @@ const deepgramVoiceAgentMaxConsecutiveToolFailures = Number(
 const deepgramVoiceAgentTimeoutFallbackThreshold = Number(
   readEnv("DEEPGRAM_VOICE_AGENT_TIMEOUT_FALLBACK_THRESHOLD") || "2",
 );
+const deepgramVoiceAgentConnectTimeoutMs = Number(
+  readEnv("DEEPGRAM_VOICE_AGENT_CONNECT_TIMEOUT_MS") || "15000",
+);
+const deepgramVoiceAgentCircuitWindowMs = Number(
+  readEnv("DEEPGRAM_VOICE_AGENT_CIRCUIT_WINDOW_MS") || "120000",
+);
+const deepgramVoiceAgentCircuitFailureThreshold = Number(
+  readEnv("DEEPGRAM_VOICE_AGENT_CIRCUIT_FAILURE_THRESHOLD") || "6",
+);
+const deepgramVoiceAgentCircuitCooldownMs = Number(
+  readEnv("DEEPGRAM_VOICE_AGENT_CIRCUIT_COOLDOWN_MS") || "180000",
+);
+const deepgramVoiceAgentFallbackMaxAttempts = Number(
+  readEnv("DEEPGRAM_VOICE_AGENT_FALLBACK_MAX_ATTEMPTS") || "3",
+);
+const deepgramVoiceAgentFallbackMaxRedirectsPerCall = Number(
+  readEnv("DEEPGRAM_VOICE_AGENT_FALLBACK_MAX_REDIRECTS_PER_CALL") || "2",
+);
+const deepgramVoiceAgentFallbackBaseDelayMs = Number(
+  readEnv("DEEPGRAM_VOICE_AGENT_FALLBACK_BASE_DELAY_MS") || "400",
+);
+const deepgramVoiceAgentFallbackMaxDelayMs = Number(
+  readEnv("DEEPGRAM_VOICE_AGENT_FALLBACK_MAX_DELAY_MS") || "2500",
+);
+const deepgramVoiceAgentFallbackRequestTimeoutMs = Number(
+  readEnv("DEEPGRAM_VOICE_AGENT_FALLBACK_REQUEST_TIMEOUT_MS") || "8000",
+);
+const deepgramVoiceAgentFallbackSkipCloseCodes = parseList(
+  readEnv("DEEPGRAM_VOICE_AGENT_FALLBACK_SKIP_CLOSE_CODES") || "1000,1001",
+)
+  .map((value) => Number(value))
+  .filter((value) => Number.isFinite(value) && value > 0);
 const twilioGatherFallback =
   String(readEnv("TWILIO_GATHER_FALLBACK") || "true").toLowerCase() === "true";
 const twilioMachineDetection = readEnv("TWILIO_MACHINE_DETECTION") || "Enable";
@@ -555,6 +587,40 @@ module.exports = {
         )
           ? deepgramVoiceAgentTimeoutFallbackThreshold
           : 2,
+        connectTimeoutMs: Number.isFinite(deepgramVoiceAgentConnectTimeoutMs)
+          ? deepgramVoiceAgentConnectTimeoutMs
+          : 15000,
+        circuitWindowMs: Number.isFinite(deepgramVoiceAgentCircuitWindowMs)
+          ? deepgramVoiceAgentCircuitWindowMs
+          : 120000,
+        circuitFailureThreshold: Number.isFinite(
+          deepgramVoiceAgentCircuitFailureThreshold,
+        )
+          ? deepgramVoiceAgentCircuitFailureThreshold
+          : 6,
+        circuitCooldownMs: Number.isFinite(deepgramVoiceAgentCircuitCooldownMs)
+          ? deepgramVoiceAgentCircuitCooldownMs
+          : 180000,
+        fallbackMaxAttempts: Number.isFinite(deepgramVoiceAgentFallbackMaxAttempts)
+          ? deepgramVoiceAgentFallbackMaxAttempts
+          : 3,
+        fallbackMaxRedirectsPerCall: Number.isFinite(
+          deepgramVoiceAgentFallbackMaxRedirectsPerCall,
+        )
+          ? deepgramVoiceAgentFallbackMaxRedirectsPerCall
+          : 2,
+        fallbackBaseDelayMs: Number.isFinite(deepgramVoiceAgentFallbackBaseDelayMs)
+          ? deepgramVoiceAgentFallbackBaseDelayMs
+          : 400,
+        fallbackMaxDelayMs: Number.isFinite(deepgramVoiceAgentFallbackMaxDelayMs)
+          ? deepgramVoiceAgentFallbackMaxDelayMs
+          : 2500,
+        fallbackRequestTimeoutMs: Number.isFinite(
+          deepgramVoiceAgentFallbackRequestTimeoutMs,
+        )
+          ? deepgramVoiceAgentFallbackRequestTimeoutMs
+          : 8000,
+        fallbackSkipCloseCodes: deepgramVoiceAgentFallbackSkipCloseCodes,
       },
     },
   },

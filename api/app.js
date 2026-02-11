@@ -1115,6 +1115,23 @@ function getVoiceAgentRuntimeConfig() {
   const maxToolResponseChars = Number(runtime.maxToolResponseChars);
   const maxConsecutiveToolFailures = Number(runtime.maxConsecutiveToolFailures);
   const timeoutFallbackThreshold = Number(runtime.timeoutFallbackThreshold);
+  const circuitWindowMs = Number(runtime.circuitWindowMs);
+  const circuitFailureThreshold = Number(runtime.circuitFailureThreshold);
+  const circuitCooldownMs = Number(runtime.circuitCooldownMs);
+  const connectTimeoutMs = Number(runtime.connectTimeoutMs);
+  const fallbackMaxAttempts = Number(runtime.fallbackMaxAttempts);
+  const fallbackMaxRedirectsPerCall = Number(
+    runtime.fallbackMaxRedirectsPerCall,
+  );
+  const fallbackBaseDelayMs = Number(runtime.fallbackBaseDelayMs);
+  const fallbackMaxDelayMs = Number(runtime.fallbackMaxDelayMs);
+  const fallbackRequestTimeoutMs = Number(runtime.fallbackRequestTimeoutMs);
+  const fallbackSkipCloseCodesRaw = Array.isArray(runtime.fallbackSkipCloseCodes)
+    ? runtime.fallbackSkipCloseCodes
+    : [];
+  const fallbackSkipCloseCodes = fallbackSkipCloseCodesRaw
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value) && value > 0);
   return {
     turnTimeoutMs:
       Number.isFinite(turnTimeoutMs) && turnTimeoutMs > 0 ? turnTimeoutMs : 12000,
@@ -1133,7 +1150,326 @@ function getVoiceAgentRuntimeConfig() {
       Number.isFinite(timeoutFallbackThreshold) && timeoutFallbackThreshold >= 0
         ? Math.round(timeoutFallbackThreshold)
         : 2,
+    circuitWindowMs:
+      Number.isFinite(circuitWindowMs) && circuitWindowMs > 0
+        ? Math.round(circuitWindowMs)
+        : 120000,
+    circuitFailureThreshold:
+      Number.isFinite(circuitFailureThreshold) && circuitFailureThreshold > 0
+        ? Math.round(circuitFailureThreshold)
+        : 6,
+    circuitCooldownMs:
+      Number.isFinite(circuitCooldownMs) && circuitCooldownMs > 0
+        ? Math.round(circuitCooldownMs)
+        : 180000,
+    connectTimeoutMs:
+      Number.isFinite(connectTimeoutMs) && connectTimeoutMs > 0
+        ? Math.round(connectTimeoutMs)
+        : 15000,
+    fallbackMaxAttempts:
+      Number.isFinite(fallbackMaxAttempts) && fallbackMaxAttempts > 0
+        ? Math.round(fallbackMaxAttempts)
+        : 3,
+    fallbackMaxRedirectsPerCall:
+      Number.isFinite(fallbackMaxRedirectsPerCall) &&
+      fallbackMaxRedirectsPerCall > 0
+        ? Math.round(fallbackMaxRedirectsPerCall)
+        : 2,
+    fallbackBaseDelayMs:
+      Number.isFinite(fallbackBaseDelayMs) && fallbackBaseDelayMs > 0
+        ? Math.round(fallbackBaseDelayMs)
+        : 400,
+    fallbackMaxDelayMs:
+      Number.isFinite(fallbackMaxDelayMs) && fallbackMaxDelayMs > 0
+        ? Math.round(fallbackMaxDelayMs)
+        : 2500,
+    fallbackRequestTimeoutMs:
+      Number.isFinite(fallbackRequestTimeoutMs) && fallbackRequestTimeoutMs > 0
+        ? Math.round(fallbackRequestTimeoutMs)
+        : 8000,
+    fallbackSkipCloseCodes,
   };
+}
+
+const VOICE_AGENT_TERMINAL_PHASES = new Set([
+  "fallback_redirecting",
+  "legacy_active",
+  "ending",
+  "ended",
+  "failed",
+]);
+
+const VOICE_AGENT_PHASE_TRANSITIONS = {
+  idle: new Set(["connecting", "connected", "legacy_active", "failed", "ending"]),
+  connecting: new Set(["connected", "fallback_redirecting", "legacy_active", "failed", "ending"]),
+  connected: new Set([
+    "user_speaking",
+    "interrupted",
+    "agent_responding",
+    "agent_speaking",
+    "timeout_waiting_agent",
+    "fallback_redirecting",
+    "legacy_active",
+    "ending",
+    "failed",
+  ]),
+  user_speaking: new Set([
+    "interrupted",
+    "agent_responding",
+    "agent_speaking",
+    "timeout_waiting_agent",
+    "fallback_redirecting",
+    "legacy_active",
+    "ending",
+    "failed",
+  ]),
+  interrupted: new Set([
+    "agent_responding",
+    "agent_speaking",
+    "timeout_waiting_agent",
+    "fallback_redirecting",
+    "legacy_active",
+    "ending",
+    "failed",
+  ]),
+  agent_responding: new Set([
+    "agent_speaking",
+    "user_speaking",
+    "interrupted",
+    "timeout_waiting_agent",
+    "fallback_redirecting",
+    "legacy_active",
+    "ending",
+    "failed",
+  ]),
+  agent_speaking: new Set([
+    "user_speaking",
+    "interrupted",
+    "agent_responding",
+    "fallback_redirecting",
+    "legacy_active",
+    "ending",
+    "failed",
+  ]),
+  timeout_waiting_agent: new Set([
+    "agent_responding",
+    "agent_speaking",
+    "fallback_redirecting",
+    "legacy_active",
+    "ending",
+    "failed",
+  ]),
+  fallback_redirecting: new Set(["legacy_active", "ending", "failed"]),
+  legacy_active: new Set(["ending", "ended", "failed"]),
+  ending: new Set(["ended"]),
+  failed: new Set(["ending", "ended"]),
+  ended: new Set([]),
+};
+
+const VOICE_AGENT_CIRCUIT_STATE_SETTING_KEY = "voice_agent_circuit_state_v1";
+const VOICE_AGENT_CIRCUIT_PERSIST_DEBOUNCE_MS = 500;
+const VOICE_AGENT_CIRCUIT_PROVIDER_KEYS = new Set([
+  "twilio",
+  "vonage",
+  "aws",
+  "unknown",
+]);
+
+let voiceAgentCircuitPersistTimer = null;
+let voiceAgentCircuitHydrated = false;
+
+function createVoiceAgentCircuitProviderState() {
+  return {
+    openedUntilMs: 0,
+    failureTimestampsMs: [],
+  };
+}
+
+function normalizeVoiceAgentProviderName(provider = "unknown") {
+  const normalized = String(provider || "")
+    .toLowerCase()
+    .trim();
+  if (!normalized) return "unknown";
+  if (VOICE_AGENT_CIRCUIT_PROVIDER_KEYS.has(normalized)) return normalized;
+  if (["amazon", "aws_connect", "awsconnect"].includes(normalized)) {
+    return "aws";
+  }
+  return "unknown";
+}
+
+const voiceAgentCircuitState = {
+  providers: {
+    twilio: createVoiceAgentCircuitProviderState(),
+    vonage: createVoiceAgentCircuitProviderState(),
+    aws: createVoiceAgentCircuitProviderState(),
+    unknown: createVoiceAgentCircuitProviderState(),
+  },
+  updatedAtMs: 0,
+};
+
+function getVoiceAgentCircuitProviderState(provider = "unknown") {
+  const normalizedProvider = normalizeVoiceAgentProviderName(provider);
+  if (!voiceAgentCircuitState.providers[normalizedProvider]) {
+    voiceAgentCircuitState.providers[normalizedProvider] =
+      createVoiceAgentCircuitProviderState();
+  }
+  return voiceAgentCircuitState.providers[normalizedProvider];
+}
+
+function getVoiceAgentCircuitSnapshot() {
+  const providers = {};
+  for (const provider of VOICE_AGENT_CIRCUIT_PROVIDER_KEYS) {
+    const state = getVoiceAgentCircuitProviderState(provider);
+    providers[provider] = {
+      openedUntilMs:
+        Number.isFinite(Number(state?.openedUntilMs)) && Number(state.openedUntilMs) > 0
+          ? Number(state.openedUntilMs)
+          : 0,
+      failureTimestampsMs: Array.isArray(state?.failureTimestampsMs)
+        ? state.failureTimestampsMs
+            .map((ts) => Number(ts))
+            .filter((ts) => Number.isFinite(ts) && ts > 0)
+        : [],
+    };
+  }
+  return {
+    version: 1,
+    updatedAtMs: Date.now(),
+    providers,
+  };
+}
+
+function applyVoiceAgentCircuitSnapshot(snapshot = {}) {
+  if (!snapshot || typeof snapshot !== "object") return false;
+  const providers = snapshot?.providers;
+  if (!providers || typeof providers !== "object") return false;
+  for (const provider of VOICE_AGENT_CIRCUIT_PROVIDER_KEYS) {
+    const source = providers[provider] || {};
+    voiceAgentCircuitState.providers[provider] = {
+      openedUntilMs:
+        Number.isFinite(Number(source?.openedUntilMs)) && Number(source.openedUntilMs) > 0
+          ? Number(source.openedUntilMs)
+          : 0,
+      failureTimestampsMs: Array.isArray(source?.failureTimestampsMs)
+        ? source.failureTimestampsMs
+            .map((ts) => Number(ts))
+            .filter((ts) => Number.isFinite(ts) && ts > 0)
+        : [],
+    };
+  }
+  voiceAgentCircuitState.updatedAtMs =
+    Number.isFinite(Number(snapshot?.updatedAtMs)) && Number(snapshot.updatedAtMs) > 0
+      ? Number(snapshot.updatedAtMs)
+      : Date.now();
+  return true;
+}
+
+async function persistVoiceAgentCircuitStateNow() {
+  if (!db?.setSetting) return false;
+  try {
+    const payload = JSON.stringify(getVoiceAgentCircuitSnapshot());
+    await db.setSetting(VOICE_AGENT_CIRCUIT_STATE_SETTING_KEY, payload);
+    return true;
+  } catch (error) {
+    console.warn(
+      `Failed to persist voice-agent circuit state: ${error?.message || error}`,
+    );
+    return false;
+  }
+}
+
+function scheduleVoiceAgentCircuitPersistence() {
+  if (!db?.setSetting) return;
+  if (voiceAgentCircuitPersistTimer) return;
+  voiceAgentCircuitPersistTimer = setTimeout(() => {
+    voiceAgentCircuitPersistTimer = null;
+    void persistVoiceAgentCircuitStateNow();
+  }, VOICE_AGENT_CIRCUIT_PERSIST_DEBOUNCE_MS);
+}
+
+async function loadPersistedVoiceAgentCircuitState() {
+  if (voiceAgentCircuitHydrated) return false;
+  voiceAgentCircuitHydrated = true;
+  if (!db?.getSetting) return false;
+  try {
+    const raw = await db.getSetting(VOICE_AGENT_CIRCUIT_STATE_SETTING_KEY);
+    if (!raw) return false;
+    const parsed = JSON.parse(String(raw));
+    const restored = applyVoiceAgentCircuitSnapshot(parsed);
+    if (restored) {
+      console.log("Loaded persisted voice-agent circuit state");
+      return true;
+    }
+  } catch (error) {
+    console.warn(
+      `Failed to load voice-agent circuit state: ${error?.message || error}`,
+    );
+  }
+  return false;
+}
+
+function pruneVoiceAgentCircuitFailures(provider = "unknown", nowMs = Date.now()) {
+  const { circuitWindowMs } = getVoiceAgentRuntimeConfig();
+  const providerState = getVoiceAgentCircuitProviderState(provider);
+  providerState.failureTimestampsMs = providerState.failureTimestampsMs.filter(
+    (ts) => Number(ts) > 0 && nowMs - ts <= circuitWindowMs,
+  );
+  return providerState;
+}
+
+function isVoiceAgentCircuitOpen(provider = "unknown") {
+  const normalizedProvider = normalizeVoiceAgentProviderName(provider);
+  const providerState = getVoiceAgentCircuitProviderState(normalizedProvider);
+  const nowMs = Date.now();
+  if (providerState.openedUntilMs > nowMs) {
+    return true;
+  }
+  if (providerState.openedUntilMs && providerState.openedUntilMs <= nowMs) {
+    providerState.openedUntilMs = 0;
+    pruneVoiceAgentCircuitFailures(normalizedProvider, nowMs);
+    scheduleVoiceAgentCircuitPersistence();
+  }
+  return false;
+}
+
+function recordVoiceAgentCircuitFailure(reason = "unknown", meta = {}) {
+  const provider = normalizeVoiceAgentProviderName(meta?.provider || "unknown");
+  const nowMs = Date.now();
+  const runtimeCfg = getVoiceAgentRuntimeConfig();
+  const providerState = getVoiceAgentCircuitProviderState(provider);
+  providerState.failureTimestampsMs.push(nowMs);
+  pruneVoiceAgentCircuitFailures(provider, nowMs);
+  if (isVoiceAgentCircuitOpen(provider)) {
+    scheduleVoiceAgentCircuitPersistence();
+    return;
+  }
+  if (providerState.failureTimestampsMs.length >= runtimeCfg.circuitFailureThreshold) {
+    providerState.openedUntilMs = nowMs + runtimeCfg.circuitCooldownMs;
+    console.error(
+      `Voice agent circuit opened for ${runtimeCfg.circuitCooldownMs}ms (failures=${providerState.failureTimestampsMs.length}, reason=${reason}, provider=${provider}, callSid=${meta.callSid || "unknown"})`,
+    );
+  }
+  scheduleVoiceAgentCircuitPersistence();
+}
+
+function recordVoiceAgentCircuitRecovery(provider = "unknown") {
+  const normalizedProvider = normalizeVoiceAgentProviderName(provider);
+  if (isVoiceAgentCircuitOpen(normalizedProvider)) {
+    return;
+  }
+  const nowMs = Date.now();
+  const providerState = pruneVoiceAgentCircuitFailures(normalizedProvider, nowMs);
+  if (providerState.failureTimestampsMs.length) {
+    providerState.failureTimestampsMs.shift();
+    scheduleVoiceAgentCircuitPersistence();
+  }
+}
+
+function canTransitionVoiceAgentPhase(currentPhase, nextPhase) {
+  if (!currentPhase || currentPhase === nextPhase) return true;
+  const allowedNext = VOICE_AGENT_PHASE_TRANSITIONS[String(currentPhase)] || null;
+  if (!allowedNext) return true;
+  return allowedNext.has(String(nextPhase));
 }
 
 function getOrCreateVoiceAgentRuntimeState(callSid) {
@@ -1149,6 +1485,9 @@ function getOrCreateVoiceAgentRuntimeState(callSid) {
       consecutiveToolFailures: 0,
       toolsDisabled: false,
       fallbackRequested: false,
+      phaseLocked: false,
+      phaseTransitionsRejected: 0,
+      fallbackReason: null,
     });
   }
   return voiceAgentRuntimeByCall.get(callSid);
@@ -1160,11 +1499,78 @@ function setVoiceAgentRuntimeProvider(callSid, provider = "unknown") {
   state.provider = String(provider || "unknown").toLowerCase();
 }
 
-function setVoiceAgentPhase(callSid, phase) {
+function setVoiceAgentPhase(callSid, phase, options = {}) {
   const state = getOrCreateVoiceAgentRuntimeState(callSid);
   if (!state || !phase) return;
-  state.phase = String(phase);
+  const nextPhase = String(phase);
+  const force = options?.force === true;
+  if (state.phaseLocked && !force) {
+    return;
+  }
+  if (!force && !canTransitionVoiceAgentPhase(state.phase, nextPhase)) {
+    state.phaseTransitionsRejected = (state.phaseTransitionsRejected || 0) + 1;
+    console.warn(
+      `Voice agent phase transition rejected for ${callSid}: ${state.phase} -> ${nextPhase}`,
+    );
+    return;
+  }
+  state.phase = nextPhase;
   state.phaseAt = new Date().toISOString();
+  if (VOICE_AGENT_TERMINAL_PHASES.has(nextPhase) || options?.lock === true) {
+    state.phaseLocked = true;
+  }
+}
+
+function beginVoiceAgentFallback(callSid, reason = "unknown") {
+  const state = getOrCreateVoiceAgentRuntimeState(callSid);
+  if (!state) return false;
+  if (state.fallbackRequested || state.phaseLocked) {
+    return false;
+  }
+  state.fallbackRequested = true;
+  state.fallbackReason = String(reason || "unknown");
+  setVoiceAgentPhase(callSid, "fallback_redirecting", { force: true, lock: true });
+  return true;
+}
+
+async function beginVoiceAgentFallbackIfAllowed(
+  callSid,
+  reason = "unknown",
+  options = {},
+) {
+  if (!callSid) {
+    return { started: false, skipped: true, skipReason: "missing_call_sid" };
+  }
+  const closeCode = Number(options?.closeCode || 0);
+  const source = String(options?.source || "unknown");
+  const skipReason = await resolveVoiceAgentFallbackSkipReason(callSid, {
+    closeCode,
+    source,
+  });
+  if (skipReason) {
+    trackVoiceAgentFallbackMetric(callSid, "voice_agent_fallback_skipped", 1, {
+      reason: String(reason || "unknown"),
+      source,
+      skip_reason: skipReason,
+      close_code: Number.isFinite(closeCode) && closeCode > 0 ? closeCode : null,
+    });
+    await db
+      ?.updateCallState?.(callSid, "voice_agent_fallback_skipped", {
+        at: new Date().toISOString(),
+        reason: String(reason || "unknown"),
+        source,
+        skip_reason: skipReason,
+        close_code: Number.isFinite(closeCode) && closeCode > 0 ? closeCode : null,
+      })
+      .catch(() => {});
+    return { started: false, skipped: true, skipReason };
+  }
+  const started = beginVoiceAgentFallback(callSid, reason);
+  return {
+    started,
+    skipped: false,
+    skipReason: started ? null : "already_in_progress",
+  };
 }
 
 function clearVoiceAgentTurnWatchdog(callSid) {
@@ -1302,6 +1708,22 @@ function resetVoiceAgentRuntimeForTests() {
   for (const callSid of voiceAgentRuntimeByCall.keys()) {
     clearVoiceAgentRuntime(callSid);
   }
+}
+
+function resetVoiceAgentCircuitStateForTests() {
+  if (voiceAgentCircuitPersistTimer) {
+    clearTimeout(voiceAgentCircuitPersistTimer);
+    voiceAgentCircuitPersistTimer = null;
+  }
+  for (const provider of VOICE_AGENT_CIRCUIT_PROVIDER_KEYS) {
+    voiceAgentCircuitState.providers[provider] = createVoiceAgentCircuitProviderState();
+  }
+  voiceAgentCircuitState.updatedAtMs = 0;
+  voiceAgentCircuitHydrated = false;
+}
+
+function setDbForTests(nextDb = null) {
+  db = nextDb;
 }
 
 function queuePendingDigitAction(callSid, action = {}) {
@@ -5558,7 +5980,10 @@ async function startServer(options = {}) {
     await loadStoredEmailProvider();
     await refreshInboundDefaultScript(true);
     await loadKeypadProviderOverrides();
-    const voiceAgentMode = resolveVoiceAgentExecutionMode();
+    await loadPersistedVoiceAgentCircuitState();
+    const voiceAgentMode = resolveVoiceAgentExecutionMode(
+      currentProvider || storedProvider || "unknown",
+    );
     logStartupRuntimeProfile(voiceAgentMode);
     console.log(
       `☎️ Default call provider: ${String(storedProvider || currentProvider || "twilio").toUpperCase()} (active: ${String(currentProvider || "twilio").toUpperCase()})`,
@@ -5641,13 +6066,15 @@ function buildVoiceAgentFunctions(functionSystem = null) {
     .filter(Boolean);
 }
 
-function resolveVoiceAgentExecutionMode() {
+function resolveVoiceAgentExecutionMode(provider = "unknown") {
+  const normalizedProvider = normalizeVoiceAgentProviderName(provider);
   const requested = config.deepgram?.voiceAgent?.enabled === true;
   if (!requested) {
     return {
       requested: false,
       enabled: false,
       reason: "disabled_by_config",
+      provider: normalizedProvider,
     };
   }
   if (!config.deepgram?.apiKey) {
@@ -5655,6 +6082,7 @@ function resolveVoiceAgentExecutionMode() {
       requested: true,
       enabled: false,
       reason: "missing_deepgram_api_key",
+      provider: normalizedProvider,
     };
   }
   if (!String(config.deepgram?.voiceAgent?.endpoint || "").trim()) {
@@ -5662,16 +6090,32 @@ function resolveVoiceAgentExecutionMode() {
       requested: true,
       enabled: false,
       reason: "missing_voice_agent_endpoint",
+      provider: normalizedProvider,
+    };
+  }
+  if (isVoiceAgentCircuitOpen(normalizedProvider)) {
+    return {
+      requested: true,
+      enabled: false,
+      reason: `circuit_open_${normalizedProvider}`,
+      provider: normalizedProvider,
     };
   }
   return {
     requested: true,
     enabled: true,
     reason: "configured",
+    provider: normalizedProvider,
   };
 }
 
 function logStartupRuntimeProfile(voiceAgentMode) {
+  const fallbackPolicy = getVoiceAgentFallbackPolicy();
+  const circuitByProvider = {
+    twilio: isVoiceAgentCircuitOpen("twilio"),
+    vonage: isVoiceAgentCircuitOpen("vonage"),
+    aws: isVoiceAgentCircuitOpen("aws"),
+  };
   const envCallProvider = String(config.platform?.provider || "twilio").toLowerCase();
   const envSmsProvider = String(
     config.sms?.provider || config.platform?.provider || "twilio",
@@ -5714,10 +6158,303 @@ function logStartupRuntimeProfile(voiceAgentMode) {
       requested: Boolean(voiceAgentMode?.requested),
       enabled: Boolean(voiceAgentMode?.enabled),
       reason: String(voiceAgentMode?.reason || "unknown"),
+      provider: normalizeVoiceAgentProviderName(voiceAgentMode?.provider || "unknown"),
       endpoint: config.deepgram?.voiceAgent?.endpoint || null,
+      circuit_open: Boolean(
+        circuitByProvider[
+          normalizeVoiceAgentProviderName(voiceAgentMode?.provider || "unknown")
+        ],
+      ),
+      circuit_by_provider: circuitByProvider,
+      runtime: {
+        connect_timeout_ms: fallbackPolicy.connectTimeoutMs,
+        fallback_max_attempts: fallbackPolicy.maxAttempts,
+        fallback_max_redirects_per_call: fallbackPolicy.maxRedirectsPerCall,
+        fallback_request_timeout_ms: fallbackPolicy.requestTimeoutMs,
+        fallback_skip_close_codes: Array.from(fallbackPolicy.skipCloseCodes),
+      },
     },
   };
   console.log(JSON.stringify(payload));
+}
+
+const VOICE_AGENT_FALLBACK_MAX_ATTEMPTS = 3;
+const VOICE_AGENT_MAX_LEGACY_REDIRECTS_PER_CALL = 2;
+const VOICE_AGENT_FALLBACK_BASE_DELAY_MS = 400;
+const VOICE_AGENT_FALLBACK_MAX_DELAY_MS = 2500;
+const VOICE_AGENT_FALLBACK_REQUEST_TIMEOUT_MS = 8000;
+const VOICE_AGENT_CONNECT_TIMEOUT_MS = 15000;
+const VOICE_AGENT_FALLBACK_SKIP_CLOSE_CODES = new Set([1000, 1001]);
+const VOICE_AGENT_TERMINAL_CALL_STATUSES = new Set([
+  "completed",
+  "no-answer",
+  "busy",
+  "failed",
+  "canceled",
+  "cancelled",
+]);
+
+function getVoiceAgentFallbackPolicy() {
+  const runtimeCfg = getVoiceAgentRuntimeConfig();
+  const fallbackMaxAttempts = Number(runtimeCfg?.fallbackMaxAttempts);
+  const fallbackMaxRedirectsPerCall = Number(
+    runtimeCfg?.fallbackMaxRedirectsPerCall,
+  );
+  const fallbackBaseDelayMs = Number(runtimeCfg?.fallbackBaseDelayMs);
+  const fallbackMaxDelayMs = Number(runtimeCfg?.fallbackMaxDelayMs);
+  const fallbackRequestTimeoutMs = Number(runtimeCfg?.fallbackRequestTimeoutMs);
+  const connectTimeoutMs = Number(runtimeCfg?.connectTimeoutMs);
+  const rawSkipCloseCodes = Array.isArray(runtimeCfg?.fallbackSkipCloseCodes)
+    ? runtimeCfg.fallbackSkipCloseCodes
+    : [];
+  const configuredSkipCloseCodes = rawSkipCloseCodes
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  const skipCloseCodes = new Set(
+    configuredSkipCloseCodes.length
+      ? configuredSkipCloseCodes
+      : Array.from(VOICE_AGENT_FALLBACK_SKIP_CLOSE_CODES),
+  );
+
+  return {
+    maxAttempts:
+      Number.isFinite(fallbackMaxAttempts) && fallbackMaxAttempts > 0
+        ? Math.round(fallbackMaxAttempts)
+        : VOICE_AGENT_FALLBACK_MAX_ATTEMPTS,
+    maxRedirectsPerCall:
+      Number.isFinite(fallbackMaxRedirectsPerCall) &&
+      fallbackMaxRedirectsPerCall > 0
+        ? Math.round(fallbackMaxRedirectsPerCall)
+        : VOICE_AGENT_MAX_LEGACY_REDIRECTS_PER_CALL,
+    baseDelayMs:
+      Number.isFinite(fallbackBaseDelayMs) && fallbackBaseDelayMs > 0
+        ? Math.round(fallbackBaseDelayMs)
+        : VOICE_AGENT_FALLBACK_BASE_DELAY_MS,
+    maxDelayMs:
+      Number.isFinite(fallbackMaxDelayMs) && fallbackMaxDelayMs > 0
+        ? Math.round(fallbackMaxDelayMs)
+        : VOICE_AGENT_FALLBACK_MAX_DELAY_MS,
+    requestTimeoutMs:
+      Number.isFinite(fallbackRequestTimeoutMs) && fallbackRequestTimeoutMs > 0
+        ? Math.round(fallbackRequestTimeoutMs)
+        : VOICE_AGENT_FALLBACK_REQUEST_TIMEOUT_MS,
+    connectTimeoutMs:
+      Number.isFinite(connectTimeoutMs) && connectTimeoutMs > 0
+        ? Math.round(connectTimeoutMs)
+        : VOICE_AGENT_CONNECT_TIMEOUT_MS,
+    skipCloseCodes,
+  };
+}
+
+function normalizeVoiceAgentCallStatus(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/_/g, "-")
+    .trim();
+}
+
+function trackVoiceAgentFallbackMetric(callSid, metric, value = 1, meta = {}) {
+  db?.addCallMetric?.(callSid, metric, value, meta).catch(() => {});
+}
+
+async function resolveVoiceAgentFallbackSkipReason(
+  callSid,
+  options = {},
+) {
+  if (!callSid) {
+    return "missing_call_sid";
+  }
+  const closeCode = Number(options?.closeCode || 0);
+  const fallbackPolicy = getVoiceAgentFallbackPolicy();
+  if (
+    Number.isFinite(closeCode) &&
+    closeCode > 0 &&
+    fallbackPolicy.skipCloseCodes.has(closeCode)
+  ) {
+    return `close_code_${closeCode}`;
+  }
+
+  if (!db?.getCall) {
+    return null;
+  }
+  try {
+    const call = await db.getCall(callSid);
+    const status = normalizeVoiceAgentCallStatus(
+      call?.status || call?.twilio_status,
+    );
+    if (VOICE_AGENT_TERMINAL_CALL_STATUSES.has(status)) {
+      return `terminal_status_${status}`;
+    }
+  } catch (_) {}
+  return null;
+}
+
+function waitMs(ms) {
+  const safeMs = Number(ms);
+  if (!Number.isFinite(safeMs) || safeMs <= 0) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    setTimeout(resolve, safeMs);
+  });
+}
+
+function computeVoiceAgentFallbackDelay(attempt) {
+  const fallbackPolicy = getVoiceAgentFallbackPolicy();
+  const exp = Math.max(0, Number(attempt) - 1);
+  const baseDelay = Math.min(
+    fallbackPolicy.baseDelayMs * Math.pow(2, exp),
+    fallbackPolicy.maxDelayMs,
+  );
+  const jitter = Math.floor(Math.random() * 250);
+  return baseDelay + jitter;
+}
+
+function classifyVoiceAgentFallbackError(error) {
+  const status = Number(
+    error?.status || error?.statusCode || error?.codeStatus || 0,
+  );
+  const codeRaw = String(
+    error?.code || error?.errno || error?.cause?.code || "",
+  ).toUpperCase();
+  const parsedProviderCode = Number(codeRaw);
+  const providerCode =
+    Number.isFinite(parsedProviderCode) && parsedProviderCode > 0
+      ? parsedProviderCode
+      : null;
+  if (codeRaw === "VOICE_AGENT_FALLBACK_LOOP_GUARD") {
+    return {
+      retryable: false,
+      category: "fallback_loop_guard",
+      status: Number.isFinite(status) && status > 0 ? status : null,
+      providerCode,
+      code: codeRaw,
+    };
+  }
+  if (codeRaw === "VOICE_AGENT_FALLBACK_SKIPPED") {
+    return {
+      retryable: false,
+      category: "fallback_skipped",
+      status: Number.isFinite(status) && status > 0 ? status : null,
+      providerCode,
+      code: codeRaw,
+    };
+  }
+
+  if (Number.isFinite(status) && [400, 401, 403, 404, 422].includes(status)) {
+    return {
+      retryable: false,
+      category: "http_non_retryable",
+      status,
+      providerCode,
+      code: codeRaw || null,
+    };
+  }
+
+  const nonRetryableProviderCodes = new Set([
+    20003, // Authentication Error
+    20004, // Permission Denied
+    21211, // Invalid 'To' Phone Number
+    21212, // Invalid 'From' Phone Number
+    21214, // 'To' number cannot be reached
+    21401, // Invalid action
+    21610, // Message blocked/unsubscribed style permanent errors
+  ]);
+  if (providerCode && nonRetryableProviderCodes.has(providerCode)) {
+    return {
+      retryable: false,
+      category: "provider_non_retryable",
+      status: Number.isFinite(status) && status > 0 ? status : null,
+      providerCode,
+      code: codeRaw || null,
+    };
+  }
+
+  if ([408, 409, 425, 429].includes(status)) {
+    return {
+      retryable: true,
+      category: "http_retryable",
+      status,
+      providerCode,
+      code: codeRaw || null,
+    };
+  }
+  if (Number.isFinite(status) && status >= 500) {
+    return {
+      retryable: true,
+      category: "http_retryable",
+      status,
+      providerCode,
+      code: codeRaw || null,
+    };
+  }
+
+  if (
+    [
+      "ECONNRESET",
+      "ETIMEDOUT",
+      "ECONNABORTED",
+      "EAI_AGAIN",
+      "ENOTFOUND",
+      "ESOCKETTIMEDOUT",
+      "VOICE_AGENT_FALLBACK_TIMEOUT",
+    ].includes(codeRaw)
+  ) {
+    return {
+      retryable: true,
+      category: "network_retryable",
+      status: Number.isFinite(status) && status > 0 ? status : null,
+      providerCode,
+      code: codeRaw || null,
+    };
+  }
+
+  const message = String(error?.message || "").toLowerCase();
+  if (
+    message.includes("timeout") ||
+    message.includes("temporarily") ||
+    message.includes("too many") ||
+    message.includes("rate limit") ||
+    message.includes("network") ||
+    message.includes("connection reset")
+  ) {
+    return {
+      retryable: true,
+      category: "message_retryable",
+      status: Number.isFinite(status) && status > 0 ? status : null,
+      providerCode,
+      code: codeRaw || null,
+    };
+  }
+  return {
+    retryable: false,
+    category: "unknown_non_retryable",
+    status: Number.isFinite(status) && status > 0 ? status : null,
+    providerCode,
+    code: codeRaw || null,
+  };
+}
+
+function reserveVoiceAgentFallbackAttempt(callSid) {
+  const fallbackPolicy = getVoiceAgentFallbackPolicy();
+  const priorAttempts = Number(voiceAgentFallbackAttempts.get(callSid) || 0);
+  if (priorAttempts >= fallbackPolicy.maxRedirectsPerCall) {
+    trackVoiceAgentFallbackMetric(callSid, "voice_agent_fallback_loop_guard", 1, {
+      max_redirects_per_call: fallbackPolicy.maxRedirectsPerCall,
+    });
+    const loopGuardError = new Error(
+      `Voice agent fallback loop guard triggered for ${callSid}`,
+    );
+    loopGuardError.code = "VOICE_AGENT_FALLBACK_LOOP_GUARD";
+    throw loopGuardError;
+  }
+  const attemptCount = priorAttempts + 1;
+  voiceAgentFallbackAttempts.set(callSid, attemptCount);
+  trackVoiceAgentFallbackMetric(callSid, "voice_agent_fallback_attempt", 1, {
+    attempt_count: attemptCount,
+    max_redirects_per_call: fallbackPolicy.maxRedirectsPerCall,
+  });
+  return attemptCount;
 }
 
 async function requestVoiceAgentFallback(callSid, req, reason = "") {
@@ -5733,16 +6470,163 @@ async function requestVoiceAgentFallback(callSid, req, reason = "") {
   if (!accountSid || !authToken) {
     throw new Error("Twilio credentials missing for voice-agent fallback");
   }
-  const attemptCount = (voiceAgentFallbackAttempts.get(callSid) || 0) + 1;
-  voiceAgentFallbackAttempts.set(callSid, attemptCount);
+  const fallbackPolicy = getVoiceAgentFallbackPolicy();
+  const attemptCount = reserveVoiceAgentFallbackAttempt(callSid);
 
   const redirectUrl = `https://${host}/incoming?voice_agent_fallback=1&va_reason=${encodeURIComponent(reason || "connect_failed")}&va_attempt=${attemptCount}`;
   const client = twilio(accountSid, authToken);
-  await client.calls(callSid).update({
-    method: "POST",
-    url: redirectUrl,
+  let lastError = null;
+  for (
+    let attempt = 1;
+    attempt <= fallbackPolicy.maxAttempts;
+    attempt += 1
+  ) {
+    try {
+      await runWithTimeout(
+        client.calls(callSid).update({
+          method: "POST",
+          url: redirectUrl,
+        }),
+        fallbackPolicy.requestTimeoutMs,
+        "voice_agent_fallback_redirect",
+        "voice_agent_fallback_timeout",
+      );
+      trackVoiceAgentFallbackMetric(
+        callSid,
+        "voice_agent_fallback_redirect_success",
+        1,
+        {
+          provider: "twilio",
+          reason: String(reason || "connect_failed"),
+          attempt,
+          max_attempts: fallbackPolicy.maxAttempts,
+        },
+      );
+      if (attempt > 1) {
+        console.warn(
+          `Voice agent fallback redirect recovered for ${callSid} on attempt ${attempt}/${fallbackPolicy.maxAttempts}`,
+        );
+      }
+      return { redirectUrl, attemptCount };
+    } catch (error) {
+      if (error?.code === "voice_agent_fallback_timeout") {
+        error.code = "VOICE_AGENT_FALLBACK_TIMEOUT";
+      }
+      lastError = error;
+      const classification = classifyVoiceAgentFallbackError(error);
+      const retryable =
+        attempt < fallbackPolicy.maxAttempts &&
+        classification.retryable;
+      trackVoiceAgentFallbackMetric(callSid, "voice_agent_fallback_failure", 1, {
+        provider: "twilio",
+        reason: String(reason || "connect_failed"),
+        attempt,
+        max_attempts: fallbackPolicy.maxAttempts,
+        retryable,
+        error_class: classification.category,
+        error_status: classification.status,
+        provider_code: classification.providerCode,
+      });
+      console.error(
+        `Voice agent fallback redirect attempt ${attempt}/${fallbackPolicy.maxAttempts} failed for ${callSid} (retryable=${retryable}, class=${classification.category}, status=${classification.status || "n/a"}, provider_code=${classification.providerCode || "n/a"}): ${formatVoiceAgentErrorForLog(error)}`,
+      );
+      if (!retryable) {
+        break;
+      }
+      await waitMs(computeVoiceAgentFallbackDelay(attempt));
+    }
+  }
+  throw lastError || new Error("voice_agent_fallback_failed");
+}
+
+async function requestVonageVoiceAgentFallback(callSid, req, reason = "") {
+  if (!callSid) {
+    throw new Error("Missing callSid for vonage voice-agent fallback");
+  }
+  const callConfig = callConfigurations.get(callSid);
+  const vonageUuid = resolveVonageHangupUuid(callSid, callConfig);
+  if (!vonageUuid) {
+    throw new Error(
+      "Vonage call UUID not available for voice-agent fallback transfer",
+    );
+  }
+  const fallbackPolicy = getVoiceAgentFallbackPolicy();
+  const attemptCount = reserveVoiceAgentFallbackAttempt(callSid);
+  const answerUrl = buildVonageAnswerWebhookUrl(req, callSid, {
+    voice_agent_fallback: "1",
+    va_attempt: String(attemptCount),
+    va_reason: reason || "runtime_failed",
+    uuid: vonageUuid,
+    direction: callDirections.get(callSid) || undefined,
   });
-  return { redirectUrl, attemptCount };
+  if (!String(answerUrl || "").trim()) {
+    throw new Error("Vonage answer URL unavailable for voice-agent fallback");
+  }
+
+  const vonageAdapter = getVonageVoiceAdapter();
+  let lastError = null;
+  for (
+    let attempt = 1;
+    attempt <= fallbackPolicy.maxAttempts;
+    attempt += 1
+  ) {
+    try {
+      await runWithTimeout(
+        vonageAdapter.transferCallWithURL(vonageUuid, answerUrl),
+        fallbackPolicy.requestTimeoutMs,
+        "vonage_voice_agent_fallback_transfer",
+        "voice_agent_fallback_timeout",
+      );
+      trackVoiceAgentFallbackMetric(
+        callSid,
+        "voice_agent_fallback_redirect_success",
+        1,
+        {
+          provider: "vonage",
+          reason: String(reason || "runtime_failed"),
+          attempt,
+          max_attempts: fallbackPolicy.maxAttempts,
+        },
+      );
+      if (attempt > 1) {
+        console.warn(
+          `Vonage voice-agent fallback transfer recovered for ${callSid} on attempt ${attempt}/${fallbackPolicy.maxAttempts}`,
+        );
+      }
+      return {
+        redirectUrl: answerUrl,
+        attemptCount,
+        vonageUuid,
+      };
+    } catch (error) {
+      if (error?.code === "voice_agent_fallback_timeout") {
+        error.code = "VOICE_AGENT_FALLBACK_TIMEOUT";
+      }
+      lastError = error;
+      const classification = classifyVoiceAgentFallbackError(error);
+      const retryable =
+        attempt < fallbackPolicy.maxAttempts &&
+        classification.retryable;
+      trackVoiceAgentFallbackMetric(callSid, "voice_agent_fallback_failure", 1, {
+        provider: "vonage",
+        reason: String(reason || "runtime_failed"),
+        attempt,
+        max_attempts: fallbackPolicy.maxAttempts,
+        retryable,
+        error_class: classification.category,
+        error_status: classification.status,
+        provider_code: classification.providerCode,
+      });
+      console.error(
+        `Vonage voice-agent fallback transfer attempt ${attempt}/${fallbackPolicy.maxAttempts} failed for ${callSid} (retryable=${retryable}, class=${classification.category}, status=${classification.status || "n/a"}, provider_code=${classification.providerCode || "n/a"}): ${formatVoiceAgentErrorForLog(error)}`,
+      );
+      if (!retryable) {
+        break;
+      }
+      await waitMs(computeVoiceAgentFallbackDelay(attempt));
+    }
+  }
+  throw lastError || new Error("vonage_voice_agent_fallback_failed");
 }
 
 async function tryStartVonageVoiceAgentSession(options = {}) {
@@ -5769,23 +6653,37 @@ async function tryStartVonageVoiceAgentSession(options = {}) {
     speakModel: config.deepgram?.voiceAgent?.speak?.model,
   });
   const voiceAgentFunctions = buildVoiceAgentFunctions(functionSystem);
+  const fallbackPolicy = getVoiceAgentFallbackPolicy();
+  setVoiceAgentRuntimeProvider(callSid, "vonage");
+  setVoiceAgentPhase(callSid, "connecting", { force: true });
 
   try {
-    await bridge.connect({
-      callSid,
-      prompt: callConfig?.prompt,
-      firstMessage: callConfig?.first_message,
-      voiceModel: resolveVoiceModel(callConfig),
-      functions: voiceAgentFunctions,
-      inputEncoding: vonageAudioSpec.sttEncoding,
-      inputSampleRate: vonageAudioSpec.sampleRate,
-      outputEncoding: vonageAudioSpec.ttsEncoding,
-      outputSampleRate: vonageAudioSpec.sampleRate,
-    });
+    await runWithTimeout(
+      bridge.connect({
+        callSid,
+        prompt: callConfig?.prompt,
+        firstMessage: callConfig?.first_message,
+        voiceModel: resolveVoiceModel(callConfig),
+        functions: voiceAgentFunctions,
+        inputEncoding: vonageAudioSpec.sttEncoding,
+        inputSampleRate: vonageAudioSpec.sampleRate,
+        outputEncoding: vonageAudioSpec.ttsEncoding,
+        outputSampleRate: vonageAudioSpec.sampleRate,
+      }),
+      fallbackPolicy.connectTimeoutMs,
+      "vonage_voice_agent_connect",
+      "voice_agent_connect_timeout",
+    );
+    recordVoiceAgentCircuitRecovery("vonage");
   } catch (error) {
+    recordVoiceAgentCircuitFailure("vonage_connect_failed", {
+      provider: "vonage",
+      callSid,
+    });
     try {
       await bridge.close();
     } catch (_) {}
+    clearVoiceAgentRuntime(callSid);
     return { started: false, reason: "connect_failed", error };
   }
 
@@ -5794,6 +6692,7 @@ async function tryStartVonageVoiceAgentSession(options = {}) {
   const cleanup = async (reason = "closed") => {
     if (cleanedUp) return;
     cleanedUp = true;
+    setVoiceAgentPhase(callSid, "ending", { force: true, lock: true });
 
     try {
       await bridge.close();
@@ -5806,7 +6705,6 @@ async function tryStartVonageVoiceAgentSession(options = {}) {
     clearSilenceTimer(callSid);
     sttFallbackCalls.delete(callSid);
     streamTimeoutCalls.delete(callSid);
-    clearVoiceAgentRuntime(callSid);
     clearKeypadCallState(callSid);
     if (digitService) {
       digitService.clearCallState(callSid);
@@ -5816,9 +6714,87 @@ async function tryStartVonageVoiceAgentSession(options = {}) {
       await handleCallEnd(callSid, activeSession.startTime);
     }
     activeCalls.delete(callSid);
+    setVoiceAgentPhase(callSid, "ended", { force: true, lock: true });
+    clearVoiceAgentRuntime(callSid);
     webhookService.addLiveEvent(callSid, `🔌 Voice agent stream ${reason}`, {
       force: true,
     });
+  };
+
+  const triggerVonageLegacyFallback = async (
+    reason = "runtime_failed",
+    sourceError = null,
+    options = {},
+  ) => {
+    if (!callSid || cleanedUp) {
+      return;
+    }
+    const fallbackStart = await beginVoiceAgentFallbackIfAllowed(callSid, reason, {
+      source: "vonage_voice_agent",
+      closeCode: Number(options?.closeCode || 0),
+    });
+    if (!fallbackStart.started) {
+      if (fallbackStart.skipped) {
+        await cleanup(`fallback_skipped(${fallbackStart.skipReason || "unknown"})`);
+        try {
+          ws.close(1000, "Vonage voice agent fallback skipped");
+        } catch (_) {}
+      }
+      return;
+    }
+    recordVoiceAgentCircuitFailure(`vonage_${reason}`, {
+      provider: "vonage",
+      callSid,
+    });
+    const safeSourceError = sourceError
+      ? formatVoiceAgentErrorForLog({ message: String(sourceError) })
+      : null;
+    try {
+      const fallback = await requestVonageVoiceAgentFallback(callSid, req, reason);
+      setVoiceAgentPhase(callSid, "legacy_active", { force: true, lock: true });
+      webhookService.addLiveEvent(
+        callSid,
+        "↩️ Voice agent issue detected. Redirecting to legacy STT+GPT+TTS pipeline…",
+        { force: true },
+      );
+      await db
+        ?.updateCallState?.(callSid, "voice_agent_vonage_fallback_redirected", {
+          at: new Date().toISOString(),
+          reason,
+          source_error: safeSourceError,
+          redirect_url: fallback?.redirectUrl || null,
+          attempt: fallback?.attemptCount || null,
+          vonage_uuid: fallback?.vonageUuid || null,
+        })
+        .catch(() => {});
+      await cleanup(`fallback_redirect(${reason})`);
+      try {
+        ws.close(4006, "Vonage voice agent fallback");
+      } catch (_) {}
+    } catch (fallbackError) {
+      const classification = classifyVoiceAgentFallbackError(fallbackError);
+      const safeFallbackError = formatVoiceAgentErrorForLog(fallbackError);
+      setVoiceAgentPhase(callSid, "failed", { force: true, lock: true });
+      console.error(
+        `Vonage voice-agent fallback failed for ${callSid} (class=${classification.category}, status=${classification.status || "n/a"}, provider_code=${classification.providerCode || "n/a"}): ${safeFallbackError}`,
+      );
+      await db
+        ?.updateCallState?.(callSid, "voice_agent_vonage_fallback_failed", {
+          at: new Date().toISOString(),
+          reason,
+          error: safeFallbackError,
+          error_class: classification.category,
+          error_status: classification.status,
+          provider_code: classification.providerCode,
+          retryable: classification.retryable,
+          source_error: safeSourceError,
+        })
+        .catch(() => {});
+      await cleanup(`fallback_failed(${reason})`);
+      try {
+        ws.close(1011, "Vonage voice-agent fallback failed");
+      } catch (_) {}
+    }
   };
 
   activeCalls.set(callSid, {
@@ -5970,6 +6946,18 @@ async function tryStartVonageVoiceAgentSession(options = {}) {
             timeout_count: timeoutCount,
           })
           .catch(() => {});
+        const runtimeCfg = getVoiceAgentRuntimeConfig();
+        if (
+          !runtimeCfg.timeoutFallbackThreshold ||
+          runtimeCfg.timeoutFallbackThreshold <= 0 ||
+          timeoutCount < runtimeCfg.timeoutFallbackThreshold
+        ) {
+          return;
+        }
+        void triggerVonageLegacyFallback(
+          "turn_timeout",
+          `timeout_count=${timeoutCount}`,
+        );
       });
       return;
     }
@@ -5987,13 +6975,47 @@ async function tryStartVonageVoiceAgentSession(options = {}) {
   });
 
   bridge.on("error", (error) => {
+    const safeError = formatVoiceAgentErrorForLog(error);
+    console.error(`Vonage voice agent bridge error: ${safeError}`);
+    webhookService.addLiveEvent(
+      callSid,
+      `⚠️ Voice agent error: ${safeError}`,
+      { force: true },
+    );
+    void triggerVonageLegacyFallback("agent_error", safeError);
+  });
+
+  bridge.on("close", async (closeInfo = {}) => {
+    if (cleanedUp) {
+      return;
+    }
+    const closeCode = Number(closeInfo?.code || 0);
+    const rawReason = String(closeInfo?.reason || "").trim();
+    const safeReason = rawReason
+      ? formatVoiceAgentErrorForLog({ message: rawReason })
+      : "none";
     console.error(
-      `Vonage voice agent bridge error: ${formatVoiceAgentErrorForLog(error)}`,
+      `Vonage voice agent stream closed for ${callSid} (code=${closeCode || "unknown"}, reason=${safeReason})`,
     );
     webhookService.addLiveEvent(
       callSid,
-      `⚠️ Voice agent error: ${error.message || "unknown error"}`,
+      `⚠️ Voice agent closed (code=${closeCode || "unknown"}, reason=${safeReason})`,
       { force: true },
+    );
+    if (db?.updateCallState) {
+      await db
+        .updateCallState(callSid, "voice_agent_stream_closed", {
+          at: new Date().toISOString(),
+          provider: "vonage",
+          code: closeCode || null,
+          reason: safeReason,
+        })
+        .catch(() => {});
+    }
+    await triggerVonageLegacyFallback(
+      `stream_closed_${closeCode || "unknown"}`,
+      safeReason,
+      { closeCode },
     );
   });
 
@@ -6026,9 +7048,9 @@ async function tryStartVonageVoiceAgentSession(options = {}) {
   });
 
   ws.on("error", (error) => {
-    console.error(
-      `Vonage voice agent websocket error: ${formatVoiceAgentErrorForLog(error)}`,
-    );
+    const safeError = formatVoiceAgentErrorForLog(error);
+    console.error(`Vonage voice agent websocket error: ${safeError}`);
+    void triggerVonageLegacyFallback("stream_error", safeError);
   });
 
   ws.on("close", async () => {
@@ -6068,6 +7090,9 @@ async function handleVoiceAgentWebSocket(ws, req) {
   const cleanup = async (reason = "closed") => {
     if (cleanedUp) return;
     cleanedUp = true;
+    if (callSid) {
+      setVoiceAgentPhase(callSid, "ending", { force: true, lock: true });
+    }
 
     try {
       await bridge.close();
@@ -6094,7 +7119,6 @@ async function handleVoiceAgentWebSocket(ws, req) {
       clearSilenceTimer(callSid);
       sttFallbackCalls.delete(callSid);
       streamTimeoutCalls.delete(callSid);
-      clearVoiceAgentRuntime(callSid);
       if (digitService) {
         digitService.clearCallState(callSid);
       }
@@ -6105,6 +7129,8 @@ async function handleVoiceAgentWebSocket(ws, req) {
       activeCalls.delete(callSid);
       streamAuthBypass.delete(callSid);
       streamStartSeen.delete(callSid);
+      setVoiceAgentPhase(callSid, "ended", { force: true, lock: true });
+      clearVoiceAgentRuntime(callSid);
       webhookService.addLiveEvent(
         callSid,
         `🔌 Voice agent stream ${reason}`,
@@ -6249,19 +7275,28 @@ async function handleVoiceAgentWebSocket(ws, req) {
         ) {
           return;
         }
-        const runtimeState = getOrCreateVoiceAgentRuntimeState(callSid);
-        if (runtimeState?.fallbackRequested) {
+        const fallbackStart = await beginVoiceAgentFallbackIfAllowed(
+          callSid,
+          "turn_timeout",
+          { source: "twilio_turn_timeout" },
+        );
+        if (!fallbackStart.started) {
           return;
         }
-        if (runtimeState) {
-          runtimeState.fallbackRequested = true;
-        }
+        recordVoiceAgentCircuitFailure("twilio_turn_timeout", {
+          provider: "twilio",
+          callSid,
+        });
         try {
           const fallback = await requestVoiceAgentFallback(
             callSid,
             req,
             "turn_timeout",
           );
+          setVoiceAgentPhase(callSid, "legacy_active", {
+            force: true,
+            lock: true,
+          });
           await db
             ?.updateCallState?.(callSid, "voice_agent_timeout_fallback_redirected", {
               at: new Date().toISOString(),
@@ -6274,12 +7309,32 @@ async function handleVoiceAgentWebSocket(ws, req) {
             ws.close(4002, "Voice agent timeout fallback");
           } catch (_) {}
         } catch (fallbackError) {
-          if (runtimeState) {
-            runtimeState.fallbackRequested = false;
-          }
+          const safeFallbackError = formatVoiceAgentErrorForLog(fallbackError);
+          const classification = classifyVoiceAgentFallbackError(fallbackError);
+          setVoiceAgentPhase(callSid, "failed", { force: true, lock: true });
           console.error(
-            `Voice agent timeout fallback failed: ${formatVoiceAgentErrorForLog(fallbackError)}`,
+            `Voice agent timeout fallback failed: ${safeFallbackError} (class=${classification.category}, status=${classification.status || "n/a"}, provider_code=${classification.providerCode || "n/a"})`,
           );
+          webhookService.addLiveEvent(
+            callSid,
+            "❌ Voice agent timeout fallback failed. Ending voice-agent stream.",
+            { force: true },
+          );
+          await db
+            ?.updateCallState?.(callSid, "voice_agent_timeout_fallback_failed", {
+              at: new Date().toISOString(),
+              timeout_count: timeoutCount,
+              error: safeFallbackError,
+              error_class: classification.category,
+              error_status: classification.status,
+              provider_code: classification.providerCode,
+              retryable: classification.retryable,
+            })
+            .catch(() => {});
+          await cleanup("timeout_fallback_failed");
+          try {
+            ws.close(1011, "Voice agent timeout fallback failed");
+          } catch (_) {}
         }
       });
       return;
@@ -6298,13 +7353,175 @@ async function handleVoiceAgentWebSocket(ws, req) {
   });
 
   bridge.on("error", (error) => {
-    console.error(`Voice agent bridge error: ${formatVoiceAgentErrorForLog(error)}`);
-    if (callSid) {
+    const safeError = formatVoiceAgentErrorForLog(error);
+    console.error(`Voice agent bridge error: ${safeError}`);
+    if (!callSid) {
+      return;
+    }
+    webhookService.addLiveEvent(callSid, `⚠️ Voice agent error: ${safeError}`, {
+      force: true,
+    });
+    if (cleanedUp) {
+      return;
+    }
+    void (async () => {
+      const fallbackStart = await beginVoiceAgentFallbackIfAllowed(
+        callSid,
+        "agent_error",
+        { source: "twilio_bridge_error" },
+      );
+      if (!fallbackStart.started) {
+        return;
+      }
+      recordVoiceAgentCircuitFailure("twilio_agent_error", {
+        provider: "twilio",
+        callSid,
+      });
+      try {
+        const fallback = await requestVoiceAgentFallback(callSid, req, "agent_error");
+        setVoiceAgentPhase(callSid, "legacy_active", { force: true, lock: true });
+        webhookService.addLiveEvent(
+          callSid,
+          "↩️ Voice agent error detected. Redirecting to legacy STT+GPT+TTS pipeline…",
+          { force: true },
+        );
+        await db
+          ?.updateCallState?.(callSid, "voice_agent_error_fallback_redirected", {
+            at: new Date().toISOString(),
+            error: safeError,
+            redirect_url: fallback?.redirectUrl || null,
+            attempt: fallback?.attemptCount || null,
+          })
+          .catch(() => {});
+        await cleanup("error_fallback_redirect");
+        try {
+          ws.close(4004, "Voice agent error fallback");
+        } catch (_) {}
+      } catch (fallbackError) {
+        const classification = classifyVoiceAgentFallbackError(fallbackError);
+        const safeFallbackError = formatVoiceAgentErrorForLog(fallbackError);
+        setVoiceAgentPhase(callSid, "failed", { force: true, lock: true });
+        console.error(
+          `Voice agent error fallback failed: ${safeFallbackError} (class=${classification.category}, status=${classification.status || "n/a"}, provider_code=${classification.providerCode || "n/a"})`,
+        );
+        await db
+          ?.updateCallState?.(callSid, "voice_agent_error_fallback_failed", {
+            at: new Date().toISOString(),
+            error: safeFallbackError,
+            source_error: safeError,
+            error_class: classification.category,
+            error_status: classification.status,
+            provider_code: classification.providerCode,
+            retryable: classification.retryable,
+          })
+          .catch(() => {});
+        await cleanup("error_fallback_failed");
+        try {
+          ws.close(1011, "Voice agent error fallback failed");
+        } catch (_) {}
+      }
+    })();
+  });
+
+  bridge.on("close", async (closeInfo = {}) => {
+    if (cleanedUp) {
+      return;
+    }
+    if (!callSid) {
+      return;
+    }
+    const closeCode = Number(closeInfo?.code || 0);
+    const rawReason = String(closeInfo?.reason || "").trim();
+    const safeReason = rawReason
+      ? formatVoiceAgentErrorForLog({ message: rawReason })
+      : "none";
+    console.error(
+      `Voice agent stream closed for ${callSid} (code=${closeCode || "unknown"}, reason=${safeReason})`,
+    );
+    webhookService.addLiveEvent(
+      callSid,
+      `⚠️ Voice agent closed (code=${closeCode || "unknown"}, reason=${safeReason})`,
+      { force: true },
+    );
+    if (db?.updateCallState) {
+      await db
+        .updateCallState(callSid, "voice_agent_stream_closed", {
+          at: new Date().toISOString(),
+          provider: "twilio",
+          code: closeCode || null,
+          reason: safeReason,
+        })
+        .catch(() => {});
+    }
+    const fallbackStart = await beginVoiceAgentFallbackIfAllowed(
+      callSid,
+      `stream_closed_${closeCode || "unknown"}`,
+      {
+        source: "twilio_stream_closed",
+        closeCode,
+      },
+    );
+    if (!fallbackStart.started) {
+      if (fallbackStart.skipped) {
+        await cleanup(`closed(code=${closeCode || "unknown"}, skipped=${fallbackStart.skipReason || "unknown"})`);
+        try {
+          ws.close(1000, "Voice agent stream closed");
+        } catch (_) {}
+      }
+      return;
+    }
+    recordVoiceAgentCircuitFailure("twilio_stream_closed", {
+      provider: "twilio",
+      callSid,
+    });
+
+    try {
+      const fallback = await requestVoiceAgentFallback(
+        callSid,
+        req,
+        `stream_closed_${closeCode || "unknown"}`,
+      );
+      setVoiceAgentPhase(callSid, "legacy_active", { force: true, lock: true });
       webhookService.addLiveEvent(
         callSid,
-        `⚠️ Voice agent error: ${error.message || "unknown error"}`,
+        "↩️ Voice agent closed. Redirecting to legacy STT+GPT+TTS pipeline…",
         { force: true },
       );
+      await db
+        ?.updateCallState?.(callSid, "voice_agent_stream_close_fallback_redirected", {
+          at: new Date().toISOString(),
+          code: closeCode || null,
+          reason: safeReason,
+          redirect_url: fallback?.redirectUrl || null,
+          attempt: fallback?.attemptCount || null,
+        })
+        .catch(() => {});
+      await cleanup(`fallback_redirect(code=${closeCode || "unknown"})`);
+      try {
+        ws.close(4003, "Voice agent stream closed");
+      } catch (_) {}
+    } catch (fallbackError) {
+      const classification = classifyVoiceAgentFallbackError(fallbackError);
+      setVoiceAgentPhase(callSid, "failed", { force: true, lock: true });
+      console.error(
+        `Voice agent close fallback failed: ${formatVoiceAgentErrorForLog(fallbackError)} (class=${classification.category}, status=${classification.status || "n/a"}, provider_code=${classification.providerCode || "n/a"})`,
+      );
+      await db
+        ?.updateCallState?.(callSid, "voice_agent_stream_close_fallback_failed", {
+          at: new Date().toISOString(),
+          code: closeCode || null,
+          reason: safeReason,
+          error: formatVoiceAgentErrorForLog(fallbackError),
+          error_class: classification.category,
+          error_status: classification.status,
+          provider_code: classification.providerCode,
+          retryable: classification.retryable,
+        })
+        .catch(() => {});
+      await cleanup(`closed(code=${closeCode || "unknown"}, reason=${safeReason})`);
+      try {
+        ws.close(1011, "Voice agent stream closed");
+      } catch (_) {}
     }
   });
 
@@ -6456,21 +7673,33 @@ async function handleVoiceAgentWebSocket(ws, req) {
         interactionCount: 0,
       });
       setVoiceAgentRuntimeProvider(callSid, "twilio");
-      setVoiceAgentPhase(callSid, "connected");
+      setVoiceAgentPhase(callSid, "connecting", { force: true });
 
       const voiceAgentFunctions = buildVoiceAgentFunctions(functionSystem);
+      const fallbackPolicy = getVoiceAgentFallbackPolicy();
       try {
-        await bridge.connect({
-          callSid,
-          prompt: callConfig?.prompt,
-          firstMessage: callConfig?.first_message,
-          voiceModel: resolveVoiceModel(callConfig),
-          functions: voiceAgentFunctions,
-        });
+        await runWithTimeout(
+          bridge.connect({
+            callSid,
+            prompt: callConfig?.prompt,
+            firstMessage: callConfig?.first_message,
+            voiceModel: resolveVoiceModel(callConfig),
+            functions: voiceAgentFunctions,
+          }),
+          fallbackPolicy.connectTimeoutMs,
+          "twilio_voice_agent_connect",
+          "voice_agent_connect_timeout",
+        );
+        setVoiceAgentPhase(callSid, "connected");
+        recordVoiceAgentCircuitRecovery("twilio");
         webhookService.addLiveEvent(callSid, "🤖 Voice agent connected", {
           force: true,
         });
       } catch (error) {
+        recordVoiceAgentCircuitFailure("twilio_connect_failed", {
+          provider: "twilio",
+          callSid,
+        });
         console.error(
           `Voice agent connect failed, falling back: ${formatVoiceAgentErrorForLog(error)}`,
         );
@@ -6487,12 +7716,29 @@ async function handleVoiceAgentWebSocket(ws, req) {
         } catch (_) {}
 
         let fallbackResult = null;
+        const fallbackStart = await beginVoiceAgentFallbackIfAllowed(
+          callSid,
+          "connect_failed",
+          { source: "twilio_connect_failure" },
+        );
+        if (!fallbackStart.started) {
+          await cleanup(
+            fallbackStart.skipped
+              ? `connect_failed_skipped(${fallbackStart.skipReason || "unknown"})`
+              : "connect_failed_locked",
+          );
+          try {
+            ws.close(1011, "Voice agent connect failed");
+          } catch (_) {}
+          return;
+        }
         try {
           fallbackResult = await requestVoiceAgentFallback(
             callSid,
             req,
             "connect_failed",
           );
+          setVoiceAgentPhase(callSid, "legacy_active", { force: true, lock: true });
           webhookService.addLiveEvent(
             callSid,
             "↩️ Redirecting call to legacy STT/TTS pipeline",
@@ -6504,14 +7750,25 @@ async function handleVoiceAgentWebSocket(ws, req) {
             at: new Date().toISOString(),
           }).catch(() => {});
         } catch (fallbackError) {
+          const classification = classifyVoiceAgentFallbackError(fallbackError);
+          const safeFallbackError = formatVoiceAgentErrorForLog(fallbackError);
+          setVoiceAgentPhase(callSid, "failed", { force: true, lock: true });
           console.error(
-            `Voice agent fallback redirect failed: ${formatVoiceAgentErrorForLog(fallbackError)}`,
+            `Voice agent fallback redirect failed: ${safeFallbackError} (class=${classification.category}, status=${classification.status || "n/a"}, provider_code=${classification.providerCode || "n/a"})`,
           );
           await db.updateCallState(callSid, "voice_agent_fallback_failed", {
-            error: fallbackError.message || "fallback_redirect_failed",
+            error: safeFallbackError,
             at: new Date().toISOString(),
+            error_class: classification.category,
+            error_status: classification.status,
+            provider_code: classification.providerCode,
+            retryable: classification.retryable,
           }).catch(() => {});
-          throw fallbackError;
+          await cleanup("fallback_redirect_failed");
+          try {
+            ws.close(1011, "Voice agent fallback failed");
+          } catch (_) {}
+          return;
         }
 
         await cleanup("fallback_redirect");
@@ -6551,9 +7808,70 @@ async function handleVoiceAgentWebSocket(ws, req) {
   });
 
   ws.on("error", (error) => {
+    const safeError = formatVoiceAgentErrorForLog(error);
     console.error(
-      `Voice agent websocket error: ${formatVoiceAgentErrorForLog(error)}`,
+      `Voice agent websocket error: ${safeError}`,
     );
+    if (!callSid || cleanedUp) {
+      return;
+    }
+    void (async () => {
+      const fallbackStart = await beginVoiceAgentFallbackIfAllowed(
+        callSid,
+        "stream_error",
+        { source: "twilio_stream_error" },
+      );
+      if (!fallbackStart.started) {
+        return;
+      }
+      recordVoiceAgentCircuitFailure("twilio_stream_error", {
+        provider: "twilio",
+        callSid,
+      });
+      try {
+        const fallback = await requestVoiceAgentFallback(callSid, req, "stream_error");
+        setVoiceAgentPhase(callSid, "legacy_active", { force: true, lock: true });
+        webhookService.addLiveEvent(
+          callSid,
+          "↩️ Stream error detected. Redirecting to legacy STT+GPT+TTS pipeline…",
+          { force: true },
+        );
+        await db
+          ?.updateCallState?.(callSid, "voice_agent_stream_error_fallback_redirected", {
+            at: new Date().toISOString(),
+            error: safeError,
+            redirect_url: fallback?.redirectUrl || null,
+            attempt: fallback?.attemptCount || null,
+          })
+          .catch(() => {});
+        await cleanup("stream_error_fallback_redirect");
+        try {
+          ws.close(4005, "Voice agent stream error fallback");
+        } catch (_) {}
+      } catch (fallbackError) {
+        const classification = classifyVoiceAgentFallbackError(fallbackError);
+        const safeFallbackError = formatVoiceAgentErrorForLog(fallbackError);
+        setVoiceAgentPhase(callSid, "failed", { force: true, lock: true });
+        console.error(
+          `Voice agent stream-error fallback failed: ${safeFallbackError} (class=${classification.category}, status=${classification.status || "n/a"}, provider_code=${classification.providerCode || "n/a"})`,
+        );
+        await db
+          ?.updateCallState?.(callSid, "voice_agent_stream_error_fallback_failed", {
+            at: new Date().toISOString(),
+            error: safeFallbackError,
+            source_error: safeError,
+            error_class: classification.category,
+            error_status: classification.status,
+            provider_code: classification.providerCode,
+            retryable: classification.retryable,
+          })
+          .catch(() => {});
+        await cleanup("stream_error_fallback_failed");
+        try {
+          ws.close(1011, "Voice agent stream error fallback failed");
+        } catch (_) {}
+      }
+    })();
   });
 
   ws.on("close", async () => {
@@ -6567,7 +7885,7 @@ app.ws("/connection", (ws, req) => {
   const host = req?.headers?.host || "unknown-host";
   console.log(`New WebSocket connection established (host=${host}, ua=${ua})`);
   const wsParams = resolveStreamAuthParams(req);
-  const voiceAgentMode = resolveVoiceAgentExecutionMode();
+  const voiceAgentMode = resolveVoiceAgentExecutionMode("twilio");
   const forceLegacyVoice = ["1", "true", "yes"].includes(
     String(
       wsParams?.va_legacy ||
@@ -7908,12 +9226,17 @@ app.ws("/vonage/stream", async (ws, req) => {
       })
         .catch(() => {});
     }
-    const voiceAgentMode = resolveVoiceAgentExecutionMode();
+    const voiceAgentMode = resolveVoiceAgentExecutionMode("vonage");
+    const forceLegacyVoice = ["1", "true", "yes"].includes(
+      String(req.query?.va_legacy || req.query?.voice_agent_fallback || req.query?.legacy || "")
+        .toLowerCase()
+        .trim(),
+    );
     const keypadRequiredFlow = isKeypadRequiredFlow(
       callConfig?.collection_profile,
       callConfig?.script_policy,
     );
-    if (voiceAgentMode.enabled && !keypadRequiredFlow) {
+    if (voiceAgentMode.enabled && !keypadRequiredFlow && !forceLegacyVoice) {
       const voiceAgentStart = await tryStartVonageVoiceAgentSession({
         ws,
         req,
@@ -7947,6 +9270,10 @@ app.ws("/vonage/stream", async (ws, req) => {
           })
           .catch(() => {});
       }
+    } else if (forceLegacyVoice) {
+      console.log(
+        `Vonage voice agent bypass requested for ${callSid}; using legacy STT+GPT+TTS pipeline`,
+      );
     } else if (keypadRequiredFlow && voiceAgentMode.enabled) {
       console.log(
         `Vonage voice agent bypassed for keypad-required flow on ${callSid}; using legacy STT+GPT+TTS`,
@@ -8594,6 +9921,7 @@ async function handleCallEnd(callSid, callStartTime) {
     streamAuthBypass.delete(callSid);
     streamRetryState.delete(callSid);
     voiceAgentFallbackAttempts.delete(callSid);
+    clearVoiceAgentRuntime(callSid);
     clearKeypadCallState(callSid);
     purgeStreamStatusDedupe(callSid);
     purgeCallStatusDedupe(callSid);
@@ -8778,6 +10106,7 @@ async function handleCallEnd(callSid, callStartTime) {
   } catch (error) {
     console.error("Error handling enhanced adaptive call end:", error);
     voiceAgentFallbackAttempts.delete(callSid);
+    clearVoiceAgentRuntime(callSid);
 
     // Log error to service health
     try {
@@ -9742,12 +11071,28 @@ const handleVonageAnswer = async (req, res) => {
       }
     }
 
+    const forceLegacyVoice = ["1", "true", "yes"].includes(
+      String(req.query?.voice_agent_fallback || req.query?.va_legacy || req.query?.legacy || "")
+        .toLowerCase()
+        .trim(),
+    );
+    if (callSid && forceLegacyVoice) {
+      db
+        ?.updateCallState?.(callSid, "voice_agent_fallback_active", {
+          at: new Date().toISOString(),
+          source: "vonage_answer",
+          provider: "vonage",
+        })
+        .catch(() => {});
+    }
+
     const wsUrl = callSid
       ? buildVonageWebsocketUrl(req, callSid, {
           uuid: vonageUuid || undefined,
           direction: isInbound ? "inbound" : "outbound",
           from: payload.from || undefined,
           to: payload.to || undefined,
+          va_legacy: forceLegacyVoice ? "1" : undefined,
         })
       : "";
     if (!callSid || !wsUrl) {
@@ -14057,6 +15402,18 @@ module.exports = {
     clampVoiceAgentFunctionResult,
     executeVoiceAgentFunctionWithGuard,
     resetVoiceAgentRuntimeForTests,
+    resetVoiceAgentCircuitStateForTests,
+    setDbForTests,
+    isVoiceAgentCircuitOpen,
+    recordVoiceAgentCircuitFailure,
+    recordVoiceAgentCircuitRecovery,
+    getVoiceAgentCircuitSnapshot,
+    applyVoiceAgentCircuitSnapshot,
+    persistVoiceAgentCircuitStateNow,
+    loadPersistedVoiceAgentCircuitState,
+    resolveVoiceAgentExecutionMode,
+    resolveVoiceAgentFallbackSkipReason,
+    beginVoiceAgentFallbackIfAllowed,
     verifyTelegramWebhookAuth,
     verifyAwsWebhookAuth,
     verifyAwsStreamAuth,
@@ -14093,6 +15450,7 @@ process.on("SIGINT", async () => {
       timestamp: new Date().toISOString(),
     });
 
+    await persistVoiceAgentCircuitStateNow();
     await db.close();
     console.log("✅ Enhanced adaptive system shutdown complete");
   } catch (shutdownError) {
@@ -14131,6 +15489,7 @@ process.on("SIGTERM", async () => {
       timestamp: new Date().toISOString(),
     });
 
+    await persistVoiceAgentCircuitStateNow();
     await db.close();
     console.log("Enhanced adaptive system shutdown complete");
   } catch (shutdownError) {
