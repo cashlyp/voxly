@@ -148,6 +148,7 @@ const keypadDtmfSeen = new Map(); // callSid -> { seenAt, source, digitsLength }
 const keypadDtmfWatchdogs = new Map(); // callSid -> timeoutId
 const vonageWebhookJtiCache = new Map(); // jti -> expiresAtMs
 let callJobProcessing = false;
+let backgroundWorkersStarted = false;
 const outboundRateBuckets = new Map(); // namespace:key -> { count, windowStart }
 const callLifecycleCleanupTimers = new Map();
 const CALL_STATUS_DEDUPE_MS = 3000;
