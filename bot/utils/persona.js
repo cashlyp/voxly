@@ -391,7 +391,12 @@ async function askOptionWithButtons(
 
   const message = await sendMenu(ctx, prompt, { parse_mode: 'Markdown', reply_markup: keyboard });
   const selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {
-    return matchesCallbackPrefix(callbackCtx.callbackQuery.data, prefixKey);
+    const callbackData = callbackCtx.callbackQuery?.data || '';
+    const callbackMessageId = callbackCtx.callbackQuery?.message?.message_id;
+    if (!callbackMessageId || callbackMessageId !== message.message_id) {
+      return false;
+    }
+    return matchesCallbackPrefix(callbackData, prefixKey);
   });
   const activeChecker = typeof ensureActive === 'function'
     ? ensureActive

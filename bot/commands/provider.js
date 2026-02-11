@@ -6,92 +6,247 @@ const { buildLine, section, escapeMarkdown, renderMenu } = require('../utils/ui'
 const { buildCallbackData } = require('../utils/actions');
 
 const ADMIN_HEADER_NAME = 'x-admin-token';
-const SUPPORTED_PROVIDERS = ['twilio', 'aws', 'vonage'];
-const PROVIDER_ACTIONS = {
-    STATUS: 'PROVIDER_STATUS',
+const CHANNELS = Object.freeze({
+    CALL: 'call',
+    SMS: 'sms',
+    EMAIL: 'email',
+});
+const CHANNEL_ORDER = [CHANNELS.CALL, CHANNELS.SMS, CHANNELS.EMAIL];
+const CHANNEL_ACTIONS = Object.freeze({
+    [CHANNELS.CALL]: 'CALL',
+    [CHANNELS.SMS]: 'SMS',
+    [CHANNELS.EMAIL]: 'EMAIL',
+});
+const ACTION_TO_CHANNEL = Object.freeze({
+    CALL: CHANNELS.CALL,
+    SMS: CHANNELS.SMS,
+    EMAIL: CHANNELS.EMAIL,
+});
+const CHANNEL_TITLES = Object.freeze({
+    [CHANNELS.CALL]: '☎️ Call Providers',
+    [CHANNELS.SMS]: '💬 SMS Providers',
+    [CHANNELS.EMAIL]: '📧 Email Providers',
+});
+const DEFAULT_SUPPORTED_PROVIDERS = Object.freeze({
+    [CHANNELS.CALL]: ['twilio', 'aws', 'vonage'],
+    [CHANNELS.SMS]: ['twilio', 'aws', 'vonage'],
+    [CHANNELS.EMAIL]: ['sendgrid', 'mailgun', 'ses'],
+});
+const PROVIDER_ACTIONS = Object.freeze({
+    HOME: 'PROVIDER:HOME',
+    CALL: 'PROVIDER:CALL',
+    SMS: 'PROVIDER:SMS',
+    EMAIL: 'PROVIDER:EMAIL',
+    BACK_PREFIX: 'PROVIDER:BACK:',
+    BACK_HOME: 'PROVIDER:BACK:HOME',
+    STATUS_PREFIX: 'PROVIDER_STATUS:',
     SET_PREFIX: 'PROVIDER_SET:',
-    OVERRIDES: 'PROVIDER_OVERRIDES',
-    CLEAR_OVERRIDES_PREFIX: 'PROVIDER_CLEAR_OVERRIDES:'
-};
+
+    // Legacy callback compatibility for older inline menus still in chat history.
+    LEGACY_STATUS: 'PROVIDER_STATUS',
+    LEGACY_STATUS_CHANNEL_PREFIX: 'PROVIDER_STATUS_CH:',
+    LEGACY_SET_PREFIX: 'PROVIDER_SET:',
+    LEGACY_SET_CHANNEL_PREFIX: 'PROVIDER_SET_CH:',
+    LEGACY_OVERRIDES: 'PROVIDER_OVERRIDES',
+    LEGACY_CLEAR_OVERRIDES_PREFIX: 'PROVIDER_CLEAR_OVERRIDES:',
+});
 const STATUS_CACHE_TTL_MS = 8000;
-const statusCache = {
-    value: null,
-    fetchedAt: 0
-};
+const statusCache = { value: null, fetchedAt: 0 };
 
-function normalizeProviders(status = {}) {
-    const supportedValues = Array.isArray(status.supported_providers) && status.supported_providers.length > 0
-        ? status.supported_providers
-        : SUPPORTED_PROVIDERS;
-    const supported = Array.from(new Set(supportedValues.map((item) => String(item).toLowerCase()))).filter(Boolean);
-    const active = typeof status.provider === 'string' ? status.provider.toLowerCase() : '';
-    return { supported, active };
+function normalizeChannel(channel) {
+    const normalized = String(channel || CHANNELS.CALL).toLowerCase().trim();
+    return CHANNEL_ORDER.includes(normalized) ? normalized : CHANNELS.CALL;
 }
 
-function formatProviderStatus(status) {
-    if (!status) {
-        return section('⚙️ Call Provider Settings', ['No status data available.']);
+function channelToActionSegment(channel) {
+    const normalizedChannel = normalizeChannel(channel);
+    return CHANNEL_ACTIONS[normalizedChannel];
+}
+
+function actionSegmentToChannel(segment) {
+    return ACTION_TO_CHANNEL[String(segment || '').toUpperCase()] || null;
+}
+
+function normalizeProviderName(value) {
+    return String(value || '').trim().toLowerCase();
+}
+
+function maskUserId(userId) {
+    if (userId === undefined || userId === null) return 'unknown';
+    const text = String(userId);
+    if (text.length <= 4) return text;
+    return `***${text.slice(-4)}`;
+}
+
+function redactLogText(input = '') {
+    let text = String(input || '');
+    if (!text) return '';
+    text = text.replace(/\+?\d[\d\s().-]{6,}\d/g, '[redacted-phone]');
+    text = text.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[redacted-email]');
+    if (text.length > 180) {
+        return `${text.slice(0, 180)}…`;
     }
-
-    const current = typeof status.provider === 'string' ? status.provider : 'unknown';
-    const stored = typeof status.stored_provider === 'string' && status.stored_provider.length > 0
-        ? status.stored_provider
-        : current;
-    const supportedValues = Array.isArray(status.supported_providers) && status.supported_providers.length > 0
-        ? status.supported_providers
-        : SUPPORTED_PROVIDERS;
-    const vonageReady = status.vonage_ready ? '✅ Ready' : '⚠️ Missing keys';
-    const vonageDtmfReady = status.vonage_dtmf_ready ? '✅ Enabled' : '⚠️ Disabled';
-    const keypadGuard = status.keypad_guard_enabled ? '✅ Enabled' : '⚠️ Disabled';
-    const keypadOverrides = Number.isFinite(Number(status.keypad_override_count))
-        ? Number(status.keypad_override_count)
-        : 0;
-
-    const details = [
-        buildLine('•', `Current Provider`, `*${current.toUpperCase()}*`),
-        buildLine('•', `Stored Default`, stored.toUpperCase()),
-        buildLine('•', `AWS Ready`, status.aws_ready ? '✅' : '⚠️'),
-        buildLine('•', `Twilio Ready`, status.twilio_ready ? '✅' : '⚠️'),
-        buildLine('•', `Vonage Ready`, vonageReady),
-        buildLine('•', `Vonage DTMF`, vonageDtmfReady),
-        buildLine('•', `Keypad Guard`, keypadGuard),
-        buildLine('•', `Keypad Overrides`, String(keypadOverrides)),
-        buildLine('•', `Supported Backbones`, supportedValues.join(', ').toUpperCase())
-    ];
-
-    return section('⚙️ Call Provider Settings', details);
+    return text;
 }
 
-function buildProviderKeyboard(ctx, activeProvider = '', supportedProviders = []) {
-    const keyboard = new InlineKeyboard();
-    const providers = supportedProviders.length ? supportedProviders : SUPPORTED_PROVIDERS;
-    providers.forEach((provider, index) => {
-        const normalized = provider.toLowerCase();
-        const isActive = normalized === activeProvider;
-        const label = isActive ? `✅ ${normalized.toUpperCase()}` : normalized.toUpperCase();
-        keyboard.text(label, buildCallbackData(ctx, `${PROVIDER_ACTIONS.SET_PREFIX}${normalized}`));
+function summarizeError(error) {
+    if (!error) return 'unknown_error';
+    if (error.response) {
+        const detail = error.response?.data?.error || error.response?.data?.message || error.response?.statusText || 'http_error';
+        return `http_${error.response.status}:${redactLogText(detail)}`;
+    }
+    if (error.request) return 'upstream_no_response';
+    return redactLogText(error.message || 'unknown_error');
+}
 
-        const shouldInsertRow = index % 2 === 1 && index < providers.length - 1;
-        if (shouldInsertRow) {
+function logProviderEvent(ctx, { action, channel, provider, result, error }) {
+    const payload = {
+        type: 'provider_action',
+        user_id: maskUserId(ctx?.from?.id),
+        action: action || 'unknown',
+        channel: channel ? normalizeChannel(channel) : null,
+        provider: provider ? normalizeProviderName(provider) : null,
+        result: result || 'unknown',
+        error: error ? summarizeError(error) : null,
+    };
+    console.log(JSON.stringify(payload));
+}
+
+function getChannelState(status = {}, channel = CHANNELS.CALL) {
+    const normalizedChannel = normalizeChannel(channel);
+    const providers = status.providers || {};
+    if (providers && providers[normalizedChannel]) {
+        return providers[normalizedChannel];
+    }
+    if (normalizedChannel === CHANNELS.CALL) {
+        return status;
+    }
+    if (normalizedChannel === CHANNELS.SMS) {
+        return {
+            provider: status.sms_provider,
+            stored_provider: status.sms_stored_provider,
+            supported_providers: status.sms_supported_providers,
+            readiness: status.sms_readiness,
+        };
+    }
+    return {
+        provider: status.email_provider,
+        stored_provider: status.email_stored_provider,
+        supported_providers: status.email_supported_providers,
+        readiness: status.email_readiness,
+    };
+}
+
+function normalizeSupportedProviders(status = {}, channel = CHANNELS.CALL) {
+    const normalizedChannel = normalizeChannel(channel);
+    const channelState = getChannelState(status, normalizedChannel);
+    const catalog = DEFAULT_SUPPORTED_PROVIDERS[normalizedChannel] || [];
+    const rawApiSupported = Array.isArray(channelState.supported_providers)
+        ? channelState.supported_providers.map((item) => normalizeProviderName(item)).filter(Boolean)
+        : [];
+    const apiSupported = Array.from(new Set(rawApiSupported));
+    let supported = apiSupported.length ? apiSupported.filter((item) => catalog.includes(item)) : [...catalog];
+    if (!supported.length && catalog.length) {
+        supported = [...catalog];
+    }
+    const active = normalizeProviderName(channelState.provider || '');
+    return {
+        channelState,
+        supported,
+        active,
+    };
+}
+
+function buildProviderDashboard(status = {}) {
+    const callState = getChannelState(status, CHANNELS.CALL);
+    const smsState = getChannelState(status, CHANNELS.SMS);
+    const emailState = getChannelState(status, CHANNELS.EMAIL);
+    return section('⚙️ Provider Dashboard', [
+        buildLine('•', '☎️ Call', `*${escapeMarkdown(String(callState.provider || 'unknown').toUpperCase())}*`),
+        buildLine('•', '💬 SMS', `*${escapeMarkdown(String(smsState.provider || 'unknown').toUpperCase())}*`),
+        buildLine('•', '📧 Email', `*${escapeMarkdown(String(emailState.provider || 'unknown').toUpperCase())}*`),
+    ]);
+}
+
+function buildProviderDashboardKeyboard(ctx) {
+    return new InlineKeyboard()
+        .text('☎️ Call Providers', buildCallbackData(ctx, PROVIDER_ACTIONS.CALL))
+        .text('💬 SMS Providers', buildCallbackData(ctx, PROVIDER_ACTIONS.SMS))
+        .text('📧 Email Providers', buildCallbackData(ctx, PROVIDER_ACTIONS.EMAIL));
+}
+
+function buildReadinessLines(status = {}, channel = CHANNELS.CALL) {
+    const normalizedChannel = normalizeChannel(channel);
+    const state = getChannelState(status, normalizedChannel);
+    const readiness = state.readiness || {};
+    const entries = Object.entries(readiness);
+    if (!entries.length && normalizedChannel !== CHANNELS.CALL) {
+        return ['• Readiness: unknown'];
+    }
+    if (normalizedChannel === CHANNELS.CALL) {
+        return [
+            buildLine('•', 'TWILIO Ready', status.twilio_ready ? '✅' : '⚠️'),
+            buildLine('•', 'AWS Ready', status.aws_ready ? '✅' : '⚠️'),
+            buildLine('•', 'VONAGE Ready', status.vonage_ready ? '✅' : '⚠️'),
+        ];
+    }
+    return entries.map(([provider, ready]) =>
+        buildLine('•', `${provider.toUpperCase()} Ready`, ready ? '✅' : '⚠️')
+    );
+}
+
+function buildProviderSubmenuText(status = {}, channel = CHANNELS.CALL) {
+    const normalizedChannel = normalizeChannel(channel);
+    const { channelState, supported, active } = normalizeSupportedProviders(status, normalizedChannel);
+    const title = CHANNEL_TITLES[normalizedChannel] || 'Provider Menu';
+    const storedProvider = String(channelState.stored_provider || channelState.provider || 'unknown').toUpperCase();
+    const supportedText = supported.length ? supported.map((item) => item.toUpperCase()).join(', ') : '—';
+    const lines = [
+        buildLine('•', 'Active', `*${escapeMarkdown(String(active || 'unknown').toUpperCase())}*`),
+        buildLine('•', 'Stored Default', escapeMarkdown(storedProvider)),
+        buildLine('•', 'Supported', escapeMarkdown(supportedText)),
+        ...buildReadinessLines(status, normalizedChannel),
+    ];
+    return `${section(title, lines)}\n\nTap a provider to set it as default.`;
+}
+
+function buildProviderSubmenuKeyboard(ctx, channel, supportedProviders = [], activeProvider = '') {
+    const normalizedChannel = normalizeChannel(channel);
+    const actionSegment = channelToActionSegment(normalizedChannel);
+    const providers = supportedProviders.length
+        ? supportedProviders
+        : DEFAULT_SUPPORTED_PROVIDERS[normalizedChannel] || [];
+    const keyboard = new InlineKeyboard();
+    providers.forEach((provider, index) => {
+        const normalizedProvider = normalizeProviderName(provider);
+        const isActive = normalizedProvider === activeProvider;
+        const label = isActive
+            ? `✅ ${normalizedProvider.toUpperCase()}`
+            : `Set ${normalizedProvider.toUpperCase()}`;
+        keyboard.text(
+            label,
+            buildCallbackData(ctx, `${PROVIDER_ACTIONS.SET_PREFIX}${actionSegment}:${normalizedProvider}`),
+        );
+        const insertRow = index % 2 === 1 && index < providers.length - 1;
+        if (insertRow) {
             keyboard.row();
         }
     });
-    keyboard.row().text('🔄 Refresh', buildCallbackData(ctx, PROVIDER_ACTIONS.STATUS));
-    keyboard
-        .text('🔐 Overrides', buildCallbackData(ctx, PROVIDER_ACTIONS.OVERRIDES))
-        .text(
-            '🧹 Clear All',
-            buildCallbackData(ctx, `${PROVIDER_ACTIONS.CLEAR_OVERRIDES_PREFIX}all`),
-        );
+    keyboard.row()
+        .text('📊 Status', buildCallbackData(ctx, `${PROVIDER_ACTIONS.STATUS_PREFIX}${actionSegment}`))
+        .text('⬅️ Back', buildCallbackData(ctx, PROVIDER_ACTIONS.BACK_HOME));
     return keyboard;
 }
 
-async function fetchProviderStatus({ force = false } = {}) {
-    if (!force && statusCache.value && Date.now() - statusCache.fetchedAt < STATUS_CACHE_TTL_MS) {
+async function fetchProviderStatus({ force = false, channel = null } = {}) {
+    const now = Date.now();
+    if (!force && statusCache.value && now - statusCache.fetchedAt < STATUS_CACHE_TTL_MS) {
         return statusCache.value;
     }
+    const normalizedChannel = channel ? normalizeChannel(channel) : null;
     const response = await httpClient.get(null, `${config.apiUrl}/admin/provider`, {
         timeout: 10000,
+        params: normalizedChannel ? { channel: normalizedChannel } : undefined,
         headers: {
             [ADMIN_HEADER_NAME]: config.admin.apiToken,
             'Content-Type': 'application/json',
@@ -102,34 +257,23 @@ async function fetchProviderStatus({ force = false } = {}) {
     return response.data;
 }
 
-function formatProviderError(error, actionLabel) {
-    const authMessage = httpClient.getUserMessage(error, null);
-    if (authMessage && (error.response?.status === 401 || error.response?.status === 403)) {
-        return `❌ Failed to ${actionLabel}: ${escapeMarkdown(authMessage)}`;
-    }
-    if (error.response) {
-        const details = error.response.data?.details || error.response.data?.error || error.response.statusText;
-        return `❌ Failed to ${actionLabel}: ${escapeMarkdown(details || 'Unknown error')}`;
-    }
-    if (error.request) {
-        return '❌ No response from provider API. Please check the server.';
-    }
-    return `❌ Error: ${escapeMarkdown(error.message || 'Unknown error')}`;
-}
-
-async function updateProvider(provider) {
+async function updateProvider(provider, channel = CHANNELS.CALL) {
+    const normalizedChannel = normalizeChannel(channel);
+    const normalizedProvider = normalizeProviderName(provider);
     const response = await httpClient.post(
         null,
         `${config.apiUrl}/admin/provider`,
-        { provider },
+        { provider: normalizedProvider, channel: normalizedChannel },
         {
             timeout: 15000,
             headers: {
                 [ADMIN_HEADER_NAME]: config.admin.apiToken,
                 'Content-Type': 'application/json',
             },
-        }
+        },
     );
+    statusCache.value = null;
+    statusCache.fetchedAt = 0;
     return response.data;
 }
 
@@ -190,9 +334,10 @@ function formatKeypadOverridesResult(payload = {}) {
 async function handleProviderOverrides(ctx) {
     try {
         const payload = await fetchKeypadOverrides();
+        logProviderEvent(ctx, { action: 'list_overrides', result: 'success' });
         await ctx.reply(formatKeypadOverridesResult(payload), { parse_mode: 'Markdown' });
     } catch (error) {
-        console.error('Provider overrides command error:', error);
+        logProviderEvent(ctx, { action: 'list_overrides', result: 'failure', error });
         await ctx.reply(formatProviderError(error, 'fetch keypad overrides'));
     }
 }
@@ -203,73 +348,59 @@ async function handleProviderClearOverrides(ctx, args = []) {
         let payload;
         if (!rawScope || rawScope.toLowerCase() === 'all') {
             payload = await clearKeypadOverrides({ all: true });
+            logProviderEvent(ctx, { action: 'clear_overrides', result: 'success' });
             await ctx.reply(
                 `🧹 Cleared keypad overrides.\n• Cleared: ${payload.cleared || 0}\n• Remaining: ${payload.remaining || 0}`,
             );
             return;
         }
         payload = await clearKeypadOverrides({ scope_key: rawScope });
+        logProviderEvent(ctx, { action: 'clear_overrides', result: 'success' });
         await ctx.reply(
             `🧹 Cleared keypad override scope.\n• Scope: ${escapeMarkdown(rawScope)}\n• Cleared: ${payload.cleared || 0}\n• Remaining: ${payload.remaining || 0}`,
             { parse_mode: 'Markdown' },
         );
     } catch (error) {
-        console.error('Provider clear overrides command error:', error);
+        logProviderEvent(ctx, { action: 'clear_overrides', result: 'failure', error });
         await ctx.reply(formatProviderError(error, 'clear keypad overrides'));
     }
 }
 
-async function handleProviderCommandAction(ctx, requestedAction, args = []) {
-    const normalizedAction = String(requestedAction || '').toLowerCase().trim();
-    if (!normalizedAction || normalizedAction === 'status') {
-        await renderProviderMenu(ctx, { forceRefresh: true });
-        return true;
+function formatProviderError(error, actionLabel) {
+    const authMessage = httpClient.getUserMessage(error, null);
+    if (authMessage && (error.response?.status === 401 || error.response?.status === 403)) {
+        return `❌ Failed to ${actionLabel}: ${escapeMarkdown(authMessage)}`;
     }
-    if (normalizedAction === 'overrides') {
-        await handleProviderOverrides(ctx);
-        return true;
+    if (error.response) {
+        const details = error.response.data?.details || error.response.data?.error || error.response.statusText;
+        return `❌ Failed to ${actionLabel}: ${escapeMarkdown(details || 'Unknown error')}`;
     }
-    if (
-        normalizedAction === 'clear-overrides' ||
-        normalizedAction === 'clearoverride' ||
-        normalizedAction === 'clear_overrides' ||
-        normalizedAction === 'clear-override' ||
-        normalizedAction === 'clear_override'
-    ) {
-        await handleProviderClearOverrides(ctx, args);
-        return true;
+    if (error.request) {
+        return '❌ No response from provider API. Please check the server.';
     }
+    return `❌ Error: ${escapeMarkdown(error.message || 'Unknown error')}`;
+}
 
-    await handleProviderSwitch(ctx, normalizedAction);
+async function ensureAuthorizedAdmin(ctx) {
+    const fromId = ctx.from?.id;
+    if (!fromId) {
+        await ctx.reply('❌ Missing sender information.');
+        return false;
+    }
+    const user = await new Promise((resolve) => getUser(fromId, resolve));
+    if (!user) {
+        await ctx.reply('❌ You are not authorized to use this bot.');
+        return false;
+    }
+    const admin = await new Promise((resolve) => isAdmin(fromId, resolve));
+    if (!admin) {
+        await ctx.reply('❌ This command is for administrators only.');
+        return false;
+    }
     return true;
 }
 
-async function handleProviderCallbackAction(ctx, action = '') {
-    const normalized = String(action || '').trim();
-    if (!normalized) return false;
-
-    if (normalized === PROVIDER_ACTIONS.STATUS) {
-        await renderProviderMenu(ctx, { forceRefresh: true });
-        return true;
-    }
-    if (normalized.startsWith(PROVIDER_ACTIONS.SET_PREFIX)) {
-        const provider = normalized.slice(PROVIDER_ACTIONS.SET_PREFIX.length);
-        await handleProviderSwitch(ctx, provider.toLowerCase());
-        return true;
-    }
-    if (normalized === PROVIDER_ACTIONS.OVERRIDES) {
-        await handleProviderOverrides(ctx);
-        return true;
-    }
-    if (normalized.startsWith(PROVIDER_ACTIONS.CLEAR_OVERRIDES_PREFIX)) {
-        const target = normalized.slice(PROVIDER_ACTIONS.CLEAR_OVERRIDES_PREFIX.length);
-        await handleProviderClearOverrides(ctx, [target]);
-        return true;
-    }
-    return false;
-}
-
-async function renderProviderMenu(ctx, { status, notice, forceRefresh = false } = {}) {
+async function renderProviderDashboard(ctx, { status, notice, forceRefresh = false } = {}) {
     try {
         let resolvedStatus = status;
         let cachedNotice = null;
@@ -285,86 +416,255 @@ async function renderProviderMenu(ctx, { status, notice, forceRefresh = false } 
                 }
             }
         }
-        const { supported, active } = normalizeProviders(resolvedStatus);
-        const keyboard = buildProviderKeyboard(ctx, active, supported);
-        let message = formatProviderStatus(resolvedStatus);
         const notices = [notice, cachedNotice].filter(Boolean);
+        let message = buildProviderDashboard(resolvedStatus);
         if (notices.length) {
             message = `${notices.join('\n')}\n\n${message}`;
         }
-        message += '\n\nUse the buttons below to switch provider or manage keypad overrides.';
-        await renderMenu(ctx, message, keyboard, { parseMode: 'Markdown' });
+        message += '\n\nSelect a category to manage default providers.';
+        await renderMenu(ctx, message, buildProviderDashboardKeyboard(ctx), { parseMode: 'Markdown' });
     } catch (error) {
-        console.error('Provider status command error:', error);
+        logProviderEvent(ctx, { action: 'render_dashboard', result: 'failure', error });
         await ctx.reply(formatProviderError(error, 'fetch provider status'));
     }
 }
 
-async function ensureAuthorizedAdmin(ctx) {
-    const fromId = ctx.from?.id;
-    if (!fromId) {
-        await ctx.reply('❌ Missing sender information.');
-        return { user: null, isAdminUser: false };
+async function renderProviderSubmenu(ctx, channel, { status, notice, forceRefresh = false } = {}) {
+    const normalizedChannel = normalizeChannel(channel);
+    try {
+        let resolvedStatus = status;
+        let cachedNotice = null;
+        if (!resolvedStatus) {
+            try {
+                resolvedStatus = await fetchProviderStatus({ force: forceRefresh, channel: normalizedChannel });
+            } catch (error) {
+                if (statusCache.value) {
+                    resolvedStatus = statusCache.value;
+                    cachedNotice = '⚠️ Showing cached provider status (API unavailable).';
+                } else {
+                    throw error;
+                }
+            }
+        }
+        const { supported, active } = normalizeSupportedProviders(resolvedStatus, normalizedChannel);
+        const keyboard = buildProviderSubmenuKeyboard(ctx, normalizedChannel, supported, active);
+        const notices = [notice, cachedNotice].filter(Boolean);
+        let message = buildProviderSubmenuText(resolvedStatus, normalizedChannel);
+        if (notices.length) {
+            message = `${notices.join('\n')}\n\n${message}`;
+        }
+        await renderMenu(ctx, message, keyboard, { parseMode: 'Markdown' });
+    } catch (error) {
+        logProviderEvent(ctx, { action: 'render_submenu', channel: normalizedChannel, result: 'failure', error });
+        await ctx.reply(formatProviderError(error, `fetch ${normalizedChannel.toUpperCase()} provider status`));
     }
-
-    const user = await new Promise((resolve) => getUser(fromId, resolve));
-    if (!user) {
-        await ctx.reply('❌ You are not authorized to use this bot.');
-        return { user: null, isAdminUser: false };
-    }
-
-    const admin = await new Promise((resolve) => isAdmin(fromId, resolve));
-    if (!admin) {
-        await ctx.reply('❌ This command is for administrators only.');
-        return { user, isAdminUser: false };
-    }
-
-    return { user, isAdminUser: true };
 }
 
-async function handleProviderSwitch(ctx, requestedProvider) {
+async function renderProviderMenu(ctx, { status, notice, forceRefresh = false, channel = null } = {}) {
+    if (!channel) {
+        await renderProviderDashboard(ctx, { status, notice, forceRefresh });
+        return;
+    }
+    await renderProviderSubmenu(ctx, channel, { status, notice, forceRefresh });
+}
+
+async function handleProviderSwitch(ctx, requestedProvider, channel = CHANNELS.CALL) {
+    const normalizedChannel = normalizeChannel(channel);
+    const normalizedProvider = normalizeProviderName(requestedProvider);
+    if (!normalizedProvider) {
+        await ctx.reply('❌ Missing provider value.');
+        return;
+    }
     try {
-        const status = await fetchProviderStatus();
-        const { supported } = normalizeProviders(status);
-        const normalized = String(requestedProvider || '').toLowerCase();
-        if (!normalized || !supported.includes(normalized)) {
-            const options = supported.map((item) => `• /provider ${item}`).join('\n');
+        const status = await fetchProviderStatus({ force: true, channel: normalizedChannel });
+        const { supported } = normalizeSupportedProviders(status, normalizedChannel);
+        if (!supported.includes(normalizedProvider)) {
+            logProviderEvent(ctx, {
+                action: 'set_provider',
+                channel: normalizedChannel,
+                provider: normalizedProvider,
+                result: 'invalid_provider',
+            });
+            const supportedLabel = supported.length
+                ? supported.map((item) => item.toUpperCase()).join(', ')
+                : 'none';
             await ctx.reply(
-                `❌ Unsupported provider "${escapeMarkdown(requestedProvider || '')}".\n\nUsage:\n• /provider status\n• /provider overrides\n• /provider clear-override <scope|all>\n${options}`
+                `❌ Unsupported ${normalizedChannel.toUpperCase()} provider "${escapeMarkdown(normalizedProvider)}".\nSupported: ${escapeMarkdown(supportedLabel)}`,
+                { parse_mode: 'Markdown' },
             );
             return;
         }
 
-        const result = await updateProvider(normalized);
-        const refreshed = await fetchProviderStatus({ force: true });
-        const activeLabel = (refreshed.provider || normalized).toUpperCase();
+        const result = await updateProvider(normalizedProvider, normalizedChannel);
+        const refreshed = await fetchProviderStatus({ force: true, channel: normalizedChannel });
+        const refreshedState = getChannelState(refreshed, normalizedChannel);
+        const activeLabel = String(refreshedState.provider || normalizedProvider).toUpperCase();
+        const channelLabel = normalizedChannel.toUpperCase();
         const notice = result.changed === false
-            ? `ℹ️ Provider already set to *${activeLabel}*.`
-            : `✅ Call provider set to *${activeLabel}*.`;
-        await renderProviderMenu(ctx, { status: refreshed, notice });
+            ? `ℹ️ ${channelLabel} provider already set to *${escapeMarkdown(activeLabel)}*.`
+            : `✅ ${channelLabel} provider set to *${escapeMarkdown(activeLabel)}*.`;
+        logProviderEvent(ctx, {
+            action: 'set_provider',
+            channel: normalizedChannel,
+            provider: normalizedProvider,
+            result: result.changed === false ? 'no_change' : 'success',
+        });
+        await renderProviderSubmenu(ctx, normalizedChannel, { status: refreshed, notice });
     } catch (error) {
-        console.error('Provider switch command error:', error);
-        await ctx.reply(formatProviderError(error, 'update provider'));
+        logProviderEvent(ctx, {
+            action: 'set_provider',
+            channel: normalizedChannel,
+            provider: normalizedProvider,
+            result: 'failure',
+            error,
+        });
+        await ctx.reply(`❌ Failed to switch ${normalizedChannel.toUpperCase()} provider. Please try again.`);
     }
+}
+
+function parseProviderAction(action = '') {
+    const normalized = String(action || '').trim();
+    if (!normalized) return null;
+
+    if (
+        normalized === PROVIDER_ACTIONS.HOME ||
+        normalized === PROVIDER_ACTIONS.BACK_HOME
+    ) {
+        return { type: 'home' };
+    }
+    if (normalized === PROVIDER_ACTIONS.CALL) {
+        return { type: 'submenu', channel: CHANNELS.CALL };
+    }
+    if (normalized === PROVIDER_ACTIONS.SMS) {
+        return { type: 'submenu', channel: CHANNELS.SMS };
+    }
+    if (normalized === PROVIDER_ACTIONS.EMAIL) {
+        return { type: 'submenu', channel: CHANNELS.EMAIL };
+    }
+
+    if (normalized.startsWith(PROVIDER_ACTIONS.BACK_PREFIX)) {
+        const scope = normalized.slice(PROVIDER_ACTIONS.BACK_PREFIX.length);
+        if (scope.toUpperCase() === 'HOME') {
+            return { type: 'home' };
+        }
+    }
+
+    if (normalized.startsWith(PROVIDER_ACTIONS.STATUS_PREFIX)) {
+        const segment = normalized.slice(PROVIDER_ACTIONS.STATUS_PREFIX.length);
+        const channel = actionSegmentToChannel(segment);
+        if (channel) {
+            return { type: 'status', channel };
+        }
+    }
+
+    if (normalized.startsWith(PROVIDER_ACTIONS.SET_PREFIX)) {
+        const payload = normalized.slice(PROVIDER_ACTIONS.SET_PREFIX.length);
+        const [segment, provider] = payload.split(':');
+        const channel = actionSegmentToChannel(segment);
+        const normalizedProvider = normalizeProviderName(provider);
+        if (channel && normalizedProvider) {
+            return { type: 'set', channel, provider: normalizedProvider };
+        }
+    }
+
+    // Legacy callback compatibility
+    if (normalized === PROVIDER_ACTIONS.LEGACY_STATUS) {
+        return { type: 'home' };
+    }
+    if (normalized.startsWith(PROVIDER_ACTIONS.LEGACY_STATUS_CHANNEL_PREFIX)) {
+        const channel = normalizeChannel(
+            normalized.slice(PROVIDER_ACTIONS.LEGACY_STATUS_CHANNEL_PREFIX.length),
+        );
+        return { type: 'submenu', channel };
+    }
+    if (normalized.startsWith(PROVIDER_ACTIONS.LEGACY_SET_PREFIX)) {
+        const provider = normalizeProviderName(
+            normalized.slice(PROVIDER_ACTIONS.LEGACY_SET_PREFIX.length),
+        );
+        if (provider) {
+            return { type: 'set', channel: CHANNELS.CALL, provider };
+        }
+    }
+    if (normalized.startsWith(PROVIDER_ACTIONS.LEGACY_SET_CHANNEL_PREFIX)) {
+        const payload = normalized.slice(PROVIDER_ACTIONS.LEGACY_SET_CHANNEL_PREFIX.length);
+        const [channel, provider] = payload.split(':');
+        const normalizedProvider = normalizeProviderName(provider);
+        if (normalizedProvider) {
+            return { type: 'set', channel: normalizeChannel(channel), provider: normalizedProvider };
+        }
+    }
+    if (normalized === PROVIDER_ACTIONS.LEGACY_OVERRIDES) {
+        return { type: 'overrides' };
+    }
+    if (normalized.startsWith(PROVIDER_ACTIONS.LEGACY_CLEAR_OVERRIDES_PREFIX)) {
+        return {
+            type: 'clear_overrides',
+            scope: normalized.slice(PROVIDER_ACTIONS.LEGACY_CLEAR_OVERRIDES_PREFIX.length),
+        };
+    }
+
+    return null;
+}
+
+function isProviderAction(action = '') {
+    return Boolean(parseProviderAction(action));
+}
+
+async function handleProviderCallbackAction(ctx, action = '') {
+    const parsed = parseProviderAction(action);
+    if (!parsed) return false;
+
+    if (parsed.type === 'home') {
+        await renderProviderDashboard(ctx, { forceRefresh: true });
+        return true;
+    }
+    if (parsed.type === 'submenu') {
+        await renderProviderSubmenu(ctx, parsed.channel, { forceRefresh: true });
+        return true;
+    }
+    if (parsed.type === 'status') {
+        await renderProviderSubmenu(ctx, parsed.channel, { forceRefresh: true });
+        return true;
+    }
+    if (parsed.type === 'set') {
+        await handleProviderSwitch(ctx, parsed.provider, parsed.channel);
+        return true;
+    }
+    if (parsed.type === 'overrides') {
+        await handleProviderOverrides(ctx);
+        return true;
+    }
+    if (parsed.type === 'clear_overrides') {
+        await handleProviderClearOverrides(ctx, [parsed.scope || 'all']);
+        return true;
+    }
+    return false;
 }
 
 function registerProviderCommand(bot) {
     bot.command('provider', async (ctx) => {
-        const text = ctx.message?.text || '';
+        const text = String(ctx.message?.text || '');
         const args = text.split(/\s+/).slice(1);
-        const requestedAction = (args[0] || '').toLowerCase();
-
-        const { isAdminUser } = await ensureAuthorizedAdmin(ctx);
+        const commandAction = String(args[0] || '').toLowerCase();
+        const isAdminUser = await ensureAuthorizedAdmin(ctx);
         if (!isAdminUser) {
             return;
         }
-
-        try {
-            await handleProviderCommandAction(ctx, requestedAction, args.slice(1));
-        } catch (error) {
-            console.error('Failed to manage provider via Telegram command:', error);
-            await ctx.reply(formatProviderError(error, 'update provider'));
+        if (commandAction === 'overrides') {
+            await handleProviderOverrides(ctx);
+            return;
         }
+        if (
+            commandAction === 'clear-overrides' ||
+            commandAction === 'clearoverride' ||
+            commandAction === 'clear_overrides' ||
+            commandAction === 'clear-override' ||
+            commandAction === 'clear_override'
+        ) {
+            await handleProviderClearOverrides(ctx, args.slice(1));
+            return;
+        }
+        await renderProviderDashboard(ctx, { forceRefresh: true });
     });
 }
 
@@ -376,16 +676,22 @@ module.exports = initializeProviderCommand;
 module.exports.registerProviderCommand = registerProviderCommand;
 module.exports.fetchProviderStatus = fetchProviderStatus;
 module.exports.updateProvider = updateProvider;
-module.exports.formatProviderStatus = formatProviderStatus;
-module.exports.handleProviderSwitch = handleProviderSwitch;
 module.exports.fetchKeypadOverrides = fetchKeypadOverrides;
 module.exports.clearKeypadOverrides = clearKeypadOverrides;
 module.exports.handleProviderOverrides = handleProviderOverrides;
 module.exports.handleProviderClearOverrides = handleProviderClearOverrides;
-module.exports.handleProviderCommandAction = handleProviderCommandAction;
+module.exports.handleProviderSwitch = handleProviderSwitch;
 module.exports.handleProviderCallbackAction = handleProviderCallbackAction;
 module.exports.renderProviderMenu = renderProviderMenu;
-module.exports.buildProviderKeyboard = buildProviderKeyboard;
-module.exports.SUPPORTED_PROVIDERS = SUPPORTED_PROVIDERS;
-module.exports.ADMIN_HEADER_NAME = ADMIN_HEADER_NAME;
+module.exports.renderProviderDashboard = renderProviderDashboard;
+module.exports.renderProviderSubmenu = renderProviderSubmenu;
+module.exports.buildProviderDashboardKeyboard = buildProviderDashboardKeyboard;
+module.exports.buildProviderSubmenuKeyboard = buildProviderSubmenuKeyboard;
+module.exports.buildProviderDashboard = buildProviderDashboard;
+module.exports.buildProviderSubmenuText = buildProviderSubmenuText;
+module.exports.normalizeChannel = normalizeChannel;
+module.exports.parseProviderAction = parseProviderAction;
+module.exports.isProviderAction = isProviderAction;
+module.exports.DEFAULT_SUPPORTED_PROVIDERS = DEFAULT_SUPPORTED_PROVIDERS;
 module.exports.PROVIDER_ACTIONS = PROVIDER_ACTIONS;
+module.exports.ADMIN_HEADER_NAME = ADMIN_HEADER_NAME;

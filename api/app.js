@@ -25,6 +25,25 @@ const { createDigitCollectionService } = require("./functions/Digit");
 const { formatDigitCaptureLabel } = require("./functions/Labels");
 const config = require("./config");
 const {
+  PROVIDER_CHANNELS,
+  SUPPORTED_CALL_PROVIDERS,
+  SUPPORTED_SMS_PROVIDERS,
+  SUPPORTED_EMAIL_PROVIDERS,
+  getActiveCallProvider,
+  getActiveSmsProvider,
+  getActiveEmailProvider,
+  getStoredCallProvider,
+  getStoredSmsProvider,
+  getStoredEmailProvider,
+  setActiveCallProvider,
+  setActiveSmsProvider,
+  setActiveEmailProvider,
+  setStoredCallProvider,
+  setStoredSmsProvider,
+  setStoredEmailProvider,
+  normalizeProvider,
+} = require("./routes/providerState");
+const {
   AwsConnectAdapter,
   AwsTtsAdapter,
   VonageVoiceAdapter,
@@ -100,7 +119,9 @@ const HMAC_BYPASS_PATH_PREFIXES = [
 let db;
 let digitService;
 const functionEngine = new DynamicFunctionEngine();
-let smsService = new EnhancedSmsService();
+let smsService = new EnhancedSmsService({
+  getActiveProvider: () => getActiveSmsProvider(),
+});
 let emailService;
 const sttFallbackCalls = new Set();
 const streamTimeoutCalls = new Set();
@@ -108,6 +129,7 @@ const inboundRateBuckets = new Map();
 const streamStartTimes = new Map();
 const sttFailureCounts = new Map();
 const voiceAgentFallbackAttempts = new Map();
+const voiceAgentRuntimeByCall = new Map(); // callSid -> runtime guards/state
 const activeStreamConnections = new Map();
 const streamStartSeen = new Map(); // callSid -> streamSid (dedupe starts)
 const streamStopSeen = new Set(); // callSid:streamSid (dedupe stops)
@@ -126,12 +148,15 @@ const keypadDtmfSeen = new Map(); // callSid -> { seenAt, source, digitsLength }
 const keypadDtmfWatchdogs = new Map(); // callSid -> timeoutId
 const vonageWebhookJtiCache = new Map(); // jti -> expiresAtMs
 let callJobProcessing = false;
+const outboundRateBuckets = new Map(); // namespace:key -> { count, windowStart }
 const callLifecycleCleanupTimers = new Map();
 const CALL_STATUS_DEDUPE_MS = 3000;
 const CALL_STATUS_DEDUPE_MAX = 5000;
 const VONAGE_WEBHOOK_JTI_CACHE_MAX = 5000;
 const KEYPAD_PROVIDER_OVERRIDE_SETTING_KEY = "keypad_provider_overrides_v1";
 const CALL_PROVIDER_SETTING_KEY = "call_provider_v1";
+const SMS_PROVIDER_SETTING_KEY = "sms_provider_v1";
+const EMAIL_PROVIDER_SETTING_KEY = "email_provider_v1";
 
 function stableStringify(value) {
   if (value === null || typeof value !== "object") {
@@ -911,13 +936,371 @@ function maskPhoneForLog(input = "") {
 }
 
 function maskSmsBodyForLog(body = "") {
-  const digits = String(body || "").replace(/\D/g, "");
-  if (digits.length >= 2) {
-    return `[${digits.length} digits]`;
+  const text = String(body || "").replace(/\s+/g, " ").trim();
+  if (!text) return "[empty len=0]";
+  const digest = crypto
+    .createHash("sha256")
+    .update(text)
+    .digest("hex")
+    .slice(0, 12);
+  return `[len=${text.length} sha=${digest}]`;
+}
+
+function redactSensitiveLogValue(input = "") {
+  let text = String(input || "");
+  if (!text) return "unknown";
+  text = text.replace(/\+?\d[\d\s().-]{6,}\d/g, (match) => {
+    const digits = String(match || "").replace(/\D/g, "");
+    if (digits.length < 4) return "[redacted-phone]";
+    return `***${digits.slice(-2)}`;
+  });
+  text = text.replace(
+    /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi,
+    "[redacted-email]",
+  );
+  if (text.length > 220) {
+    return `${text.slice(0, 200)}...[redacted]`;
   }
-  const text = String(body || "").trim();
-  if (!text) return "[empty]";
-  return text.length > 80 ? `${text.slice(0, 77)}...` : text;
+  return text;
+}
+
+function normalizeRequestId(value = "") {
+  const candidate = String(value || "").trim();
+  if (!candidate) return null;
+  if (candidate.length > 80) return null;
+  if (!/^[A-Za-z0-9._:-]+$/.test(candidate)) return null;
+  return candidate;
+}
+
+function buildApiError(code, message, requestId = null, extra = {}) {
+  return {
+    success: false,
+    error: message,
+    code,
+    ...(requestId ? { request_id: requestId } : {}),
+    ...(extra || {}),
+  };
+}
+
+function sendApiError(res, status, code, message, requestId = null, extra = {}) {
+  return res.status(status).json(buildApiError(code, message, requestId, extra));
+}
+
+function getOutboundActorKey(req, explicitValue = null) {
+  const explicit = String(explicitValue || "").trim();
+  if (explicit) return explicit;
+  const bodyUser = String(req?.body?.user_chat_id || req?.body?.userChatId || "").trim();
+  if (bodyUser) return bodyUser;
+  const tenant = String(req?.body?.tenant_id || req?.body?.tenantId || "").trim();
+  if (tenant) return `tenant:${tenant}`;
+  return String(req?.ip || req?.headers?.["x-forwarded-for"] || "anonymous");
+}
+
+async function checkOutboundRateLimit(scope, key, limit, windowMs) {
+  const safeLimit = Number(limit);
+  const safeWindowMs = Number(windowMs);
+  if (!Number.isFinite(safeLimit) || safeLimit <= 0) {
+    return { allowed: true };
+  }
+  if (!Number.isFinite(safeWindowMs) || safeWindowMs <= 0) {
+    return { allowed: true };
+  }
+
+  if (db?.checkAndConsumeOutboundRateLimit) {
+    try {
+      return await db.checkAndConsumeOutboundRateLimit({
+        scope,
+        key,
+        limit: safeLimit,
+        windowMs: safeWindowMs,
+        nowMs: Date.now(),
+      });
+    } catch (error) {
+      console.error("outbound_rate_limit_store_error", {
+        scope: String(scope || "unknown"),
+        key: redactSensitiveLogValue(String(key || "anonymous")),
+        reason: redactSensitiveLogValue(error?.message || "unknown"),
+      });
+    }
+  }
+
+  const now = Date.now();
+  if (outboundRateBuckets.size > 5000) {
+    for (const [entryKey, entry] of outboundRateBuckets.entries()) {
+      if (!entry || now - entry.windowStart >= safeWindowMs * 2) {
+        outboundRateBuckets.delete(entryKey);
+      }
+    }
+  }
+  const bucketKey = `${scope}:${key}`;
+  const existing = outboundRateBuckets.get(bucketKey);
+  if (!existing || now - existing.windowStart >= safeWindowMs) {
+    outboundRateBuckets.set(bucketKey, {
+      count: 1,
+      windowStart: now,
+    });
+    return { allowed: true };
+  }
+  if (existing.count >= safeLimit) {
+    const retryAfterMs = Math.max(0, safeWindowMs - (now - existing.windowStart));
+    return { allowed: false, retryAfterMs };
+  }
+  existing.count += 1;
+  outboundRateBuckets.set(bucketKey, existing);
+  return { allowed: true };
+}
+
+async function enforceOutboundRateLimits(req, res, options = {}) {
+  const requestId = req.requestId || null;
+  const actorKey = getOutboundActorKey(req, options.actorKey);
+  const windowMs = Number(options.windowMs) || Number(config.outboundLimits?.windowMs) || 60000;
+  const perUserLimit = Number(options.perUserLimit);
+  const globalLimit = Number(options.globalLimit);
+  const namespace = options.namespace || "outbound";
+
+  const perUserCheck = await checkOutboundRateLimit(
+    `${namespace}:user`,
+    actorKey,
+    perUserLimit,
+    windowMs,
+  );
+  if (!perUserCheck.allowed) {
+    res.setHeader("retry-after", Math.ceil(perUserCheck.retryAfterMs / 1000));
+    return sendApiError(
+      res,
+      429,
+      `${namespace}_per_user_rate_limited`,
+      "Too many requests for this user. Please retry shortly.",
+      requestId,
+      { retry_after_ms: perUserCheck.retryAfterMs },
+    );
+  }
+
+  const globalCheck = await checkOutboundRateLimit(
+    `${namespace}:global`,
+    "all",
+    globalLimit,
+    windowMs,
+  );
+  if (!globalCheck.allowed) {
+    res.setHeader("retry-after", Math.ceil(globalCheck.retryAfterMs / 1000));
+    return sendApiError(
+      res,
+      429,
+      `${namespace}_global_rate_limited`,
+      "Service is temporarily rate limited. Please retry shortly.",
+      requestId,
+      { retry_after_ms: globalCheck.retryAfterMs },
+    );
+  }
+
+  return null;
+}
+
+function formatVoiceAgentErrorForLog(error) {
+  if (!error) return "unknown";
+  const message =
+    error?.message ||
+    error?.description ||
+    error?.type ||
+    "voice_agent_error";
+  return redactSensitiveLogValue(message);
+}
+
+function getVoiceAgentRuntimeConfig() {
+  const runtime = config.deepgram?.voiceAgent?.runtime || {};
+  const turnTimeoutMs = Number(runtime.turnTimeoutMs);
+  const toolTimeoutMs = Number(runtime.toolTimeoutMs);
+  const maxToolResponseChars = Number(runtime.maxToolResponseChars);
+  const maxConsecutiveToolFailures = Number(runtime.maxConsecutiveToolFailures);
+  const timeoutFallbackThreshold = Number(runtime.timeoutFallbackThreshold);
+  return {
+    turnTimeoutMs:
+      Number.isFinite(turnTimeoutMs) && turnTimeoutMs > 0 ? turnTimeoutMs : 12000,
+    toolTimeoutMs:
+      Number.isFinite(toolTimeoutMs) && toolTimeoutMs > 0 ? toolTimeoutMs : 8000,
+    maxToolResponseChars:
+      Number.isFinite(maxToolResponseChars) && maxToolResponseChars > 256
+        ? maxToolResponseChars
+        : 4000,
+    maxConsecutiveToolFailures:
+      Number.isFinite(maxConsecutiveToolFailures) &&
+      maxConsecutiveToolFailures > 0
+        ? Math.round(maxConsecutiveToolFailures)
+        : 3,
+    timeoutFallbackThreshold:
+      Number.isFinite(timeoutFallbackThreshold) && timeoutFallbackThreshold >= 0
+        ? Math.round(timeoutFallbackThreshold)
+        : 2,
+  };
+}
+
+function getOrCreateVoiceAgentRuntimeState(callSid) {
+  if (!callSid) return null;
+  if (!voiceAgentRuntimeByCall.has(callSid)) {
+    voiceAgentRuntimeByCall.set(callSid, {
+      provider: "unknown",
+      phase: "idle",
+      phaseAt: new Date().toISOString(),
+      turnId: 0,
+      turnTimeoutCount: 0,
+      turnTimeoutTimer: null,
+      consecutiveToolFailures: 0,
+      toolsDisabled: false,
+      fallbackRequested: false,
+    });
+  }
+  return voiceAgentRuntimeByCall.get(callSid);
+}
+
+function setVoiceAgentRuntimeProvider(callSid, provider = "unknown") {
+  const state = getOrCreateVoiceAgentRuntimeState(callSid);
+  if (!state) return;
+  state.provider = String(provider || "unknown").toLowerCase();
+}
+
+function setVoiceAgentPhase(callSid, phase) {
+  const state = getOrCreateVoiceAgentRuntimeState(callSid);
+  if (!state || !phase) return;
+  state.phase = String(phase);
+  state.phaseAt = new Date().toISOString();
+}
+
+function clearVoiceAgentTurnWatchdog(callSid) {
+  const state = voiceAgentRuntimeByCall.get(callSid);
+  if (!state?.turnTimeoutTimer) return;
+  clearTimeout(state.turnTimeoutTimer);
+  state.turnTimeoutTimer = null;
+}
+
+function clearVoiceAgentRuntime(callSid) {
+  const state = voiceAgentRuntimeByCall.get(callSid);
+  if (!state) return;
+  if (state.turnTimeoutTimer) {
+    clearTimeout(state.turnTimeoutTimer);
+  }
+  voiceAgentRuntimeByCall.delete(callSid);
+}
+
+function armVoiceAgentTurnWatchdog(callSid, onTimeout) {
+  const state = getOrCreateVoiceAgentRuntimeState(callSid);
+  if (!state) return;
+  const { turnTimeoutMs } = getVoiceAgentRuntimeConfig();
+  clearVoiceAgentTurnWatchdog(callSid);
+  state.turnId += 1;
+  const watchTurnId = state.turnId;
+  state.turnTimeoutTimer = setTimeout(() => {
+    const current = voiceAgentRuntimeByCall.get(callSid);
+    if (!current) return;
+    if (current.turnId !== watchTurnId) return;
+    current.turnTimeoutTimer = null;
+    current.turnTimeoutCount += 1;
+    setVoiceAgentPhase(callSid, "timeout_waiting_agent");
+    Promise.resolve(
+      onTimeout?.({
+        turnId: watchTurnId,
+        timeoutMs: turnTimeoutMs,
+        timeoutCount: current.turnTimeoutCount,
+      }),
+    ).catch(() => {});
+  }, turnTimeoutMs);
+}
+
+function markVoiceAgentAgentResponsive(callSid, phase = "agent_speaking") {
+  clearVoiceAgentTurnWatchdog(callSid);
+  setVoiceAgentPhase(callSid, phase);
+}
+
+function clampVoiceAgentFunctionResult(result) {
+  const { maxToolResponseChars } = getVoiceAgentRuntimeConfig();
+  const serialized =
+    typeof result === "string" ? result : JSON.stringify(result || {});
+  if (serialized.length <= maxToolResponseChars) {
+    return result;
+  }
+  return {
+    truncated: true,
+    preview: `${serialized.slice(0, maxToolResponseChars)}...[truncated]`,
+    original_length: serialized.length,
+  };
+}
+
+async function executeVoiceAgentFunctionWithGuard(
+  callSid,
+  functionSystem,
+  functionName,
+  args = {},
+) {
+  const state = getOrCreateVoiceAgentRuntimeState(callSid);
+  const {
+    toolTimeoutMs,
+    maxConsecutiveToolFailures,
+  } = getVoiceAgentRuntimeConfig();
+
+  if (state?.toolsDisabled) {
+    return {
+      error:
+        "Function execution is temporarily disabled for this call due to repeated tool failures.",
+    };
+  }
+
+  const fn = functionSystem?.implementations?.[functionName];
+  if (!fn) {
+    throw new Error(`Function ${functionName} is not available`);
+  }
+
+  let timeoutId = null;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      const timeoutError = new Error(
+        `Function ${functionName} timed out after ${toolTimeoutMs}ms`,
+      );
+      timeoutError.code = "voice_agent_tool_timeout";
+      reject(timeoutError);
+    }, toolTimeoutMs);
+  });
+
+  try {
+    const result = await Promise.race([Promise.resolve(fn(args || {})), timeoutPromise]);
+    if (timeoutId) clearTimeout(timeoutId);
+    if (state) {
+      state.consecutiveToolFailures = 0;
+    }
+    db
+      ?.addCallMetric?.(callSid, "voice_agent_tool_success", 1, {
+        function_name: functionName,
+      })
+      .catch(() => {});
+    return clampVoiceAgentFunctionResult(result);
+  } catch (error) {
+    if (timeoutId) clearTimeout(timeoutId);
+    const safeReason = formatVoiceAgentErrorForLog(error);
+    if (state) {
+      state.consecutiveToolFailures += 1;
+      if (state.consecutiveToolFailures >= maxConsecutiveToolFailures) {
+        state.toolsDisabled = true;
+        db
+          ?.updateCallState?.(callSid, "voice_agent_tools_disabled", {
+            at: new Date().toISOString(),
+            consecutive_tool_failures: state.consecutiveToolFailures,
+          })
+          .catch(() => {});
+      }
+    }
+    db
+      ?.addCallMetric?.(callSid, "voice_agent_tool_failure", 1, {
+        function_name: functionName,
+        reason: safeReason,
+      })
+      .catch(() => {});
+    throw new Error(safeReason);
+  }
+}
+
+function resetVoiceAgentRuntimeForTests() {
+  for (const callSid of voiceAgentRuntimeByCall.keys()) {
+    clearVoiceAgentRuntime(callSid);
+  }
 }
 
 function queuePendingDigitAction(callSid, action = {}) {
@@ -2382,8 +2765,9 @@ function verifyHmacSignature(req) {
     return { ok: true, skipped: true, reason: "missing_secret" };
   }
 
-  const timestampHeader = req.headers[HMAC_HEADER_TIMESTAMP];
-  const signatureHeader = req.headers[HMAC_HEADER_SIGNATURE];
+  const headers = req?.headers || {};
+  const timestampHeader = headers[HMAC_HEADER_TIMESTAMP];
+  const signatureHeader = headers[HMAC_HEADER_SIGNATURE];
 
   if (!timestampHeader || !signatureHeader) {
     return { ok: false, reason: "missing_headers" };
@@ -2420,6 +2804,104 @@ function verifyHmacSignature(req) {
   }
 
   return { ok: true };
+}
+
+function safeCompareSecret(provided, expected) {
+  if (!provided || !expected) return false;
+  try {
+    const expectedBuf = Buffer.from(String(expected), "utf8");
+    const providedBuf = Buffer.from(String(provided), "utf8");
+    if (expectedBuf.length !== providedBuf.length) return false;
+    return crypto.timingSafeEqual(expectedBuf, providedBuf);
+  } catch {
+    return false;
+  }
+}
+
+function verifyTelegramWebhookAuth(req) {
+  const hmac = verifyHmacSignature(req);
+  if (hmac.ok && !hmac.skipped) {
+    return { ok: true, method: "hmac" };
+  }
+  if (hmac.skipped) {
+    return { ok: false, reason: "missing_auth_config" };
+  }
+  return { ok: false, reason: hmac.reason || "invalid_hmac" };
+}
+
+function requireValidTelegramWebhook(req, res, label = "") {
+  const mode = String(config.telegram?.webhookValidation || "warn").toLowerCase();
+  if (mode === "off") return true;
+  const verification = verifyTelegramWebhookAuth(req);
+  if (verification.ok) return true;
+  const path = label || req.originalUrl || req.path || "unknown";
+  console.warn(
+    `⚠️ Telegram webhook auth failed for ${path}: ${verification.reason || "unknown"}`,
+  );
+  if (mode === "strict") {
+    res.status(401).send("Unauthorized");
+    return false;
+  }
+  return true;
+}
+
+function verifyAwsWebhookAuth(req, options = {}) {
+  const { allowQuerySecret = false } = options;
+  const expectedSecret = config.aws?.webhookSecret;
+  const providedHeaderSecret = req?.headers?.["x-aws-webhook-secret"];
+  const providedQuerySecret = allowQuerySecret
+    ? req.query?.awsWebhookSecret || req.query?.secret
+    : null;
+  const providedSecret = providedHeaderSecret || providedQuerySecret;
+  if (expectedSecret) {
+    if (!providedSecret) {
+      return { ok: false, reason: "missing_aws_secret" };
+    }
+    if (!safeCompareSecret(providedSecret, expectedSecret)) {
+      return { ok: false, reason: "invalid_aws_secret" };
+    }
+    return { ok: true, method: "aws_secret" };
+  }
+
+  const hmac = verifyHmacSignature(req);
+  if (hmac.ok && !hmac.skipped) {
+    return { ok: true, method: "hmac" };
+  }
+  if (hmac.skipped) {
+    return { ok: false, reason: "missing_auth_config" };
+  }
+  return { ok: false, reason: hmac.reason || "invalid_hmac" };
+}
+
+function requireValidAwsWebhook(req, res, label = "", options = {}) {
+  const mode = String(config.aws?.webhookValidation || "warn").toLowerCase();
+  if (mode === "off") return true;
+  const verification = verifyAwsWebhookAuth(req, options);
+  if (verification.ok) return true;
+  const path = label || req.originalUrl || req.path || "unknown";
+  console.warn(
+    `⚠️ AWS webhook auth failed for ${path}: ${verification.reason || "unknown"}`,
+  );
+  if (mode === "strict") {
+    res.status(401).send("Unauthorized");
+    return false;
+  }
+  return true;
+}
+
+function verifyAwsStreamAuth(callSid, req) {
+  const streamAuth = verifyStreamAuth(callSid, req);
+  if (streamAuth.ok || streamAuth.skipped) {
+    return { ok: true, method: "stream_auth" };
+  }
+  const awsFallback = verifyAwsWebhookAuth(req, { allowQuerySecret: true });
+  if (awsFallback.ok) {
+    return { ok: true, method: awsFallback.method };
+  }
+  return {
+    ok: false,
+    reason: streamAuth.reason || awsFallback.reason || "unauthorized",
+  };
 }
 
 function parseBearerToken(value) {
@@ -2653,6 +3135,14 @@ function captureRawBody(req, _res, buf) {
 
 app.use(express.json({ verify: captureRawBody }));
 app.use(express.urlencoded({ extended: true, verify: captureRawBody }));
+
+app.use((req, res, next) => {
+  const incoming = normalizeRequestId(req.headers["x-request-id"]);
+  const requestId = incoming || uuidv4();
+  req.requestId = requestId;
+  res.setHeader("x-request-id", requestId);
+  next();
+});
 
 const apiLimiter = rateLimit({
   windowMs: config.server?.rateLimit?.windowMs || 60000,
@@ -3699,9 +4189,22 @@ function shouldCloseConversation(text = "") {
 }
 
 const ADMIN_HEADER_NAME = "x-admin-token";
-const SUPPORTED_PROVIDERS = ["twilio", "aws", "vonage"];
-let currentProvider = config.platform?.provider || "twilio";
-let storedProvider = currentProvider;
+const SUPPORTED_PROVIDERS = [...SUPPORTED_CALL_PROVIDERS];
+let currentProvider = getActiveCallProvider();
+let storedProvider = getStoredCallProvider();
+let currentSmsProvider = getActiveSmsProvider();
+let storedSmsProvider = getStoredSmsProvider();
+let currentEmailProvider = getActiveEmailProvider();
+let storedEmailProvider = getStoredEmailProvider();
+
+function syncRuntimeProviderMirrors() {
+  currentProvider = getActiveCallProvider();
+  storedProvider = getStoredCallProvider();
+  currentSmsProvider = getActiveSmsProvider();
+  storedSmsProvider = getStoredSmsProvider();
+  currentEmailProvider = getActiveEmailProvider();
+  storedEmailProvider = getStoredEmailProvider();
+}
 const awsContactMap = new Map();
 const vonageCallMap = new Map();
 
@@ -3967,6 +4470,23 @@ function hasAdminToken(req) {
   return Boolean(provided && provided === token);
 }
 
+function requireOutboundAuthorization(req, res, next) {
+  // If request HMAC is configured, global middleware already enforces it.
+  if (config.apiAuth?.hmacSecret) {
+    return next();
+  }
+  if (hasAdminToken(req)) {
+    return next();
+  }
+  return sendApiError(
+    res,
+    403,
+    "admin_token_required",
+    "Admin token required",
+    req.requestId || null,
+  );
+}
+
 function supportsKeypadCaptureProvider(provider) {
   const normalized = String(provider || "")
     .trim()
@@ -4108,41 +4628,98 @@ async function clearKeypadProviderOverrides(params = {}) {
   };
 }
 
-async function loadStoredCallProvider() {
+async function loadStoredProviderSetting(options = {}) {
+  const {
+    channel,
+    settingKey,
+    label = "provider",
+    supportedProviders = [],
+    getReadiness = () => ({}),
+    getActive = () => "unknown",
+    setActive = () => {},
+    setStored = () => {},
+  } = options;
   if (!db?.getSetting) return;
+
   try {
-    const raw = await db.getSetting(CALL_PROVIDER_SETTING_KEY);
+    const raw = await db.getSetting(settingKey);
     if (!raw) {
       console.log(
-        `☎️ Default call provider from env: ${String(currentProvider || "twilio").toUpperCase()}`,
+        `☎️ Default ${label} provider from env: ${String(getActive() || "unknown").toUpperCase()}`,
       );
       return;
     }
-    const normalized = String(raw).trim().toLowerCase();
-    if (!SUPPORTED_PROVIDERS.includes(normalized)) {
+
+    let normalized = null;
+    try {
+      normalized = normalizeProvider(channel, raw);
+    } catch {
       console.warn(
-        `Ignoring invalid stored call provider "${raw}". Supported values: ${SUPPORTED_PROVIDERS.join(", ")}`,
+        `Ignoring invalid stored ${label} provider "${raw}". Supported values: ${supportedProviders.join(", ")}`,
       );
       return;
     }
-    storedProvider = normalized;
-    const readiness = getProviderReadiness();
+
+    setStored(normalized);
+    const readiness = getReadiness() || {};
     if (readiness[normalized]) {
-      currentProvider = normalized;
+      setActive(normalized);
       console.log(
-        `☎️ Loaded default call provider from storage: ${normalized.toUpperCase()} (active)`,
+        `☎️ Loaded default ${label} provider from storage: ${normalized.toUpperCase()} (active)`,
       );
       return;
     }
+
     console.warn(
-      `Stored provider "${normalized}" is not configured/ready in this environment. Keeping active provider "${currentProvider}".`,
+      `Stored ${label} provider "${normalized}" is not configured/ready in this environment. Keeping active provider "${getActive()}".`,
     );
     console.log(
-      `☎️ Default call provider remains: ${String(currentProvider || "twilio").toUpperCase()}`,
+      `☎️ Default ${label} provider remains: ${String(getActive() || "unknown").toUpperCase()}`,
     );
   } catch (error) {
-    console.error("Failed to load stored call provider:", error);
+    console.error(`Failed to load stored ${label} provider:`, error);
+  } finally {
+    syncRuntimeProviderMirrors();
   }
+}
+
+async function loadStoredCallProvider() {
+  await loadStoredProviderSetting({
+    channel: PROVIDER_CHANNELS.CALL,
+    settingKey: CALL_PROVIDER_SETTING_KEY,
+    label: "call",
+    supportedProviders: SUPPORTED_CALL_PROVIDERS,
+    getReadiness: getProviderReadiness,
+    getActive: getActiveCallProvider,
+    setActive: setActiveCallProvider,
+    setStored: setStoredCallProvider,
+  });
+}
+
+async function loadStoredSmsProvider() {
+  await loadStoredProviderSetting({
+    channel: PROVIDER_CHANNELS.SMS,
+    settingKey: SMS_PROVIDER_SETTING_KEY,
+    label: "sms",
+    supportedProviders: SUPPORTED_SMS_PROVIDERS,
+    getReadiness: getSmsProviderReadiness,
+    getActive: getActiveSmsProvider,
+    setActive: setActiveSmsProvider,
+    setStored: setStoredSmsProvider,
+  });
+}
+
+async function loadStoredEmailProvider() {
+  await loadStoredProviderSetting({
+    channel: PROVIDER_CHANNELS.EMAIL,
+    settingKey: EMAIL_PROVIDER_SETTING_KEY,
+    label: "email",
+    supportedProviders: SUPPORTED_EMAIL_PROVIDERS,
+    getReadiness: getEmailProviderReadiness,
+    getActive: getActiveEmailProvider,
+    setActive: setActiveEmailProvider,
+    setStored: setStoredEmailProvider,
+  });
 }
 
 async function persistKeypadProviderOverrides() {
@@ -4371,6 +4948,44 @@ function getProviderReadiness() {
     ),
     aws: !!(config.aws.connect.instanceId && config.aws.connect.contactFlowId),
     vonage: vonageHasCredentials && vonageHasRouting && vonageWebhookReady,
+  };
+}
+
+function getSmsProviderReadiness() {
+  if (smsService?.getProviderReadiness) {
+    return smsService.getProviderReadiness();
+  }
+  return {
+    twilio: !!(
+      config.twilio?.accountSid &&
+      config.twilio?.authToken &&
+      config.twilio?.fromNumber
+    ),
+    aws: !!(
+      config.aws?.pinpoint?.applicationId &&
+      config.aws?.pinpoint?.originationNumber &&
+      config.aws?.pinpoint?.region
+    ),
+    vonage: !!(
+      config.vonage?.apiKey &&
+      config.vonage?.apiSecret &&
+      config.vonage?.sms?.fromNumber
+    ),
+  };
+}
+
+function getEmailProviderReadiness() {
+  if (emailService?.getProviderReadiness) {
+    return emailService.getProviderReadiness();
+  }
+  return {
+    sendgrid: !!config.email?.sendgrid?.apiKey,
+    mailgun: !!(config.email?.mailgun?.apiKey && config.email?.mailgun?.domain),
+    ses: !!(
+      config.email?.ses?.region &&
+      config.email?.ses?.accessKeyId &&
+      config.email?.ses?.secretAccessKey
+    ),
   };
 }
 
@@ -4932,14 +5547,26 @@ async function startServer(options = {}) {
     if (smsService?.setDb) {
       smsService.setDb(db);
     }
-    emailService = new EmailService({ db, config });
+    emailService = new EmailService({
+      db,
+      config,
+      providerResolver: () => getActiveEmailProvider(),
+    });
     await loadStoredCallProvider();
+    await loadStoredSmsProvider();
+    await loadStoredEmailProvider();
     await refreshInboundDefaultScript(true);
     await loadKeypadProviderOverrides();
     const voiceAgentMode = resolveVoiceAgentExecutionMode();
     logStartupRuntimeProfile(voiceAgentMode);
     console.log(
       `☎️ Default call provider: ${String(storedProvider || currentProvider || "twilio").toUpperCase()} (active: ${String(currentProvider || "twilio").toUpperCase()})`,
+    );
+    console.log(
+      `✉️ Default SMS provider: ${String(storedSmsProvider || currentSmsProvider || "twilio").toUpperCase()} (active: ${String(currentSmsProvider || "twilio").toUpperCase()})`,
+    );
+    console.log(
+      `📧 Default email provider: ${String(storedEmailProvider || currentEmailProvider || "sendgrid").toUpperCase()} (active: ${String(currentEmailProvider || "sendgrid").toUpperCase()})`,
     );
     if (voiceAgentMode.enabled) {
       console.log("🤖 Voice agent default mode: enabled");
@@ -5044,21 +5671,43 @@ function resolveVoiceAgentExecutionMode() {
 }
 
 function logStartupRuntimeProfile(voiceAgentMode) {
-  const envDefaultProvider = String(
-    config.platform?.provider || "twilio",
+  const envCallProvider = String(config.platform?.provider || "twilio").toLowerCase();
+  const envSmsProvider = String(
+    config.sms?.provider || config.platform?.provider || "twilio",
   ).toLowerCase();
-  const storedDefaultProvider = storedProvider
-    ? String(storedProvider).toLowerCase()
-    : null;
-  const activeProvider = String(currentProvider || "twilio").toLowerCase();
+  const envEmailProvider = String(config.email?.provider || "sendgrid").toLowerCase();
   const payload = {
     type: "startup_runtime_profile",
     timestamp: new Date().toISOString(),
     provider: {
-      env_default: envDefaultProvider,
-      stored_default: storedDefaultProvider,
-      effective_default: storedDefaultProvider || envDefaultProvider,
-      active: activeProvider,
+      call: {
+        env_default: envCallProvider,
+        stored_default: storedProvider ? String(storedProvider).toLowerCase() : null,
+        effective_default:
+          (storedProvider ? String(storedProvider).toLowerCase() : null) ||
+          envCallProvider,
+        active: String(currentProvider || "twilio").toLowerCase(),
+      },
+      sms: {
+        env_default: envSmsProvider,
+        stored_default: storedSmsProvider
+          ? String(storedSmsProvider).toLowerCase()
+          : null,
+        effective_default:
+          (storedSmsProvider ? String(storedSmsProvider).toLowerCase() : null) ||
+          envSmsProvider,
+        active: String(currentSmsProvider || "twilio").toLowerCase(),
+      },
+      email: {
+        env_default: envEmailProvider,
+        stored_default: storedEmailProvider
+          ? String(storedEmailProvider).toLowerCase()
+          : null,
+        effective_default:
+          (storedEmailProvider ? String(storedEmailProvider).toLowerCase() : null) ||
+          envEmailProvider,
+        active: String(currentEmailProvider || "sendgrid").toLowerCase(),
+      },
     },
     voice_agent: {
       requested: Boolean(voiceAgentMode?.requested),
@@ -5156,6 +5805,7 @@ async function tryStartVonageVoiceAgentSession(options = {}) {
     clearSilenceTimer(callSid);
     sttFallbackCalls.delete(callSid);
     streamTimeoutCalls.delete(callSid);
+    clearVoiceAgentRuntime(callSid);
     clearKeypadCallState(callSid);
     if (digitService) {
       digitService.clearCallState(callSid);
@@ -5177,6 +5827,8 @@ async function tryStartVonageVoiceAgentSession(options = {}) {
     voiceAgent: true,
     interactionCount: 0,
   });
+  setVoiceAgentRuntimeProvider(callSid, "vonage");
+  setVoiceAgentPhase(callSid, "connected");
   clearKeypadCallState(callSid);
   scheduleSilenceTimer(callSid);
 
@@ -5196,6 +5848,7 @@ async function tryStartVonageVoiceAgentSession(options = {}) {
   bridge.on("audio", (base64Audio) => {
     if (!base64Audio) return;
     try {
+      markVoiceAgentAgentResponsive(callSid, "agent_speaking");
       const buffer = Buffer.from(base64Audio, "base64");
       ws.send(buffer);
       const level = estimateAudioLevelFromBase64(base64Audio);
@@ -5204,7 +5857,9 @@ async function tryStartVonageVoiceAgentSession(options = {}) {
         .catch(() => {});
       scheduleSpeechTicksFromAudio(callSid, "agent_speaking", base64Audio);
     } catch (error) {
-      console.error("Vonage voice agent audio send error:", error);
+      console.error(
+        `Vonage voice agent audio send error: ${formatVoiceAgentErrorForLog(error)}`,
+      );
     }
   });
 
@@ -5214,8 +5869,10 @@ async function tryStartVonageVoiceAgentSession(options = {}) {
     const consoleRole = speaker === "ai" ? "agent" : "user";
     webhookService.recordTranscriptTurn(callSid, consoleRole, text);
     if (speaker === "user") {
+      setVoiceAgentPhase(callSid, "user_speaking");
       webhookService.setLiveCallPhase(callSid, "user_speaking").catch(() => {});
     } else {
+      setVoiceAgentPhase(callSid, "agent_responding");
       webhookService
         .setLiveCallPhase(callSid, "agent_responding")
         .catch(() => {});
@@ -5236,7 +5893,9 @@ async function tryStartVonageVoiceAgentSession(options = {}) {
         provider: "vonage",
       });
     } catch (error) {
-      console.error("Vonage voice agent transcript save error:", error);
+      console.error(
+        `Vonage voice agent transcript save error: ${formatVoiceAgentErrorForLog(error)}`,
+      );
     }
 
     if (speaker === "user") {
@@ -5265,11 +5924,12 @@ async function tryStartVonageVoiceAgentSession(options = {}) {
 
     let responsePayload;
     try {
-      const fn = functionSystem?.implementations?.[functionName];
-      if (!fn) {
-        throw new Error(`Function ${functionName} is not available`);
-      }
-      responsePayload = await fn(args || {});
+      responsePayload = await executeVoiceAgentFunctionWithGuard(
+        callSid,
+        functionSystem,
+        functionName,
+        args || {},
+      );
     } catch (error) {
       responsePayload = { error: error.message || "Function failed" };
       webhookService.addLiveEvent(
@@ -5286,22 +5946,49 @@ async function tryStartVonageVoiceAgentSession(options = {}) {
     const type = String(event?.type || event?.event || "").toLowerCase();
     if (!type) return;
     if (type.includes("userstartedspeaking")) {
-      webhookService.setLiveCallPhase(callSid, "user_speaking").catch(() => {});
+      clearSpeechTicks(callSid);
+      setVoiceAgentPhase(callSid, "interrupted");
+      webhookService.setLiveCallPhase(callSid, "interrupted").catch(() => {});
+      armVoiceAgentTurnWatchdog(callSid, async ({ timeoutMs, timeoutCount }) => {
+        webhookService.addLiveEvent(
+          callSid,
+          `⚠️ Voice agent response timeout (${timeoutMs}ms, count=${timeoutCount})`,
+          { force: true },
+        );
+        db
+          ?.addCallMetric?.(callSid, "voice_agent_turn_timeout_ms", timeoutMs, {
+            provider: "vonage",
+            timeout_count: timeoutCount,
+          })
+          .catch(() => {});
+        db
+          ?.updateCallState?.(callSid, "voice_agent_turn_timeout", {
+            at: new Date().toISOString(),
+            provider: "vonage",
+            timeout_ms: timeoutMs,
+            timeout_count: timeoutCount,
+          })
+          .catch(() => {});
+      });
       return;
     }
     if (type.includes("agentthinking")) {
+      markVoiceAgentAgentResponsive(callSid, "agent_responding");
       webhookService
         .setLiveCallPhase(callSid, "agent_responding")
         .catch(() => {});
       return;
     }
     if (type.includes("agentstartedspeaking")) {
+      markVoiceAgentAgentResponsive(callSid, "agent_speaking");
       webhookService.setLiveCallPhase(callSid, "agent_speaking").catch(() => {});
     }
   });
 
   bridge.on("error", (error) => {
-    console.error("Vonage voice agent bridge error:", error);
+    console.error(
+      `Vonage voice agent bridge error: ${formatVoiceAgentErrorForLog(error)}`,
+    );
     webhookService.addLiveEvent(
       callSid,
       `⚠️ Voice agent error: ${error.message || "unknown error"}`,
@@ -5338,7 +6025,9 @@ async function tryStartVonageVoiceAgentSession(options = {}) {
   });
 
   ws.on("error", (error) => {
-    console.error("Vonage voice agent websocket error:", error);
+    console.error(
+      `Vonage voice agent websocket error: ${formatVoiceAgentErrorForLog(error)}`,
+    );
   });
 
   ws.on("close", async () => {
@@ -5404,6 +6093,7 @@ async function handleVoiceAgentWebSocket(ws, req) {
       clearSilenceTimer(callSid);
       sttFallbackCalls.delete(callSid);
       streamTimeoutCalls.delete(callSid);
+      clearVoiceAgentRuntime(callSid);
       if (digitService) {
         digitService.clearCallState(callSid);
       }
@@ -5424,6 +6114,7 @@ async function handleVoiceAgentWebSocket(ws, req) {
 
   bridge.on("audio", (base64Audio) => {
     if (!base64Audio) return;
+    markVoiceAgentAgentResponsive(callSid, "agent_speaking");
     streamService.buffer(null, base64Audio);
     if (callSid) {
       webhookService
@@ -5438,8 +6129,10 @@ async function handleVoiceAgentWebSocket(ws, req) {
     const consoleRole = speaker === "ai" ? "agent" : "user";
     webhookService.recordTranscriptTurn(callSid, consoleRole, text);
     if (speaker === "user") {
+      setVoiceAgentPhase(callSid, "user_speaking");
       webhookService.setLiveCallPhase(callSid, "user_speaking").catch(() => {});
     } else {
+      setVoiceAgentPhase(callSid, "agent_responding");
       webhookService
         .setLiveCallPhase(callSid, "agent_responding")
         .catch(() => {});
@@ -5459,7 +6152,9 @@ async function handleVoiceAgentWebSocket(ws, req) {
         source: "voice_agent",
       });
     } catch (error) {
-      console.error("Voice agent transcript save error:", error);
+      console.error(
+        `Voice agent transcript save error: ${formatVoiceAgentErrorForLog(error)}`,
+      );
     }
     if (speaker === "user") {
       interactionCount += 1;
@@ -5487,11 +6182,12 @@ async function handleVoiceAgentWebSocket(ws, req) {
 
     let responsePayload;
     try {
-      const fn = functionSystem?.implementations?.[functionName];
-      if (!fn) {
-        throw new Error(`Function ${functionName} is not available`);
-      }
-      responsePayload = await fn(args || {});
+      responsePayload = await executeVoiceAgentFunctionWithGuard(
+        callSid,
+        functionSystem,
+        functionName,
+        args || {},
+      );
     } catch (error) {
       responsePayload = { error: error.message || "Function failed" };
       if (callSid) {
@@ -5510,22 +6206,98 @@ async function handleVoiceAgentWebSocket(ws, req) {
     const type = String(event?.type || event?.event || "").toLowerCase();
     if (!type) return;
     if (type.includes("userstartedspeaking")) {
-      webhookService.setLiveCallPhase(callSid, "user_speaking").catch(() => {});
+      clearSpeechTicks(callSid);
+      setVoiceAgentPhase(callSid, "interrupted");
+      webhookService.setLiveCallPhase(callSid, "interrupted").catch(() => {});
+      if (streamSid && ws?.readyState === 1) {
+        try {
+          ws.send(
+            JSON.stringify({
+              streamSid,
+              event: "clear",
+            }),
+          );
+        } catch (_) {}
+      }
+      armVoiceAgentTurnWatchdog(callSid, async ({ timeoutMs, timeoutCount }) => {
+        webhookService.addLiveEvent(
+          callSid,
+          `⚠️ Voice agent response timeout (${timeoutMs}ms, count=${timeoutCount})`,
+          { force: true },
+        );
+        db
+          ?.addCallMetric?.(callSid, "voice_agent_turn_timeout_ms", timeoutMs, {
+            provider: "twilio",
+            timeout_count: timeoutCount,
+          })
+          .catch(() => {});
+        db
+          ?.updateCallState?.(callSid, "voice_agent_turn_timeout", {
+            at: new Date().toISOString(),
+            provider: "twilio",
+            timeout_ms: timeoutMs,
+            timeout_count: timeoutCount,
+          })
+          .catch(() => {});
+
+        const runtimeCfg = getVoiceAgentRuntimeConfig();
+        if (
+          !runtimeCfg.timeoutFallbackThreshold ||
+          runtimeCfg.timeoutFallbackThreshold <= 0 ||
+          timeoutCount < runtimeCfg.timeoutFallbackThreshold
+        ) {
+          return;
+        }
+        const runtimeState = getOrCreateVoiceAgentRuntimeState(callSid);
+        if (runtimeState?.fallbackRequested) {
+          return;
+        }
+        if (runtimeState) {
+          runtimeState.fallbackRequested = true;
+        }
+        try {
+          const fallback = await requestVoiceAgentFallback(
+            callSid,
+            req,
+            "turn_timeout",
+          );
+          await db
+            ?.updateCallState?.(callSid, "voice_agent_timeout_fallback_redirected", {
+              at: new Date().toISOString(),
+              timeout_count: timeoutCount,
+              redirect_url: fallback?.redirectUrl || null,
+            })
+            .catch(() => {});
+          await cleanup("timeout_fallback_redirect");
+          try {
+            ws.close(4002, "Voice agent timeout fallback");
+          } catch (_) {}
+        } catch (fallbackError) {
+          if (runtimeState) {
+            runtimeState.fallbackRequested = false;
+          }
+          console.error(
+            `Voice agent timeout fallback failed: ${formatVoiceAgentErrorForLog(fallbackError)}`,
+          );
+        }
+      });
       return;
     }
     if (type.includes("agentthinking")) {
+      markVoiceAgentAgentResponsive(callSid, "agent_responding");
       webhookService
         .setLiveCallPhase(callSid, "agent_responding")
         .catch(() => {});
       return;
     }
     if (type.includes("agentstartedspeaking")) {
+      markVoiceAgentAgentResponsive(callSid, "agent_speaking");
       webhookService.setLiveCallPhase(callSid, "agent_speaking").catch(() => {});
     }
   });
 
   bridge.on("error", (error) => {
-    console.error("Voice agent bridge error:", error);
+    console.error(`Voice agent bridge error: ${formatVoiceAgentErrorForLog(error)}`);
     if (callSid) {
       webhookService.addLiveEvent(
         callSid,
@@ -5557,19 +6329,10 @@ async function handleVoiceAgentWebSocket(ws, req) {
       const customParams = msg.start?.customParameters || {};
       const authResult = verifyStreamAuth(callSid, req, customParams);
       if (!authResult.ok) {
-        if (authResult.reason !== "missing_token") {
-          ws.close();
-          return;
-        }
-        streamAuthBypass.set(callSid, {
-          reason: authResult.reason,
-          at: new Date().toISOString(),
-        });
+        ws.close();
+        return;
       }
-      streamAuthOk =
-        authResult.ok ||
-        authResult.skipped ||
-        authResult.reason === "missing_token";
+      streamAuthOk = authResult.ok || authResult.skipped;
 
       const priorStreamSid = streamStartSeen.get(callSid);
       if (priorStreamSid && priorStreamSid === streamSid) {
@@ -5691,6 +6454,8 @@ async function handleVoiceAgentWebSocket(ws, req) {
         voiceAgent: true,
         interactionCount: 0,
       });
+      setVoiceAgentRuntimeProvider(callSid, "twilio");
+      setVoiceAgentPhase(callSid, "connected");
 
       const voiceAgentFunctions = buildVoiceAgentFunctions(functionSystem);
       try {
@@ -5705,7 +6470,9 @@ async function handleVoiceAgentWebSocket(ws, req) {
           force: true,
         });
       } catch (error) {
-        console.error("Voice agent connect failed, falling back:", error);
+        console.error(
+          `Voice agent connect failed, falling back: ${formatVoiceAgentErrorForLog(error)}`,
+        );
         webhookService.addLiveEvent(
           callSid,
           "⚠️ Voice agent unavailable. Switching to legacy audio pipeline…",
@@ -5736,7 +6503,9 @@ async function handleVoiceAgentWebSocket(ws, req) {
             at: new Date().toISOString(),
           }).catch(() => {});
         } catch (fallbackError) {
-          console.error("Voice agent fallback redirect failed:", fallbackError);
+          console.error(
+            `Voice agent fallback redirect failed: ${formatVoiceAgentErrorForLog(fallbackError)}`,
+          );
           await db.updateCallState(callSid, "voice_agent_fallback_failed", {
             error: fallbackError.message || "fallback_redirect_failed",
             at: new Date().toISOString(),
@@ -5781,7 +6550,9 @@ async function handleVoiceAgentWebSocket(ws, req) {
   });
 
   ws.on("error", (error) => {
-    console.error("Voice agent websocket error:", error);
+    console.error(
+      `Voice agent websocket error: ${formatVoiceAgentErrorForLog(error)}`,
+    );
   });
 
   ws.on("close", async () => {
@@ -5932,24 +6703,10 @@ app.ws("/connection", (ws, req) => {
               stream_sid: streamSid || null,
               at: new Date().toISOString(),
             }).catch(() => {});
-            if (authResult.reason !== "missing_token") {
-              ws.close();
-              return;
-            }
-            streamAuthBypass.set(callSid, {
-              reason: authResult.reason,
-              at: new Date().toISOString(),
-            });
-            webhookService.addLiveEvent(
-              callSid,
-              "⚠️ Stream auth token missing; continuing without auth",
-              { force: true },
-            );
+            ws.close();
+            return;
           }
-          streamAuthOk =
-            authResult.ok ||
-            authResult.skipped ||
-            authResult.reason === "missing_token";
+          streamAuthOk = authResult.ok || authResult.skipped;
           const priorStreamSid = streamStartSeen.get(callSid);
           if (priorStreamSid && priorStreamSid === streamSid) {
             console.log(
@@ -7580,11 +8337,25 @@ app.ws("/aws/stream", (ws, req) => {
       return;
     }
 
-    const callConfig = callConfigurations.get(callSid);
-    const resolvedVoiceModel = resolveVoiceModel(callConfig);
-    if (resolvedVoiceModel) {
-      ttsService.voiceModel = resolvedVoiceModel;
+    const awsWebhookMode = String(config.aws?.webhookValidation || "warn")
+      .toLowerCase()
+      .trim();
+    if (awsWebhookMode !== "off") {
+      const authResult = verifyAwsStreamAuth(callSid, req);
+      if (!authResult.ok) {
+        console.warn("AWS websocket auth failed", {
+          callSid,
+          contactId,
+          reason: authResult.reason || "unknown",
+        });
+        if (awsWebhookMode === "strict") {
+          ws.close();
+          return;
+        }
+      }
     }
+
+    const callConfig = callConfigurations.get(callSid);
     if (!callConfig) {
       ws.close();
       return;
@@ -8346,6 +9117,9 @@ app.get("/incoming", handleTwilioIncoming);
 // Telegram callback webhook (live console actions)
 app.post("/webhook/telegram", async (req, res) => {
   try {
+    if (!requireValidTelegramWebhook(req, res, "/webhook/telegram")) {
+      return;
+    }
     const update = req.body;
     res.status(200).send("OK");
 
@@ -9113,6 +9887,9 @@ app.post("/event", handleVonageEvent);
 
 app.post("/webhook/aws/status", async (req, res) => {
   try {
+    if (!requireValidAwsWebhook(req, res, "/webhook/aws/status")) {
+      return;
+    }
     const { contactId, status, duration, callSid } = req.body || {};
     const resolvedCallSid =
       callSid || (contactId ? awsContactMap.get(contactId) : null);
@@ -9157,6 +9934,9 @@ app.post("/webhook/aws/status", async (req, res) => {
 
 app.post("/aws/transcripts", async (req, res) => {
   try {
+    if (!requireValidAwsWebhook(req, res, "/aws/transcripts")) {
+      return;
+    }
     const { callSid, transcript, isPartial } = req.body || {};
     if (!callSid || !transcript) {
       return res
@@ -9209,52 +9989,197 @@ app.post("/aws/transcripts", async (req, res) => {
 });
 
 // Provider status/update endpoints (admin only)
-app.get("/admin/provider", requireAdminToken, async (req, res) => {
-  const readiness = getProviderReadiness();
-  pruneExpiredKeypadProviderOverrides();
-
-  res.json({
+function getProviderStateSnapshot() {
+  const callReadiness = getProviderReadiness();
+  const smsReadiness = getSmsProviderReadiness();
+  const emailReadiness = getEmailProviderReadiness();
+  const callState = {
     provider: currentProvider,
     stored_provider: storedProvider,
     supported_providers: SUPPORTED_PROVIDERS,
-    twilio_ready: readiness.twilio,
-    aws_ready: readiness.aws,
-    vonage_ready: readiness.vonage,
+    readiness: callReadiness,
+    twilio_ready: callReadiness.twilio,
+    aws_ready: callReadiness.aws,
+    vonage_ready: callReadiness.vonage,
+  };
+  const smsState = {
+    provider: currentSmsProvider,
+    stored_provider: storedSmsProvider,
+    supported_providers: SUPPORTED_SMS_PROVIDERS,
+    readiness: smsReadiness,
+  };
+  const emailState = {
+    provider: currentEmailProvider,
+    stored_provider: storedEmailProvider,
+    supported_providers: SUPPORTED_EMAIL_PROVIDERS,
+    readiness: emailReadiness,
+  };
+  return {
+    callState,
+    smsState,
+    emailState,
+  };
+}
+
+function resolveProviderChannel(value) {
+  const normalized = String(value || PROVIDER_CHANNELS.CALL)
+    .trim()
+    .toLowerCase();
+  if (
+    normalized !== PROVIDER_CHANNELS.CALL &&
+    normalized !== PROVIDER_CHANNELS.SMS &&
+    normalized !== PROVIDER_CHANNELS.EMAIL
+  ) {
+    return null;
+  }
+  return normalized;
+}
+
+app.get("/admin/provider", requireAdminToken, async (req, res) => {
+  syncRuntimeProviderMirrors();
+  const { callState, smsState, emailState } = getProviderStateSnapshot();
+  pruneExpiredKeypadProviderOverrides();
+  const requestedChannel = resolveProviderChannel(req.query?.channel);
+  if (!requestedChannel && req.query?.channel) {
+    return res.status(400).json({
+      success: false,
+      error: "Unsupported provider channel",
+    });
+  }
+  const channel = requestedChannel || PROVIDER_CHANNELS.CALL;
+  const selectedState =
+    channel === PROVIDER_CHANNELS.CALL
+      ? callState
+      : channel === PROVIDER_CHANNELS.SMS
+        ? smsState
+        : emailState;
+
+  res.json({
+    channel,
+    provider: selectedState.provider,
+    stored_provider: selectedState.stored_provider,
+    supported_providers: selectedState.supported_providers,
+    twilio_ready: callState.twilio_ready,
+    aws_ready: callState.aws_ready,
+    vonage_ready: callState.vonage_ready,
     vonage_dtmf_ready: config.vonage?.dtmfWebhookEnabled === true,
     keypad_guard_enabled: config.keypadGuard?.enabled === true,
     keypad_override_count: keypadProviderOverrides.size,
+    sms_provider: smsState.provider,
+    sms_stored_provider: smsState.stored_provider,
+    sms_supported_providers: smsState.supported_providers,
+    sms_readiness: smsState.readiness,
+    email_provider: emailState.provider,
+    email_stored_provider: emailState.stored_provider,
+    email_supported_providers: emailState.supported_providers,
+    email_readiness: emailState.readiness,
+    providers: {
+      call: callState,
+      sms: smsState,
+      email: emailState,
+    },
   });
 });
 
 app.post("/admin/provider", requireAdminToken, async (req, res) => {
-  const { provider } = req.body || {};
-  if (!provider || !SUPPORTED_PROVIDERS.includes(provider)) {
+  syncRuntimeProviderMirrors();
+  const body = req.body || {};
+  const provider = String(body.provider || "")
+    .trim()
+    .toLowerCase();
+  const channel = resolveProviderChannel(body.channel);
+  if (!channel) {
+    return res.status(400).json({
+      success: false,
+      error: "Unsupported provider channel",
+    });
+  }
+  const channelStateMap = getProviderStateSnapshot();
+  const stateByChannel = {
+    [PROVIDER_CHANNELS.CALL]: channelStateMap.callState,
+    [PROVIDER_CHANNELS.SMS]: channelStateMap.smsState,
+    [PROVIDER_CHANNELS.EMAIL]: channelStateMap.emailState,
+  };
+  const selectedState = stateByChannel[channel];
+  if (!provider || !selectedState.supported_providers.includes(provider)) {
     return res
       .status(400)
-      .json({ success: false, error: "Unsupported provider" });
+      .json({
+        success: false,
+        error: "Unsupported provider",
+        channel,
+        supported_providers: selectedState.supported_providers,
+      });
   }
-  const readiness = getProviderReadiness();
+  const readiness = selectedState.readiness || {};
   if (!readiness[provider]) {
     return res.status(400).json({
       success: false,
-      error: `Provider ${provider} is not configured`,
+      error: `Provider ${provider} is not configured for ${channel}`,
+      channel,
     });
   }
-  const normalized = provider.toLowerCase();
-  const changed = normalized !== currentProvider;
-  currentProvider = normalized;
-  storedProvider = normalized;
+  const normalized = provider;
+  const changed = normalized !== selectedState.provider;
+  if (channel === PROVIDER_CHANNELS.CALL) {
+    setActiveCallProvider(normalized);
+    setStoredCallProvider(normalized);
+  } else if (channel === PROVIDER_CHANNELS.SMS) {
+    setActiveSmsProvider(normalized);
+    setStoredSmsProvider(normalized);
+  } else if (channel === PROVIDER_CHANNELS.EMAIL) {
+    setActiveEmailProvider(normalized);
+    setStoredEmailProvider(normalized);
+  }
+  syncRuntimeProviderMirrors();
+
+  const settingKey =
+    channel === PROVIDER_CHANNELS.CALL
+      ? CALL_PROVIDER_SETTING_KEY
+      : channel === PROVIDER_CHANNELS.SMS
+        ? SMS_PROVIDER_SETTING_KEY
+        : EMAIL_PROVIDER_SETTING_KEY;
   if (db?.setSetting) {
     await db
-      .setSetting(CALL_PROVIDER_SETTING_KEY, normalized)
+      .setSetting(settingKey, normalized)
       .catch((error) =>
-        console.error("Failed to persist selected call provider:", error),
+        console.error(
+          `Failed to persist selected ${channel} provider:`,
+          error,
+        ),
       );
   }
+
+  const label =
+    channel === PROVIDER_CHANNELS.CALL
+      ? "call"
+      : channel === PROVIDER_CHANNELS.SMS
+        ? "SMS"
+        : "email";
   console.log(
-    `☎️ Default call provider updated: ${storedProvider.toUpperCase()} (active: ${currentProvider.toUpperCase()}, changed=${changed})`,
+    `☎️ Default ${label} provider updated: ${normalized.toUpperCase()} (changed=${changed})`,
   );
-  return res.json({ success: true, provider: currentProvider, changed });
+  const { callState, smsState, emailState } = getProviderStateSnapshot();
+  const activeChannelProvider =
+    channel === PROVIDER_CHANNELS.CALL
+      ? currentProvider
+      : channel === PROVIDER_CHANNELS.SMS
+        ? currentSmsProvider
+        : currentEmailProvider;
+  return res.json({
+    success: true,
+    channel,
+    provider: activeChannelProvider,
+    changed,
+    call_provider: callState.provider,
+    sms_provider: smsState.provider,
+    email_provider: emailState.provider,
+    providers: {
+      call: callState,
+      sms: smsState,
+      email: emailState,
+    },
+  });
 });
 
 app.get("/admin/provider/keypad-overrides", requireAdminToken, async (req, res) => {
@@ -9315,6 +10240,213 @@ app.post(
     }
   },
 );
+
+app.get("/admin/call-jobs/dlq", requireAdminToken, async (req, res) => {
+  try {
+    if (!db) {
+      return res
+        .status(500)
+        .json({ success: false, error: "Database not initialized" });
+    }
+    const limit = Math.min(Math.max(Number(req.query?.limit) || 20, 1), 100);
+    const offset = Math.max(Number(req.query?.offset) || 0, 0);
+    const status = req.query?.status ? String(req.query.status) : null;
+    const rows = await db.listCallJobDlq({ status, limit, offset });
+    return res.json({
+      success: true,
+      rows,
+      limit,
+      offset,
+      status: status || "all",
+    });
+  } catch (error) {
+    console.error("Failed to list call-job DLQ:", error);
+    return res
+      .status(500)
+      .json({ success: false, error: "Failed to list call-job DLQ" });
+  }
+});
+
+app.post(
+  "/admin/call-jobs/dlq/:id/replay",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      if (!db) {
+        return res
+          .status(500)
+          .json({ success: false, error: "Database not initialized" });
+      }
+      const dlqId = Number(req.params?.id);
+      if (!Number.isFinite(dlqId) || dlqId <= 0) {
+        return res.status(400).json({ success: false, error: "Invalid DLQ id" });
+      }
+      const entry = await db.getCallJobDlqEntry(dlqId);
+      if (!entry) {
+        return res
+          .status(404)
+          .json({ success: false, error: "DLQ entry not found" });
+      }
+      const maxReplays = Number(config.callJobs?.dlqMaxReplays) || 2;
+      if (Number(entry.replay_count) >= maxReplays) {
+        return res.status(409).json({
+          success: false,
+          error: "Replay limit reached for this DLQ entry",
+          replay_count: Number(entry.replay_count) || 0,
+          max_replays: maxReplays,
+        });
+      }
+      let runAt = new Date().toISOString();
+      if (req.body?.run_at) {
+        const parsed = new Date(String(req.body.run_at));
+        if (Number.isNaN(parsed.getTime())) {
+          return res
+            .status(400)
+            .json({ success: false, error: "Invalid run_at timestamp" });
+        }
+        runAt = parsed.toISOString();
+      }
+      let payload = {};
+      try {
+        payload = entry.payload ? JSON.parse(entry.payload) : {};
+      } catch {
+        return res.status(400).json({
+          success: false,
+          error: "DLQ payload is not valid JSON; cannot replay",
+        });
+      }
+      const replayJobId = await db.createCallJob(entry.job_type, payload, runAt);
+      await db.markCallJobDlqReplayed(dlqId, replayJobId);
+      db
+        ?.logServiceHealth?.("call_jobs", "dlq_replayed", {
+          dlq_id: dlqId,
+          original_job_id: entry.job_id,
+          replay_job_id: replayJobId,
+          replay_count: (Number(entry.replay_count) || 0) + 1,
+          at: new Date().toISOString(),
+        })
+        .catch(() => {});
+      return res.json({
+        success: true,
+        dlq_id: dlqId,
+        original_job_id: entry.job_id,
+        replay_job_id: replayJobId,
+      });
+    } catch (error) {
+      console.error("Failed to replay call-job DLQ entry:", error);
+      return res
+        .status(500)
+        .json({ success: false, error: "Failed to replay call-job DLQ entry" });
+    }
+  },
+);
+
+app.get("/admin/email/dlq", requireAdminToken, async (req, res) => {
+  try {
+    if (!db) {
+      return res
+        .status(500)
+        .json({ success: false, error: "Database not initialized" });
+    }
+    const limit = Math.min(Math.max(Number(req.query?.limit) || 20, 1), 100);
+    const offset = Math.max(Number(req.query?.offset) || 0, 0);
+    const status = req.query?.status ? String(req.query.status) : null;
+    const rows = await db.listEmailDlq({ status, limit, offset });
+    return res.json({
+      success: true,
+      rows,
+      limit,
+      offset,
+      status: status || "all",
+    });
+  } catch (error) {
+    console.error("Failed to list email DLQ:", error);
+    return res
+      .status(500)
+      .json({ success: false, error: "Failed to list email DLQ" });
+  }
+});
+
+app.post("/admin/email/dlq/:id/replay", requireAdminToken, async (req, res) => {
+  try {
+    if (!db) {
+      return res
+        .status(500)
+        .json({ success: false, error: "Database not initialized" });
+    }
+    const dlqId = Number(req.params?.id);
+    if (!Number.isFinite(dlqId) || dlqId <= 0) {
+      return res.status(400).json({ success: false, error: "Invalid DLQ id" });
+    }
+    const entry = await db.getEmailDlqEntry(dlqId);
+    if (!entry) {
+      return res
+        .status(404)
+        .json({ success: false, error: "DLQ entry not found" });
+    }
+    const maxReplays = Number(config.email?.dlqMaxReplays) || 2;
+    if (Number(entry.replay_count) >= maxReplays) {
+      return res.status(409).json({
+        success: false,
+        error: "Replay limit reached for this DLQ entry",
+        replay_count: Number(entry.replay_count) || 0,
+        max_replays: maxReplays,
+      });
+    }
+    const message = await db.getEmailMessage(entry.message_id);
+    if (!message) {
+      await db.markEmailDlqReplayed(dlqId, "email_message_not_found");
+      return res.status(404).json({
+        success: false,
+        error: "Email message not found for DLQ entry",
+      });
+    }
+    const immutableStatuses = new Set(["queued", "retry", "sending", "sent", "delivered"]);
+    if (immutableStatuses.has(String(message.status || "").toLowerCase())) {
+      return res.status(409).json({
+        success: false,
+        error: `Cannot replay email message with status "${message.status}"`,
+      });
+    }
+    const nextAttempt = new Date().toISOString();
+    await db.updateEmailMessageStatus(message.message_id, {
+      status: "queued",
+      failure_reason: null,
+      provider_message_id: null,
+      provider_response: null,
+      last_attempt_at: null,
+      next_attempt_at: nextAttempt,
+      retry_count: 0,
+      failed_at: null,
+      suppressed_reason: null,
+    });
+    await db.addEmailEvent(message.message_id, "requeued_from_dlq", {
+      dlq_id: dlqId,
+      next_attempt_at: nextAttempt,
+    });
+    await db.markEmailDlqReplayed(dlqId);
+    db
+      ?.logServiceHealth?.("email_queue", "dlq_replayed", {
+        dlq_id: dlqId,
+        message_id: message.message_id,
+        replay_count: (Number(entry.replay_count) || 0) + 1,
+        at: new Date().toISOString(),
+      })
+      .catch(() => {});
+    return res.json({
+      success: true,
+      dlq_id: dlqId,
+      message_id: message.message_id,
+      status: "queued",
+      next_attempt_at: nextAttempt,
+    });
+  } catch (error) {
+    console.error("Failed to replay email DLQ entry:", error);
+    return res
+      .status(500)
+      .json({ success: false, error: "Failed to replay email DLQ entry" });
+  }
+});
 
 // Personas list for bot selection
 app.get("/api/personas", async (req, res) => {
@@ -9636,11 +10768,65 @@ function computeCallJobBackoff(attempt) {
   return delay;
 }
 
+async function runWithTimeout(
+  operationPromise,
+  timeoutMs,
+  label = "operation",
+  timeoutCode = "operation_timeout",
+) {
+  const safeTimeoutMs = Number(timeoutMs);
+  if (!Number.isFinite(safeTimeoutMs) || safeTimeoutMs <= 0) {
+    return operationPromise;
+  }
+  let settled = false;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      const timeoutError = new Error(
+        `${label} timed out after ${safeTimeoutMs}ms`,
+      );
+      timeoutError.code = timeoutCode;
+      reject(timeoutError);
+    }, safeTimeoutMs);
+
+    Promise.resolve(operationPromise)
+      .then((result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result);
+      })
+      .catch((error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      });
+  });
+}
+
 async function processCallJobs() {
   if (!db || callJobProcessing) return;
   callJobProcessing = true;
   try {
+    const staleLockMs = Number(config.callJobs?.staleLockMs) || 300000;
+    const reclaimedJobs = await db.reclaimStaleRunningCallJobs(staleLockMs);
+    if (reclaimedJobs > 0) {
+      console.warn(
+        `Reclaimed ${reclaimedJobs} stale call job lock(s) older than ${staleLockMs}ms`,
+      );
+      db
+        ?.logServiceHealth?.("call_jobs", "jobs_reclaimed", {
+          reclaimed_jobs: reclaimedJobs,
+          stale_lock_ms: staleLockMs,
+          at: new Date().toISOString(),
+        })
+        .catch(() => {});
+    }
+
     const jobs = await db.claimDueCallJobs(10);
+    const jobTimeoutMs = Number(config.callJobs?.timeoutMs) || 45000;
     for (const job of jobs) {
       let payload = {};
       try {
@@ -9653,20 +10839,121 @@ async function processCallJobs() {
           job.job_type === "outbound_call" ||
           job.job_type === "callback_call"
         ) {
-          await placeOutboundCall(payload);
+          await runWithTimeout(
+            placeOutboundCall(payload),
+            jobTimeoutMs,
+            `call job ${job.id}`,
+            "call_job_timeout",
+          );
+        } else if (job.job_type === "sms_scheduled_send") {
+          const to = String(payload?.to || "").trim();
+          const message = String(payload?.message || "").trim();
+          const from = payload?.from || null;
+          const userChatId = payload?.user_chat_id || null;
+          if (!to || !message) {
+            throw new Error("sms_scheduled_send requires to and message");
+          }
+          const smsOptions = {
+            ...(payload?.sms_options || {}),
+            allowQuietHours: false,
+            minIntervalMs: 0,
+          };
+          if (payload?.idempotency_key && !smsOptions.idempotencyKey) {
+            smsOptions.idempotencyKey = payload.idempotency_key;
+          }
+          if (userChatId && !smsOptions.userChatId) {
+            smsOptions.userChatId = userChatId;
+          }
+          const smsResult = await runWithTimeout(
+            smsService.sendSMS(to, message, from, smsOptions),
+            jobTimeoutMs,
+            `sms job ${job.id}`,
+            "call_job_timeout",
+          );
+          if (smsResult?.message_sid && db && smsResult.idempotent !== true) {
+            try {
+              await db.saveSMSMessage({
+                message_sid: smsResult.message_sid,
+                to_number: to,
+                from_number: smsResult.from || from,
+                body: message,
+                status: smsResult.status || "queued",
+                direction: "outbound",
+                user_chat_id: userChatId || null,
+              });
+            } catch (saveError) {
+              const saveMsg = String(saveError?.message || "");
+              if (
+                !saveMsg.includes("UNIQUE constraint failed") &&
+                !saveMsg.includes("SQLITE_CONSTRAINT")
+              ) {
+                throw saveError;
+              }
+            }
+            if (userChatId) {
+              await db.createEnhancedWebhookNotification(
+                smsResult.message_sid,
+                "sms_sent",
+                String(userChatId),
+              );
+            }
+          }
         } else {
           throw new Error(`Unsupported job type ${job.job_type}`);
         }
         await db.completeCallJob(job.id, "completed");
       } catch (error) {
+        const isTimeout = error?.code === "call_job_timeout";
+        if (isTimeout) {
+          db
+            ?.logServiceHealth?.("call_jobs", "job_timeout", {
+              job_id: job.id,
+              job_type: job.job_type,
+              timeout_ms: jobTimeoutMs,
+              attempts: Number(job.attempts) || 1,
+              at: new Date().toISOString(),
+            })
+            .catch(() => {});
+        }
         const attempts = Number(job.attempts) || 1;
         const maxAttempts = Number(config.callJobs?.maxAttempts) || 3;
         if (attempts >= maxAttempts) {
+          const failureReason = error.message || String(error);
           await db.completeCallJob(
             job.id,
             "failed",
-            error.message || String(error),
+            failureReason,
           );
+          await db.moveCallJobToDlq(
+            {
+              ...job,
+              attempts,
+            },
+            "max_attempts_exceeded",
+            failureReason,
+          );
+          db
+            ?.logServiceHealth?.("call_jobs", "job_dead_lettered", {
+              job_id: job.id,
+              job_type: job.job_type,
+              attempts,
+              max_attempts: maxAttempts,
+              reason: failureReason,
+              at: new Date().toISOString(),
+            })
+            .catch(() => {});
+          const openDlqCount = await db.countOpenCallJobDlq().catch(() => null);
+          const dlqAlertThreshold =
+            Number(config.callJobs?.dlqAlertThreshold) || 20;
+          if (openDlqCount !== null && openDlqCount >= dlqAlertThreshold) {
+            db
+              ?.logServiceHealth?.("call_jobs", "dlq_alert_threshold", {
+                open_dlq: openDlqCount,
+                alert_threshold: dlqAlertThreshold,
+                at: new Date().toISOString(),
+              })
+              .catch(() => {});
+          }
         } else {
           const delay = computeCallJobBackoff(attempts);
           const nextRunAt = new Date(Date.now() + delay).toISOString();
@@ -11247,7 +12534,12 @@ app.post("/webhook/sms", async (req, res) => {
     }
     const { From, Body, MessageSid, SmsStatus } = req.body;
 
-    console.log(`SMS webhook: ${From} -> ${maskSmsBodyForLog(Body)}`);
+    console.log("sms_webhook_received", {
+      request_id: req.requestId || null,
+      from: maskPhoneForLog(From),
+      body: maskSmsBodyForLog(Body),
+      message_sid: MessageSid || null,
+    });
 
     if (digitService?.handleIncomingSms) {
       const handled = await digitService.handleIncomingSms(From, Body);
@@ -11400,52 +12692,155 @@ const twilioGatherHandler = createTwilioGatherHandler({
 app.post("/webhook/twilio-gather", twilioGatherHandler);
 
 // Email API endpoints
-app.post("/email/send", async (req, res) => {
+app.post("/email/send", requireOutboundAuthorization, async (req, res) => {
   try {
     if (!emailService) {
-      return res
-        .status(500)
-        .json({ success: false, error: "Email service not initialized" });
+      return sendApiError(
+        res,
+        500,
+        "email_service_unavailable",
+        "Email service not initialized",
+        req.requestId,
+      );
+    }
+    const limitResponse = await enforceOutboundRateLimits(req, res, {
+      namespace: "email_send",
+      actorKey: getOutboundActorKey(req),
+      perUserLimit: Number(config.outboundLimits?.email?.perUser) || 20,
+      globalLimit: Number(config.outboundLimits?.email?.global) || 120,
+      windowMs: Number(config.outboundLimits?.windowMs) || 60000,
+    });
+    if (limitResponse) {
+      return;
+    }
+    const emailPayload = { ...(req.body || {}) };
+    if (!emailPayload.provider) {
+      emailPayload.provider = getActiveEmailProvider();
     }
     const idempotencyKey =
       req.headers["idempotency-key"] || req.headers["Idempotency-Key"];
-    const result = await emailService.enqueueEmail(req.body || {}, {
-      idempotencyKey,
+    console.log("email_send_request", {
+      request_id: req.requestId || null,
+      to: redactSensitiveLogValue(req.body?.to || ""),
+      from: redactSensitiveLogValue(req.body?.from || ""),
+      actor: getOutboundActorKey(req),
+      provider: String(emailPayload.provider || "unknown").toLowerCase(),
+      idempotency_key: idempotencyKey ? "present" : "absent",
     });
+    const result = await runWithTimeout(
+      emailService.enqueueEmail(emailPayload, {
+        idempotencyKey,
+      }),
+      Number(config.outboundLimits?.handlerTimeoutMs) || 30000,
+      "email send handler",
+      "email_handler_timeout",
+    );
     res.json({
       success: true,
       message_id: result.message_id,
       deduped: result.deduped || false,
       suppressed: result.suppressed || false,
+      request_id: req.requestId || null,
     });
   } catch (error) {
-    const status = error.code === "idempotency_conflict" ? 409 : 400;
-    res
-      .status(status)
-      .json({ success: false, error: error.message, missing: error.missing });
+    const status =
+      error.code === "idempotency_conflict"
+        ? 409
+        : error.code === "email_handler_timeout"
+          ? 504
+          : error.code === "missing_variables" || error.code === "validation_error"
+            ? 400
+            : 500;
+    console.error("email_send_error", {
+      request_id: req.requestId || null,
+      actor: getOutboundActorKey(req),
+      error: redactSensitiveLogValue(error.message || "email_send_failed"),
+      code: error.code || null,
+    });
+    sendApiError(
+      res,
+      status,
+      error.code || "email_send_failed",
+      error.message || "Email send failed",
+      req.requestId,
+      { missing: error.missing },
+    );
   }
 });
 
-app.post("/email/bulk", async (req, res) => {
+app.post("/email/bulk", requireOutboundAuthorization, async (req, res) => {
   try {
     if (!emailService) {
-      return res
-        .status(500)
-        .json({ success: false, error: "Email service not initialized" });
+      return sendApiError(
+        res,
+        500,
+        "email_service_unavailable",
+        "Email service not initialized",
+        req.requestId,
+      );
+    }
+    const limitResponse = await enforceOutboundRateLimits(req, res, {
+      namespace: "email_bulk",
+      actorKey: getOutboundActorKey(req),
+      perUserLimit: Number(config.outboundLimits?.email?.perUser) || 20,
+      globalLimit: Number(config.outboundLimits?.email?.global) || 120,
+      windowMs: Number(config.outboundLimits?.windowMs) || 60000,
+    });
+    if (limitResponse) {
+      return;
+    }
+    const bulkPayload = { ...(req.body || {}) };
+    if (!bulkPayload.provider) {
+      bulkPayload.provider = getActiveEmailProvider();
     }
     const idempotencyKey =
       req.headers["idempotency-key"] || req.headers["Idempotency-Key"];
-    const result = await emailService.enqueueBulk(req.body || {}, {
-      idempotencyKey,
+    const recipientCount = Array.isArray(req.body?.recipients)
+      ? req.body.recipients.length
+      : 0;
+    console.log("email_bulk_request", {
+      request_id: req.requestId || null,
+      actor: getOutboundActorKey(req),
+      recipients: recipientCount,
+      provider: String(bulkPayload.provider || "unknown").toLowerCase(),
+      idempotency_key: idempotencyKey ? "present" : "absent",
     });
+    const result = await runWithTimeout(
+      emailService.enqueueBulk(bulkPayload, {
+        idempotencyKey,
+      }),
+      Number(config.outboundLimits?.handlerTimeoutMs) || 30000,
+      "email bulk handler",
+      "email_handler_timeout",
+    );
     res.json({
       success: true,
       bulk_job_id: result.bulk_job_id,
       deduped: result.deduped || false,
+      request_id: req.requestId || null,
     });
   } catch (error) {
-    const status = error.code === "idempotency_conflict" ? 409 : 400;
-    res.status(status).json({ success: false, error: error.message });
+    const status =
+      error.code === "idempotency_conflict"
+        ? 409
+        : error.code === "email_handler_timeout"
+          ? 504
+          : error.code === "validation_error"
+            ? 400
+            : 500;
+    console.error("email_bulk_error", {
+      request_id: req.requestId || null,
+      actor: getOutboundActorKey(req),
+      error: redactSensitiveLogValue(error.message || "email_bulk_failed"),
+      code: error.code || null,
+    });
+    sendApiError(
+      res,
+      status,
+      error.code || "email_bulk_failed",
+      error.message || "Bulk email enqueue failed",
+      req.requestId,
+    );
   }
 });
 
@@ -11671,7 +13066,7 @@ app.get("/email/bulk/stats", async (req, res) => {
 });
 
 // Send single SMS endpoint
-app.post("/api/sms/send", async (req, res) => {
+app.post("/api/sms/send", requireOutboundAuthorization, async (req, res) => {
   try {
     const {
       to,
@@ -11683,27 +13078,57 @@ app.post("/api/sms/send", async (req, res) => {
       allow_quiet_hours,
       quiet_hours,
       media_url,
+      provider,
     } = req.body;
+    const idempotencyHeader =
+      req.headers["idempotency-key"] || req.headers["Idempotency-Key"];
 
     if (!to || !message) {
-      return res.status(400).json({
-        success: false,
-        error: "Phone number and message are required",
-      });
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        "Phone number and message are required",
+        req.requestId,
+      );
     }
 
     // Validate phone number format
     if (!to.match(/^\+[1-9]\d{1,14}$/)) {
-      return res.status(400).json({
-        success: false,
-        error:
-          "Invalid phone number format. Use E.164 format (e.g., +1234567890)",
-      });
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        "Invalid phone number format. Use E.164 format (e.g., +1234567890)",
+        req.requestId,
+      );
+    }
+
+    const maxSmsChars = Number(config.sms?.maxMessageChars) || 1600;
+    if (String(message).length > maxSmsChars) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        `Message exceeds ${maxSmsChars} characters`,
+        req.requestId,
+      );
+    }
+
+    const limitResponse = await enforceOutboundRateLimits(req, res, {
+      namespace: "sms_send",
+      actorKey: getOutboundActorKey(req, user_chat_id),
+      perUserLimit: Number(config.outboundLimits?.sms?.perUser) || 15,
+      globalLimit: Number(config.outboundLimits?.sms?.global) || 120,
+      windowMs: Number(config.outboundLimits?.windowMs) || 60000,
+    });
+    if (limitResponse) {
+      return;
     }
 
     const smsOptions = { ...(options || {}) };
-    if (idempotency_key && !smsOptions.idempotencyKey) {
-      smsOptions.idempotencyKey = idempotency_key;
+    if ((idempotency_key || idempotencyHeader) && !smsOptions.idempotencyKey) {
+      smsOptions.idempotencyKey = idempotency_key || idempotencyHeader;
     }
     if (allow_quiet_hours === false) {
       smsOptions.allowQuietHours = false;
@@ -11714,20 +13139,50 @@ app.post("/api/sms/send", async (req, res) => {
     if (media_url && !smsOptions.mediaUrl) {
       smsOptions.mediaUrl = media_url;
     }
+    if (user_chat_id && !smsOptions.userChatId) {
+      smsOptions.userChatId = String(user_chat_id);
+    }
+    if (provider && !smsOptions.provider) {
+      smsOptions.provider = String(provider).trim().toLowerCase();
+    }
 
-    const result = await smsService.sendSMS(to, message, from, smsOptions);
+    console.log("sms_send_request", {
+      request_id: req.requestId || null,
+      actor: getOutboundActorKey(req, user_chat_id),
+      to: maskPhoneForLog(to),
+      body: maskSmsBodyForLog(message),
+      provider: smsOptions.provider || getActiveSmsProvider(),
+      idempotency_key: smsOptions.idempotencyKey ? "present" : "absent",
+    });
+
+    const result = await runWithTimeout(
+      smsService.sendSMS(to, message, from, smsOptions),
+      Number(config.outboundLimits?.handlerTimeoutMs) || 30000,
+      "sms send handler",
+      "sms_handler_timeout",
+    );
 
     // Save to database
-    if (db) {
-      await db.saveSMSMessage({
-        message_sid: result.message_sid,
-        to_number: to,
-        from_number: result.from,
-        body: message,
-        status: result.status,
-        direction: "outbound",
-        user_chat_id: user_chat_id,
-      });
+    if (db && result.message_sid && result.idempotent !== true) {
+      try {
+        await db.saveSMSMessage({
+          message_sid: result.message_sid,
+          to_number: to,
+          from_number: result.from,
+          body: message,
+          status: result.status,
+          direction: "outbound",
+          user_chat_id: user_chat_id,
+        });
+      } catch (saveError) {
+        const saveMsg = String(saveError?.message || "");
+        if (
+          !saveMsg.includes("UNIQUE constraint failed") &&
+          !saveMsg.includes("SQLITE_CONSTRAINT")
+        ) {
+          throw saveError;
+        }
+      }
 
       // Create webhook notification
       if (user_chat_id) {
@@ -11742,19 +13197,49 @@ app.post("/api/sms/send", async (req, res) => {
     res.json({
       success: true,
       ...result,
+      request_id: req.requestId || null,
     });
   } catch (error) {
-    console.error("❌ SMS send error:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to send SMS",
-      details: error.message,
+    const providerStatus = Number(
+      error?.status || error?.statusCode || error?.response?.status,
+    );
+    const status =
+      error.code === "idempotency_conflict"
+        ? 409
+        : error.code === "sms_validation_failed"
+          ? 400
+          : error.code === "sms_handler_timeout" ||
+              error.code === "sms_provider_timeout" ||
+              error.code === "sms_timeout"
+            ? 504
+            : providerStatus === 429
+              ? 429
+              : providerStatus >= 400 && providerStatus < 500
+                ? 400
+                : providerStatus >= 500
+                  ? 502
+                  : error.code === "sms_config_error"
+                    ? 500
+                    : 500;
+    console.error("sms_send_error", {
+      request_id: req.requestId || null,
+      actor: getOutboundActorKey(req, req.body?.user_chat_id),
+      to: maskPhoneForLog(req.body?.to || ""),
+      error: redactSensitiveLogValue(error.message || "sms_send_failed"),
+      code: error.code || null,
     });
+    sendApiError(
+      res,
+      status,
+      error.code || "sms_send_failed",
+      error.message || "Failed to send SMS",
+      req.requestId,
+    );
   }
 });
 
 // Send bulk SMS endpoint
-app.post("/api/sms/bulk", async (req, res) => {
+app.post("/api/sms/bulk", requireOutboundAuthorization, async (req, res) => {
   try {
     const {
       recipients,
@@ -11763,27 +13248,69 @@ app.post("/api/sms/bulk", async (req, res) => {
       user_chat_id,
       from,
       sms_options,
+      idempotency_key,
+      provider,
     } = req.body;
+    const idempotencyHeader =
+      req.headers["idempotency-key"] || req.headers["Idempotency-Key"];
 
     if (!recipients || !Array.isArray(recipients) || recipients.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: "Recipients array is required and must not be empty",
-      });
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        "Recipients array is required and must not be empty",
+        req.requestId,
+      );
     }
 
     if (!message) {
-      return res.status(400).json({
-        success: false,
-        error: "Message is required",
-      });
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        "Message is required",
+        req.requestId,
+      );
     }
 
-    if (recipients.length > 100) {
-      return res.status(400).json({
-        success: false,
-        error: "Maximum 100 recipients per bulk send",
-      });
+    const maxBulkRecipients = Math.min(
+      250,
+      Math.max(1, Number(config.email?.maxBulkRecipients) || 100),
+    );
+    if (recipients.length > maxBulkRecipients) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        `Maximum ${maxBulkRecipients} recipients per bulk send`,
+        req.requestId,
+      );
+    }
+
+    const maxSmsChars = Number(config.sms?.maxMessageChars) || 1600;
+    if (String(message).length > maxSmsChars) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        `Message exceeds ${maxSmsChars} characters`,
+        req.requestId,
+      );
+    }
+
+    const limitResponse = await enforceOutboundRateLimits(req, res, {
+      namespace: "sms_bulk",
+      actorKey: getOutboundActorKey(req, user_chat_id),
+      perUserLimit: Math.max(
+        1,
+        Math.floor((Number(config.outboundLimits?.sms?.perUser) || 15) / 3),
+      ),
+      globalLimit: Number(config.outboundLimits?.sms?.global) || 120,
+      windowMs: Number(config.outboundLimits?.windowMs) || 60000,
+    });
+    if (limitResponse) {
+      return;
     }
 
     const bulkOptions = { ...(options || {}) };
@@ -11793,11 +13320,41 @@ app.post("/api/sms/bulk", async (req, res) => {
     if (sms_options && !bulkOptions.smsOptions) {
       bulkOptions.smsOptions = sms_options;
     }
+    if (provider) {
+      bulkOptions.smsOptions = {
+        ...(bulkOptions.smsOptions || {}),
+        provider:
+          bulkOptions.smsOptions?.provider || String(provider).trim().toLowerCase(),
+      };
+    }
+    if (user_chat_id && !bulkOptions.userChatId) {
+      bulkOptions.userChatId = String(user_chat_id);
+    }
+    if ((idempotency_key || idempotencyHeader) && !bulkOptions.idempotencyKey) {
+      bulkOptions.idempotencyKey = idempotency_key || idempotencyHeader;
+    }
+    if (!Object.prototype.hasOwnProperty.call(bulkOptions, "durable")) {
+      bulkOptions.durable = true;
+    }
 
-    const result = await smsService.sendBulkSMS(
-      recipients,
-      message,
-      bulkOptions,
+    console.log("sms_bulk_request", {
+      request_id: req.requestId || null,
+      actor: getOutboundActorKey(req, user_chat_id),
+      recipients: recipients.length,
+      provider: bulkOptions.smsOptions?.provider || getActiveSmsProvider(),
+      durable: bulkOptions.durable === true,
+      idempotency_key: bulkOptions.idempotencyKey ? "present" : "absent",
+    });
+
+    const result = await runWithTimeout(
+      smsService.sendBulkSMS(
+        recipients,
+        message,
+        bulkOptions,
+      ),
+      Number(config.outboundLimits?.handlerTimeoutMs) || 30000,
+      "sms bulk handler",
+      "sms_handler_timeout",
     );
 
     // Log bulk operation
@@ -11815,55 +13372,180 @@ app.post("/api/sms/bulk", async (req, res) => {
     res.json({
       success: true,
       ...result,
+      request_id: req.requestId || null,
     });
   } catch (error) {
-    console.error("❌ Bulk SMS error:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to send bulk SMS",
-      details: error.message,
+    const providerStatus = Number(
+      error?.status || error?.statusCode || error?.response?.status,
+    );
+    const status =
+      error.code === "idempotency_conflict"
+        ? 409
+        : error.code === "sms_validation_failed"
+          ? 400
+          : error.code === "sms_handler_timeout" ||
+              error.code === "sms_provider_timeout" ||
+              error.code === "sms_timeout"
+            ? 504
+            : providerStatus === 429
+              ? 429
+              : providerStatus >= 400 && providerStatus < 500
+                ? 400
+                : providerStatus >= 500
+                  ? 502
+                  : 500;
+    console.error("sms_bulk_error", {
+      request_id: req.requestId || null,
+      actor: getOutboundActorKey(req, req.body?.user_chat_id),
+      recipients: Array.isArray(req.body?.recipients)
+        ? req.body.recipients.length
+        : 0,
+      error: redactSensitiveLogValue(error.message || "sms_bulk_failed"),
+      code: error.code || null,
     });
+    sendApiError(
+      res,
+      status,
+      error.code || "sms_bulk_failed",
+      error.message || "Failed to send bulk SMS",
+      req.requestId,
+    );
   }
 });
 
 // Schedule SMS endpoint
-app.post("/api/sms/schedule", async (req, res) => {
+app.post("/api/sms/schedule", requireOutboundAuthorization, async (req, res) => {
   try {
-    const { to, message, scheduled_time, options = {} } = req.body;
+    const {
+      to,
+      message,
+      from,
+      user_chat_id,
+      scheduled_time,
+      options = {},
+      idempotency_key,
+      provider,
+    } = req.body;
+    const idempotencyHeader =
+      req.headers["idempotency-key"] || req.headers["Idempotency-Key"];
 
     if (!to || !message || !scheduled_time) {
-      return res.status(400).json({
-        success: false,
-        error: "Phone number, message, and scheduled_time are required",
-      });
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        "Phone number, message, and scheduled_time are required",
+        req.requestId,
+      );
     }
 
     const scheduledDate = new Date(scheduled_time);
-    if (scheduledDate <= new Date()) {
-      return res.status(400).json({
-        success: false,
-        error: "Scheduled time must be in the future",
-      });
+    if (Number.isNaN(scheduledDate.getTime()) || scheduledDate <= new Date()) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        "Scheduled time must be in the future",
+        req.requestId,
+      );
     }
 
-    const result = await smsService.scheduleSMS(
-      to,
-      message,
-      scheduled_time,
-      options,
+    const maxSmsChars = Number(config.sms?.maxMessageChars) || 1600;
+    if (String(message).length > maxSmsChars) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        `Message exceeds ${maxSmsChars} characters`,
+        req.requestId,
+      );
+    }
+
+    const limitResponse = await enforceOutboundRateLimits(req, res, {
+      namespace: "sms_schedule",
+      actorKey: getOutboundActorKey(req, user_chat_id),
+      perUserLimit: Number(config.outboundLimits?.sms?.perUser) || 15,
+      globalLimit: Number(config.outboundLimits?.sms?.global) || 120,
+      windowMs: Number(config.outboundLimits?.windowMs) || 60000,
+    });
+    if (limitResponse) {
+      return;
+    }
+
+    const scheduleOptions = { ...(options || {}) };
+    if (from && !scheduleOptions.from) {
+      scheduleOptions.from = from;
+    }
+    if (user_chat_id && !scheduleOptions.userChatId) {
+      scheduleOptions.userChatId = String(user_chat_id);
+    }
+    if ((idempotency_key || idempotencyHeader) && !scheduleOptions.idempotencyKey) {
+      scheduleOptions.idempotencyKey = idempotency_key || idempotencyHeader;
+    }
+    if (provider && !scheduleOptions.provider) {
+      scheduleOptions.provider = String(provider).trim().toLowerCase();
+    }
+
+    console.log("sms_schedule_request", {
+      request_id: req.requestId || null,
+      actor: getOutboundActorKey(req, user_chat_id),
+      to: maskPhoneForLog(to),
+      provider: scheduleOptions.provider || getActiveSmsProvider(),
+      scheduled_at: scheduledDate.toISOString(),
+      idempotency_key: scheduleOptions.idempotencyKey ? "present" : "absent",
+    });
+
+    const result = await runWithTimeout(
+      smsService.scheduleSMS(
+        to,
+        message,
+        scheduled_time,
+        scheduleOptions,
+      ),
+      Number(config.outboundLimits?.handlerTimeoutMs) || 30000,
+      "sms schedule handler",
+      "sms_handler_timeout",
     );
 
     res.json({
       success: true,
       ...result,
+      request_id: req.requestId || null,
     });
   } catch (error) {
-    console.error("❌ SMS schedule error:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to schedule SMS",
-      details: error.message,
+    const providerStatus = Number(
+      error?.status || error?.statusCode || error?.response?.status,
+    );
+    const status =
+      error.code === "idempotency_conflict"
+        ? 409
+        : error.code === "sms_validation_failed"
+          ? 400
+          : error.code === "sms_handler_timeout" ||
+              error.code === "sms_provider_timeout" ||
+              error.code === "sms_timeout"
+            ? 504
+            : providerStatus === 429
+              ? 429
+              : providerStatus >= 400 && providerStatus < 500
+                ? 400
+                : providerStatus >= 500
+                  ? 502
+                  : 500;
+    console.error("sms_schedule_error", {
+      request_id: req.requestId || null,
+      actor: getOutboundActorKey(req, req.body?.user_chat_id),
+      to: maskPhoneForLog(req.body?.to || ""),
+      error: redactSensitiveLogValue(error.message || "sms_schedule_failed"),
+      code: error.code || null,
     });
+    sendApiError(
+      res,
+      status,
+      error.code || "sms_schedule_failed",
+      error.message || "Failed to schedule SMS",
+      req.requestId,
+    );
   }
 });
 
@@ -12361,7 +14043,25 @@ if (require.main === module) {
   startServer();
 }
 
-module.exports = { app, startServer };
+module.exports = {
+  app,
+  startServer,
+  __testables: {
+    getVoiceAgentRuntimeConfig,
+    getOrCreateVoiceAgentRuntimeState,
+    clearVoiceAgentTurnWatchdog,
+    clearVoiceAgentRuntime,
+    armVoiceAgentTurnWatchdog,
+    markVoiceAgentAgentResponsive,
+    clampVoiceAgentFunctionResult,
+    executeVoiceAgentFunctionWithGuard,
+    resetVoiceAgentRuntimeForTests,
+    verifyTelegramWebhookAuth,
+    verifyAwsWebhookAuth,
+    verifyAwsStreamAuth,
+    buildStreamAuthToken,
+  },
+};
 
 // Enhanced graceful shutdown with comprehensive cleanup
 process.on("SIGINT", async () => {

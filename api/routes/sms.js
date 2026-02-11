@@ -1,7 +1,18 @@
 const EventEmitter = require('events');
-const axios = require('axios');
 const crypto = require('crypto');
 const config = require('../config');
+const { PinpointClient, SendMessagesCommand } = require('@aws-sdk/client-pinpoint');
+const { Vonage } = require('@vonage/server-sdk');
+
+const SUPPORTED_SMS_PROVIDERS = ['twilio', 'aws', 'vonage'];
+const RETRYABLE_NETWORK_CODES = new Set([
+    'ECONNRESET',
+    'ECONNABORTED',
+    'ETIMEDOUT',
+    'ECONNREFUSED',
+    'EAI_AGAIN',
+    'ENOTFOUND',
+]);
 
 const GSM7_BASIC_CHARS = new Set([
     '@', '£', '$', '¥', 'è', 'é', 'ù', 'ì', 'ò', 'Ç', '\n', 'Ø', 'ø', '\r', 'Å', 'å',
@@ -52,14 +63,358 @@ function isValidE164(number) {
     return /^\+[1-9]\d{1,14}$/.test(String(number || '').trim());
 }
 
+function redactPhoneForLog(value = '') {
+    const digits = String(value || '').replace(/\D/g, '');
+    if (!digits) return 'unknown';
+    return `***${digits.slice(-4)}`;
+}
+
+function redactBodyForLog(value = '') {
+    const text = String(value || '').replace(/\s+/g, ' ').trim();
+    if (!text) return '[empty len=0]';
+    const digest = crypto.createHash('sha256').update(text).digest('hex').slice(0, 12);
+    return `[len=${text.length} sha=${digest}]`;
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeProviderName(value) {
+    return String(value || '')
+        .trim()
+        .toLowerCase();
+}
+
+function sanitizeErrorMessage(value) {
+    const text = String(value || '').trim();
+    if (!text) return 'provider_error';
+    return text.length > 180 ? `${text.slice(0, 177)}...` : text;
+}
+
+function createSmsProviderError(provider, options = {}) {
+    const {
+        message = 'SMS provider request failed',
+        code = 'sms_provider_error',
+        status = null,
+        statusCode = null,
+        retryable = false,
+        providerCode = null,
+        cause = null,
+    } = options;
+    const err = new Error(sanitizeErrorMessage(message));
+    err.code = code;
+    err.status = Number.isFinite(Number(status)) ? Number(status) : null;
+    err.statusCode = Number.isFinite(Number(statusCode))
+        ? Number(statusCode)
+        : err.status;
+    err.retryable = retryable === true;
+    err.provider = normalizeProviderName(provider) || 'unknown';
+    if (providerCode !== null && providerCode !== undefined && providerCode !== '') {
+        err.providerCode = providerCode;
+    }
+    if (cause) {
+        err.cause = cause;
+    }
+    return err;
+}
+
+class TwilioSmsAdapter {
+    constructor(options = {}) {
+        this.provider = 'twilio';
+        this.client = options.client;
+        this.defaultFrom = options.defaultFrom || null;
+    }
+
+    resolveFromNumber(from) {
+        return String(from || this.defaultFrom || '').trim();
+    }
+
+    isConfigured() {
+        return !!(this.client && this.defaultFrom);
+    }
+
+    mapError(error) {
+        if (error?.code === 'sms_provider_timeout') {
+            return error;
+        }
+        const status = Number(error?.status || error?.statusCode || error?.response?.status);
+        const code = String(error?.code || '').toUpperCase();
+        const twilioCode = Number(error?.code);
+        const retryable =
+            status === 429 ||
+            (status >= 500 && status < 600) ||
+            RETRYABLE_NETWORK_CODES.has(code) ||
+            twilioCode === 20429 ||
+            twilioCode === 30008;
+        return createSmsProviderError(this.provider, {
+            message: error?.message || 'Twilio SMS send failed',
+            code: 'sms_provider_error',
+            status,
+            retryable,
+            providerCode: Number.isFinite(twilioCode) ? twilioCode : null,
+            cause: error,
+        });
+    }
+
+    async sendSms(payload, options = {}) {
+        const { withTimeout, providerTimeoutMs } = options;
+        if (!this.client) {
+            throw createSmsProviderError(this.provider, {
+                message: 'Twilio client is not configured',
+                code: 'sms_config_error',
+                retryable: false,
+            });
+        }
+        const requestPayload = {
+            body: payload.body,
+            to: payload.to,
+            from: payload.from,
+        };
+        if (payload.statusCallback) {
+            requestPayload.statusCallback = payload.statusCallback;
+        }
+        if (payload.mediaUrl) {
+            requestPayload.mediaUrl = payload.mediaUrl;
+        }
+        try {
+            const result = await withTimeout(
+                this.client.messages.create(requestPayload),
+                providerTimeoutMs,
+                'sms_provider_timeout',
+            );
+            return {
+                provider: this.provider,
+                messageSid: result?.sid || null,
+                status: result?.status || 'queued',
+                from: requestPayload.from,
+                response: result || null,
+            };
+        } catch (error) {
+            throw this.mapError(error);
+        }
+    }
+}
+
+class AwsPinpointSmsAdapter {
+    constructor(options = {}) {
+        this.provider = 'aws';
+        this.applicationId = options.applicationId || null;
+        this.defaultFrom = options.defaultFrom || null;
+        this.region = options.region || null;
+        this.client = this.region ? new PinpointClient({ region: this.region }) : null;
+    }
+
+    resolveFromNumber(from) {
+        return String(from || this.defaultFrom || '').trim();
+    }
+
+    isConfigured() {
+        return !!(this.client && this.applicationId && this.defaultFrom);
+    }
+
+    mapError(error) {
+        if (error?.code === 'sms_provider_timeout') {
+            return error;
+        }
+        const status = Number(error?.status || error?.statusCode || error?.response?.status);
+        const sdkCode = String(error?.name || error?.Code || error?.code || '').toUpperCase();
+        const retryable =
+            status === 429 ||
+            (status >= 500 && status < 600) ||
+            RETRYABLE_NETWORK_CODES.has(sdkCode) ||
+            sdkCode.includes('THROTT') ||
+            sdkCode.includes('TOOMANYREQUESTS');
+        return createSmsProviderError(this.provider, {
+            message: error?.message || 'AWS Pinpoint SMS send failed',
+            code: 'sms_provider_error',
+            status,
+            retryable,
+            providerCode: sdkCode || null,
+            cause: error,
+        });
+    }
+
+    async sendSms(payload, options = {}) {
+        const { withTimeout, providerTimeoutMs } = options;
+        if (!this.client || !this.applicationId) {
+            throw createSmsProviderError(this.provider, {
+                message: 'AWS Pinpoint is not configured',
+                code: 'sms_config_error',
+                retryable: false,
+            });
+        }
+        if (payload.mediaUrl) {
+            throw createSmsProviderError(this.provider, {
+                message: 'Media messages are not supported by AWS Pinpoint adapter',
+                code: 'sms_validation_failed',
+                retryable: false,
+            });
+        }
+        const command = new SendMessagesCommand({
+            ApplicationId: this.applicationId,
+            MessageRequest: {
+                Addresses: {
+                    [payload.to]: {
+                        ChannelType: 'SMS',
+                    },
+                },
+                MessageConfiguration: {
+                    SMSMessage: {
+                        Body: payload.body,
+                        OriginationNumber: payload.from,
+                        MessageType: 'TRANSACTIONAL',
+                    },
+                },
+                TraceId: payload.idempotencyKey || undefined,
+            },
+        });
+        try {
+            const response = await withTimeout(
+                this.client.send(command),
+                providerTimeoutMs,
+                'sms_provider_timeout',
+            );
+            const result = response?.MessageResponse?.Result?.[payload.to] || {};
+            const statusCode = Number(result?.StatusCode);
+            if (Number.isFinite(statusCode) && statusCode >= 400) {
+                const retryable = statusCode === 429 || statusCode >= 500;
+                throw createSmsProviderError(this.provider, {
+                    message: result?.StatusMessage || 'AWS Pinpoint rejected SMS',
+                    code: 'sms_provider_error',
+                    status: statusCode,
+                    retryable,
+                    providerCode: result?.DeliveryStatus || null,
+                });
+            }
+            return {
+                provider: this.provider,
+                messageSid: result?.MessageId || null,
+                status: 'accepted',
+                from: payload.from,
+                response: response || null,
+            };
+        } catch (error) {
+            if (error?.provider === this.provider) {
+                throw error;
+            }
+            throw this.mapError(error);
+        }
+    }
+}
+
+class VonageSmsAdapter {
+    constructor(options = {}) {
+        this.provider = 'vonage';
+        this.defaultFrom = options.defaultFrom || null;
+        this.apiKey = options.apiKey || null;
+        this.apiSecret = options.apiSecret || null;
+        this.client =
+            this.apiKey && this.apiSecret
+                ? new Vonage({
+                    apiKey: this.apiKey,
+                    apiSecret: this.apiSecret,
+                })
+                : null;
+    }
+
+    resolveFromNumber(from) {
+        return String(from || this.defaultFrom || '').trim();
+    }
+
+    isConfigured() {
+        return !!(this.client && this.defaultFrom);
+    }
+
+    mapError(error) {
+        if (error?.code === 'sms_provider_timeout') {
+            return error;
+        }
+        const status = Number(error?.status || error?.statusCode || error?.response?.status);
+        const providerCode = String(error?.providerCode || error?.code || '').toUpperCase();
+        const retryable =
+            status === 429 ||
+            (status >= 500 && status < 600) ||
+            RETRYABLE_NETWORK_CODES.has(providerCode) ||
+            ['1', '5', '6', 'THROTTLED', 'TOOMANYREQUESTS'].includes(providerCode);
+        return createSmsProviderError(this.provider, {
+            message: error?.message || 'Vonage SMS send failed',
+            code: 'sms_provider_error',
+            status,
+            retryable,
+            providerCode: providerCode || null,
+            cause: error,
+        });
+    }
+
+    async sendSms(payload, options = {}) {
+        const { withTimeout, providerTimeoutMs } = options;
+        if (!this.client) {
+            throw createSmsProviderError(this.provider, {
+                message: 'Vonage SMS adapter is not configured',
+                code: 'sms_config_error',
+                retryable: false,
+            });
+        }
+        if (payload.mediaUrl) {
+            throw createSmsProviderError(this.provider, {
+                message: 'Media messages are not supported by Vonage SMS adapter',
+                code: 'sms_validation_failed',
+                retryable: false,
+            });
+        }
+        try {
+            const response = await withTimeout(
+                this.client.sms.send({
+                    to: payload.to,
+                    from: payload.from,
+                    text: payload.body,
+                }),
+                providerTimeoutMs,
+                'sms_provider_timeout',
+            );
+            const message = Array.isArray(response?.messages) ? response.messages[0] : null;
+            const vonageStatus = Number(message?.status);
+            if (Number.isFinite(vonageStatus) && vonageStatus !== 0) {
+                const retryable = vonageStatus === 1;
+                throw createSmsProviderError(this.provider, {
+                    message: message?.['error-text'] || 'Vonage SMS rejected',
+                    code: 'sms_provider_error',
+                    status: retryable ? 429 : 400,
+                    retryable,
+                    providerCode: String(vonageStatus),
+                });
+            }
+            return {
+                provider: this.provider,
+                messageSid: message?.['message-id'] || null,
+                status: 'accepted',
+                from: payload.from,
+                response: response || null,
+            };
+        } catch (error) {
+            if (error?.provider === this.provider) {
+                throw error;
+            }
+            throw this.mapError(error);
+        }
+    }
+}
+
 class EnhancedSmsService extends EventEmitter {
     constructor(options = {}) {
         super();
         this.db = options.db || null;
+        this.logger = options.logger || console;
+        this.getActiveProvider =
+            typeof options.getActiveProvider === 'function'
+                ? options.getActiveProvider
+                : () => config.sms?.provider || 'twilio';
         this.twilio = require('twilio')(
             config.twilio.accountSid,
             config.twilio.authToken
         );
+        this.smsAdapters = new Map();
         this.openai = new(require('openai'))({
             baseURL: "https://openrouter.ai/api/v1",
             apiKey: config.openRouter.apiKey,
@@ -76,10 +431,14 @@ class EnhancedSmsService extends EventEmitter {
         this.optOutCache = new Map();
         this.idempotencyCache = new Map();
         this.lastSendAt = new Map();
+        this.scheduledProcessing = false;
         this.defaultQuietHours = { start: 9, end: 20 };
         this.defaultMaxRetries = 2;
         this.defaultRetryDelayMs = 2000;
         this.defaultMinIntervalMs = 2000;
+        this.defaultProviderTimeoutMs = Number(config.sms?.providerTimeoutMs) || 15000;
+        this.defaultAiTimeoutMs = Number(config.sms?.aiTimeoutMs) || 12000;
+        this.maxMessageChars = Number(config.sms?.maxMessageChars) || 1600;
     }
 
     setDb(db) {
@@ -100,12 +459,130 @@ class EnhancedSmsService extends EventEmitter {
         return crypto.createHash('sha256').update(text).digest('hex');
     }
 
+    async withTimeout(promise, timeoutMs, timeoutCode = 'sms_timeout') {
+        const safeTimeout = Number(timeoutMs);
+        if (!Number.isFinite(safeTimeout) || safeTimeout <= 0) {
+            return promise;
+        }
+        let settled = false;
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                if (settled) return;
+                settled = true;
+                const timeoutError = new Error(`Operation timed out after ${safeTimeout}ms`);
+                timeoutError.code = timeoutCode;
+                reject(timeoutError);
+            }, safeTimeout);
+
+            Promise.resolve(promise)
+                .then((result) => {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timer);
+                    resolve(result);
+                })
+                .catch((error) => {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timer);
+                    reject(error);
+                });
+        });
+    }
+
+    computeRetryDelayMs(baseDelayMs, attempt) {
+        const base = Math.max(250, Number(baseDelayMs) || this.defaultRetryDelayMs);
+        const exp = Math.min(30000, base * Math.pow(2, Math.max(0, Number(attempt) - 1)));
+        const jitter = Math.floor(Math.random() * 750);
+        return exp + jitter;
+    }
+
+    resolveProvider(providerOverride = null) {
+        const provider = normalizeProviderName(providerOverride || this.getActiveProvider?.());
+        if (!SUPPORTED_SMS_PROVIDERS.includes(provider)) {
+            throw createSmsProviderError(provider || 'unknown', {
+                message: `Unsupported SMS provider "${provider || providerOverride}"`,
+                code: 'sms_validation_failed',
+                retryable: false,
+            });
+        }
+        return provider;
+    }
+
+    getProviderReadiness() {
+        return {
+            twilio: !!(
+                config.twilio?.accountSid &&
+                config.twilio?.authToken &&
+                config.twilio?.fromNumber
+            ),
+            aws: !!(
+                config.aws?.pinpoint?.applicationId &&
+                config.aws?.pinpoint?.originationNumber &&
+                config.aws?.pinpoint?.region
+            ),
+            vonage: !!(
+                config.vonage?.apiKey &&
+                config.vonage?.apiSecret &&
+                config.vonage?.sms?.fromNumber
+            ),
+        };
+    }
+
+    getAdapter(provider) {
+        const resolved = this.resolveProvider(provider);
+        if (this.smsAdapters.has(resolved)) {
+            return this.smsAdapters.get(resolved);
+        }
+        let adapter = null;
+        if (resolved === 'twilio') {
+            adapter = new TwilioSmsAdapter({
+                client: this.twilio,
+                defaultFrom: config.twilio?.fromNumber,
+            });
+        } else if (resolved === 'aws') {
+            adapter = new AwsPinpointSmsAdapter({
+                applicationId: config.aws?.pinpoint?.applicationId,
+                defaultFrom: config.aws?.pinpoint?.originationNumber,
+                region: config.aws?.pinpoint?.region || config.aws?.region,
+            });
+        } else if (resolved === 'vonage') {
+            adapter = new VonageSmsAdapter({
+                apiKey: config.vonage?.apiKey,
+                apiSecret: config.vonage?.apiSecret,
+                defaultFrom: config.vonage?.sms?.fromNumber,
+            });
+        }
+        if (!adapter) {
+            throw createSmsProviderError(resolved, {
+                message: `Unsupported SMS provider: ${resolved}`,
+                code: 'sms_config_error',
+                retryable: false,
+            });
+        }
+        this.smsAdapters.set(resolved, adapter);
+        return adapter;
+    }
+
     isRetryableSmsError(error) {
-        const code = error?.code || error?.status || error?.statusCode;
-        const retryableCodes = new Set([30005, 30007, 30008, 21614, 21617]);
-        if (retryableCodes.has(code)) return true;
-        const msg = String(error?.message || '').toLowerCase();
-        return msg.includes('timeout') || msg.includes('rate') || msg.includes('temporarily');
+        if (typeof error?.retryable === 'boolean') {
+            return error.retryable;
+        }
+        const status = Number(error?.status || error?.statusCode || error?.response?.status);
+        if (status === 429) return true;
+        if (status >= 500 && status < 600) return true;
+        const code = String(error?.code || '').toUpperCase();
+        if (code === 'SMS_PROVIDER_TIMEOUT' || code === 'SMS_TIMEOUT') {
+            return true;
+        }
+        if (RETRYABLE_NETWORK_CODES.has(code)) {
+            return true;
+        }
+        const twilioCode = Number(error?.code);
+        if (twilioCode === 20429 || twilioCode === 30008) {
+            return true;
+        }
+        return false;
     }
 
     matchesOptOut(text = '') {
@@ -169,109 +646,255 @@ class EnhancedSmsService extends EventEmitter {
 
     // Send individual SMS
     async sendSMS(to, message, from = null, options = {}) {
-        try {
-            const fromNumber = from || config.twilio.fromNumber;
-            const normalizedTo = this.normalizePhone(to);
-            const body = this.normalizeBody(message);
-            const {
-                idempotencyKey = null,
-                allowQuietHours = true,
-                quietHours = null,
-                maxRetries = this.defaultMaxRetries,
-                retryDelayMs = this.defaultRetryDelayMs,
-                minIntervalMs = this.defaultMinIntervalMs,
-                mediaUrl = null
-            } = options;
+        const normalizedTo = this.normalizePhone(to);
+        const body = this.normalizeBody(message);
+        const bodyHash = this.hashBody(body);
+        const {
+            idempotencyKey = null,
+            allowQuietHours = true,
+            quietHours = null,
+            maxRetries = this.defaultMaxRetries,
+            retryDelayMs = this.defaultRetryDelayMs,
+            minIntervalMs = this.defaultMinIntervalMs,
+            mediaUrl = null,
+            providerTimeoutMs = this.defaultProviderTimeoutMs,
+            userChatId = null,
+            provider = null,
+        } = options;
 
-            if (!fromNumber) {
-                throw new Error('No FROM_NUMBER configured for SMS');
-            }
-
-            if (!normalizedTo) {
-                throw new Error('No destination number provided');
-            }
-
-            if (!body) {
-                throw new Error('No message body provided');
-            }
-
-            const segmentInfo = getSmsSegmentInfo(body);
-
-            if (await this.isOptedOut(normalizedTo)) {
-                return { success: false, suppressed: true, reason: 'opted_out', segment_info: segmentInfo };
-            }
-
-            if (allowQuietHours && this.isWithinQuietHours(new Date(), quietHours)) {
-                const scheduledTime = this.nextAllowedTime(new Date(), quietHours);
-                await this.scheduleSMS(normalizedTo, body, scheduledTime, { reason: 'quiet_hours' });
-                return { success: true, scheduled: true, scheduled_time: scheduledTime.toISOString(), segment_info: segmentInfo };
-            }
-
-            const lastSend = this.lastSendAt.get(normalizedTo) || 0;
-            if (Date.now() - lastSend < minIntervalMs) {
-                const scheduledTime = new Date(Date.now() + minIntervalMs);
-                await this.scheduleSMS(normalizedTo, body, scheduledTime, { reason: 'rate_limit' });
-                return { success: true, scheduled: true, scheduled_time: scheduledTime.toISOString(), segment_info: segmentInfo };
-            }
-
-            if (idempotencyKey) {
-                if (this.idempotencyCache.has(idempotencyKey)) {
-                    return { success: true, idempotent: true, message_sid: this.idempotencyCache.get(idempotencyKey), segment_info: segmentInfo };
-                }
-                if (this.db?.getSmsIdempotency) {
-                    const existing = await this.db.getSmsIdempotency(idempotencyKey);
-                    if (existing?.message_sid) {
-                        this.idempotencyCache.set(idempotencyKey, existing.message_sid);
-                        return { success: true, idempotent: true, message_sid: existing.message_sid, segment_info: segmentInfo };
-                    }
-                }
-            }
-
-            console.log(`📱 Sending SMS to ${normalizedTo}: ${body.substring(0, 50)}...`);
-
-            const payload = {
-                body,
-                from: fromNumber,
-                to: normalizedTo,
-                statusCallback: config.server.hostname
-                    ? `https://${config.server.hostname}/webhook/sms-status`
-                    : undefined
-            };
-            if (mediaUrl) {
-                payload.mediaUrl = Array.isArray(mediaUrl) ? mediaUrl : [mediaUrl];
-            }
-
-            const smsMessage = await this.twilio.messages.create(payload);
-
-            console.log(`✅ SMS sent successfully: ${smsMessage.sid}`);
-            this.lastSendAt.set(normalizedTo, Date.now());
-            if (idempotencyKey) {
-                this.idempotencyCache.set(idempotencyKey, smsMessage.sid);
-                if (this.db?.saveSmsIdempotency) {
-                    await this.db.saveSmsIdempotency(idempotencyKey, smsMessage.sid, normalizedTo, this.hashBody(body));
-                }
-            }
-            return {
-                success: true,
-                message_sid: smsMessage.sid,
-                to: normalizedTo,
-                from: fromNumber,
-                body,
-                status: smsMessage.status,
-                segment_info: segmentInfo
-            };
-        } catch (error) {
-            console.error('❌ SMS sending error:', error);
-            const attempts = Number.isFinite(options?.attempts) ? options.attempts : 0;
-            if (attempts < (options?.maxRetries ?? this.defaultMaxRetries) && this.isRetryableSmsError(error)) {
-                const delay = (options?.retryDelayMs ?? this.defaultRetryDelayMs) * Math.pow(2, attempts);
-                setTimeout(() => {
-                    this.sendSMS(to, message, from, { ...options, attempts: attempts + 1 }).catch(() => {});
-                }, delay);
-                return { success: false, queued_retry: true, retry_in_ms: delay };
-            }
+        if (!normalizedTo) {
+            const error = new Error('No destination number provided');
+            error.code = 'sms_validation_failed';
             throw error;
         }
+        if (!isValidE164(normalizedTo)) {
+            const error = new Error('Destination phone number must be in E.164 format');
+            error.code = 'sms_validation_failed';
+            throw error;
+        }
+        if (!body) {
+            const error = new Error('No message body provided');
+            error.code = 'sms_validation_failed';
+            throw error;
+        }
+        if (body.length > this.maxMessageChars) {
+            const error = new Error(`Message body exceeds ${this.maxMessageChars} characters`);
+            error.code = 'sms_validation_failed';
+            throw error;
+        }
+
+        const segmentInfo = getSmsSegmentInfo(body);
+        const resolvedProvider = this.resolveProvider(provider);
+        const providerReadiness = this.getProviderReadiness();
+        if (!providerReadiness[resolvedProvider]) {
+            throw createSmsProviderError(resolvedProvider, {
+                message: `SMS provider ${resolvedProvider} is not configured`,
+                code: 'sms_config_error',
+                retryable: false,
+            });
+        }
+        const adapter = this.getAdapter(resolvedProvider);
+        if (!adapter.isConfigured()) {
+            throw createSmsProviderError(resolvedProvider, {
+                message: `SMS provider ${resolvedProvider} is not ready`,
+                code: 'sms_config_error',
+                retryable: false,
+            });
+        }
+        const fromNumber = adapter.resolveFromNumber(from);
+
+        if (!fromNumber) {
+            throw createSmsProviderError(resolvedProvider, {
+                message: 'No source number configured for selected SMS provider',
+                code: 'sms_config_error',
+                retryable: false,
+            });
+        }
+
+        if (await this.isOptedOut(normalizedTo)) {
+            return { success: false, suppressed: true, reason: 'opted_out', segment_info: segmentInfo };
+        }
+
+        if (allowQuietHours && this.isWithinQuietHours(new Date(), quietHours)) {
+            const scheduledTime = this.nextAllowedTime(new Date(), quietHours);
+            await this.scheduleSMS(normalizedTo, body, scheduledTime, {
+                reason: 'quiet_hours',
+                from: fromNumber,
+                userChatId,
+                idempotencyKey: idempotencyKey ? `${idempotencyKey}:quiet_hours` : null,
+                smsOptions: {
+                    allowQuietHours: false,
+                    maxRetries,
+                    retryDelayMs,
+                    minIntervalMs,
+                    mediaUrl,
+                    provider: resolvedProvider,
+                },
+            });
+            return { success: true, scheduled: true, scheduled_time: scheduledTime.toISOString(), segment_info: segmentInfo };
+        }
+
+        const lastSend = this.lastSendAt.get(normalizedTo) || 0;
+        if (Number(minIntervalMs) > 0 && Date.now() - lastSend < minIntervalMs) {
+            const scheduledTime = new Date(Date.now() + Number(minIntervalMs));
+            await this.scheduleSMS(normalizedTo, body, scheduledTime, {
+                reason: 'rate_limit',
+                from: fromNumber,
+                userChatId,
+                idempotencyKey: idempotencyKey ? `${idempotencyKey}:rate_limit` : null,
+                smsOptions: {
+                    allowQuietHours: false,
+                    maxRetries,
+                    retryDelayMs,
+                    minIntervalMs: 0,
+                    mediaUrl,
+                    provider: resolvedProvider,
+                },
+            });
+            return { success: true, scheduled: true, scheduled_time: scheduledTime.toISOString(), segment_info: segmentInfo };
+        }
+
+        if (idempotencyKey) {
+            const cached = this.idempotencyCache.get(idempotencyKey);
+            if (cached?.messageSid) {
+                if (
+                    (cached.toNumber && cached.toNumber !== normalizedTo) ||
+                    (cached.bodyHash && cached.bodyHash !== bodyHash)
+                ) {
+                    const conflict = new Error('Idempotency key reuse with different payload');
+                    conflict.code = 'idempotency_conflict';
+                    throw conflict;
+                }
+                return {
+                    success: true,
+                    idempotent: true,
+                    message_sid: cached.messageSid,
+                    segment_info: segmentInfo,
+                };
+            }
+            if (this.db?.getSmsIdempotency) {
+                const existing = await this.db.getSmsIdempotency(idempotencyKey);
+                if (existing?.message_sid) {
+                    if (
+                        (existing.to_number && existing.to_number !== normalizedTo) ||
+                        (existing.body_hash && existing.body_hash !== bodyHash)
+                    ) {
+                        const conflict = new Error('Idempotency key reuse with different payload');
+                        conflict.code = 'idempotency_conflict';
+                        throw conflict;
+                    }
+                    this.idempotencyCache.set(idempotencyKey, {
+                        messageSid: existing.message_sid,
+                        toNumber: existing.to_number || normalizedTo,
+                        bodyHash: existing.body_hash || bodyHash,
+                    });
+                    return {
+                        success: true,
+                        idempotent: true,
+                        message_sid: existing.message_sid,
+                        segment_info: segmentInfo,
+                    };
+                }
+            }
+        }
+
+        const payload = {
+            body,
+            from: fromNumber,
+            to: normalizedTo,
+            statusCallback: config.server.hostname
+                ? `https://${config.server.hostname}/webhook/sms-status`
+                : undefined,
+            idempotencyKey: idempotencyKey || undefined,
+        };
+        if (mediaUrl) {
+            const mediaList = Array.isArray(mediaUrl) ? mediaUrl : [mediaUrl];
+            payload.mediaUrl = mediaList.filter(Boolean).slice(0, 5);
+        }
+
+        const maxAttempts = Math.max(1, Number(maxRetries || 0) + 1);
+        let attempt = 0;
+        let lastError = null;
+        while (attempt < maxAttempts) {
+            attempt += 1;
+            try {
+                console.log('sms_send_attempt', {
+                    provider: resolvedProvider,
+                    to: redactPhoneForLog(normalizedTo),
+                    from: redactPhoneForLog(fromNumber),
+                    idempotency_key: idempotencyKey ? 'present' : 'absent',
+                    attempt,
+                    max_attempts: maxAttempts,
+                    body_preview: redactBodyForLog(body),
+                });
+                const smsMessage = await adapter.sendSms(
+                    payload,
+                    {
+                        withTimeout: this.withTimeout.bind(this),
+                        providerTimeoutMs,
+                    },
+                );
+                const messageSid = smsMessage?.messageSid || null;
+                if (!messageSid) {
+                    throw createSmsProviderError(resolvedProvider, {
+                        message: 'SMS provider did not return message id',
+                        code: 'sms_provider_error',
+                        retryable: false,
+                    });
+                }
+                this.lastSendAt.set(normalizedTo, Date.now());
+                if (idempotencyKey) {
+                    this.idempotencyCache.set(idempotencyKey, {
+                        messageSid,
+                        toNumber: normalizedTo,
+                        bodyHash,
+                        provider: resolvedProvider,
+                    });
+                    if (this.db?.saveSmsIdempotency) {
+                        await this.db.saveSmsIdempotency(
+                            idempotencyKey,
+                            messageSid,
+                            normalizedTo,
+                            bodyHash,
+                        );
+                    }
+                }
+                console.log('sms_send_success', {
+                    provider: resolvedProvider,
+                    to: redactPhoneForLog(normalizedTo),
+                    message_sid: messageSid,
+                    attempt,
+                    status: smsMessage?.status || 'queued',
+                });
+                return {
+                    success: true,
+                    message_sid: messageSid,
+                    provider: resolvedProvider,
+                    to: normalizedTo,
+                    from: smsMessage?.from || fromNumber,
+                    body,
+                    status: smsMessage?.status,
+                    segment_info: segmentInfo
+                };
+            } catch (error) {
+                lastError = error;
+                const retryable = this.isRetryableSmsError(error);
+                if (!retryable || attempt >= maxAttempts) {
+                    break;
+                }
+                const delay = this.computeRetryDelayMs(retryDelayMs, attempt);
+                console.warn('sms_send_retry_scheduled', {
+                    provider: resolvedProvider,
+                    to: redactPhoneForLog(normalizedTo),
+                    attempt,
+                    max_attempts: maxAttempts,
+                    retry_in_ms: delay,
+                    reason: sanitizeErrorMessage(error?.message || 'send_failed'),
+                });
+                await sleep(delay);
+            }
+        }
+        throw lastError || new Error('SMS send failed');
     }
 
     // Send bulk SMS
@@ -282,12 +905,93 @@ class EnhancedSmsService extends EventEmitter {
             batchSize = 10,
             from = null,
             smsOptions = {},
-            validateNumbers = true
+            validateNumbers = true,
+            idempotencyKey = null,
+            durable = false,
+            userChatId = null,
         } = options;
 
-        const segmentInfo = getSmsSegmentInfo(message);
+        const body = this.normalizeBody(message);
+        if (!body) {
+            throw new Error('No message body provided');
+        }
+        if (body.length > this.maxMessageChars) {
+            throw new Error(`Message body exceeds ${this.maxMessageChars} characters`);
+        }
 
-        console.log(`📱 Sending bulk SMS to ${recipients.length} recipients`);
+        const segmentInfo = getSmsSegmentInfo(body);
+
+        console.log('sms_bulk_start', {
+            recipients: recipients.length,
+            durable: durable === true,
+            body_preview: redactBodyForLog(body),
+        });
+
+        if (durable && this.db?.createCallJob) {
+            let queued = 0;
+            let invalid = 0;
+            for (const recipient of recipients) {
+                const normalizedRecipient = this.normalizePhone(recipient);
+                if (validateNumbers && !isValidE164(normalizedRecipient)) {
+                    invalid += 1;
+                    results.push({
+                        recipient: normalizedRecipient,
+                        success: false,
+                        error: 'invalid_phone_format',
+                        segment_info: segmentInfo,
+                    });
+                    continue;
+                }
+                const recipientHash = crypto
+                    .createHash('sha1')
+                    .update(normalizedRecipient)
+                    .digest('hex')
+                    .slice(0, 16);
+                const recipientIdempotencyKey = idempotencyKey
+                    ? `${idempotencyKey}:${recipientHash}`
+                    : null;
+                try {
+                    const schedule = await this.scheduleSMS(
+                        normalizedRecipient,
+                        body,
+                        new Date(),
+                        {
+                            reason: 'bulk_durable',
+                            from,
+                            userChatId,
+                            idempotencyKey: recipientIdempotencyKey,
+                            smsOptions: { ...smsOptions, allowQuietHours: false, minIntervalMs: 0 },
+                        },
+                    );
+                    queued += 1;
+                    results.push({
+                        recipient: normalizedRecipient,
+                        success: true,
+                        queued: true,
+                        schedule_id: schedule?.schedule_id || null,
+                        segment_info: segmentInfo,
+                    });
+                } catch (scheduleError) {
+                    results.push({
+                        recipient: normalizedRecipient,
+                        success: false,
+                        error: scheduleError?.message || 'schedule_failed',
+                        segment_info: segmentInfo,
+                    });
+                }
+            }
+            return {
+                total: recipients.length,
+                successful: queued,
+                failed: recipients.length - queued,
+                scheduled: queued,
+                suppressed: 0,
+                invalid,
+                durable: true,
+                segment_info: segmentInfo,
+                results,
+            };
+        }
 
         // Process in batches to avoid rate limiting
         for (let i = 0; i < recipients.length; i += batchSize) {
@@ -303,7 +1007,19 @@ class EnhancedSmsService extends EventEmitter {
                     };
                 }
                 try {
-                    const result = await this.sendSMS(normalizedRecipient, message, from, smsOptions);
+                    const recipientHash = crypto
+                        .createHash('sha1')
+                        .update(normalizedRecipient)
+                        .digest('hex')
+                        .slice(0, 16);
+                    const recipientIdempotencyKey = idempotencyKey
+                        ? `${idempotencyKey}:${recipientHash}`
+                        : null;
+                    const result = await this.sendSMS(normalizedRecipient, body, from, {
+                        ...smsOptions,
+                        userChatId,
+                        idempotencyKey: recipientIdempotencyKey || smsOptions.idempotencyKey || null,
+                    });
                     return { ...result,
                         recipient: normalizedRecipient,
                         success: result.success === true,
@@ -320,7 +1036,19 @@ class EnhancedSmsService extends EventEmitter {
             });
 
             const batchResults = await Promise.allSettled(batchPromises);
-            results.push(...batchResults.map(r => r.value));
+            results.push(
+                ...batchResults.map((entry, index) => {
+                    if (entry.status === 'fulfilled') {
+                        return entry.value;
+                    }
+                    return {
+                        recipient: this.normalizePhone(batch[index]),
+                        success: false,
+                        error: entry.reason?.message || 'send_failed',
+                        segment_info: segmentInfo,
+                    };
+                }),
+            );
 
             // Add delay between batches
             if (i + batchSize < recipients.length) {
@@ -351,7 +1079,11 @@ class EnhancedSmsService extends EventEmitter {
     // AI-powered SMS conversation
     async handleIncomingSMS(from, body, messageSid) {
         try {
-            console.log(`📨 Incoming SMS from ${from}: ${body}`);
+            console.log('sms_incoming', {
+                from: redactPhoneForLog(from),
+                message_sid: messageSid || null,
+                body_preview: redactBodyForLog(body),
+            });
             const normalizedFrom = this.normalizePhone(from);
             const normalizedBody = this.normalizeBody(body);
 
@@ -419,7 +1151,11 @@ class EnhancedSmsService extends EventEmitter {
             };
 
         } catch (error) {
-            console.error('❌ Error handling incoming SMS:', error);
+            console.error('❌ Error handling incoming SMS:', {
+                from: redactPhoneForLog(from),
+                message_sid: messageSid || null,
+                error: redactBodyForLog(error?.message || 'incoming_sms_failed', 120),
+            });
 
             // Send fallback message
             try {
@@ -441,12 +1177,16 @@ class EnhancedSmsService extends EventEmitter {
             }, ...conversation.messages.slice(-10) // Keep last 10 messages for context
             ];
 
-            const completion = await this.openai.chat.completions.create({
-                model: this.model,
-                messages: messages,
-                max_tokens: 150,
-                temperature: 0.7
-            });
+            const completion = await this.withTimeout(
+                this.openai.chat.completions.create({
+                    model: this.model,
+                    messages: messages,
+                    max_tokens: 150,
+                    temperature: 0.7
+                }),
+                this.defaultAiTimeoutMs,
+                'sms_ai_timeout',
+            );
 
             let response = completion.choices[0].message.content.trim();
 
@@ -458,7 +1198,9 @@ class EnhancedSmsService extends EventEmitter {
             return response;
 
         } catch (error) {
-            console.error('❌ AI response generation error:', error);
+            console.error('❌ AI response generation error:', {
+                error: redactBodyForLog(error?.message || 'ai_response_failed', 120),
+            });
             return "I apologize, but I'm having trouble processing your request right now. Please try again later.";
         }
     }
@@ -503,10 +1245,63 @@ class EnhancedSmsService extends EventEmitter {
 
     // Schedule SMS for later sending
     async scheduleSMS(to, message, scheduledTime, options = {}) {
+        const normalizedTo = this.normalizePhone(to);
+        const body = this.normalizeBody(message);
+        if (!isValidE164(normalizedTo)) {
+            throw new Error('Invalid phone number format');
+        }
+        if (!body) {
+            throw new Error('No message body provided');
+        }
+        if (body.length > this.maxMessageChars) {
+            throw new Error(`Message body exceeds ${this.maxMessageChars} characters`);
+        }
+        const parsedSchedule = new Date(scheduledTime);
+        if (Number.isNaN(parsedSchedule.getTime())) {
+            throw new Error('Invalid scheduled time');
+        }
+
+        const fromNumber = options.from || null;
+        const smsOptions = { ...(options.smsOptions || {}) };
+        const idempotencyKey = options.idempotencyKey || null;
+        const userChatId = options.userChatId || null;
+
+        if (this.db?.createCallJob) {
+            const payload = {
+                to: normalizedTo,
+                message: body,
+                from: fromNumber,
+                user_chat_id: userChatId,
+                idempotency_key: idempotencyKey,
+                sms_options: {
+                    ...smsOptions,
+                    allowQuietHours: false,
+                    minIntervalMs: 0,
+                },
+            };
+            const jobId = await this.db.createCallJob(
+                'sms_scheduled_send',
+                payload,
+                parsedSchedule.toISOString(),
+            );
+            console.log('sms_scheduled_job_created', {
+                schedule_id: `sms_job_${jobId}`,
+                to: redactPhoneForLog(normalizedTo),
+                scheduled_at: parsedSchedule.toISOString(),
+                reason: options.reason || 'scheduled',
+            });
+            return {
+                schedule_id: `sms_job_${jobId}`,
+                scheduled_time: parsedSchedule.toISOString(),
+                status: 'scheduled',
+                durable: true,
+            };
+        }
+
         const scheduleData = {
-            to,
-            message,
-            scheduledTime: new Date(scheduledTime),
+            to: normalizedTo,
+            message: body,
+            scheduledTime: parsedSchedule,
             created_at: new Date(),
             options,
             status: 'scheduled'
@@ -517,48 +1312,77 @@ class EnhancedSmsService extends EventEmitter {
         const scheduleId = `sched_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
         this.messageQueue.set(scheduleId, scheduleData);
 
-        console.log(`🗓️ SMS scheduled for ${scheduledTime}: ${scheduleId}`);
+        console.log('sms_scheduled_in_memory', {
+            schedule_id: scheduleId,
+            to: redactPhoneForLog(normalizedTo),
+            scheduled_at: parsedSchedule.toISOString(),
+            reason: options.reason || 'scheduled',
+        });
 
         return {
             schedule_id: scheduleId,
-            scheduled_time: scheduledTime,
+            scheduled_time: parsedSchedule.toISOString(),
             status: 'scheduled'
         };
     }
 
     // Process scheduled messages
     async processScheduledMessages() {
+        if (this.scheduledProcessing) {
+            return 0;
+        }
+        this.scheduledProcessing = true;
         const now = new Date();
         const toSend = [];
 
-        for (const [scheduleId, scheduleData] of this.messageQueue.entries()) {
-            if (scheduleData.status === 'scheduled' && scheduleData.scheduledTime <= now) {
-                toSend.push({
+        try {
+            for (const [scheduleId, scheduleData] of this.messageQueue.entries()) {
+                if (scheduleData.status === 'scheduled' && scheduleData.scheduledTime <= now) {
+                    toSend.push({
+                        scheduleId,
+                        scheduleData
+                    });
+                }
+            }
+
+            for (const {
                     scheduleId,
                     scheduleData
-                });
+                } of toSend) {
+                try {
+                    const result = await this.sendSMS(
+                        scheduleData.to,
+                        scheduleData.message,
+                        scheduleData?.options?.from || null,
+                        {
+                            ...(scheduleData?.options?.smsOptions || {}),
+                            allowQuietHours: false,
+                            minIntervalMs: 0,
+                            idempotencyKey: scheduleData?.options?.idempotencyKey || null,
+                        },
+                    );
+                    scheduleData.status = 'sent';
+                    scheduleData.sent_at = new Date();
+                    scheduleData.message_sid = result.message_sid;
+
+                    console.log('sms_scheduled_sent', {
+                        schedule_id: scheduleId,
+                        message_sid: result.message_sid || null,
+                    });
+                } catch (error) {
+                    console.error('❌ Failed to send scheduled SMS', {
+                        schedule_id: scheduleId,
+                        error: redactBodyForLog(error?.message || 'scheduled_send_failed', 120),
+                    });
+                    scheduleData.status = 'failed';
+                    scheduleData.error = error.message;
+                }
             }
+
+            return toSend.length;
+        } finally {
+            this.scheduledProcessing = false;
         }
-
-        for (const {
-                scheduleId,
-                scheduleData
-            } of toSend) {
-            try {
-                const result = await this.sendSMS(scheduleData.to, scheduleData.message);
-                scheduleData.status = 'sent';
-                scheduleData.sent_at = new Date();
-                scheduleData.message_sid = result.message_sid;
-
-                console.log(`📱 Scheduled SMS sent: ${scheduleId}`);
-            } catch (error) {
-                console.error(`❌ Failed to send scheduled SMS ${scheduleId}:`, error);
-                scheduleData.status = 'failed';
-                scheduleData.error = error.message;
-            }
-        }
-
-        return toSend.length;
     }
 
     // SMS scripts system

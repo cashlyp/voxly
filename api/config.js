@@ -56,7 +56,7 @@ function parseList(rawValue) {
     .filter(Boolean);
 }
 
-const corsOriginsRaw = ensure("CORS_ORIGINS", process.env.WEB_APP_URL || "");
+const corsOriginsRaw = ensure("CORS_ORIGINS", "");
 const corsOrigins = corsOriginsRaw
   .split(",")
   .map((origin) => origin.trim())
@@ -83,6 +83,21 @@ const deepgramVoiceAgentSpeakModel =
   readEnv("DEEPGRAM_VOICE_AGENT_SPEAK_MODEL") || null;
 const deepgramVoiceAgentKeepAliveMs = Number(
   readEnv("DEEPGRAM_VOICE_AGENT_KEEPALIVE_MS") || "8000",
+);
+const deepgramVoiceAgentTurnTimeoutMs = Number(
+  readEnv("DEEPGRAM_VOICE_AGENT_TURN_TIMEOUT_MS") || "12000",
+);
+const deepgramVoiceAgentToolTimeoutMs = Number(
+  readEnv("DEEPGRAM_VOICE_AGENT_TOOL_TIMEOUT_MS") || "8000",
+);
+const deepgramVoiceAgentMaxToolResponseChars = Number(
+  readEnv("DEEPGRAM_VOICE_AGENT_MAX_TOOL_RESPONSE_CHARS") || "4000",
+);
+const deepgramVoiceAgentMaxConsecutiveToolFailures = Number(
+  readEnv("DEEPGRAM_VOICE_AGENT_MAX_CONSECUTIVE_TOOL_FAILURES") || "3",
+);
+const deepgramVoiceAgentTimeoutFallbackThreshold = Number(
+  readEnv("DEEPGRAM_VOICE_AGENT_TIMEOUT_FALLBACK_THRESHOLD") || "2",
 );
 const twilioGatherFallback =
   String(readEnv("TWILIO_GATHER_FALLBACK") || "true").toLowerCase() === "true";
@@ -129,6 +144,29 @@ const vonageWebhookRequirePayloadHash =
 const vonageDtmfWebhookEnabled =
   String(readEnv("VONAGE_DTMF_WEBHOOK_ENABLED") || "false").toLowerCase() ===
   "true";
+const telegramWebhookValidationRaw = (
+  readEnv("TELEGRAM_WEBHOOK_VALIDATION") || (isProduction ? "strict" : "warn")
+).toLowerCase();
+const telegramWebhookValidationModes = new Set(["strict", "warn", "off"]);
+const telegramWebhookValidation = telegramWebhookValidationModes.has(
+  telegramWebhookValidationRaw,
+)
+  ? telegramWebhookValidationRaw
+  : isProduction
+    ? "strict"
+    : "warn";
+const awsWebhookValidationRaw = (
+  readEnv("AWS_WEBHOOK_VALIDATION") || (isProduction ? "strict" : "warn")
+).toLowerCase();
+const awsWebhookValidationModes = new Set(["strict", "warn", "off"]);
+const awsWebhookValidation = awsWebhookValidationModes.has(
+  awsWebhookValidationRaw,
+)
+  ? awsWebhookValidationRaw
+  : isProduction
+    ? "strict"
+    : "warn";
+const awsWebhookSecret = readEnv("AWS_WEBHOOK_SECRET");
 
 const callProvider = ensure("CALL_PROVIDER", "twilio").toLowerCase();
 const awsRegion = ensure("AWS_REGION", "us-east-1");
@@ -225,6 +263,16 @@ const callJobIntervalMs = Number(
 const callJobRetryBaseMs = Number(readEnv("CALL_JOB_RETRY_BASE_MS") || "5000");
 const callJobRetryMaxMs = Number(readEnv("CALL_JOB_RETRY_MAX_MS") || "60000");
 const callJobMaxAttempts = Number(readEnv("CALL_JOB_MAX_ATTEMPTS") || "3");
+const callJobTimeoutMs = Number(readEnv("CALL_JOB_TIMEOUT_MS") || "45000");
+const callJobStaleLockMs = Number(
+  readEnv("CALL_JOB_STALE_LOCK_MS") || "300000",
+);
+const callJobDlqAlertThreshold = Number(
+  readEnv("CALL_JOB_DLQ_ALERT_THRESHOLD") || "20",
+);
+const callJobDlqMaxReplays = Number(
+  readEnv("CALL_JOB_DLQ_MAX_REPLAYS") || "2",
+);
 const callSloFirstMediaMs = Number(
   readEnv("CALL_SLO_FIRST_MEDIA_MS") || "4000",
 );
@@ -236,6 +284,9 @@ const webhookRetryBaseMs = Number(readEnv("WEBHOOK_RETRY_BASE_MS") || "5000");
 const webhookRetryMaxMs = Number(readEnv("WEBHOOK_RETRY_MAX_MS") || "60000");
 const webhookRetryMaxAttempts = Number(
   readEnv("WEBHOOK_RETRY_MAX_ATTEMPTS") || "5",
+);
+const webhookTelegramTimeoutMs = Number(
+  readEnv("WEBHOOK_TELEGRAM_TIMEOUT_MS") || "15000",
 );
 
 function loadPrivateKey(rawValue) {
@@ -313,6 +364,44 @@ const emailQueueIntervalMs = Number(
   readEnv("EMAIL_QUEUE_INTERVAL_MS") || "5000",
 );
 const emailMaxRetries = Number(readEnv("EMAIL_MAX_RETRIES") || "5");
+const emailRequestTimeoutMs = Number(
+  readEnv("EMAIL_REQUEST_TIMEOUT_MS") || "15000",
+);
+const emailMaxSubjectChars = Number(
+  readEnv("EMAIL_MAX_SUBJECT_CHARS") || "200",
+);
+const emailMaxBodyChars = Number(readEnv("EMAIL_MAX_BODY_CHARS") || "200000");
+const emailMaxBulkRecipients = Number(
+  readEnv("EMAIL_MAX_BULK_RECIPIENTS") || "500",
+);
+const emailDlqAlertThreshold = Number(
+  readEnv("EMAIL_DLQ_ALERT_THRESHOLD") || "25",
+);
+const emailDlqMaxReplays = Number(readEnv("EMAIL_DLQ_MAX_REPLAYS") || "2");
+const smsProviderTimeoutMs = Number(
+  readEnv("SMS_PROVIDER_TIMEOUT_MS") || "15000",
+);
+const smsProvider = (readEnv("SMS_PROVIDER") || callProvider).toLowerCase();
+const smsAiTimeoutMs = Number(readEnv("SMS_AI_TIMEOUT_MS") || "12000");
+const smsMaxMessageChars = Number(readEnv("SMS_MAX_MESSAGE_CHARS") || "1600");
+const outboundRateWindowMs = Number(
+  readEnv("OUTBOUND_RATE_LIMIT_WINDOW_MS") || "60000",
+);
+const smsOutboundUserRateLimit = Number(
+  readEnv("SMS_OUTBOUND_USER_RATE_LIMIT_PER_WINDOW") || "15",
+);
+const smsOutboundGlobalRateLimit = Number(
+  readEnv("SMS_OUTBOUND_GLOBAL_RATE_LIMIT_PER_WINDOW") || "120",
+);
+const emailOutboundUserRateLimit = Number(
+  readEnv("EMAIL_OUTBOUND_USER_RATE_LIMIT_PER_WINDOW") || "20",
+);
+const emailOutboundGlobalRateLimit = Number(
+  readEnv("EMAIL_OUTBOUND_GLOBAL_RATE_LIMIT_PER_WINDOW") || "120",
+);
+const outboundHandlerTimeoutMs = Number(
+  readEnv("OUTBOUND_HANDLER_TIMEOUT_MS") || "30000",
+);
 const emailUnsubscribeUrl =
   readEnv("EMAIL_UNSUBSCRIBE_URL") ||
   (serverHostname ? `https://${serverHostname}/webhook/email-unsubscribe` : "");
@@ -382,6 +471,8 @@ module.exports = {
       languageCode: ensure("AWS_TRANSCRIBE_LANGUAGE_CODE", "en-US"),
       vocabularyFilterName: readEnv("AWS_TRANSCRIBE_VOCABULARY_FILTER_NAME"),
     },
+    webhookValidation: awsWebhookValidation,
+    webhookSecret: awsWebhookSecret,
   },
   vonage: {
     apiKey: readEnv("VONAGE_API_KEY"),
@@ -414,6 +505,7 @@ module.exports = {
     operatorUserIds: telegramOperatorUserIds,
     viewerChatIds: telegramViewerChatIds,
     viewerUserIds: telegramViewerUserIds,
+    webhookValidation: telegramWebhookValidation,
   },
   openRouter: {
     apiKey: ensure("OPENROUTER_API_KEY"),
@@ -432,7 +524,7 @@ module.exports = {
       endpoint: deepgramVoiceAgentEndpoint,
       keepAliveMs: Number.isFinite(deepgramVoiceAgentKeepAliveMs)
         ? deepgramVoiceAgentKeepAliveMs
-        : 15000,
+        : 8000,
       think: {
         providerType: deepgramVoiceAgentThinkProviderType,
         model: deepgramVoiceAgentThinkModel,
@@ -442,6 +534,27 @@ module.exports = {
       },
       speak: {
         model: deepgramVoiceAgentSpeakModel,
+      },
+      runtime: {
+        turnTimeoutMs: Number.isFinite(deepgramVoiceAgentTurnTimeoutMs)
+          ? deepgramVoiceAgentTurnTimeoutMs
+          : 12000,
+        toolTimeoutMs: Number.isFinite(deepgramVoiceAgentToolTimeoutMs)
+          ? deepgramVoiceAgentToolTimeoutMs
+          : 8000,
+        maxToolResponseChars: Number.isFinite(deepgramVoiceAgentMaxToolResponseChars)
+          ? deepgramVoiceAgentMaxToolResponseChars
+          : 4000,
+        maxConsecutiveToolFailures: Number.isFinite(
+          deepgramVoiceAgentMaxConsecutiveToolFailures,
+        )
+          ? deepgramVoiceAgentMaxConsecutiveToolFailures
+          : 3,
+        timeoutFallbackThreshold: Number.isFinite(
+          deepgramVoiceAgentTimeoutFallbackThreshold,
+        )
+          ? deepgramVoiceAgentTimeoutFallbackThreshold
+          : 2,
       },
     },
   },
@@ -489,6 +602,22 @@ module.exports = {
       ? emailQueueIntervalMs
       : 5000,
     maxRetries: Number.isFinite(emailMaxRetries) ? emailMaxRetries : 5,
+    requestTimeoutMs: Number.isFinite(emailRequestTimeoutMs)
+      ? emailRequestTimeoutMs
+      : 15000,
+    maxSubjectChars: Number.isFinite(emailMaxSubjectChars)
+      ? emailMaxSubjectChars
+      : 200,
+    maxBodyChars: Number.isFinite(emailMaxBodyChars) ? emailMaxBodyChars : 200000,
+    maxBulkRecipients: Number.isFinite(emailMaxBulkRecipients)
+      ? emailMaxBulkRecipients
+      : 500,
+    dlqAlertThreshold: Number.isFinite(emailDlqAlertThreshold)
+      ? emailDlqAlertThreshold
+      : 25,
+    dlqMaxReplays: Number.isFinite(emailDlqMaxReplays)
+      ? emailDlqMaxReplays
+      : 2,
     unsubscribeUrl: emailUnsubscribeUrl,
     rateLimits: {
       perProviderPerMinute: Number.isFinite(emailRateLimitProvider)
@@ -528,6 +657,40 @@ module.exports = {
   },
   smsDefaults: {
     businessId: defaultSmsBusinessId,
+  },
+  sms: {
+    provider: smsProvider,
+    providerTimeoutMs: Number.isFinite(smsProviderTimeoutMs)
+      ? smsProviderTimeoutMs
+      : 15000,
+    aiTimeoutMs: Number.isFinite(smsAiTimeoutMs) ? smsAiTimeoutMs : 12000,
+    maxMessageChars: Number.isFinite(smsMaxMessageChars)
+      ? smsMaxMessageChars
+      : 1600,
+  },
+  outboundLimits: {
+    windowMs: Number.isFinite(outboundRateWindowMs)
+      ? outboundRateWindowMs
+      : 60000,
+    handlerTimeoutMs: Number.isFinite(outboundHandlerTimeoutMs)
+      ? outboundHandlerTimeoutMs
+      : 30000,
+    sms: {
+      perUser: Number.isFinite(smsOutboundUserRateLimit)
+        ? smsOutboundUserRateLimit
+        : 15,
+      global: Number.isFinite(smsOutboundGlobalRateLimit)
+        ? smsOutboundGlobalRateLimit
+        : 120,
+    },
+    email: {
+      perUser: Number.isFinite(emailOutboundUserRateLimit)
+        ? emailOutboundUserRateLimit
+        : 20,
+      global: Number.isFinite(emailOutboundGlobalRateLimit)
+        ? emailOutboundGlobalRateLimit
+        : 120,
+    },
   },
   apiAuth: {
     hmacSecret: apiHmacSecret,
@@ -570,6 +733,16 @@ module.exports = {
     retryBaseMs: callJobRetryBaseMs,
     retryMaxMs: callJobRetryMaxMs,
     maxAttempts: callJobMaxAttempts,
+    timeoutMs: Number.isFinite(callJobTimeoutMs) ? callJobTimeoutMs : 45000,
+    staleLockMs: Number.isFinite(callJobStaleLockMs)
+      ? callJobStaleLockMs
+      : 300000,
+    dlqAlertThreshold: Number.isFinite(callJobDlqAlertThreshold)
+      ? callJobDlqAlertThreshold
+      : 20,
+    dlqMaxReplays: Number.isFinite(callJobDlqMaxReplays)
+      ? callJobDlqMaxReplays
+      : 2,
   },
   callSlo: {
     firstMediaMs: callSloFirstMediaMs,
@@ -580,5 +753,8 @@ module.exports = {
     retryBaseMs: webhookRetryBaseMs,
     retryMaxMs: webhookRetryMaxMs,
     retryMaxAttempts: webhookRetryMaxAttempts,
+    telegramRequestTimeoutMs: Number.isFinite(webhookTelegramTimeoutMs)
+      ? webhookTelegramTimeoutMs
+      : 15000,
   },
 };

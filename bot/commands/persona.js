@@ -32,7 +32,10 @@ const {
 const personaApi = axios.create({
   baseURL: config.apiUrl.replace(/\/+$/, ''),
   timeout: 15000,
-  headers: { 'Content-Type': 'application/json' }
+  headers: {
+    'Content-Type': 'application/json',
+    ...(config.admin?.apiToken ? { 'x-admin-token': config.admin.apiToken } : {})
+  }
 });
 
 let apiOrigin;
@@ -107,7 +110,11 @@ async function fetchSmsScriptsSummary(ctx, ensureActive) {
       params: { include_builtins: true }
     });
     const custom = Array.isArray(data.scripts) ? data.scripts : [];
-    const builtin = Array.isArray(data.builtin) ? data.builtin : [];
+    const builtin = Array.isArray(data.builtin)
+      ? data.builtin
+      : Array.isArray(data.available_scripts)
+        ? data.available_scripts.map((name) => ({ name, is_builtin: true }))
+        : [];
     return [...custom, ...builtin];
   } catch (error) {
     console.error('Failed to fetch SMS scripts for persona command:', error?.message);

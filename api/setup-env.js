@@ -11,6 +11,8 @@ const SECTIONS = [
     ],
     fields: [
       { key: 'CALL_PROVIDER', prompt: 'Primary call provider', defaultValue: 'twilio' },
+      { key: 'SMS_PROVIDER', prompt: 'Primary SMS provider', defaultValue: 'twilio' },
+      { key: 'EMAIL_PROVIDER', prompt: 'Primary email provider', defaultValue: 'sendgrid' },
     ],
   },
   {

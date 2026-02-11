@@ -57,12 +57,25 @@ async function withRetry(fn, options = {}) {
   }
 }
 
+function redactSensitiveRoute(value = '') {
+  return String(value || '')
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[redacted-email]')
+    .replace(/\+?\d[\d\s().-]{6,}\d/g, '[redacted-phone]');
+}
+
 function sanitizeUrl(url = '') {
   try {
     const parsed = new URL(url);
-    return `${parsed.origin}${parsed.pathname}`;
+    const decodedPath = (() => {
+      try {
+        return decodeURIComponent(parsed.pathname || '');
+      } catch (_) {
+        return parsed.pathname || '';
+      }
+    })();
+    return `${parsed.origin}${redactSensitiveRoute(decodedPath)}`;
   } catch (_) {
-    return String(url || '');
+    return redactSensitiveRoute(String(url || ''));
   }
 }
 

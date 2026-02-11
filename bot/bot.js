@@ -69,10 +69,52 @@ const {
 // Bot initialization
 const token = config.botToken;
 const bot = new Bot(token);
+const CONVERSATION_IDLE_TIMEOUT_MS = 4 * 60 * 1000;
+
+async function waitWithConversationTimeout(waitFactory, ctx, conversationName) {
+  let timeoutId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(
+        new OperationCancelledError(
+          `Conversation ${conversationName} timed out due to inactivity.`,
+        ),
+      );
+    }, CONVERSATION_IDLE_TIMEOUT_MS);
+  });
+
+  try {
+    return await Promise.race([waitFactory(), timeoutPromise]);
+  } catch (error) {
+    if (
+      error instanceof OperationCancelledError &&
+      /timed out due to inactivity/i.test(error.message || "")
+    ) {
+      try {
+        await clearMenuMessages(ctx);
+      } catch (_) {}
+      resetSession(ctx);
+      await ctx.reply("⌛ Session timed out due to inactivity. Use /menu to start again.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
 
 // Initialize conversations with error handling wrapper
 function wrapConversation(handler, name) {
   return createConversation(async (conversation, ctx) => {
+    if (typeof conversation.wait === "function") {
+      const originalWait = conversation.wait.bind(conversation);
+      conversation.wait = (...args) =>
+        waitWithConversationTimeout(() => originalWait(...args), ctx, name);
+    }
+    if (typeof conversation.waitFor === "function") {
+      const originalWaitFor = conversation.waitFor.bind(conversation);
+      conversation.waitFor = (...args) =>
+        waitWithConversationTimeout(() => originalWaitFor(...args), ctx, name);
+    }
     try {
       await handler(conversation, ctx);
     } catch (error) {
@@ -263,8 +305,12 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
     }
   } catch (error) {
     console.error("Operator action error:", error?.message || error);
+    const callbackText =
+      error?.response?.status === 404
+        ? "⚠️ Operator action endpoint is unavailable."
+        : "⚠️ Failed to execute action";
     await ctx.answerCallbackQuery({
-      text: "⚠️ Failed to execute action",
+      text: callbackText,
       show_alert: false,
     });
   }
@@ -397,6 +443,7 @@ const {
 const {
   registerProviderCommand,
   handleProviderCallbackAction,
+  isProviderAction,
   PROVIDER_ACTIONS,
 } = require("./commands/provider");
 const {
@@ -475,6 +522,7 @@ registerGuideCommand(bot);
 registerApiCommands(bot);
 registerProviderCommand(bot);
 const API_BASE = config.apiUrl;
+const REQUEST_ACCESS_ACTION = "REQUEST_ACCESS";
 
 function parseCallbackAction(action) {
   if (!action || !action.includes(":")) {
@@ -486,6 +534,23 @@ function parseCallbackAction(action) {
     return { prefix, opId: parts[1], value: parts.slice(2).join(":") };
   }
   return { prefix, opId: null, value: parts.slice(1).join(":") };
+}
+
+function escapeMarkdownValue(value = "") {
+  return String(value).replace(/([_*[\]()`])/g, "\\$1");
+}
+
+function getTelegramAccountName(from = {}) {
+  const firstName = String(from?.first_name || "").trim();
+  const lastName = String(from?.last_name || "").trim();
+  const fullName = [firstName, lastName].filter(Boolean).join(" ").trim();
+  if (fullName) {
+    return fullName;
+  }
+  if (from?.username) {
+    return `@${from.username}`;
+  }
+  return "Unknown";
 }
 
 function resolveConversationFromPrefix(prefix) {
@@ -522,16 +587,26 @@ bot.command("start", async (ctx) => {
     const isOwner = access.isAdmin;
     await syncChatCommands(ctx, access);
 
+    const accountName = escapeMarkdownValue(getTelegramAccountName(ctx.from));
+    const usernameValue = ctx.from?.username
+      ? `@${escapeMarkdownValue(ctx.from.username)}`
+      : "none";
+
     const userStats = access.user
       ? `👤 *User Information*
+• Account Name: ${accountName}
 • ID: \`${ctx.from.id}\`
-• Username: @${ctx.from.username || "none"}
+• Username: ${usernameValue}
 • Role: ${access.user.role}
 • Joined: ${new Date(access.user.timestamp).toLocaleDateString()}`
-      : `👤 *Guest Access*
-• ID: \`${ctx.from.id}\`
-• Username: @${ctx.from.username || "none"}
-• Role: Guest`;
+      : [
+          `👤 *Guest Access*`,
+          `• Account Name: ${accountName}`,
+          `• ID: \`${ctx.from.id}\``,
+          ctx.from?.username ? `• Username: ${usernameValue}` : null,
+        ]
+          .filter(Boolean)
+          .join("\n");
 
     const welcomeText = access.user
       ? isOwner
@@ -574,7 +649,7 @@ bot.command("start", async (ctx) => {
         .text("📵 Caller Flags", buildCallbackData(ctx, "CALLER_FLAGS"))
         .row()
         .text("🧰 Scripts", buildCallbackData(ctx, "SCRIPTS"))
-        .text("☎️ Provider", buildCallbackData(ctx, "PROVIDER_STATUS"))
+        .text("☎️ Provider", buildCallbackData(ctx, PROVIDER_ACTIONS.HOME))
         .row()
         .text("🔍 Status", buildCallbackData(ctx, "STATUS"))
         .row();
@@ -582,10 +657,7 @@ bot.command("start", async (ctx) => {
 
     // REQUEST ACCESS: For guests (admin-only)
     if (!access.user) {
-      const adminUsername = (config.admin.username || "").replace(/^@/, "");
-      if (adminUsername) {
-        kb.url("📱 Request Access", `https://t.me/${adminUsername}`);
-      }
+      kb.text("📩 Request Access", buildCallbackData(ctx, REQUEST_ACCESS_ACTION));
     }
 
     const tips = ["Tip: SMS and Email actions are grouped under /sms and /email."];
@@ -599,6 +671,18 @@ bot.command("start", async (ctx) => {
     await ctx.reply(
       "❌ An error occurred. Please try again or contact support.",
     );
+  }
+});
+
+bot.command("cancel", async (ctx) => {
+  try {
+    await cancelActiveFlow(ctx, "command:/cancel");
+    resetSession(ctx);
+    await clearMenuMessages(ctx);
+    await ctx.reply("✅ Current operation cancelled.\n📋 Use /menu to start again.");
+  } catch (error) {
+    console.error("Cancel command error:", error?.message || error);
+    await ctx.reply("⚠️ Could not cancel the current operation. Please try /menu.");
   }
 });
 
@@ -622,13 +706,19 @@ bot.on("callback_query:data", async (ctx) => {
       ? { status: "ok", action: rawAction }
       : validateCallback(ctx, rawAction);
     if (validation.status !== "ok") {
+      const staleAction = validation.action || rawAction || "";
+      const shouldReopenProvider = isProviderAction(staleAction);
       const message =
         validation.status === "expired"
           ? "⌛ This menu expired. Opening the latest view…"
           : "⚠️ This menu is no longer active.";
       await ctx.answerCallbackQuery({ text: message, show_alert: false });
       await clearMenuMessages(ctx);
-      await handleMenu(ctx);
+      if (shouldReopenProvider) {
+        await handleProviderCallbackAction(ctx, PROVIDER_ACTIONS.HOME);
+      } else {
+        await handleMenu(ctx);
+      }
       finishMetric(validation.status, { reason: validation.reason });
       return;
     }
@@ -668,7 +758,11 @@ bot.on("callback_query:data", async (ctx) => {
     const latestMenuId = getLatestMenuMessageId(ctx, menuChatId);
     if (!isMenuExemptAction && isLatestMenuExpired(ctx, menuChatId)) {
       await clearMenuMessages(ctx);
-      await handleMenu(ctx);
+      if (isProviderAction(action)) {
+        await handleProviderCallbackAction(ctx, PROVIDER_ACTIONS.HOME);
+      } else {
+        await handleMenu(ctx);
+      }
       finishMetric("expired");
       return;
     }
@@ -679,7 +773,11 @@ bot.on("callback_query:data", async (ctx) => {
       menuMessageId !== latestMenuId
     ) {
       await clearMenuMessages(ctx);
-      await handleMenu(ctx);
+      if (isProviderAction(action)) {
+        await handleProviderCallbackAction(ctx, PROVIDER_ACTIONS.HOME);
+      } else {
+        await handleMenu(ctx);
+      }
       finishMetric("stale");
       return;
     }
@@ -697,16 +795,18 @@ bot.on("callback_query:data", async (ctx) => {
       return;
     }
 
-    const isProviderCallbackAction =
-      action === PROVIDER_ACTIONS.STATUS ||
-      action === PROVIDER_ACTIONS.OVERRIDES ||
-      action.startsWith(PROVIDER_ACTIONS.SET_PREFIX) ||
-      action.startsWith(PROVIDER_ACTIONS.CLEAR_OVERRIDES_PREFIX);
+    const isProviderCallbackAction = isProviderAction(action);
     if (isProviderCallbackAction) {
       await cancelActiveFlow(ctx, `callback:${action}`);
       resetSession(ctx);
       await clearMenuMessages(ctx);
       await handleProviderCallbackAction(ctx, action);
+      finishMetric("ok");
+      return;
+    }
+
+    if (action === REQUEST_ACCESS_ACTION) {
+      await handleRequestAccess(ctx);
       finishMetric("ok");
       return;
     }
@@ -770,6 +870,7 @@ bot.on("callback_query:data", async (ctx) => {
           await ctx.reply("↩️ Reopening the menu so you can continue.");
           await ctx.conversation.enter(conversationTarget);
           finishMetric("stale");
+          return;
         }
         finishMetric("routed");
         return;
@@ -996,6 +1097,7 @@ bot.on("callback_query:data", async (ctx) => {
 
 const TELEGRAM_COMMANDS = [
   { command: "start", description: "Start or restart the bot" },
+  { command: "cancel", description: "Cancel the current operation" },
   { command: "help", description: "Show available commands" },
   { command: "menu", description: "Show quick action menu" },
   { command: "guide", description: "Show detailed usage guide" },
@@ -1008,7 +1110,7 @@ const TELEGRAM_COMMANDS = [
   { command: "mailer", description: "Bulk email center (admin only)" },
   { command: "scripts", description: "Manage call & SMS scripts (admin only)" },
   { command: "persona", description: "Manage personas (admin only)" },
-  { command: "provider", description: "Manage call provider (admin only)" },
+  { command: "provider", description: "Manage providers (admin only)" },
   { command: "callerflags", description: "Manage caller flags (admin only)" },
   { command: "users", description: "Manage users (admin only)" },
   { command: "status", description: "System status (admin only)" },
@@ -1016,6 +1118,7 @@ const TELEGRAM_COMMANDS = [
 
 const TELEGRAM_COMMANDS_GUEST = [
   { command: "start", description: "Start or restart the bot" },
+  { command: "cancel", description: "Cancel the current operation" },
   { command: "help", description: "Learn how the bot works" },
   { command: "menu", description: "Browse the feature menu" },
   { command: "guide", description: "View the user guide" },
@@ -1023,6 +1126,7 @@ const TELEGRAM_COMMANDS_GUEST = [
 
 const TELEGRAM_COMMANDS_USER = [
   { command: "start", description: "Start or restart the bot" },
+  { command: "cancel", description: "Cancel the current operation" },
   { command: "help", description: "Show available commands" },
   { command: "menu", description: "Show quick action menu" },
   { command: "guide", description: "Show detailed usage guide" },
@@ -1067,6 +1171,45 @@ bot.on("message:text", async (ctx) => {
     );
   }
 });
+
+async function handleRequestAccess(ctx) {
+  try {
+    const configuredAdmin =
+      config.admin && (config.admin.id || config.admin.telegramId || config.admin.userId)
+        ? (config.admin.id || config.admin.telegramId || config.admin.userId)
+        : (process.env.ADMIN_TELEGRAM_ID ? Number(process.env.ADMIN_TELEGRAM_ID) : null);
+    const adminId =
+      configuredAdmin !== null && configuredAdmin !== undefined && /^\-?\d+$/.test(String(configuredAdmin))
+        ? Number(configuredAdmin)
+        : null;
+
+    const username = ctx.from?.username ? `@${ctx.from.username}` : "none";
+    const displayName =
+      [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(" ") ||
+      username ||
+      "Unknown";
+
+    const message =
+      "📥 New access request\n\n" +
+      "👤 Guest Information\n" +
+      `• Name: ${displayName}\n` +
+      `• ID: ${ctx.from?.id}\n` +
+      `• Username: ${username}\n` +
+      (ctx.from?.language_code ? `• Language: ${ctx.from.language_code}\n` : "") +
+      `• Requested at: ${new Date().toISOString()}`;
+
+    if (adminId) {
+      await ctx.api.sendMessage(adminId, message);
+    } else {
+      console.warn("No admin Telegram ID configured; cannot forward access request.");
+    }
+
+    await ctx.reply("✅ Your access request has been sent to the administrator.");
+  } catch (error) {
+    console.error("Request access handler error:", error?.message || error);
+    await ctx.reply("⚠️ Failed to send access request. Please contact the administrator directly.");
+  }
+}
 
 async function bootstrap() {
   try {

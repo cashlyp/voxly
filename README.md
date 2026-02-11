@@ -40,6 +40,12 @@ A comprehensive Telegram bot system for making AI-powered voice calls using Twil
 - Each provider has matching SMS adapters (Twilio SMS, AWS Pinpoint, Vonage SMS) so outbound texts follow the active backbone.
 - When Twilio is selected but credentials are missing, the API now fails fast with a targeted message pointing to the relevant `.env` entries and the `npm run setup --prefix api` helper.
 - Deepgram Voice Agent is now the default path (`USE_DEEPGRAM_VOICE_AGENT=true`) for Twilio and Vonage streams, and automatically falls back to the legacy STT+GPT+TTS pipeline when Voice Agent is unavailable, bypassed, or when keypad-required capture flows need the legacy digit path.
+- Voice Agent runtime guardrails (recommended):
+  - `DEEPGRAM_VOICE_AGENT_TURN_TIMEOUT_MS=12000`
+  - `DEEPGRAM_VOICE_AGENT_TOOL_TIMEOUT_MS=8000`
+  - `DEEPGRAM_VOICE_AGENT_MAX_TOOL_RESPONSE_CHARS=4000`
+  - `DEEPGRAM_VOICE_AGENT_MAX_CONSECUTIVE_TOOL_FAILURES=3`
+  - `DEEPGRAM_VOICE_AGENT_TIMEOUT_FALLBACK_THRESHOLD=2` (Twilio path; set `0` to disable)
 
 ### Vonage Signed Callbacks (Recommended for production)
 
@@ -72,6 +78,30 @@ A comprehensive Telegram bot system for making AI-powered voice calls using Twil
 - If callback verification fails in strict mode, the API returns `503` so Vonage can retry delivery.
 - Run a local control-plane parity smoke check with:
   - `npm run parity:providers --prefix api`
+
+### Telegram + AWS Callback Auth (Recommended for production)
+
+- Telegram callback endpoint (`POST /webhook/telegram`) now enforces auth in `strict` mode by default in production.
+  - Sign requests with API HMAC headers (`x-api-timestamp`, `x-api-signature`).
+- AWS callback endpoints (`POST /webhook/aws/status`, `POST /aws/transcripts`) now enforce auth in `strict` mode by default in production.
+  - Preferred: sign requests with API HMAC headers.
+  - Fallback for forwarders: set `AWS_WEBHOOK_SECRET` and send it in `x-aws-webhook-secret`.
+- AWS websocket ingress (`WS /aws/stream`) now requires stream auth token (`token` + `ts`) or `AWS_WEBHOOK_SECRET` as query/header secret.
+
+### Queue/Worker Hardening (Recommended for production)
+
+- `CALL_JOB_TIMEOUT_MS` bounds each outbound job execution to avoid stalled workers.
+- `CALL_JOB_STALE_LOCK_MS` reclaims `running` jobs that were abandoned after a crash/restart.
+- `CALL_JOB_DLQ_ALERT_THRESHOLD` raises service-health alerts when open call-job DLQ entries exceed a threshold.
+- `CALL_JOB_DLQ_MAX_REPLAYS` caps manual replay attempts per call-job DLQ entry.
+- `WEBHOOK_TELEGRAM_TIMEOUT_MS` bounds Telegram notification API calls.
+- `EMAIL_REQUEST_TIMEOUT_MS` bounds outbound provider requests for SendGrid/Mailgun/SES adapters.
+- `EMAIL_DLQ_ALERT_THRESHOLD` raises service-health alerts when open email DLQ entries exceed a threshold.
+- `EMAIL_DLQ_MAX_REPLAYS` caps manual replay attempts per email DLQ entry.
+
+Admin replay endpoints:
+- `GET /admin/call-jobs/dlq`, `POST /admin/call-jobs/dlq/:id/replay`
+- `GET /admin/email/dlq`, `POST /admin/email/dlq/:id/replay`
 
 ## 🏗️ System Architecture
 

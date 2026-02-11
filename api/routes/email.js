@@ -47,6 +47,20 @@ function getDomain(email) {
   return parts.length === 2 ? parts[1] : '';
 }
 
+function redactEmailForLog(value = '') {
+  const email = normalizeEmail(value);
+  if (!email || !email.includes('@')) return '[redacted-email]';
+  const [local, domain] = email.split('@');
+  const localTail = local ? local.slice(-2) : '**';
+  return `***${localTail}@${domain || 'redacted'}`;
+}
+
+function previewForLog(value = '', max = 120) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!text) return '[empty]';
+  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+}
+
 function getNestedValue(obj, path) {
   if (!obj || !path) return undefined;
   return path.split('.').reduce((acc, key) => {
@@ -94,7 +108,51 @@ function safeParseJson(value) {
   }
 }
 
+const SUPPORTED_EMAIL_PROVIDERS = ['sendgrid', 'mailgun', 'ses'];
+const RETRYABLE_NETWORK_CODES = new Set([
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'ECONNREFUSED',
+  'EAI_AGAIN',
+  'ECONNABORTED',
+]);
+
+function normalizeProviderName(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function mapProviderError(provider, err) {
+  const status = Number(err?.response?.status || err?.status || err?.statusCode);
+  const code = String(err?.code || err?.name || '').toUpperCase();
+  const retryable =
+    status === 429 ||
+    (status >= 500 && status < 600) ||
+    RETRYABLE_NETWORK_CODES.has(code);
+  const wrapped = new Error(
+    err?.response?.data?.error_description ||
+      err?.response?.data?.error ||
+      err?.message ||
+      'email_provider_error',
+  );
+  wrapped.code = err?.code === 'email_provider_timeout' ? 'email_provider_timeout' : 'email_provider_error';
+  wrapped.statusCode = Number.isFinite(status) ? status : null;
+  wrapped.status = wrapped.statusCode;
+  wrapped.retryable = retryable;
+  wrapped.provider = normalizeProviderName(provider) || 'unknown';
+  wrapped.providerCode = code || null;
+  wrapped.cause = err;
+  return wrapped;
+}
+
 class ProviderAdapter {
+  constructor(providerName = 'unknown') {
+    this.providerName = providerName;
+  }
+
+  mapError(err) {
+    return mapProviderError(this.providerName, err);
+  }
+
   async sendEmail() {
     throw new Error('ProviderAdapter.sendEmail not implemented');
   }
@@ -102,9 +160,10 @@ class ProviderAdapter {
 
 class SendGridAdapter extends ProviderAdapter {
   constructor(options = {}) {
-    super();
+    super('sendgrid');
     this.apiKey = options.apiKey;
     this.baseUrl = options.baseUrl || 'https://api.sendgrid.com/v3';
+    this.requestTimeoutMs = Number(options.requestTimeoutMs) || 15000;
   }
 
   async sendEmail(message) {
@@ -132,23 +191,29 @@ class SendGridAdapter extends ProviderAdapter {
     if (message.html) {
       payload.content.push({ type: 'text/html', value: message.html });
     }
-    const response = await axios.post(url, payload, {
-      headers: {
-        Authorization: `Bearer ${this.apiKey}`,
-        'Content-Type': 'application/json'
-      }
-    });
-    const providerMessageId = response.headers?.['x-message-id'] || null;
-    return { providerMessageId, response: response.data };
+    try {
+      const response = await axios.post(url, payload, {
+        timeout: this.requestTimeoutMs,
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          'Content-Type': 'application/json'
+        }
+      });
+      const providerMessageId = response.headers?.['x-message-id'] || null;
+      return { providerMessageId, response: response.data };
+    } catch (err) {
+      throw this.mapError(err);
+    }
   }
 }
 
 class MailgunAdapter extends ProviderAdapter {
   constructor(options = {}) {
-    super();
+    super('mailgun');
     this.apiKey = options.apiKey;
     this.domain = options.domain;
     this.baseUrl = options.baseUrl || 'https://api.mailgun.net/v3';
+    this.requestTimeoutMs = Number(options.requestTimeoutMs) || 15000;
   }
 
   async sendEmail(message) {
@@ -179,28 +244,33 @@ class MailgunAdapter extends ProviderAdapter {
         params.append(`h:${key}`, value);
       });
     }
-
-    const response = await axios.post(url, params, {
-      auth: {
-        username: 'api',
-        password: this.apiKey
-      },
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded'
-      }
-    });
-    const providerMessageId = response.data?.id || null;
-    return { providerMessageId, response: response.data };
+    try {
+      const response = await axios.post(url, params, {
+        timeout: this.requestTimeoutMs,
+        auth: {
+          username: 'api',
+          password: this.apiKey
+        },
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded'
+        }
+      });
+      const providerMessageId = response.data?.id || null;
+      return { providerMessageId, response: response.data };
+    } catch (err) {
+      throw this.mapError(err);
+    }
   }
 }
 
 class SesAdapter extends ProviderAdapter {
   constructor(options = {}) {
-    super();
+    super('ses');
     this.region = options.region;
     this.accessKeyId = options.accessKeyId;
     this.secretAccessKey = options.secretAccessKey;
     this.sessionToken = options.sessionToken;
+    this.requestTimeoutMs = Number(options.requestTimeoutMs) || 15000;
   }
 
   async sendEmail(message) {
@@ -258,34 +328,91 @@ class SesAdapter extends ProviderAdapter {
     });
 
     const signed = await signer.sign(request);
-    const response = await axios.post(url, body, { headers: signed.headers });
-    const providerMessageId = response.data?.MessageId || null;
-    return { providerMessageId, response: response.data };
+    try {
+      const response = await axios.post(url, body, {
+        timeout: this.requestTimeoutMs,
+        headers: signed.headers,
+      });
+      const providerMessageId = response.data?.MessageId || null;
+      return { providerMessageId, response: response.data };
+    } catch (err) {
+      throw this.mapError(err);
+    }
   }
 }
 
 class EmailService {
-  constructor({ db, logger = console, config: cfg = config }) {
+  constructor({
+    db,
+    logger = console,
+    config: cfg = config,
+    getActiveProvider = null,
+    providerResolver = null,
+  }) {
     this.db = db;
     this.logger = logger;
     this.config = cfg?.email || {};
+    this.getActiveProvider =
+      typeof getActiveProvider === 'function'
+        ? getActiveProvider
+        : typeof providerResolver === 'function'
+          ? providerResolver
+          : () => this.config.provider || 'sendgrid';
     this.adapters = new Map();
     this.processing = false;
     this.rateBuckets = new Map();
+    this.requestTimeoutMs = Number(this.config.requestTimeoutMs) || 15000;
+    this.dlqAlertThreshold = Number(this.config.dlqAlertThreshold) || 25;
+    this.maxSubjectChars = Number(this.config.maxSubjectChars) || 200;
+    this.maxBodyChars = Number(this.config.maxBodyChars) || 200000;
+    this.maxBulkRecipients = Number(this.config.maxBulkRecipients) || 500;
+  }
+
+  resolveProvider(providerOverride = null) {
+    const resolved = normalizeProviderName(
+      providerOverride || this.getActiveProvider?.() || this.config.provider || 'sendgrid',
+    );
+    if (!SUPPORTED_EMAIL_PROVIDERS.includes(resolved)) {
+      const error = new Error(`Unsupported email provider: ${resolved || providerOverride}`);
+      error.code = 'validation_error';
+      throw error;
+    }
+    return resolved;
+  }
+
+  getProviderReadiness() {
+    return {
+      sendgrid: !!this.config?.sendgrid?.apiKey,
+      mailgun: !!(this.config?.mailgun?.apiKey && this.config?.mailgun?.domain),
+      ses: !!(
+        this.config?.ses?.region &&
+        this.config?.ses?.accessKeyId &&
+        this.config?.ses?.secretAccessKey
+      ),
+    };
   }
 
   getAdapter(provider) {
-    const resolved = provider || this.config.provider || 'sendgrid';
+    const resolved = this.resolveProvider(provider);
     if (this.adapters.has(resolved)) {
       return this.adapters.get(resolved);
     }
     let adapter = null;
     if (resolved === 'sendgrid') {
-      adapter = new SendGridAdapter(this.config.sendgrid || {});
+      adapter = new SendGridAdapter({
+        ...(this.config.sendgrid || {}),
+        requestTimeoutMs: this.requestTimeoutMs,
+      });
     } else if (resolved === 'mailgun') {
-      adapter = new MailgunAdapter(this.config.mailgun || {});
+      adapter = new MailgunAdapter({
+        ...(this.config.mailgun || {}),
+        requestTimeoutMs: this.requestTimeoutMs,
+      });
     } else if (resolved === 'ses') {
-      adapter = new SesAdapter(this.config.ses || {});
+      adapter = new SesAdapter({
+        ...(this.config.ses || {}),
+        requestTimeoutMs: this.requestTimeoutMs,
+      });
     } else {
       throw new Error(`Unsupported email provider: ${resolved}`);
     }
@@ -399,6 +526,44 @@ class EmailService {
     }
 
     const rendered = this.renderTemplate(script, variables);
+    if (rendered.subject && rendered.subject.length > this.maxSubjectChars) {
+      const error = new Error(
+        `Subject exceeds ${this.maxSubjectChars} characters`,
+      );
+      error.code = 'validation_error';
+      throw error;
+    }
+    if (rendered.text && rendered.text.length > this.maxBodyChars) {
+      const error = new Error(
+        `Text body exceeds ${this.maxBodyChars} characters`,
+      );
+      error.code = 'validation_error';
+      throw error;
+    }
+    if (rendered.html && rendered.html.length > this.maxBodyChars) {
+      const error = new Error(
+        `HTML body exceeds ${this.maxBodyChars} characters`,
+      );
+      error.code = 'validation_error';
+      throw error;
+    }
+
+    let scheduledAt = null;
+    if (payload.send_at) {
+      const parsed = new Date(payload.send_at);
+      if (Number.isNaN(parsed.getTime())) {
+        const error = new Error('send_at must be a valid ISO timestamp');
+        error.code = 'validation_error';
+        throw error;
+      }
+      if (parsed.getTime() <= Date.now()) {
+        const error = new Error('send_at must be in the future');
+        error.code = 'validation_error';
+        throw error;
+      }
+      scheduledAt = parsed.toISOString();
+    }
+
     const requestHash = hashPayload({
       to,
       from,
@@ -407,8 +572,9 @@ class EmailService {
       variables,
       html: rendered.html,
       text: rendered.text,
-      send_at: payload.send_at || null
+      send_at: scheduledAt
     });
+    const resolvedProvider = this.resolveProvider(payload.provider);
 
     if (idempotencyKey) {
       const existing = await this.db.getEmailIdempotency(idempotencyKey);
@@ -439,10 +605,10 @@ class EmailService {
       variables_hash: hashPayload(variables),
       metadata_json: JSON.stringify(metadata),
       status,
-      provider: payload.provider || this.config.provider || 'sendgrid',
+      provider: resolvedProvider,
       tenant_id: payload.tenant_id || null,
       bulk_job_id: payload.bulk_job_id || null,
-      scheduled_at: payload.send_at || null,
+      scheduled_at: scheduledAt,
       max_retries: payload.max_retries || this.config.maxRetries || 5
     });
 
@@ -462,7 +628,7 @@ class EmailService {
       return { message_id: messageId, suppressed: true };
     }
 
-    await this.db.addEmailEvent(messageId, 'queued', { scheduled_at: payload.send_at || null });
+    await this.db.addEmailEvent(messageId, 'queued', { scheduled_at: scheduledAt });
     await this.db.incrementEmailMetric('queued');
     return { message_id: messageId };
   }
@@ -472,6 +638,13 @@ class EmailService {
     const recipients = Array.isArray(payload.recipients) ? payload.recipients : [];
     if (!recipients.length) {
       throw new Error('Recipients list is required');
+    }
+    if (recipients.length > this.maxBulkRecipients) {
+      const error = new Error(
+        `Recipients exceed maximum of ${this.maxBulkRecipients}`,
+      );
+      error.code = 'validation_error';
+      throw error;
     }
 
     const requestHash = hashPayload({
@@ -540,8 +713,8 @@ class EmailService {
       } catch (err) {
         failed += 1;
         this.logger.warn('⚠️ Bulk email enqueue failed:', {
-          email: normalizeEmail(recipient.email),
-          error: err.message
+          email: redactEmailForLog(recipient.email),
+          error: previewForLog(err.message)
         });
       }
     }
@@ -605,7 +778,7 @@ class EmailService {
 
   async processMessage(message) {
     const messageId = message.message_id;
-    const provider = message.provider || this.config.provider || 'sendgrid';
+    const provider = this.resolveProvider(message.provider);
     const now = new Date();
     const nowIso = now.toISOString();
 
@@ -665,7 +838,6 @@ class EmailService {
     });
     await this.db.addEmailEvent(messageId, 'sending', { provider });
 
-    const adapter = this.getAdapter(provider);
     const metadata = safeParseJson(message.metadata_json) || {};
     const headers = this.buildHeaders({
       ...message,
@@ -675,6 +847,7 @@ class EmailService {
     });
 
     try {
+      const adapter = this.getAdapter(provider);
       const result = await adapter.sendEmail({
         to: message.to_email,
         from: message.from_email,
@@ -700,13 +873,19 @@ class EmailService {
   }
 
   classifyError(err) {
-    const status = err?.response?.status;
-    const code = err?.code;
+    const status = Number(err?.statusCode || err?.status || err?.response?.status);
+    const code = String(err?.code || err?.providerCode || '').toUpperCase();
     const message = err?.response?.data?.error || err?.message || 'send_failed';
+    if (err?.retryable === true) {
+      return { permanent: false, reason: 'provider_error', statusCode: status || null };
+    }
+    if (err?.code === 'email_provider_timeout') {
+      return { permanent: false, reason: 'provider_timeout', statusCode: status || null };
+    }
     if (status === 429) return { permanent: false, reason: 'rate_limited', statusCode: status };
     if (status && status >= 500) return { permanent: false, reason: 'provider_error', statusCode: status };
     if (status && status >= 400) return { permanent: true, reason: 'invalid_request', statusCode: status };
-    if (code && ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EAI_AGAIN'].includes(code)) {
+    if (code && RETRYABLE_NETWORK_CODES.has(code)) {
       return { permanent: false, reason: 'network_error', statusCode: status };
     }
     return { permanent: true, reason: message, statusCode: status };
@@ -744,6 +923,26 @@ class EmailService {
       provider: message.provider,
       to: message.to_email
     });
+    this.db
+      ?.logServiceHealth?.('email_queue', 'message_dead_lettered', {
+        message_id: messageId,
+        reason: classification.reason,
+        status_code: classification.statusCode || null,
+        retry_count: retryCount,
+        max_retries: maxRetries,
+        at: new Date().toISOString(),
+      })
+      .catch(() => {});
+    const openDlq = await this.db.countOpenEmailDlq().catch(() => null);
+    if (openDlq !== null && openDlq >= this.dlqAlertThreshold) {
+      this.db
+        ?.logServiceHealth?.('email_queue', 'dlq_alert_threshold', {
+          open_dlq: openDlq,
+          alert_threshold: this.dlqAlertThreshold,
+          at: new Date().toISOString(),
+        })
+        .catch(() => {});
+    }
     await this.updateBulkCounters(message.bulk_job_id, message.status, 'failed');
   }
 

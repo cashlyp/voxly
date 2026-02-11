@@ -1,6 +1,7 @@
 const httpClient = require('../utils/httpClient');
 const { InlineKeyboard } = require('grammy');
 const config = require('../config');
+const crypto = require('crypto');
 const {
   getUser,
   isAdmin,
@@ -48,6 +49,23 @@ async function safeReplyMarkdown(ctx, text, options = {}) {
 async function replyApiError(ctx, error, fallback) {
   const message = httpClient.getUserMessage(error, fallback);
   return safeReply(ctx, message);
+}
+
+function summarizeEmailError(error) {
+  if (!error) return 'unknown_error';
+  if (error.response) {
+    const detail = error.response?.data?.error || error.response?.data?.message || error.response?.statusText || 'http_error';
+    const safeDetail = String(detail)
+      .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[redacted-email]')
+      .replace(/\+?\d[\d\s().-]{6,}\d/g, '[redacted-phone]');
+    return `http_${error.response.status}:${safeDetail.slice(0, 140)}`;
+  }
+  if (error.request) return 'upstream_no_response';
+  return String(error.message || 'unknown_error').slice(0, 140);
+}
+
+function logEmailError(label, error) {
+  console.error(`${label}: ${summarizeEmailError(error)}`);
 }
 
 function buildBackToMenuKeyboard(ctx, action = 'EMAIL', label = '⬅️ Back to Email Menu') {
@@ -110,6 +128,16 @@ function isValidEmail(value) {
   if (parts.length !== 2) return false;
   if (!parts[0] || !parts[1]) return false;
   return true;
+}
+
+function buildIdempotencyKey(scope, actorId, payload = {}) {
+  const digest = crypto
+    .createHash('sha256')
+    .update(JSON.stringify(payload))
+    .digest('hex')
+    .slice(0, 16);
+  const actor = String(actorId || 'anon');
+  return `${scope}:${actor}:${Date.now().toString(36)}:${digest}`;
 }
 
 function parseJsonInput(text) {
@@ -819,7 +847,7 @@ async function emailTemplatesFlow(conversation, ctx, options = {}) {
       }
     }
   } catch (error) {
-    console.error('Email template flow error:', error);
+    logEmailError('Email template flow error', error);
     await replyApiError(ctx, error, 'Failed to manage templates.');
   }
 }
@@ -867,7 +895,7 @@ async function emailStatusFlow(conversation, ctx) {
     }
     await sendEmailStatusCard(ctx, messageId, { forceReply: true });
   } catch (error) {
-    console.error('Email status flow error:', error);
+    logEmailError('Email status flow error', error);
     await replyApiError(ctx, error, 'Failed to fetch email status.');
   }
 }
@@ -1035,7 +1063,7 @@ async function bulkEmailStatusFlow(conversation, ctx) {
     }
     await sendBulkStatusCard(ctx, jobId, { forceReply: true });
   } catch (error) {
-    console.error('Bulk email status flow error:', error);
+    logEmailError('Bulk email status flow error', error);
     await replyApiError(ctx, error, 'Failed to fetch bulk email status.');
   }
 }
@@ -1450,7 +1478,10 @@ async function emailFlow(conversation, ctx) {
       payload.send_at = schedule.sendAt;
     }
 
-    const response = await guardedPost(ctx, `${config.apiUrl}/email/send`, payload);
+    const idempotencyKey = buildIdempotencyKey('email_send', ctx.from?.id, payload);
+    const response = await guardedPost(ctx, `${config.apiUrl}/email/send`, payload, {
+      headers: { 'Idempotency-Key': idempotencyKey }
+    });
     const messageId = response.data?.message_id;
     if (!messageId) {
       await ctx.reply('❌ Email enqueue failed.');
@@ -1464,11 +1495,8 @@ async function emailFlow(conversation, ctx) {
     });
     await sendEmailStatusCard(ctx, messageId, { forceReply: true });
   } catch (error) {
-    console.error('Email flow error:', error);
-    await ctx.reply(section('❌ Email Error', [error.message || 'Failed to send email.']), {
-      parse_mode: 'Markdown',
-      reply_markup: buildBackToMenuKeyboard(ctx, 'EMAIL')
-    });
+    logEmailError('Email flow error', error);
+    await replyApiError(ctx, error, 'Failed to send email.');
   }
 }
 
@@ -1602,7 +1630,10 @@ async function bulkEmailFlow(conversation, ctx) {
       payload.send_at = schedule.sendAt;
     }
 
-    const response = await guardedPost(ctx, `${config.apiUrl}/email/bulk`, payload);
+    const idempotencyKey = buildIdempotencyKey('email_bulk', ctx.from?.id, payload);
+    const response = await guardedPost(ctx, `${config.apiUrl}/email/bulk`, payload, {
+      headers: { 'Idempotency-Key': idempotencyKey }
+    });
     const jobId = response.data?.bulk_job_id;
     if (!jobId) {
       await ctx.reply('❌ Bulk job enqueue failed.');
@@ -1617,7 +1648,7 @@ async function bulkEmailFlow(conversation, ctx) {
     });
     await sendBulkStatusCard(ctx, jobId, { forceReply: true });
   } catch (error) {
-    console.error('Bulk email flow error:', error);
+    logEmailError('Bulk email flow error', error);
     await replyApiError(ctx, error, 'Failed to send bulk email.');
   }
 }
@@ -1627,7 +1658,7 @@ function registerEmailCommands(bot) {
     try {
       await renderEmailMenu(ctx);
     } catch (error) {
-      console.error('Email command error:', error);
+      logEmailError('Email command error', error);
       await ctx.reply('❌ Could not open email menu.');
     }
   });
@@ -1636,7 +1667,7 @@ function registerEmailCommands(bot) {
     try {
       await renderBulkEmailMenu(ctx);
     } catch (error) {
-      console.error('Bulk email command error:', error);
+      logEmailError('Bulk email command error', error);
       await ctx.reply('❌ Could not open bulk email menu.');
     }
   });
@@ -1657,7 +1688,7 @@ function registerEmailCommands(bot) {
       const messageId = args[1].trim();
       await sendEmailStatusCard(ctx, messageId, { forceReply: true });
     } catch (error) {
-      console.error('Email status command error:', error);
+      logEmailError('Email status command error', error);
       await replyApiError(ctx, error, 'Failed to fetch email status.');
     }
   });

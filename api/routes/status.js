@@ -124,6 +124,10 @@ class EnhancedWebhookService {
     this.retryBaseMs = Number(config.webhook?.retryBaseMs) || 5000;
     this.retryMaxMs = Number(config.webhook?.retryMaxMs) || 60000;
     this.retryMaxAttempts = Number(config.webhook?.retryMaxAttempts) || 5;
+    this.telegramRequestTimeoutMs =
+      Number(config.webhook?.telegramRequestTimeoutMs) || 15000;
+    this.notificationProcessing = false;
+    this.notificationOverlapSkips = 0;
     this.pendingTranscriptTimers = new Map();
     this.transcriptRetryMs = 3000;
     this.transcriptMaxWaitMs = 10 * 60 * 1000;
@@ -417,6 +421,7 @@ class EnhancedWebhookService {
     this.lastSentimentAt.clear();
     this.mediaSeen.clear();
     this.inboundGate.clear();
+    this.notificationProcessing = false;
     console.log('Enhanced webhook service stopped');
   }
 
@@ -500,6 +505,24 @@ class EnhancedWebhookService {
       return;
     }
 
+    if (this.notificationProcessing) {
+      this.notificationOverlapSkips += 1;
+      if (this.notificationOverlapSkips % 10 === 1) {
+        console.warn(
+          `⏭️ Skipping overlapping notification run (count=${this.notificationOverlapSkips})`,
+        );
+        this.db
+          ?.logServiceHealth?.('webhook_notifications', 'notification_overlap_skipped', {
+            overlap_count: this.notificationOverlapSkips,
+            process_interval_ms: this.processInterval,
+            at: new Date().toISOString(),
+          })
+          .catch(() => {});
+      }
+      return;
+    }
+
+    this.notificationProcessing = true;
     try {
       const notifications = await this.db.getEnhancedPendingWebhookNotifications(50, this.retryMaxAttempts);
       
@@ -516,6 +539,8 @@ class EnhancedWebhookService {
       }
     } catch (error) {
       console.error('❌ Error processing notifications:', error);
+    } finally {
+      this.notificationProcessing = false;
     }
   }
 
@@ -1164,7 +1189,7 @@ class EnhancedWebhookService {
     }
 
     const response = await axios.post(url, payload, {
-      timeout: 15000, // Longer timeout for better reliability
+      timeout: this.telegramRequestTimeoutMs,
       headers: {
         'Content-Type': 'application/json'
       }
@@ -1184,7 +1209,9 @@ class EnhancedWebhookService {
       audio: audioUrl,
       caption: caption || undefined
     };
-    const response = await axios.post(url, payload);
+    const response = await axios.post(url, payload, {
+      timeout: this.telegramRequestTimeoutMs
+    });
     return response.data;
   }
 
@@ -1207,7 +1234,7 @@ class EnhancedWebhookService {
     }
 
     const response = await axios.post(url, payload, {
-      timeout: 15000,
+      timeout: this.telegramRequestTimeoutMs,
       headers: {
         'Content-Type': 'application/json'
       }

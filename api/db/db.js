@@ -6,6 +6,8 @@ class EnhancedDatabase {
         this.db = null;
         this.isInitialized = false;
         this.dbPath = path.join(__dirname, 'data.db');
+        this.emailDlqColumnsEnsured = false;
+        this.outboundRateLastCleanupMs = 0;
     }
 
     async initialize() {
@@ -20,9 +22,11 @@ class EnhancedDatabase {
                 this.createEnhancedTables().then(() => {
                     this.initializeSMSTables().then(() => {
                         this.initializeEmailTables().then(() => {
-                        this.isInitialized = true;
-                        console.log('✅ Enhanced database initialization complete');
-                        resolve();
+                            this.ensureEmailDlqColumns().then(() => {
+                                this.isInitialized = true;
+                                console.log('✅ Enhanced database initialization complete');
+                                resolve();
+                            }).catch(reject);
                         }).catch(reject);
                     }).catch(reject);
                 }).catch(reject);
@@ -215,6 +219,33 @@ class EnhancedDatabase {
                 completed_at DATETIME
             )`,
 
+            // Durable call-job dead-letter queue
+            `CREATE TABLE IF NOT EXISTS call_job_dlq (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL UNIQUE,
+                job_type TEXT NOT NULL,
+                payload TEXT,
+                attempts INTEGER DEFAULT 0,
+                last_error TEXT,
+                dead_letter_reason TEXT,
+                status TEXT DEFAULT 'open' CHECK(status IN ('open', 'replayed')),
+                replay_count INTEGER DEFAULT 0,
+                last_replay_job_id INTEGER,
+                replayed_at DATETIME,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            // Outbound API rate-limit counters (shared coordination across app instances)
+            `CREATE TABLE IF NOT EXISTS outbound_rate_limits (
+                scope TEXT NOT NULL,
+                actor_key TEXT NOT NULL,
+                window_start INTEGER NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (scope, actor_key)
+            )`,
+
             // Enhanced user sessions tracking - FIXED: Added UNIQUE constraint
             `CREATE TABLE IF NOT EXISTS user_sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -293,6 +324,9 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_call_metrics_type ON call_metrics(metric_type)',
             'CREATE INDEX IF NOT EXISTS idx_call_jobs_status ON call_jobs(status)',
             'CREATE INDEX IF NOT EXISTS idx_call_jobs_run_at ON call_jobs(run_at)',
+            'CREATE INDEX IF NOT EXISTS idx_call_job_dlq_status ON call_job_dlq(status)',
+            'CREATE INDEX IF NOT EXISTS idx_call_job_dlq_created_at ON call_job_dlq(created_at)',
+            'CREATE INDEX IF NOT EXISTS idx_outbound_rate_limits_updated_at ON outbound_rate_limits(updated_at)',
             
             // Health indexes
             'CREATE INDEX IF NOT EXISTS idx_health_service ON service_health_logs(service_name)',
@@ -1430,6 +1464,37 @@ class EnhancedDatabase {
         return claimed;
     }
 
+    async reclaimStaleRunningCallJobs(staleAfterMs = 300000) {
+        const nowMs = Date.now();
+        const thresholdMs = Math.max(1000, Number(staleAfterMs) || 300000);
+        const now = new Date(nowMs).toISOString();
+        const staleBefore = new Date(nowMs - thresholdMs).toISOString();
+        const reclaimReason = 'reclaimed_stale_lock';
+        return new Promise((resolve, reject) => {
+            const sql = `
+                UPDATE call_jobs
+                SET status = 'pending',
+                    locked_at = NULL,
+                    updated_at = ?,
+                    run_at = CASE WHEN run_at > ? THEN run_at ELSE ? END,
+                    last_error = COALESCE(last_error, ?)
+                WHERE status = 'running'
+                  AND (
+                    (locked_at IS NOT NULL AND locked_at <= ?)
+                    OR
+                    (locked_at IS NULL AND updated_at <= ?)
+                  )
+            `;
+            this.db.run(sql, [now, now, now, reclaimReason, staleBefore, staleBefore], function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.changes || 0);
+                }
+            });
+        });
+    }
+
     async rescheduleCallJob(job_id, run_at, error = null) {
         const updatedAt = new Date().toISOString();
         return new Promise((resolve, reject) => {
@@ -1438,7 +1503,8 @@ class EnhancedDatabase {
                 SET status = 'pending',
                     run_at = ?,
                     last_error = ?,
-                    updated_at = ?
+                    updated_at = ?,
+                    locked_at = NULL
                 WHERE id = ?
             `;
             this.db.run(sql, [run_at, error, updatedAt, job_id], function(err) {
@@ -1460,7 +1526,8 @@ class EnhancedDatabase {
                 SET status = ?,
                     last_error = ?,
                     updated_at = ?,
-                    completed_at = COALESCE(?, completed_at)
+                    completed_at = COALESCE(?, completed_at),
+                    locked_at = NULL
                 WHERE id = ?
             `;
             this.db.run(sql, [status, error, updatedAt, completedAt, job_id], function(err) {
@@ -1468,6 +1535,131 @@ class EnhancedDatabase {
                     reject(err);
                 } else {
                     resolve(this.changes);
+                }
+            });
+        });
+    }
+
+    async moveCallJobToDlq(job = {}, reason = 'max_attempts_exceeded', error = null) {
+        const now = new Date().toISOString();
+        const jobId = Number(job?.id);
+        if (!Number.isFinite(jobId) || jobId <= 0) {
+            throw new Error('Invalid call job id for DLQ');
+        }
+        const payload = typeof job?.payload === 'string'
+            ? job.payload
+            : JSON.stringify(job?.payload || {});
+        const attempts = Math.max(0, Number(job?.attempts) || 0);
+        const sql = `
+            INSERT INTO call_job_dlq (
+                job_id,
+                job_type,
+                payload,
+                attempts,
+                last_error,
+                dead_letter_reason,
+                status,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                job_type = excluded.job_type,
+                payload = excluded.payload,
+                attempts = excluded.attempts,
+                last_error = excluded.last_error,
+                dead_letter_reason = excluded.dead_letter_reason,
+                status = 'open',
+                updated_at = excluded.updated_at
+        `;
+        return new Promise((resolve, reject) => {
+            this.db.run(sql, [
+                jobId,
+                String(job?.job_type || 'unknown'),
+                payload,
+                attempts,
+                error || job?.last_error || null,
+                reason || null,
+                now,
+            ], function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.lastID || jobId);
+                }
+            });
+        });
+    }
+
+    async listCallJobDlq({ status = null, limit = 20, offset = 0 } = {}) {
+        const params = [];
+        const clauses = [];
+        if (status && String(status).toLowerCase() !== 'all') {
+            clauses.push('status = ?');
+            params.push(String(status).toLowerCase());
+        }
+        const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+        const sql = `
+            SELECT *
+            FROM call_job_dlq
+            ${where}
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+        `;
+        params.push(Math.min(100, Math.max(1, Number(limit) || 20)));
+        params.push(Math.max(0, Number(offset) || 0));
+        return new Promise((resolve, reject) => {
+            this.db.all(sql, params, (err, rows) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(rows || []);
+                }
+            });
+        });
+    }
+
+    async getCallJobDlqEntry(dlqId) {
+        return new Promise((resolve, reject) => {
+            const sql = 'SELECT * FROM call_job_dlq WHERE id = ?';
+            this.db.get(sql, [dlqId], (err, row) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(row || null);
+                }
+            });
+        });
+    }
+
+    async countOpenCallJobDlq() {
+        return new Promise((resolve, reject) => {
+            const sql = `SELECT COUNT(*) AS total FROM call_job_dlq WHERE status = 'open'`;
+            this.db.get(sql, [], (err, row) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(Number(row?.total) || 0);
+                }
+            });
+        });
+    }
+
+    async markCallJobDlqReplayed(dlqId, replayJobId) {
+        const now = new Date().toISOString();
+        return new Promise((resolve, reject) => {
+            const sql = `
+                UPDATE call_job_dlq
+                SET replay_count = replay_count + 1,
+                    status = 'replayed',
+                    last_replay_job_id = ?,
+                    replayed_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+            `;
+            this.db.run(sql, [replayJobId || null, now, now, dlqId], function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.changes || 0);
                 }
             });
         });
@@ -1894,6 +2086,11 @@ class EnhancedDatabase {
                message_id TEXT NOT NULL,
                reason TEXT,
                payload TEXT,
+               status TEXT DEFAULT 'open',
+               replay_count INTEGER DEFAULT 0,
+               replayed_at DATETIME,
+               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               last_replay_error TEXT,
                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
            )`;
 
@@ -2008,6 +2205,73 @@ class EnhancedDatabase {
        });
    }
 
+   async ensureEmailDlqColumns() {
+       if (this.emailDlqColumnsEnsured) {
+           return;
+       }
+       const existing = await new Promise((resolve, reject) => {
+           this.db.all('PRAGMA table_info(email_dlq)', (err, rows) => {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(rows || []);
+               }
+           });
+       });
+       const names = new Set(existing.map((row) => row.name));
+       const alterStatements = [];
+       if (!names.has('status')) {
+           alterStatements.push(`ALTER TABLE email_dlq ADD COLUMN status TEXT DEFAULT 'open'`);
+       }
+       if (!names.has('replay_count')) {
+           alterStatements.push(`ALTER TABLE email_dlq ADD COLUMN replay_count INTEGER DEFAULT 0`);
+       }
+       if (!names.has('updated_at')) {
+           alterStatements.push(`ALTER TABLE email_dlq ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP`);
+       }
+       if (!names.has('replayed_at')) {
+           alterStatements.push(`ALTER TABLE email_dlq ADD COLUMN replayed_at DATETIME`);
+       }
+       if (!names.has('last_replay_error')) {
+           alterStatements.push(`ALTER TABLE email_dlq ADD COLUMN last_replay_error TEXT`);
+       }
+       for (const stmt of alterStatements) {
+           await new Promise((resolve, reject) => {
+               this.db.run(stmt, (err) => {
+                   if (err) {
+                       const message = String(err.message || '').toLowerCase();
+                       if (message.includes('duplicate column name')) {
+                           resolve();
+                           return;
+                       }
+                       reject(err);
+                   } else {
+                       resolve();
+                   }
+               });
+           });
+       }
+       await new Promise((resolve, reject) => {
+           this.db.run(
+               `CREATE INDEX IF NOT EXISTS idx_email_dlq_status ON email_dlq(status)`,
+               (err) => {
+                   if (err) reject(err);
+                   else resolve();
+               },
+           );
+       });
+       await new Promise((resolve, reject) => {
+           this.db.run(
+               `CREATE INDEX IF NOT EXISTS idx_email_dlq_created_at ON email_dlq(created_at)`,
+               (err) => {
+                   if (err) reject(err);
+                   else resolve();
+               },
+           );
+       });
+       this.emailDlqColumnsEnsured = true;
+   }
+
    // Save SMS message
    async saveSMSMessage(messageData) {
        return new Promise((resolve, reject) => {
@@ -2119,6 +2383,97 @@ class EnhancedDatabase {
                    resolve(true);
                }
            });
+       });
+   }
+
+   async checkAndConsumeOutboundRateLimit({
+       scope,
+       key,
+       limit,
+       windowMs,
+       nowMs = Date.now(),
+   } = {}) {
+       const safeLimit = Number(limit);
+       const safeWindowMs = Number(windowMs);
+       if (!Number.isFinite(safeLimit) || safeLimit <= 0) {
+           return { allowed: true, retryAfterMs: 0, count: 0 };
+       }
+       if (!Number.isFinite(safeWindowMs) || safeWindowMs <= 0) {
+           return { allowed: true, retryAfterMs: 0, count: 0 };
+       }
+
+       const resolvedScope = String(scope || 'outbound');
+       const resolvedKey = String(key || 'anonymous');
+       const bucketStart = Math.floor(Number(nowMs) / safeWindowMs) * safeWindowMs;
+
+       const upsertSql = `
+           INSERT INTO outbound_rate_limits (scope, actor_key, window_start, count, updated_at)
+           VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)
+           ON CONFLICT(scope, actor_key) DO UPDATE SET
+               count = CASE
+                   WHEN outbound_rate_limits.window_start = excluded.window_start THEN
+                       outbound_rate_limits.count + 1
+                   ELSE 1
+               END,
+               window_start = excluded.window_start,
+               updated_at = CURRENT_TIMESTAMP
+       `;
+
+       await new Promise((resolve, reject) => {
+           this.db.run(
+               upsertSql,
+               [resolvedScope, resolvedKey, bucketStart],
+               (err) => {
+                   if (err) reject(err);
+                   else resolve();
+               },
+           );
+       });
+
+       const row = await new Promise((resolve, reject) => {
+           this.db.get(
+               `SELECT count, window_start FROM outbound_rate_limits WHERE scope = ? AND actor_key = ?`,
+               [resolvedScope, resolvedKey],
+               (err, result) => {
+                   if (err) reject(err);
+                   else resolve(result || null);
+               },
+           );
+       });
+
+       const count = Number(row?.count || 0);
+       const windowStart = Number(row?.window_start || bucketStart);
+       const retryAfterMs = Math.max(0, windowStart + safeWindowMs - Number(nowMs));
+       const allowed = count <= safeLimit;
+
+       const cleanupIntervalMs = Math.max(60000, safeWindowMs * 10);
+       if (Number(nowMs) - this.outboundRateLastCleanupMs >= cleanupIntervalMs) {
+           this.outboundRateLastCleanupMs = Number(nowMs);
+           const staleBeforeMs = Number(nowMs) - Math.max(cleanupIntervalMs, safeWindowMs);
+           this.cleanupOutboundRateLimits(staleBeforeMs).catch(() => {});
+       }
+
+       return {
+           allowed,
+           retryAfterMs: allowed ? 0 : retryAfterMs,
+           count,
+           limit: safeLimit,
+           windowStart,
+       };
+   }
+
+   async cleanupOutboundRateLimits(staleBeforeMs) {
+       const threshold = Number(staleBeforeMs);
+       if (!Number.isFinite(threshold)) return 0;
+       return new Promise((resolve, reject) => {
+           this.db.run(
+               `DELETE FROM outbound_rate_limits WHERE window_start < ?`,
+               [threshold],
+               function (err) {
+                   if (err) reject(err);
+                   else resolve(this.changes || 0);
+               },
+           );
        });
    }
 
@@ -2658,15 +3013,117 @@ class EnhancedDatabase {
    }
 
    async insertEmailDlq(messageId, reason, payload = null) {
+       await this.ensureEmailDlqColumns();
        return new Promise((resolve, reject) => {
-           const sql = `INSERT INTO email_dlq (message_id, reason, payload)
-               VALUES (?, ?, ?)`;
+           const sql = `INSERT INTO email_dlq (message_id, reason, payload, status, updated_at)
+               VALUES (?, ?, ?, 'open', CURRENT_TIMESTAMP)`;
            this.db.run(sql, [messageId, reason || null, payload ? JSON.stringify(payload) : null], function (err) {
                if (err) {
                    console.error('Error inserting email DLQ:', err);
                    reject(err);
                } else {
                    resolve(this.lastID);
+               }
+           });
+       });
+   }
+
+   async listEmailDlq({ status = null, limit = 20, offset = 0 } = {}) {
+       await this.ensureEmailDlqColumns();
+       const clauses = [];
+       const params = [];
+       if (status && String(status).toLowerCase() !== 'all') {
+           clauses.push('d.status = ?');
+           params.push(String(status).toLowerCase());
+       }
+       const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+       const sql = `
+           SELECT
+               d.*,
+               m.to_email,
+               m.subject,
+               m.provider,
+               m.status AS message_status
+           FROM email_dlq d
+           LEFT JOIN email_messages m ON m.message_id = d.message_id
+           ${where}
+           ORDER BY d.created_at DESC
+           LIMIT ? OFFSET ?
+       `;
+       params.push(Math.min(100, Math.max(1, Number(limit) || 20)));
+       params.push(Math.max(0, Number(offset) || 0));
+       return new Promise((resolve, reject) => {
+           this.db.all(sql, params, (err, rows) => {
+               if (err) {
+                   console.error('Error listing email DLQ:', err);
+                   reject(err);
+               } else {
+                   resolve(rows || []);
+               }
+           });
+       });
+   }
+
+   async getEmailDlqEntry(dlqId) {
+       await this.ensureEmailDlqColumns();
+       return new Promise((resolve, reject) => {
+           const sql = `
+               SELECT
+                   d.*,
+                   m.to_email,
+                   m.subject,
+                   m.provider,
+                   m.status AS message_status
+               FROM email_dlq d
+               LEFT JOIN email_messages m ON m.message_id = d.message_id
+               WHERE d.id = ?
+           `;
+           this.db.get(sql, [dlqId], (err, row) => {
+               if (err) {
+                   console.error('Error fetching email DLQ entry:', err);
+                   reject(err);
+               } else {
+                   resolve(row || null);
+               }
+           });
+       });
+   }
+
+   async countOpenEmailDlq() {
+       await this.ensureEmailDlqColumns();
+       return new Promise((resolve, reject) => {
+           const sql = `SELECT COUNT(*) AS total FROM email_dlq WHERE status = 'open'`;
+           this.db.get(sql, [], (err, row) => {
+               if (err) {
+                   console.error('Error counting open email DLQ rows:', err);
+                   reject(err);
+               } else {
+                   resolve(Number(row?.total) || 0);
+               }
+           });
+       });
+   }
+
+   async markEmailDlqReplayed(dlqId, replayError = null) {
+       await this.ensureEmailDlqColumns();
+       const now = new Date().toISOString();
+       const status = replayError ? 'open' : 'replayed';
+       return new Promise((resolve, reject) => {
+           const sql = `
+               UPDATE email_dlq
+               SET replay_count = replay_count + 1,
+                   status = ?,
+                   replayed_at = ?,
+                   last_replay_error = ?,
+                   updated_at = ?
+               WHERE id = ?
+           `;
+           this.db.run(sql, [status, now, replayError || null, now, dlqId], function(err) {
+               if (err) {
+                   console.error('Error marking email DLQ replay:', err);
+                   reject(err);
+               } else {
+                   resolve(this.changes || 0);
                }
            });
        });
@@ -2775,6 +3232,40 @@ class EnhancedDatabase {
        });
        cleanupResults.call_jobs = jobsCleaned;
        totalCleaned += jobsCleaned;
+
+       const callDlqCleaned = await new Promise((resolve, reject) => {
+           const sql = `
+               DELETE FROM call_job_dlq
+               WHERE status = 'replayed'
+                 AND updated_at < datetime('now', '-${daysToKeep} days')
+           `;
+           this.db.run(sql, function(err) {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(this.changes);
+               }
+           });
+       });
+       cleanupResults.call_job_dlq = callDlqCleaned;
+       totalCleaned += callDlqCleaned;
+
+       const emailDlqCleaned = await new Promise((resolve, reject) => {
+           const sql = `
+               DELETE FROM email_dlq
+               WHERE status = 'replayed'
+                 AND updated_at < datetime('now', '-${daysToKeep} days')
+           `;
+           this.db.run(sql, function(err) {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(this.changes);
+               }
+           });
+       });
+       cleanupResults.email_dlq = emailDlqCleaned;
+       totalCleaned += emailDlqCleaned;
        
        // Clean up old successful webhook notifications (keep for 7 days)
        const webhooksCleaned = await new Promise((resolve, reject) => {

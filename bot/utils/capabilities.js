@@ -1,7 +1,6 @@
 const { InlineKeyboard } = require('grammy');
 const fs = require('fs');
 const path = require('path');
-const config = require('../config');
 const { getUser, isAdmin } = require('../db/db');
 const { buildCallbackData } = require('./actions');
 const { ensureSession } = require('./sessionState');
@@ -69,6 +68,7 @@ const ACTION_CAPABILITIES = [
   { match: (action) => action === 'HELP', cap: 'view_help' },
   { match: (action) => action === 'GUIDE', cap: 'view_guide' },
   { match: (action) => action === 'MENU', cap: 'view_menu' },
+  { match: (action) => action === 'REQUEST_ACCESS', cap: 'view_menu' },
   { match: (action) => action === 'HEALTH', cap: 'health' },
   { match: (action) => action === 'STATUS', cap: 'status_admin' },
   { match: (action) => action === 'CALL', cap: 'call' },
@@ -89,10 +89,18 @@ const ACTION_CAPABILITIES = [
   { match: (action) => action.startsWith('BULK_EMAIL_'), cap: 'bulk_email' },
   { match: (action) => action === 'SCRIPTS', cap: 'scripts_manage' },
   { match: (action) => action === 'PERSONA', cap: 'persona_manage' },
+  { match: (action) => action === 'PROVIDER:HOME', cap: 'provider_manage' },
+  { match: (action) => action === 'PROVIDER:CALL', cap: 'provider_manage' },
+  { match: (action) => action === 'PROVIDER:SMS', cap: 'provider_manage' },
+  { match: (action) => action === 'PROVIDER:EMAIL', cap: 'provider_manage' },
+  { match: (action) => action.startsWith('PROVIDER:BACK:'), cap: 'provider_manage' },
+  { match: (action) => action.startsWith('PROVIDER_STATUS:'), cap: 'provider_manage' },
+  { match: (action) => action.startsWith('PROVIDER_SET:'), cap: 'provider_manage' },
   { match: (action) => action === 'PROVIDER_STATUS', cap: 'provider_manage' },
+  { match: (action) => action.startsWith('PROVIDER_STATUS_CH:'), cap: 'provider_manage' },
   { match: (action) => action === 'PROVIDER_OVERRIDES', cap: 'provider_manage' },
   { match: (action) => action.startsWith('PROVIDER_CLEAR_OVERRIDES:'), cap: 'provider_manage' },
-  { match: (action) => action.startsWith('PROVIDER_SET:'), cap: 'provider_manage' },
+  { match: (action) => action.startsWith('PROVIDER_SET_CH:'), cap: 'provider_manage' },
   { match: (action) => ['USERS', 'USERS_LIST', 'ADDUSER', 'PROMOTE', 'REMOVE'].includes(action), cap: 'users_manage' },
   { match: (action) => ['CALLER_FLAGS', 'CALLER_FLAGS_LIST', 'CALLER_FLAGS_ALLOW', 'CALLER_FLAGS_BLOCK', 'CALLER_FLAGS_SPAM'].includes(action), cap: 'caller_flags_manage' },
   { match: (action) => action.startsWith('CALL_DETAILS:'), cap: 'calllog_view' },
@@ -154,12 +162,9 @@ function getCapabilityForAction(action = '') {
 }
 
 function buildAccessKeyboard(ctx) {
-  const adminUsername = (config.admin.username || '').replace(/^@/, '');
   const keyboard = new InlineKeyboard()
     .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
-  if (adminUsername) {
-    keyboard.row().url('📱 Request Access', `https://t.me/${adminUsername}`);
-  }
+  keyboard.row().text('📩 Request Access', buildCallbackData(ctx, 'REQUEST_ACCESS'));
   return keyboard;
 }
 

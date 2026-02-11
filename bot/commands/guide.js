@@ -29,8 +29,8 @@ async function handleGuide(ctx) {
     ];
 
     const adminControls = [
-        '📍 /provider status — see the active provider',
-        '🔁 /provider <name> — switch providers on the fly',
+        '📍 /provider — open provider dashboard',
+        '🔁 Use inline Provider menus to switch Call/SMS/Email defaults',
         '🔐 /provider overrides — list active keypad provider overrides',
         '🧹 /provider clear-override <scope|all> — clear keypad provider overrides',
         '👥 /users — manage seats'
@@ -80,10 +80,7 @@ async function handleGuide(ctx) {
             .row()
             .text('📧 Email', buildCallbackData(ctx, 'EMAIL'));
     } else {
-        const adminUsername = (config.admin.username || '').replace(/^@/, '');
-        if (adminUsername) {
-            kb.row().url('🔓 Request Access', `https://t.me/${adminUsername}`);
-        }
+        kb.row().text('📩 Request Access', buildCallbackData(ctx, 'REQUEST_ACCESS'));
     }
 
     await renderMenu(ctx, guideText, kb, { parseMode: 'HTML' });

@@ -101,8 +101,6 @@ async function handleHelp(ctx) {
 
         const helpText = isAuthorized ? helpSections.join('\n\n') : unauthSections.join('\n\n');
 
-        const adminUsername = (config.admin.username || '').replace(/^@/, '');
-
         const kb = isAuthorized
             ? (() => {
                 const keyboard = new InlineKeyboard()
@@ -121,7 +119,7 @@ async function handleHelp(ctx) {
                         .text('👥 Users', buildCallbackData(ctx, 'USERS'))
                         .text('📵 Caller Flags', buildCallbackData(ctx, 'CALLER_FLAGS'))
                         .row()
-                        .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER_STATUS'));
+                        .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER:HOME'));
                 }
                 return keyboard;
             })()
@@ -129,9 +127,7 @@ async function handleHelp(ctx) {
                 const keyboard = new InlineKeyboard()
                     .text('📚 Guide', buildCallbackData(ctx, 'GUIDE'))
                     .text('📋 Menu', buildCallbackData(ctx, 'MENU'));
-                if (adminUsername) {
-                    keyboard.row().url('🔓 Request Access', `https://t.me/${adminUsername}`);
-                }
+                keyboard.row().text('📩 Request Access', buildCallbackData(ctx, 'REQUEST_ACCESS'));
                 return keyboard;
             })();
 

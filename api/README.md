@@ -24,6 +24,9 @@ Twilio Media Streams is still supported, but the API now ships with an AWS-nativ
 - `AWS_REGION`, `AWS_CONNECT_INSTANCE_ID`, and `AWS_CONNECT_CONTACT_FLOW_ID`
 - `AWS_POLLY_OUTPUT_BUCKET` (Polly audio will be persisted here for Connect to play)
 - `AWS_PINPOINT_APPLICATION_ID` and `AWS_PINPOINT_ORIGINATION_NUMBER` for SMS
+- `AWS_WEBHOOK_VALIDATION` and one of:
+  - API HMAC headers (`x-api-timestamp`, `x-api-signature`) on `POST /webhook/aws/status` and `POST /aws/transcripts`
+  - or `AWS_WEBHOOK_SECRET` sent as `x-aws-webhook-secret` for callback forwarders
 - Optional: `AWS_TRANSCRIBE_LANGUAGE_CODE`, custom queue/phone routing, and vocabulary filters
 
 When running in AWS mode:
@@ -32,8 +35,25 @@ When running in AWS mode:
 - Real-time transcriptions should be forwarded to the API via the new `POST /aws/transcripts` endpoint (used by the StreamAdapter worker).
 - Contact state changes from Connect can be normalized by posting to `POST /aws/contact-events`.
 - AI responses are synthesized with Polly and queued for playback through contact attributes, so the contact flow can fetch the latest S3 object and play it back to the caller.
+- `WS /aws/stream` requires stream auth query params (`token`, `ts`) or the `AWS_WEBHOOK_SECRET` query/header fallback.
 
 Keep the Twilio credentials in place if you want a rapid rollback path—switching the provider back to `twilio` will re-enable the original websocket-based flow without redeploying code.
+
+## Worker Reliability Controls
+
+- `CALL_JOB_TIMEOUT_MS` limits each call job execution window.
+- `CALL_JOB_STALE_LOCK_MS` reclaims stale `running` call jobs during processor loops.
+- `CALL_JOB_DLQ_ALERT_THRESHOLD` emits health alerts when open call-job DLQ entries exceed the threshold.
+- `CALL_JOB_DLQ_MAX_REPLAYS` limits replay attempts for a single call-job DLQ entry.
+- `WEBHOOK_TELEGRAM_TIMEOUT_MS` sets Telegram send/edit timeout for notification delivery.
+- `EMAIL_REQUEST_TIMEOUT_MS` sets HTTP timeout for SendGrid/Mailgun/SES provider calls.
+- `EMAIL_DLQ_ALERT_THRESHOLD` emits health alerts when open email DLQ entries exceed the threshold.
+- `EMAIL_DLQ_MAX_REPLAYS` limits replay attempts for a single email DLQ entry.
+- Admin DLQ control endpoints:
+  - `GET /admin/call-jobs/dlq`
+  - `POST /admin/call-jobs/dlq/:id/replay`
+  - `GET /admin/email/dlq`
+  - `POST /admin/email/dlq/:id/replay`
 
 ## Adaptive Persona and Mood Profiles
 

@@ -7,6 +7,21 @@ const { renderMenu, escapeMarkdown, buildLine, section } = require('../utils/ui'
 const { buildCallbackData } = require('../utils/actions');
 const { getAccessProfile } = require('../utils/capabilities');
 
+function maskPhoneForDisplay(value = '') {
+    const text = String(value || '').trim();
+    if (!text) return 'N/A';
+    const digits = text.replace(/\D/g, '');
+    if (digits.length < 4) return '***';
+    const prefix = text.startsWith('+') ? '+' : '';
+    return `${prefix}***${digits.slice(-4)}`;
+}
+
+function summarizeSensitiveText(value = '') {
+    const text = String(value || '').trim();
+    if (!text) return '';
+    return `🔒 redacted (${text.length} chars)`;
+}
+
 function parseRecentFilter(input = '') {
     const trimmed = String(input || '').trim();
     if (!trimmed) return null;
@@ -116,7 +131,7 @@ async function calllogRecentFlow(conversation, ctx) {
             const duration = call.duration ? `${Math.floor(call.duration / 60)}:${String(call.duration % 60).padStart(2, '0')}` : 'N/A';
             return [
                 `• ${escapeMarkdown(call.call_sid || 'unknown')} (${escapeMarkdown(status)})`,
-                `📞 ${escapeMarkdown(call.phone_number || 'N/A')}`,
+                `📞 ${escapeMarkdown(maskPhoneForDisplay(call.phone_number))}`,
                 `⏱️ ${duration} | 🕒 ${escapeMarkdown(when)}`
             ].join('\n');
         });
@@ -170,8 +185,8 @@ async function calllogSearchFlow(conversation, ctx) {
         const lines = results.slice(0, 5).map((c) => {
             const status = c.status || 'unknown';
             const when = new Date(c.created_at).toLocaleString();
-            const summary = c.call_summary ? `\n📝 ${escapeMarkdown(c.call_summary.slice(0, 120))}${c.call_summary.length > 120 ? '…' : ''}` : '';
-            return `• ${escapeMarkdown(c.call_sid || 'unknown')} (${escapeMarkdown(status)})\n📞 ${escapeMarkdown(c.phone_number || 'N/A')}\n🕒 ${escapeMarkdown(when)}${summary}`;
+            const summary = c.call_summary ? `\n📝 ${escapeMarkdown(summarizeSensitiveText(c.call_summary))}` : '';
+            return `• ${escapeMarkdown(c.call_sid || 'unknown')} (${escapeMarkdown(status)})\n📞 ${escapeMarkdown(maskPhoneForDisplay(c.phone_number))}\n🕒 ${escapeMarkdown(when)}${summary}`;
         });
         await ctx.reply(lines.join('\n\n'), {
             parse_mode: 'Markdown',
@@ -217,13 +232,13 @@ async function calllogDetailsFlow(conversation, ctx) {
         const duration = call.duration ? `${Math.floor(call.duration / 60)}:${String(call.duration % 60).padStart(2, '0')}` : 'N/A';
         const lines = [
             buildLine('🆔', 'Call', escapeMarkdown(call.call_sid || callSid)),
-            buildLine('📞', 'Phone', escapeMarkdown(call.phone_number || 'N/A')),
+            buildLine('📞', 'Phone', escapeMarkdown(maskPhoneForDisplay(call.phone_number))),
             buildLine('📊', 'Status', escapeMarkdown(call.status || 'unknown')),
             buildLine('⏱️', 'Duration', escapeMarkdown(duration)),
             buildLine('🕒', 'Started', escapeMarkdown(call.created_at ? new Date(call.created_at).toLocaleString() : 'N/A'))
         ];
         if (call.call_summary) {
-            lines.push(`📝 ${escapeMarkdown(call.call_summary.slice(0, 300))}${call.call_summary.length > 300 ? '…' : ''}`);
+            lines.push(`📝 ${escapeMarkdown(summarizeSensitiveText(call.call_summary))}`);
         }
         await ctx.reply(section('📄 Call Details', lines), {
             parse_mode: 'Markdown',

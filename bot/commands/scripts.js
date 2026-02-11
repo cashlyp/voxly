@@ -97,7 +97,7 @@ async function scriptsApiRequest(options) {
 }
 
 function formatScriptsApiError(error, action) {
-  const baseHelp = `Ensure the scripts service is reachable at ${config.scriptsApiUrl} or update SCRIPTS_API_URL.`;
+  const baseHelp = 'Ensure the scripts service is reachable or update SCRIPTS_API_URL.';
 
   const apiCode = error.response?.data?.code || error.code;
   if (apiCode === 'SCRIPT_NAME_DUPLICATE') {
@@ -1588,7 +1588,12 @@ async function fetchSmsScripts({ includeContent = false } = {}) {
     metadata: script.metadata || {}
   }));
 
-  const builtin = (data.builtin || []).map((script) => ({
+  const builtinSource = Array.isArray(data.builtin)
+    ? data.builtin
+    : Array.isArray(data.available_scripts)
+      ? data.available_scripts.map((name) => ({ name, description: 'Built-in script' }))
+      : [];
+  const builtin = builtinSource.map((script) => ({
     ...script,
     is_builtin: true,
     metadata: script.metadata || {}
@@ -1604,7 +1609,14 @@ async function fetchSmsScriptByName(name, { detailed = true } = {}) {
     params: { detailed }
   });
 
-  const script = data.script;
+  const script = typeof data.script === 'string'
+    ? {
+      name: data.script_name || name,
+      content: data.script,
+      is_builtin: true,
+      metadata: {}
+    }
+    : data.script;
   if (script) {
     script.is_builtin = !!script.is_builtin;
     script.metadata = script.metadata || {};

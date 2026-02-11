@@ -1,5 +1,4 @@
 const { InlineKeyboard } = require('grammy');
-const config = require('../config');
 const { getAccessProfile } = require('../utils/capabilities');
 const { cancelActiveFlow, resetSession } = require('../utils/sessionState');
 const { escapeHtml, renderMenu } = require('../utils/ui');
@@ -43,15 +42,12 @@ async function handleMenu(ctx) {
                 .text('🧰 Scripts', buildCallbackData(ctx, 'SCRIPTS'))
                 .row()
                 .text('📵 Caller Flags', buildCallbackData(ctx, 'CALLER_FLAGS'))
-                .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER_STATUS'))
+                .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER:HOME'))
                 .row()
                 .text('📤 SMS Sender', buildCallbackData(ctx, 'BULK_SMS'))
                 .text('📧 Mailer', buildCallbackData(ctx, 'BULK_EMAIL'));
         } else if (!access.user) {
-            const adminUsername = (config.admin.username || '').replace(/^@/, '');
-            if (adminUsername) {
-                kb.row().url('📱 Request Access', `https://t.me/${adminUsername}`);
-            }
+            kb.row().text('📩 Request Access', buildCallbackData(ctx, 'REQUEST_ACCESS'));
         }
 
         const commonHint = 'SMS and Email actions are grouped under /sms and /email.';
