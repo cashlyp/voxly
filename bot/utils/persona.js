@@ -408,7 +408,7 @@ async function askOptionWithButtons(
     });
 
     const callbackData = selectionCtx.callbackQuery?.data || '';
-    const validation = validateCallback(ctx, callbackData);
+    const validation = validateCallback(selectionCtx, callbackData);
     if (validation.status !== 'ok') {
       await selectionCtx.answerCallbackQuery({
         text: '⌛ This menu expired. Use /menu to start again.',

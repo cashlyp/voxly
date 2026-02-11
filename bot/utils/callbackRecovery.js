@@ -40,7 +40,7 @@ async function handleInvalidCallback({
 
     await safeAnswerCallback(ctx, {
       text: firstExpiredNotice
-        ? "⌛ Session timed out. Use /menu to start again."
+        ? "⌛ This menu expired. Use /menu to start again."
         : "⌛ Session expired. Use /menu to start again.",
       show_alert: false,
     });

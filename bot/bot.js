@@ -77,66 +77,6 @@ const {
 // Bot initialization
 const token = config.botToken;
 const bot = new Bot(token);
-const CONVERSATION_IDLE_TIMEOUT_MS = 4 * 60 * 1000;
-
-async function waitWithConversationTimeout(waitFactory, ctx, conversationName) {
-  let timeoutId;
-  const timeoutPromise = new Promise((_, reject) => {
-    timeoutId = setTimeout(() => {
-      reject(
-        new OperationCancelledError(
-          `Conversation ${conversationName} timed out due to inactivity.`,
-        ),
-      );
-    }, CONVERSATION_IDLE_TIMEOUT_MS);
-  });
-
-  try {
-    return await Promise.race([waitFactory(), timeoutPromise]);
-  } catch (error) {
-    if (
-      error instanceof OperationCancelledError &&
-      /timed out due to inactivity/i.test(error.message || "")
-    ) {
-      ensureSession(ctx);
-      const expiredOp = ctx.session?.currentOp
-        ? {
-            id: ctx.session.currentOp.id || null,
-            token: ctx.session.currentOp.token || null,
-          }
-        : { id: null, token: null };
-      const priorExpired = ctx.session?.meta?.expiredConversation || null;
-      const alreadyNotified =
-        Boolean(priorExpired?.noticeSent) &&
-        Boolean(priorExpired?.opId) &&
-        priorExpired.opId === expiredOp.id;
-      try {
-        await cancelActiveFlow(ctx, `timeout:${conversationName}`);
-      } catch (_) {}
-      try {
-        await clearMenuMessages(ctx);
-      } catch (_) {}
-      resetSession(ctx);
-      ensureSession(ctx);
-      ctx.session.meta.expiredConversation = {
-        conversation: conversationName,
-        opId: expiredOp.id,
-        token: expiredOp.token,
-        expiredAt: Date.now(),
-        noticeSent: alreadyNotified,
-      };
-      if (!alreadyNotified) {
-        try {
-          await ctx.reply("⌛ Session timed out due to inactivity. Use /menu to start again.");
-          ctx.session.meta.expiredConversation.noticeSent = true;
-        } catch (_) {}
-      }
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeoutId);
-  }
-}
 
 async function clearCallbackMessageMarkup(ctx) {
   const chatId = ctx.callbackQuery?.message?.chat?.id;
@@ -175,16 +115,6 @@ async function safeAnswerCallback(ctx, payload = {}) {
 // Initialize conversations with error handling wrapper
 function wrapConversation(handler, name) {
   return createConversation(async (conversation, ctx) => {
-    if (typeof conversation.wait === "function") {
-      const originalWait = conversation.wait.bind(conversation);
-      conversation.wait = (...args) =>
-        waitWithConversationTimeout(() => originalWait(...args), ctx, name);
-    }
-    if (typeof conversation.waitFor === "function") {
-      const originalWaitFor = conversation.waitFor.bind(conversation);
-      conversation.waitFor = (...args) =>
-        waitWithConversationTimeout(() => originalWaitFor(...args), ctx, name);
-    }
     try {
       await handler(conversation, ctx);
     } catch (error) {
@@ -881,6 +811,38 @@ bot.on("callback_query:data", async (ctx) => {
       }
     }
 
+    const parsedCallback = parseCallbackAction(action);
+    if (parsedCallback) {
+      const conversationTarget = resolveConversationFromPrefix(
+        parsedCallback.prefix,
+      );
+      if (conversationTarget) {
+        const currentOpId = ctx.session?.currentOp?.id;
+        if (isConversationCallbackStale(parsedCallback, currentOpId)) {
+          const staleConversationKey = buildStaleConversationKey(
+            conversationTarget,
+            parsedCallback.opId,
+          );
+          const firstStaleConversationNotice = !isDuplicateAction(
+            ctx,
+            staleConversationKey,
+            60 * 60 * 1000,
+          );
+          await cancelActiveFlow(ctx, `stale_callback:${action}`);
+          resetSession(ctx);
+          await clearCallbackMessageMarkup(ctx);
+          if (firstStaleConversationNotice) {
+            await ctx.reply("⌛ This menu expired. Opening a fresh one…");
+            await reopenFreshMenu(ctx, action);
+          }
+          finishMetric("stale");
+          return;
+        }
+        finishMetric("routed");
+        return;
+      }
+    }
+
     const isMenuExemptAction = menuExemptPrefixes.some((prefix) =>
       action.startsWith(prefix),
     );
@@ -1004,38 +966,6 @@ bot.on("callback_query:data", async (ctx) => {
       await sendBulkStatusCard(ctx, jobId);
       finishMetric("ok");
       return;
-    }
-
-    const parsedCallback = parseCallbackAction(action);
-    if (parsedCallback) {
-      const conversationTarget = resolveConversationFromPrefix(
-        parsedCallback.prefix,
-      );
-      if (conversationTarget) {
-        const currentOpId = ctx.session?.currentOp?.id;
-        if (isConversationCallbackStale(parsedCallback, currentOpId)) {
-          const staleConversationKey = buildStaleConversationKey(
-            conversationTarget,
-            parsedCallback.opId,
-          );
-          const firstStaleConversationNotice = !isDuplicateAction(
-            ctx,
-            staleConversationKey,
-            60 * 60 * 1000,
-          );
-          await cancelActiveFlow(ctx, `stale_callback:${action}`);
-          resetSession(ctx);
-          await clearCallbackMessageMarkup(ctx);
-          if (firstStaleConversationNotice) {
-            await ctx.reply("⌛ This menu expired. Opening a fresh one…");
-            await reopenFreshMenu(ctx, action);
-          }
-          finishMetric("stale");
-          return;
-        }
-        finishMetric("routed");
-        return;
-      }
     }
 
     // Handle conversation actions

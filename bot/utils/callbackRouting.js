@@ -12,9 +12,11 @@ function parseCallbackAction(action) {
 
 function resolveConversationFromPrefix(prefix) {
   if (!prefix) return null;
+  if (prefix === "call-script-fallback") return "call-conversation";
   if (prefix.startsWith("call-script-")) return "scripts-conversation";
   if (prefix === "call-script") return "call-conversation";
   if (prefix.startsWith("sms-script-")) return "scripts-conversation";
+  if (prefix.startsWith("inbound-default")) return "scripts-conversation";
   if (prefix === "sms-script") return "sms-conversation";
   if (prefix.startsWith("script-") || prefix === "confirm") {
     return "scripts-conversation";
@@ -28,9 +30,15 @@ function resolveConversationFromPrefix(prefix) {
   if (prefix.startsWith("sms-")) return "sms-conversation";
   if (prefix.startsWith("persona-")) return "persona-conversation";
   if (
-    ["persona", "purpose", "tone", "urgency", "tech", "call-config"].includes(
-      prefix,
-    )
+    [
+      "persona",
+      "purpose",
+      "tone",
+      "urgency",
+      "tech",
+      "call-config",
+      "call-voice",
+    ].includes(prefix)
   ) {
     return "call-conversation";
   }

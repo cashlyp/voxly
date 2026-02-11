@@ -102,7 +102,7 @@ function formatScriptsApiError(error, action) {
     error instanceof OperationCancelledError ||
     /timed out due to inactivity/i.test(error?.message || '')
   ) {
-    return '⌛ Session timed out due to inactivity. Use /menu to start again.';
+    return '⌛ Session expired. Use /menu to start again.';
   }
 
   const baseHelp = 'Ensure the scripts service is reachable or update SCRIPTS_API_URL.';
