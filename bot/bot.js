@@ -127,12 +127,6 @@ function wrapConversation(handler, name) {
         "❌ An error occurred during the conversation. Please try again.";
       const message = error?.userMessage || fallback;
       await ctx.reply(message);
-    } finally {
-      // Conversation handlers can return early without clearing operation state.
-      // Keep callback routing deterministic by ending any leftover op after exit.
-      if (ctx.session?.currentOp) {
-        ctx.session.currentOp = null;
-      }
     }
   }, name);
 }
