@@ -139,8 +139,12 @@ function validateCallback(ctx, rawAction, options = {}) {
       return { status: 'expired', reason: 'ttl', action: parsed.action };
     }
     const currentToken = ctx.session?.currentOp?.token;
+    const expiredToken = ctx.session?.meta?.expiredConversation?.token;
     if (parsed.token && currentToken && parsed.token !== currentToken) {
       return { status: 'stale', reason: 'token_mismatch', action: parsed.action };
+    }
+    if (parsed.token && !currentToken && expiredToken && parsed.token === expiredToken) {
+      return { status: 'expired', reason: 'token_expired', action: parsed.action };
     }
     return { status: 'ok', action: parsed.action };
   }

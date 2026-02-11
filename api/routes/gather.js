@@ -159,15 +159,33 @@ function createTwilioGatherHandler(deps = {}) {
       const queryStepIndex = Number.isFinite(Number(req.query?.stepIndex))
         ? Number(req.query.stepIndex)
         : null;
+      const queryChannelSessionId = req.query?.channelSessionId
+        ? String(req.query.channelSessionId)
+        : null;
+      const shouldResetOnInterrupt = (exp, reason = '') => {
+        if (!exp) return false;
+        if (exp.reset_on_interrupt === true) return true;
+        const reasonCode = String(reason || '').toLowerCase();
+        return [
+          'spam_pattern',
+          'too_long',
+          'invalid_card_number',
+          'invalid_cvv',
+          'invalid_expiry_length'
+        ].includes(reasonCode);
+      };
       const currentExpectation = digitService?.getExpectation?.(callSid);
-      if (currentExpectation && (queryPlanId || queryStepIndex)) {
+      if (currentExpectation && (queryPlanId || queryStepIndex || queryChannelSessionId)) {
         const missingPlan = queryPlanId && !currentExpectation.plan_id;
         const missingStep = Number.isFinite(queryStepIndex) && !Number.isFinite(currentExpectation.plan_step_index);
         const mismatchedPlan = queryPlanId && currentExpectation.plan_id && queryPlanId !== String(currentExpectation.plan_id);
         const mismatchedStep = Number.isFinite(queryStepIndex)
           && Number.isFinite(currentExpectation.plan_step_index)
           && queryStepIndex !== Number(currentExpectation.plan_step_index);
-        if (missingPlan || missingStep || mismatchedPlan || mismatchedStep) {
+        const mismatchedChannelSession = queryChannelSessionId
+          && currentExpectation.channel_session_id
+          && queryChannelSessionId !== String(currentExpectation.channel_session_id);
+        if (missingPlan || missingStep || mismatchedPlan || mismatchedStep || mismatchedChannelSession) {
           const prompt = currentExpectation.prompt || digitService.buildDigitPrompt(currentExpectation);
           console.warn(`Stale gather ignored for ${callSid} (plan=${queryPlanId || 'n/a'} step=${queryStepIndex ?? 'n/a'})`);
           if (await respondWithGather(currentExpectation, prompt)) {
@@ -214,7 +232,9 @@ function createTwilioGatherHandler(deps = {}) {
 
       const digits = String(Digits || '').trim();
       const stepTag = expectation?.plan_id ? `${expectation.plan_id}:${expectation.plan_step_index || 'na'}` : 'no_plan';
-      const dedupeKey = digits ? `${callSid}:${stepTag}:${digits}` : null;
+      const dedupeKey = digits
+        ? `${callSid}:${stepTag}:${queryChannelSessionId || expectation?.channel_session_id || 'no_channel'}:${digits}`
+        : null;
       if (dedupeKey) {
         const lastSeen = gatherEventDedupe?.get(dedupeKey);
         if (lastSeen && Date.now() - lastSeen < 2000) {
@@ -281,7 +301,8 @@ function createTwilioGatherHandler(deps = {}) {
           full_input: true,
           attempt_id: attemptId,
           plan_id: expectation?.plan_id || null,
-          plan_step_index: expectation?.plan_step_index || null
+          plan_step_index: expectation?.plan_step_index || null,
+          channel_session_id: queryChannelSessionId || expectation?.channel_session_id || null
         });
         await digitService.handleCollectionResult(callSid, collection, null, 0, 'gather', { allowCallEnd: true, deferCallEnd: true });
 
@@ -352,7 +373,9 @@ function createTwilioGatherHandler(deps = {}) {
         clearPendingDigitReprompts?.(callSid);
         digitService.clearDigitTimeout(callSid);
         digitService.markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: reprompt });
-        if (await respondWithGather(expectation, reprompt, '', { resetBuffer: true })) {
+        if (await respondWithGather(expectation, reprompt, '', {
+          resetBuffer: shouldResetOnInterrupt(expectation, collection.reason)
+        })) {
           return;
         }
         respondWithStream();
@@ -376,7 +399,9 @@ function createTwilioGatherHandler(deps = {}) {
             const prompt = digitService.buildPlanStepPrompt
               ? digitService.buildPlanStepPrompt(expectation)
               : (expectation.prompt || digitService.buildDigitPrompt(expectation));
-            if (await respondWithGather(expectation, prompt, '', { resetBuffer: true })) {
+            if (await respondWithGather(expectation, prompt, '', {
+              resetBuffer: shouldResetOnInterrupt(expectation, 'timeout')
+            })) {
               return;
             }
           }
@@ -428,7 +453,9 @@ function createTwilioGatherHandler(deps = {}) {
       clearPendingDigitReprompts?.(callSid);
       digitService.clearDigitTimeout(callSid);
       digitService.markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: timeoutPrompt });
-      if (await respondWithGather(expectation, timeoutPrompt, '', { resetBuffer: true })) {
+      if (await respondWithGather(expectation, timeoutPrompt, '', {
+        resetBuffer: shouldResetOnInterrupt(expectation, 'timeout')
+      })) {
         return;
       }
       respondWithStream();

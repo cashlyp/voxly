@@ -6,6 +6,9 @@ const fetch = require("node-fetch");
 const ExpressWs = require("express-ws");
 const path = require("path");
 const crypto = require("crypto");
+const helmet = require("helmet");
+const cors = require("cors");
+const compression = require("compression");
 const rateLimit = require("express-rate-limit");
 
 const { EnhancedGptService } = require("./routes/gpt");
@@ -16,6 +19,9 @@ const { recordingService } = require("./routes/recording");
 const { EnhancedSmsService } = require("./routes/sms.js");
 const { EmailService } = require("./routes/email");
 const { createTwilioGatherHandler } = require("./routes/gather");
+const { registerCallRoutes } = require("./routes/callRoutes");
+const { registerStatusRoutes } = require("./routes/statusRoutes");
+const { registerWebhookRoutes } = require("./routes/webhookRoutes");
 const Database = require("./db/db");
 const { webhookService } = require("./routes/status");
 const twilioSignature = require("./middleware/twilioSignature");
@@ -108,6 +114,7 @@ const HMAC_HEADER_TIMESTAMP = "x-api-timestamp";
 const HMAC_HEADER_SIGNATURE = "x-api-signature";
 const HMAC_BYPASS_PATH_PREFIXES = [
   "/webhook/",
+  "/capture/",
   "/incoming",
   "/aws/transcripts",
   "/connection",
@@ -138,6 +145,7 @@ const callLifecycle = new Map(); // callSid -> { status, updatedAt }
 const streamLastMediaAt = new Map(); // callSid -> timestamp
 const sttLastFrameAt = new Map(); // callSid -> timestamp
 const streamWatchdogState = new Map(); // callSid -> { noMediaNotifiedAt, noMediaEscalatedAt, sttNotifiedAt }
+const providerEventDedupe = new Map(); // source:hash -> ts
 const providerHealth = new Map();
 const keypadProviderGuardWarnings = new Set(); // provider -> warning emitted
 const keypadProviderOverrides = new Map(); // scopeKey -> { provider, expiresAt, ... }
@@ -150,6 +158,8 @@ const outboundRateBuckets = new Map(); // namespace:key -> { count, windowStart 
 const callLifecycleCleanupTimers = new Map();
 const CALL_STATUS_DEDUPE_MS = 3000;
 const CALL_STATUS_DEDUPE_MAX = 5000;
+const PROVIDER_EVENT_DEDUPE_MS = 5 * 60 * 1000;
+const PROVIDER_EVENT_DEDUPE_MAX = 10000;
 const VONAGE_WEBHOOK_JTI_CACHE_MAX = 5000;
 const KEYPAD_PROVIDER_OVERRIDE_SETTING_KEY = "keypad_provider_overrides_v1";
 const CALL_PROVIDER_SETTING_KEY = "call_provider_v1";
@@ -237,6 +247,30 @@ function purgeCallStatusDedupe(callSid) {
       callStatusDedupe.delete(key);
     }
   }
+}
+
+function shouldProcessProviderEvent(source, dedupePayload = {}, options = {}) {
+  const payload =
+    dedupePayload && typeof dedupePayload === "object"
+      ? dedupePayload
+      : { value: dedupePayload };
+  const hash = crypto
+    .createHash("sha1")
+    .update(stableStringify(payload))
+    .digest("hex");
+  const key = `${String(source || "unknown")}:${hash}`;
+  const now = Date.now();
+  const ttlMs =
+    Number.isFinite(Number(options.ttlMs)) && Number(options.ttlMs) > 0
+      ? Number(options.ttlMs)
+      : PROVIDER_EVENT_DEDUPE_MS;
+  const lastSeen = providerEventDedupe.get(key);
+  if (lastSeen && now - lastSeen < ttlMs) {
+    return false;
+  }
+  providerEventDedupe.set(key, now);
+  pruneDedupeMap(providerEventDedupe, PROVIDER_EVENT_DEDUPE_MAX);
+  return true;
 }
 
 function recordCallLifecycle(callSid, status, meta = {}) {
@@ -982,6 +1016,51 @@ function buildApiError(code, message, requestId = null, extra = {}) {
 
 function sendApiError(res, status, code, message, requestId = null, extra = {}) {
   return res.status(status).json(buildApiError(code, message, requestId, extra));
+}
+
+function parseBoundedInteger(value, options = {}) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) {
+    return Number.isFinite(options.defaultValue) ? options.defaultValue : null;
+  }
+  const min = Number.isFinite(options.min) ? options.min : null;
+  const max = Number.isFinite(options.max) ? options.max : null;
+  if (min !== null && parsed < min) {
+    return Number.isFinite(options.defaultValue) ? options.defaultValue : min;
+  }
+  if (max !== null && parsed > max) {
+    return max;
+  }
+  return parsed;
+}
+
+function parsePagination(query = {}, options = {}) {
+  const defaultLimit = Number.isFinite(options.defaultLimit)
+    ? options.defaultLimit
+    : 10;
+  const maxLimit = Number.isFinite(options.maxLimit) ? options.maxLimit : 50;
+  const limit = parseBoundedInteger(query.limit, {
+    defaultValue: defaultLimit,
+    min: 1,
+    max: maxLimit,
+  });
+  const offset = parseBoundedInteger(query.offset, {
+    defaultValue: 0,
+    min: 0,
+  });
+  return { limit, offset };
+}
+
+function isSafeId(value, options = {}) {
+  const candidate = String(value || "").trim();
+  if (!candidate) return false;
+  const max = Number.isFinite(options.max) ? options.max : 128;
+  if (candidate.length > max) return false;
+  return /^[A-Za-z0-9._:-]+$/.test(candidate);
+}
+
+function buildErrorDetails(error) {
+  return redactSensitiveLogValue(error?.message || String(error || "unknown"));
 }
 
 function getOutboundActorKey(req, explicitValue = null) {
@@ -2305,6 +2384,7 @@ async function handleExternalDtmfInput(callSid, digits, options = {}) {
     attempt_id: activeExpectation?.attempt_id || null,
     plan_id: activeExpectation?.plan_id || null,
     plan_step_index: activeExpectation?.plan_step_index || null,
+    channel_session_id: activeExpectation?.channel_session_id || null,
   });
 
   await digitService.handleCollectionResult(
@@ -2545,7 +2625,10 @@ function shouldBypassHmac(req) {
   }
   if (
     req.method === "GET" &&
-    (path === "/" || path === "/favicon.ico" || path === "/health")
+    (path === "/" ||
+      path === "/favicon.ico" ||
+      path === "/health" ||
+      path === "/status")
   ) {
     return true;
   }
@@ -2922,6 +3005,32 @@ ExpressWs(app, null, {
 // Trust the first proxy (ngrok/load balancer) so rate limiting can read X-Forwarded-For safely
 app.set("trust proxy", 1);
 
+const allowedCorsOrigins = Array.isArray(config.server?.corsOrigins)
+  ? config.server.corsOrigins.filter(Boolean)
+  : [];
+
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false,
+  }),
+);
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || !allowedCorsOrigins.length) {
+        return callback(null, true);
+      }
+      if (allowedCorsOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(null, false);
+    },
+    credentials: true,
+  }),
+);
+app.use(compression());
+
 function captureRawBody(req, _res, buf) {
   if (!buf || !buf.length) return;
   req.rawBody = buf.toString("utf8");
@@ -3162,6 +3271,14 @@ const DIGIT_SETTINGS = {
   smsFallbackMinRetries: Number(
     process.env.DIGIT_SMS_FALLBACK_MIN_RETRIES || 2,
   ),
+  captureVaultTtlMs: 10 * 60 * 1000,
+  captureSlo: {
+    windowSize: 200,
+    successRateMin: 0.78,
+    medianCaptureMsMax: 45000,
+    duplicateSuppressionRateMax: 0.35,
+    timeoutErrorRateMax: 0.2,
+  },
   healthThresholds: {
     degraded: Number(process.env.DIGIT_HEALTH_DEGRADED || 30),
     overloaded: Number(process.env.DIGIT_HEALTH_OVERLOADED || 60),
@@ -3857,6 +3974,36 @@ const DIGIT_PROFILE_LABELS = {
   generic: "Digits",
 };
 
+function maskSensitiveDigitValue(value, keepTail = 2) {
+  const raw = String(value || "").replace(/\D/g, "");
+  if (!raw) return "";
+  if (raw.length <= keepTail) {
+    return "*".repeat(raw.length);
+  }
+  return `${"*".repeat(Math.max(2, raw.length - keepTail))}${raw.slice(
+    -keepTail,
+  )}`;
+}
+
+function formatDigitSummaryValue(profile, value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "none";
+
+  if (profile === "amount") {
+    const cents = Number(raw);
+    if (!Number.isNaN(cents)) {
+      return `$${(cents / 100).toFixed(2)}`;
+    }
+    return raw;
+  }
+
+  if (profile === "card_expiry") {
+    return "**/**";
+  }
+
+  return maskSensitiveDigitValue(raw, 2) || "masked";
+}
+
 function buildDigitSummary(digitEvents = []) {
   if (!Array.isArray(digitEvents) || digitEvents.length === 0) {
     return { summary: "", count: 0 };
@@ -3880,25 +4027,7 @@ function buildDigitSummary(digitEvents = []) {
       ? acceptedEvents[acceptedEvents.length - 1]
       : events[events.length - 1];
     const label = DIGIT_PROFILE_LABELS[profile] || profile;
-    let value = chosen.digits || "";
-
-    if (profile === "amount" && value) {
-      const cents = Number(value);
-      if (!Number.isNaN(cents)) {
-        value = `$${(cents / 100).toFixed(2)}`;
-      }
-    }
-    if (profile === "card_expiry" && value) {
-      if (value.length === 4) {
-        value = `${value.slice(0, 2)}/${value.slice(2)}`;
-      } else if (value.length === 6) {
-        value = `${value.slice(0, 2)}/${value.slice(2)}`;
-      }
-    }
-
-    if (!value) {
-      value = "none";
-    }
+    const value = formatDigitSummaryValue(profile, chosen.digits);
 
     const suffix = chosen.accepted ? "" : " (unverified)";
     if (chosen.accepted) {
@@ -5138,6 +5267,7 @@ async function recordCallStatus(callSid, status, notificationType, extra = {}) {
   if (!callSid) return;
   const call = await db.getCall(callSid).catch(() => null);
   const previousStatus = call?.status || call?.twilio_status;
+  const previousNormalized = normalizeCallStatus(previousStatus);
   const normalizedStatus = normalizeCallStatus(status);
   const applyStatus = shouldApplyStatusUpdate(
     previousStatus,
@@ -5149,8 +5279,9 @@ async function recordCallStatus(callSid, status, notificationType, extra = {}) {
   const finalStatus = applyStatus
     ? normalizedStatus
     : normalizeCallStatus(previousStatus || normalizedStatus);
+  const statusChanged = previousNormalized !== finalStatus;
   await db.updateCallStatus(callSid, finalStatus, extra);
-  if (applyStatus) {
+  if (applyStatus && statusChanged) {
     recordCallLifecycle(callSid, finalStatus, {
       source: "internal",
       raw_status: status,
@@ -5160,7 +5291,7 @@ async function recordCallStatus(callSid, status, notificationType, extra = {}) {
       scheduleCallLifecycleCleanup(callSid);
     }
   }
-  if (call?.user_chat_id && notificationType && applyStatus) {
+  if (call?.user_chat_id && notificationType && applyStatus && statusChanged) {
     await db.createEnhancedWebhookNotification(
       callSid,
       notificationType,
@@ -5485,6 +5616,9 @@ app.ws("/connection", (ws, req) => {
     let gptService;
     const streamService = new StreamService(ws, {
       audioTickIntervalMs: liveConsoleAudioTickMs,
+    });
+    streamService.on("error", (error) => {
+      console.error("Stream service error:", error);
     });
     const transcriptionService = new TranscriptionService();
     const ttsService = new TextToSpeechService({});
@@ -6526,6 +6660,7 @@ app.ws("/connection", (ws, req) => {
             attempt_id: activeExpectation?.attempt_id || null,
             plan_id: activeExpectation?.plan_id || null,
             plan_step_index: activeExpectation?.plan_step_index || null,
+            channel_session_id: activeExpectation?.channel_session_id || null,
           },
         );
         await digitService.handleCollectionResult(
@@ -6636,6 +6771,8 @@ app.ws("/connection", (ws, req) => {
       console.log(
         `WebSocket connection closed for adaptive call: ${callSid || "unknown"}`,
       );
+      transcriptionService.close();
+      streamService.close();
       if (digitService) {
         digitService.clearCallState(callSid);
       }
@@ -7003,6 +7140,7 @@ app.ws("/vonage/stream", async (ws, req) => {
             attempt_id: activeExpectation?.attempt_id || null,
             plan_id: activeExpectation?.plan_id || null,
             plan_step_index: activeExpectation?.plan_step_index || null,
+            channel_session_id: activeExpectation?.channel_session_id || null,
           },
         );
         await digitService.handleCollectionResult(
@@ -7103,6 +7241,7 @@ app.ws("/vonage/stream", async (ws, req) => {
     });
 
     ws.on("close", async () => {
+      transcriptionService.close();
       const session = activeCalls.get(callSid);
       if (session?.startTime) {
         await handleCallEnd(callSid, session.startTime);
@@ -7282,6 +7421,7 @@ app.ws("/aws/stream", (ws, req) => {
             attempt_id: activeExpectation?.attempt_id || null,
             plan_id: activeExpectation?.plan_id || null,
             plan_step_index: activeExpectation?.plan_step_index || null,
+            channel_session_id: activeExpectation?.channel_session_id || null,
           },
         );
         await digitService.handleCollectionResult(
@@ -7365,6 +7505,7 @@ app.ws("/aws/stream", (ws, req) => {
     });
 
     ws.on("close", async () => {
+      transcriptionService.close();
       const session = activeCalls.get(callSid);
       if (session?.startTime) {
         await handleCallEnd(callSid, session.startTime);
@@ -7912,490 +8053,6 @@ async function handleTwilioIncoming(req, res) {
 app.post("/incoming", handleTwilioIncoming);
 app.get("/incoming", handleTwilioIncoming);
 
-// Telegram callback webhook (live console actions)
-app.post("/webhook/telegram", async (req, res) => {
-  try {
-    if (!requireValidTelegramWebhook(req, res, "/webhook/telegram")) {
-      return;
-    }
-    const update = req.body;
-    res.status(200).send("OK");
-
-    if (!update) return;
-    const cb = update.callback_query;
-    if (!cb?.data) return;
-
-    const parts = cb.data.split(":");
-    const prefix = parts[0];
-    let action = null;
-    let callSid = null;
-    if (prefix === "lc") {
-      action = parts[1];
-      callSid = parts[2];
-    } else if (prefix === "recap" || prefix === "retry") {
-      action = parts[1];
-      callSid = parts[2];
-    } else {
-      callSid = parts[1];
-    }
-    if (!prefix || !callSid || (prefix === "lc" && !action)) {
-      webhookService
-        .answerCallbackQuery(cb.id, "Unsupported action")
-        .catch(() => {});
-      return;
-    }
-
-    if (prefix === "retry") {
-      const retryAction = action;
-      try {
-        const callRecord = await db.getCall(callSid).catch(() => null);
-        const chatId = cb.message?.chat?.id;
-        if (!callRecord) {
-          webhookService
-            .answerCallbackQuery(cb.id, "Call not found")
-            .catch(() => {});
-          return;
-        }
-        if (
-          callRecord.user_chat_id &&
-          chatId &&
-          String(callRecord.user_chat_id) !== String(chatId)
-        ) {
-          webhookService
-            .answerCallbackQuery(cb.id, "Not authorized for this call")
-            .catch(() => {});
-          return;
-        }
-
-        if (retryAction === "sms") {
-          if (!callRecord?.phone_number) {
-            webhookService
-              .answerCallbackQuery(cb.id, "No phone number on record")
-              .catch(() => {});
-            return;
-          }
-          const callState = await db
-            .getLatestCallState(callSid, "call_created")
-            .catch(() => null);
-          const smsBody = buildRetrySmsBody(callRecord, callState);
-          try {
-            await smsService.sendSMS(callRecord.phone_number, smsBody);
-            webhookService
-              .answerCallbackQuery(cb.id, "SMS sent")
-              .catch(() => {});
-            await webhookService.sendTelegramMessage(
-              chatId,
-              "💬 Follow-up SMS sent to the victim.",
-            );
-          } catch (smsError) {
-            webhookService
-              .answerCallbackQuery(cb.id, "Failed to send SMS")
-              .catch(() => {});
-            await webhookService.sendTelegramMessage(
-              chatId,
-              `❌ Failed to send follow-up SMS: ${smsError.message || smsError}`,
-            );
-          }
-          return;
-        }
-
-        const payload = await buildRetryPayload(callSid);
-        const delayMs = retryAction === "15m" ? 15 * 60 * 1000 : 0;
-
-        if (delayMs > 0) {
-          const runAt = new Date(Date.now() + delayMs).toISOString();
-          await scheduleCallJob("outbound_call", payload, runAt);
-          await db
-            .updateCallState(callSid, "retry_scheduled", {
-              at: new Date().toISOString(),
-              run_at: runAt,
-            })
-            .catch(() => {});
-          webhookService
-            .answerCallbackQuery(cb.id, "Retry scheduled")
-            .catch(() => {});
-          await webhookService.sendTelegramMessage(
-            chatId,
-            `⏲ Retry scheduled in 15 minutes for ${formatContactLabel(payload)}.`,
-          );
-          return;
-        }
-
-        const retryResult = await placeOutboundCall(payload);
-        webhookService
-          .answerCallbackQuery(cb.id, "Retry started")
-          .catch(() => {});
-        await webhookService.sendTelegramMessage(
-          chatId,
-          `🔁 Retry started for ${formatContactLabel(payload)} (call ${retryResult.callId.slice(-6)}).`,
-        );
-      } catch (error) {
-        webhookService
-          .answerCallbackQuery(cb.id, "Retry failed")
-          .catch(() => {});
-        await webhookService.sendTelegramMessage(
-          cb.message?.chat?.id,
-          `❌ Retry failed: ${error.message || error}`,
-        );
-      }
-      return;
-    }
-
-    if (prefix === "recap") {
-      try {
-        const callRecord = await db.getCall(callSid).catch(() => null);
-        const chatId = cb.message?.chat?.id;
-        if (
-          callRecord?.user_chat_id &&
-          chatId &&
-          String(callRecord.user_chat_id) !== String(chatId)
-        ) {
-          webhookService
-            .answerCallbackQuery(cb.id, "Not authorized for this call")
-            .catch(() => {});
-          return;
-        }
-
-        const recapAction = parts[1];
-        if (recapAction === "skip") {
-          webhookService.answerCallbackQuery(cb.id, "Skipped").catch(() => {});
-          return;
-        }
-
-        if (recapAction === "sms") {
-          if (!callRecord?.phone_number) {
-            webhookService
-              .answerCallbackQuery(cb.id, "No phone number on record")
-              .catch(() => {});
-            return;
-          }
-
-          const smsBody = buildRecapSmsBody(callRecord);
-          try {
-            await smsService.sendSMS(callRecord.phone_number, smsBody);
-            webhookService
-              .answerCallbackQuery(cb.id, "Recap sent via SMS")
-              .catch(() => {});
-            await webhookService.sendTelegramMessage(
-              chatId,
-              "📩 Recap sent via SMS to the victim.",
-            );
-          } catch (smsError) {
-            webhookService
-              .answerCallbackQuery(cb.id, "Failed to send SMS")
-              .catch(() => {});
-            await webhookService.sendTelegramMessage(
-              chatId,
-              `❌ Failed to send recap SMS: ${smsError.message || smsError}`,
-            );
-          }
-          return;
-        }
-      } catch (error) {
-        webhookService
-          .answerCallbackQuery(cb.id, "Error handling recap")
-          .catch(() => {});
-      }
-      return;
-    }
-
-    const callRecord = await db.getCall(callSid).catch(() => null);
-    const chatId = cb.message?.chat?.id;
-    if (
-      callRecord?.user_chat_id &&
-      chatId &&
-      String(callRecord.user_chat_id) !== String(chatId)
-    ) {
-      webhookService
-        .answerCallbackQuery(cb.id, "Not authorized for this call")
-        .catch(() => {});
-      return;
-    }
-    const callState = await db
-      .getLatestCallState(callSid, "call_created")
-      .catch(() => null);
-
-    if (prefix === "tr") {
-      webhookService
-        .answerCallbackQuery(cb.id, "Sending transcript...")
-        .catch(() => {});
-      await webhookService.sendFullTranscript(
-        callSid,
-        chatId,
-        cb.message?.message_id,
-      );
-      return;
-    }
-
-    if (prefix === "rca") {
-      webhookService
-        .answerCallbackQuery(cb.id, "Fetching recording…")
-        .catch(() => {});
-      try {
-        await db.updateCallState(callSid, "recording_access_requested", {
-          at: new Date().toISOString(),
-        });
-      } catch (stateError) {
-        console.error("Failed to log recording access request:", stateError);
-      }
-      await webhookService.sendTelegramMessage(
-        chatId,
-        "🎧 Recording is being prepared. You will receive it here if available.",
-      );
-      return;
-    }
-
-    if (action === "answer" || action === "decline") {
-      webhookService
-        .answerCallbackQuery(cb.id, "Answer/decline is managed by admin controls")
-        .catch(() => {});
-      return;
-    }
-
-    if (action === "privacy") {
-      const redacted = webhookService.togglePreviewRedaction(callSid);
-      if (redacted === null) {
-        webhookService
-          .answerCallbackQuery(cb.id, "Console not active")
-          .catch(() => {});
-        return;
-      }
-      const label = redacted ? "Preview hidden" : "Preview revealed";
-      await logConsoleAction(callSid, "privacy", { redacted });
-      webhookService.answerCallbackQuery(cb.id, label).catch(() => {});
-      return;
-    }
-
-    if (action === "actions") {
-      const expanded = webhookService.toggleConsoleActions(callSid);
-      if (expanded === null) {
-        webhookService
-          .answerCallbackQuery(cb.id, "Console not active")
-          .catch(() => {});
-        return;
-      }
-      webhookService
-        .answerCallbackQuery(
-          cb.id,
-          expanded ? "Actions expanded" : "Actions hidden",
-        )
-        .catch(() => {});
-      return;
-    }
-
-    if (action === "sms") {
-      if (!callRecord?.phone_number) {
-        webhookService
-          .answerCallbackQuery(cb.id, "No phone number on record")
-          .catch(() => {});
-        return;
-      }
-      webhookService.lockConsoleButtons(callSid, "Sending SMS…");
-      try {
-        const inbound = callState?.inbound === true;
-        const smsBody = inbound
-          ? buildInboundSmsBody(callRecord, callState)
-          : buildRetrySmsBody(callRecord, callState);
-        await smsService.sendSMS(callRecord.phone_number, smsBody);
-        webhookService.addLiveEvent(callSid, "💬 Follow-up SMS sent", {
-          force: true,
-        });
-        await logConsoleAction(callSid, "sms", {
-          inbound,
-          to: callRecord.phone_number,
-        });
-        webhookService.answerCallbackQuery(cb.id, "SMS sent").catch(() => {});
-      } catch (smsError) {
-        webhookService
-          .answerCallbackQuery(cb.id, "Failed to send SMS")
-          .catch(() => {});
-        await webhookService.sendTelegramMessage(
-          chatId,
-          `❌ Failed to send follow-up SMS: ${smsError.message || smsError}`,
-        );
-      } finally {
-        setTimeout(() => webhookService.unlockConsoleButtons(callSid), 1000);
-      }
-      return;
-    }
-
-    if (action === "callback") {
-      if (!callRecord?.phone_number) {
-        webhookService
-          .answerCallbackQuery(cb.id, "No phone number on record")
-          .catch(() => {});
-        return;
-      }
-      webhookService.lockConsoleButtons(callSid, "Scheduling…");
-      try {
-        const delayMin = Math.max(
-          1,
-          Number(config.inbound?.callbackDelayMinutes) || 15,
-        );
-        const runAt = new Date(Date.now() + delayMin * 60 * 1000).toISOString();
-        const payload = buildCallbackPayload(callRecord, callState);
-        await scheduleCallJob("callback_call", payload, runAt);
-        webhookService.addLiveEvent(
-          callSid,
-          `⏲ Callback scheduled in ${delayMin}m`,
-          { force: true },
-        );
-        await logConsoleAction(callSid, "callback_scheduled", {
-          run_at: runAt,
-        });
-        webhookService
-          .answerCallbackQuery(cb.id, "Callback scheduled")
-          .catch(() => {});
-      } catch (callbackError) {
-        webhookService
-          .answerCallbackQuery(cb.id, "Failed to schedule callback")
-          .catch(() => {});
-      } finally {
-        setTimeout(() => webhookService.unlockConsoleButtons(callSid), 1000);
-      }
-      return;
-    }
-
-    if (action === "block" || action === "allow" || action === "spam") {
-      if (!callRecord?.phone_number) {
-        webhookService
-          .answerCallbackQuery(cb.id, "No phone number on record")
-          .catch(() => {});
-        return;
-      }
-      const status =
-        action === "block"
-          ? "blocked"
-          : action === "allow"
-            ? "allowed"
-            : "spam";
-      const flagPhone =
-        normalizePhoneForFlag(callRecord.phone_number) ||
-        callRecord.phone_number;
-      webhookService.lockConsoleButtons(callSid, "Saving…");
-      try {
-        await db.setCallerFlag(flagPhone, status, {
-          updated_by: chatId,
-          source: "telegram",
-        });
-        webhookService.setCallerFlag(callSid, status);
-        webhookService.addLiveEvent(callSid, `📛 Caller marked ${status}`, {
-          force: true,
-        });
-        await logConsoleAction(callSid, "caller_flag", {
-          status,
-          phone_number: flagPhone,
-        });
-        webhookService
-          .answerCallbackQuery(cb.id, `Caller ${status}`)
-          .catch(() => {});
-      } catch (flagError) {
-        webhookService
-          .answerCallbackQuery(cb.id, "Failed to update caller flag")
-          .catch(() => {});
-      } finally {
-        setTimeout(() => webhookService.unlockConsoleButtons(callSid), 1000);
-      }
-      return;
-    }
-
-    if (action === "rec") {
-      webhookService.lockConsoleButtons(callSid, "Recording…");
-      try {
-        await db.updateCallState(callSid, "recording_requested", {
-          at: new Date().toISOString(),
-        });
-        webhookService.addLiveEvent(callSid, "⏺ Recording requested", {
-          force: true,
-        });
-        await logConsoleAction(callSid, "recording");
-        webhookService
-          .answerCallbackQuery(cb.id, "Recording toggled")
-          .catch(() => {});
-      } catch (e) {
-        webhookService
-          .answerCallbackQuery(cb.id, `Failed: ${e.message}`.slice(0, 180))
-          .catch(() => {});
-      }
-      setTimeout(() => webhookService.unlockConsoleButtons(callSid), 1200);
-      return;
-    }
-
-    if (action === "compact") {
-      const isCompact = webhookService.toggleConsoleCompact(callSid);
-      if (isCompact === null) {
-        webhookService
-          .answerCallbackQuery(cb.id, "Console not active")
-          .catch(() => {});
-        return;
-      }
-      await logConsoleAction(callSid, "compact", { compact: isCompact });
-      webhookService
-        .answerCallbackQuery(
-          cb.id,
-          isCompact ? "Compact view enabled" : "Full view enabled",
-        )
-        .catch(() => {});
-      return;
-    }
-
-    if (action === "end") {
-      webhookService.lockConsoleButtons(callSid, "Ending…");
-      try {
-        await endCallForProvider(callSid);
-        webhookService.setLiveCallPhase(callSid, "ended").catch(() => {});
-        await logConsoleAction(callSid, "end");
-        webhookService
-          .answerCallbackQuery(cb.id, "Ending call...")
-          .catch(() => {});
-      } catch (e) {
-        webhookService
-          .answerCallbackQuery(cb.id, `Failed: ${e.message}`.slice(0, 180))
-          .catch(() => {});
-        webhookService.unlockConsoleButtons(callSid);
-      }
-      setTimeout(() => webhookService.unlockConsoleButtons(callSid), 1500);
-      return;
-    }
-
-    if (action === "xfer") {
-      if (!config.twilio.transferNumber) {
-        webhookService
-          .answerCallbackQuery(cb.id, "Transfer not configured")
-          .catch(() => {});
-        return;
-      }
-      webhookService.lockConsoleButtons(callSid, "Transferring…");
-      try {
-        const transferCall = require("./functions/transferCall");
-        await transferCall({ callSid });
-        webhookService
-          .markToolInvocation(callSid, "transferCall")
-          .catch(() => {});
-        await logConsoleAction(callSid, "transfer");
-        webhookService
-          .answerCallbackQuery(cb.id, "Transferring...")
-          .catch(() => {});
-      } catch (e) {
-        webhookService
-          .answerCallbackQuery(
-            cb.id,
-            `Transfer failed: ${e.message}`.slice(0, 180),
-          )
-          .catch(() => {});
-        webhookService.unlockConsoleButtons(callSid);
-      }
-      setTimeout(() => webhookService.unlockConsoleButtons(callSid), 2000);
-      return;
-    }
-  } catch (error) {
-    try {
-      res.status(200).send("OK");
-    } catch {}
-    console.error("Telegram webhook error:", error);
-  }
-});
-
 function buildVonageUnavailableNcco() {
   return [
     {
@@ -8405,330 +8062,6 @@ function buildVonageUnavailableNcco() {
     { action: "hangup" },
   ];
 }
-
-const handleVonageAnswer = async (req, res) => {
-  if (!requireValidVonageWebhook(req, res, req.path || "/answer")) {
-    return;
-  }
-  try {
-    const payload = getVonageCallPayload(req);
-    const resolvedCallSid = await resolveVonageCallSid(req, payload);
-    let callSid = resolvedCallSid;
-    const vonageUuid =
-      req.query?.uuid || req.query?.conversation_uuid || req.query?.vonage_uuid;
-    let synthesizedInbound = false;
-    if (!callSid && vonageUuid) {
-      // Inbound Vonage callbacks do not include our internal callSid.
-      callSid = buildVonageInboundCallSid(vonageUuid);
-      synthesizedInbound = true;
-    }
-    const existingCallConfig = callSid ? callConfigurations.get(callSid) : null;
-    let isInbound;
-    if (typeof existingCallConfig?.inbound === "boolean") {
-      isInbound = existingCallConfig.inbound;
-    } else if (synthesizedInbound || String(callSid || "").startsWith("vonage-in-")) {
-      isInbound = true;
-    } else if (payload.direction) {
-      isInbound = !isOutboundVonageDirection(payload.direction);
-    } else {
-      // If callSid is known but no direction hint exists, default to outbound.
-      isInbound = false;
-    }
-
-    if (callSid && vonageUuid) {
-      rememberVonageCallMapping(callSid, vonageUuid, "answer");
-    }
-    if (callSid) {
-      if (isInbound) {
-        await refreshInboundDefaultScript();
-      }
-      let setup =
-        existingCallConfig && callFunctionSystems.get(callSid)
-          ? {
-              callConfig: existingCallConfig,
-              functionSystem: callFunctionSystems.get(callSid),
-            }
-          : null;
-      if (!setup && !isInbound) {
-        const hydrated = await hydrateCallConfigFromDb(callSid);
-        if (hydrated?.callConfig && hydrated?.functionSystem) {
-          setup = hydrated;
-        }
-      }
-      if (!setup) {
-        setup = ensureCallSetup(callSid, payload, {
-          provider: "vonage",
-          inbound: isInbound,
-        });
-      }
-      if (setup?.callConfig) {
-        if (!setup.callConfig.provider_metadata) {
-          setup.callConfig.provider_metadata = {};
-        }
-        setup.callConfig.provider = "vonage";
-        setup.callConfig.inbound = isInbound;
-        if (vonageUuid) {
-          setup.callConfig.provider_metadata.vonage_uuid = String(vonageUuid);
-        }
-        callConfigurations.set(callSid, setup.callConfig);
-      }
-      callDirections.set(callSid, isInbound ? "inbound" : "outbound");
-
-      if (isInbound) {
-        const callRecord = await ensureCallRecord(
-          callSid,
-          payload,
-          "vonage_answer",
-          {
-            provider: "vonage",
-            inbound: true,
-          },
-        );
-        const chatId = callRecord?.user_chat_id || config.telegram?.adminChatId;
-        const callerLookup = callRecord?.phone_number
-          ? normalizePhoneForFlag(callRecord.phone_number) || callRecord.phone_number
-          : null;
-        let callerFlag = null;
-        if (callerLookup && db?.getCallerFlag) {
-          callerFlag = await db.getCallerFlag(callerLookup).catch(() => null);
-        }
-        if (callerFlag?.status === "blocked") {
-          if (db?.updateCallState) {
-            await db
-              .updateCallState(callSid, "caller_blocked", {
-                at: new Date().toISOString(),
-                phone_number: callerLookup || callRecord?.phone_number || null,
-                status: callerFlag.status,
-                note: callerFlag.note || null,
-                provider: "vonage",
-              })
-              .catch(() => {});
-          }
-          return res.json(
-            buildVonageTalkHangupNcco("We cannot take your call at this time."),
-          );
-        }
-        if (callerFlag?.status !== "allowed") {
-          const rateLimit = shouldRateLimitInbound(req, payload || {});
-          if (rateLimit.limited) {
-            if (db?.updateCallState) {
-              await db.updateCallState(callSid, "inbound_rate_limited", {
-                at: new Date().toISOString(),
-                key: rateLimit.key,
-                count: rateLimit.count,
-                reset_at: rateLimit.resetAt,
-                provider: "vonage",
-              })
-                .catch(() => {});
-            }
-            return res.json(
-              buildVonageTalkHangupNcco(
-                "We are experiencing high call volume. Please try again later.",
-              ),
-            );
-          }
-        }
-        if (chatId) {
-          webhookService
-            .sendCallStatusUpdate(callSid, "ringing", chatId, {
-              status_source: "vonage_inbound",
-            })
-            .catch(() => {});
-          webhookService.setInboundGate(callSid, "answered", { chatId });
-        }
-      }
-    }
-
-    const wsUrl = callSid
-      ? buildVonageWebsocketUrl(req, callSid, {
-          uuid: vonageUuid || undefined,
-          direction: isInbound ? "inbound" : "outbound",
-          from: payload.from || undefined,
-          to: payload.to || undefined,
-        })
-      : "";
-    if (!callSid || !wsUrl) {
-      console.warn("Vonage answer callback missing callSid/host", {
-        callSid: callSid || null,
-        uuid: vonageUuid || null,
-        host: resolveHost(req) || null,
-      });
-      return res.json(buildVonageUnavailableNcco());
-    }
-
-    const connectAction = {
-      action: "connect",
-      endpoint: [
-        {
-          type: "websocket",
-          uri: wsUrl,
-          "content-type": getVonageWebsocketContentType(),
-        },
-      ],
-    };
-    const eventUrl = buildVonageEventWebhookUrl(req, callSid, {
-      uuid: vonageUuid || undefined,
-      direction: isInbound ? "inbound" : "outbound",
-    });
-    if (eventUrl) {
-      // Vonage connect action supports explicit event URL/method for action callbacks.
-      connectAction.eventUrl = [eventUrl];
-      connectAction.eventMethod = "POST";
-    }
-
-    return res.json([connectAction]);
-  } catch (error) {
-    console.error("Vonage answer callback error:", error);
-    return res.json(buildVonageUnavailableNcco());
-  }
-};
-
-const handleVonageEvent = async (req, res) => {
-  if (!requireValidVonageWebhook(req, res, req.path || "/event")) {
-    return;
-  }
-  try {
-    const payload = req.body || {};
-    const normalizedPayload = getVonageCallPayload(req, payload);
-    const { uuid, status } = payload;
-    const dtmfDigits = getVonageDtmfDigits(payload);
-    const durationRaw =
-      payload.duration ||
-      payload.conversation_duration ||
-      payload.usage_duration ||
-      payload.call_duration;
-    let callSid = await resolveVonageCallSid(req, payload);
-    if (!callSid && uuid && !isOutboundVonageDirection(normalizedPayload.direction)) {
-      // Accept inbound events even when Vonage does not provide a custom callSid.
-      callSid = buildVonageInboundCallSid(uuid);
-      if (callSid) {
-        const existingConfig = callConfigurations.get(callSid);
-        if (!existingConfig) {
-          ensureCallSetup(callSid, normalizedPayload, {
-            provider: "vonage",
-            inbound: true,
-          });
-        }
-      }
-    }
-    if (callSid && uuid) {
-      rememberVonageCallMapping(callSid, uuid, "event");
-    }
-
-    if (callSid && dtmfDigits) {
-      const existingConfig = callConfigurations.get(callSid);
-      if (!existingConfig) {
-        ensureCallSetup(callSid, normalizedPayload, {
-          provider: "vonage",
-          inbound: callDirections.get(callSid) !== "outbound",
-        });
-      }
-      await handleExternalDtmfInput(callSid, dtmfDigits, {
-        source: "vonage_webhook_dtmf",
-        provider: "vonage",
-      });
-    } else if (dtmfDigits && !callSid) {
-      console.warn("Vonage DTMF event received without resolvable callSid", {
-        uuid: uuid || null,
-        digits_length: dtmfDigits.length,
-      });
-    }
-
-    const statusMap = {
-      started: { status: "initiated", notification: "call_initiated" },
-      ringing: { status: "ringing", notification: "call_ringing" },
-      answered: { status: "answered", notification: "call_answered" },
-      completed: { status: "completed", notification: "call_completed" },
-      rejected: { status: "canceled", notification: "call_canceled" },
-      busy: { status: "busy", notification: "call_busy" },
-      failed: { status: "failed", notification: "call_failed" },
-      unanswered: { status: "no-answer", notification: "call_no_answer" },
-      timeout: { status: "no-answer", notification: "call_no_answer" },
-      cancelled: { status: "canceled", notification: "call_canceled" },
-    };
-
-    const mapped = statusMap[String(status || "").toLowerCase()];
-    if (callSid && mapped) {
-      const parsedDuration = parseInt(durationRaw, 10);
-      await recordCallStatus(callSid, mapped.status, mapped.notification, {
-        duration: Number.isFinite(parsedDuration) ? parsedDuration : undefined,
-      });
-      if (mapped.status === "completed") {
-        const session = activeCalls.get(callSid);
-        if (session?.startTime) {
-          await handleCallEnd(callSid, session.startTime);
-        }
-        activeCalls.delete(callSid);
-        clearVonageCallMappings(callSid);
-      }
-    }
-
-    if (!callSid) {
-      console.warn("Vonage event callback could not resolve internal callSid", {
-        uuid: uuid || null,
-        status: status || null,
-      });
-    }
-
-    res.status(200).send("OK");
-  } catch (error) {
-    console.error("Vonage webhook error:", error);
-    res.status(200).send("OK");
-  }
-};
-
-app.get("/webhook/vonage/answer", handleVonageAnswer);
-app.get("/answer", handleVonageAnswer);
-
-app.post("/webhook/vonage/event", handleVonageEvent);
-app.post("/event", handleVonageEvent);
-
-app.post("/webhook/aws/status", async (req, res) => {
-  try {
-    if (!requireValidAwsWebhook(req, res, "/webhook/aws/status")) {
-      return;
-    }
-    const { contactId, status, duration, callSid } = req.body || {};
-    const resolvedCallSid =
-      callSid || (contactId ? awsContactMap.get(contactId) : null);
-    if (!resolvedCallSid) {
-      return res.status(200).send("OK");
-    }
-
-    const normalized = String(status || "").toLowerCase();
-    const map = {
-      initiated: { status: "initiated", notification: "call_initiated" },
-      connected: { status: "answered", notification: "call_answered" },
-      ended: { status: "completed", notification: "call_completed" },
-      failed: { status: "failed", notification: "call_failed" },
-      no_answer: { status: "no-answer", notification: "call_no_answer" },
-      busy: { status: "busy", notification: "call_busy" },
-    };
-    const mapped = map[normalized];
-    if (mapped) {
-      await recordCallStatus(
-        resolvedCallSid,
-        mapped.status,
-        mapped.notification,
-        {
-          duration: duration ? parseInt(duration, 10) : undefined,
-        },
-      );
-      if (mapped.status === "completed") {
-        const session = activeCalls.get(resolvedCallSid);
-        if (session?.startTime) {
-          await handleCallEnd(resolvedCallSid, session.startTime);
-        }
-        activeCalls.delete(resolvedCallSid);
-      }
-    }
-
-    res.status(200).send("OK");
-  } catch (error) {
-    console.error("AWS status webhook error:", error);
-    res.status(200).send("OK");
-  }
-});
 
 app.post("/aws/transcripts", async (req, res) => {
   try {
@@ -10113,7 +9446,9 @@ async function placeOutboundCall(payload, hostOverride = null) {
       );
     }
 
-    console.log(`Enhanced adaptive call created: ${callId} to ${number}`);
+    console.log(
+      `Enhanced adaptive call created: ${callId} to ${maskPhoneForLog(number)}`,
+    );
     console.log(
       `Business context: ${functionSystem.context.industry} - ${functionSystem.context.businessType}`,
     );
@@ -10121,60 +9456,13 @@ async function placeOutboundCall(payload, hostOverride = null) {
     console.error("Database error:", dbError);
   }
 
-  return { callId, callStatus, functionSystem };
+  return {
+    callId,
+    callStatus,
+    functionSystem,
+    provider: selectedProvider || currentProvider,
+  };
 }
-
-// Enhanced outbound call endpoint with dynamic function generation
-app.post("/outbound-call", async (req, res) => {
-  try {
-    const resolvedCustomerName =
-      req.body?.customer_name ?? req.body?.victim_name ?? null;
-    const payload = {
-      number: req.body?.number,
-      prompt: req.body?.prompt,
-      first_message: req.body?.first_message,
-      user_chat_id: req.body?.user_chat_id,
-      customer_name: resolvedCustomerName,
-      business_id: req.body?.business_id,
-      script: req.body?.script,
-      script_id: req.body?.script_id,
-      purpose: req.body?.purpose,
-      emotion: req.body?.emotion,
-      urgency: req.body?.urgency,
-      technical_level: req.body?.technical_level,
-      voice_model: req.body?.voice_model,
-      collection_profile: req.body?.collection_profile,
-      collection_expected_length: req.body?.collection_expected_length,
-      collection_timeout_s: req.body?.collection_timeout_s,
-      collection_max_retries: req.body?.collection_max_retries,
-      collection_mask_for_gpt: req.body?.collection_mask_for_gpt,
-      collection_speak_confirmation: req.body?.collection_speak_confirmation,
-    };
-
-    const host = resolveHost(req) || config.server?.hostname;
-    const result = await placeOutboundCall(payload, host);
-
-    res.json({
-      success: true,
-      call_sid: result.callId,
-      to: payload.number,
-      status: result.callStatus,
-      provider: currentProvider,
-      business_context: result.functionSystem.context,
-      generated_functions: result.functionSystem.functions.length,
-      function_types: result.functionSystem.functions.map(
-        (f) => f.function.name,
-      ),
-      enhanced_webhooks: true,
-    });
-  } catch (error) {
-    console.error("Error creating enhanced adaptive outbound call:", error);
-    res.status(500).json({
-      error: "Failed to create outbound call",
-      details: error.message,
-    });
-  }
-});
 
 async function processCallStatusWebhookPayload(payload = {}, options = {}) {
   const {
@@ -10345,7 +9633,9 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
   const finalStatus = applyStatus
     ? actualStatus
     : normalizeCallStatus(priorStatus || actualStatus);
-  const finalNotificationType = applyStatus ? notificationType : null;
+  const statusChanged = normalizeCallStatus(priorStatus) !== finalStatus;
+  const finalNotificationType =
+    applyStatus && statusChanged ? notificationType : null;
 
   if (applyStatus && actualStatus === "ringing") {
     try {
@@ -10404,7 +9694,7 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
   }
 
   await db.updateCallStatus(CallSid, finalStatus, updateData);
-  if (applyStatus) {
+  if (applyStatus && statusChanged) {
     recordCallLifecycle(CallSid, finalStatus, {
       source,
       raw_status: CallStatus,
@@ -10480,83 +9770,6 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
     voicemailDetected,
   };
 }
-
-// Enhanced webhook endpoint for call status updates
-app.post("/webhook/call-status", async (req, res) => {
-  try {
-    if (!requireValidTwilioSignature(req, res, "/webhook/call-status")) {
-      return;
-    }
-    await processCallStatusWebhookPayload(req.body, { source: "provider" });
-  } catch (error) {
-    console.error("Error processing fixed call status webhook:", error);
-
-    // Log error to service health
-    try {
-      await db.logServiceHealth("webhook_system", "error", {
-        operation: "process_webhook",
-        error: error.message,
-        call_sid: req.body?.CallSid,
-      });
-    } catch (logError) {
-      console.error("Failed to log webhook error:", logError);
-    }
-  }
-  res.status(200).send("OK");
-});
-
-// Twilio Media Stream status callback
-app.post("/webhook/twilio-stream", (req, res) => {
-  try {
-    if (!requireValidTwilioSignature(req, res, "/webhook/twilio-stream")) {
-      return;
-    }
-    const payload = req.body || {};
-    const callSid = payload.CallSid || payload.callSid || "unknown";
-    const streamSid = payload.StreamSid || payload.streamSid || "unknown";
-    const eventType =
-      payload.EventType || payload.eventType || payload.event || "unknown";
-    const dedupeKey = `${callSid}:${streamSid}:${eventType}`;
-    const now = Date.now();
-    const lastSeen = streamStatusDedupe.get(dedupeKey);
-    if (!lastSeen || now - lastSeen > 2000) {
-      streamStatusDedupe.set(dedupeKey, now);
-      console.log("Twilio stream status", {
-        callSid,
-        streamSid,
-        eventType,
-        status: payload.StreamStatus || payload.streamStatus || null,
-      });
-    }
-
-    if (eventType === "start") {
-      if (callSid !== "unknown" && streamSid !== "unknown") {
-        const existing = activeStreamConnections.get(callSid);
-        if (!existing) {
-          activeStreamConnections.set(callSid, {
-            ws: null,
-            streamSid,
-            connectedAt: new Date().toISOString(),
-          });
-        }
-        db.updateCallState(callSid, "stream_status_start", {
-          stream_sid: streamSid,
-          at: new Date().toISOString(),
-        }).catch(() => {});
-      }
-    } else if (eventType === "end") {
-      if (callSid !== "unknown") {
-        db.updateCallState(callSid, "stream_status_end", {
-          stream_sid: streamSid,
-          at: new Date().toISOString(),
-        }).catch(() => {});
-      }
-    }
-  } catch (err) {
-    console.error("Twilio stream status webhook error:", err);
-  }
-  res.status(200).send("OK");
-});
 
 function escapeCsvValue(value) {
   if (value === null || value === undefined) return "";
@@ -10687,694 +9900,51 @@ async function applyScriptInjection(callSid, scriptId, userId) {
   return { ok: true, script };
 }
 
-// Enhanced API endpoints with adaptation analytics
-
-// Get call details with enhanced personality and function analytics
-app.get("/api/calls/:callSid", async (req, res) => {
-  try {
-    const { callSid } = req.params;
-
-    const call = await db.getCall(callSid);
-    if (!call) {
-      return res.status(404).json({ error: "Call not found" });
-    }
-    let callState = null;
-    try {
-      callState = await db.getLatestCallState(callSid, "call_created");
-    } catch (_) {
-      callState = null;
-    }
-    const enrichedCall =
-      callState?.customer_name || callState?.victim_name
-        ? {
-            ...call,
-            customer_name: callState?.customer_name || callState?.victim_name,
-          }
-        : call;
-    const normalizedCall = normalizeCallRecordForApi(enrichedCall);
-
-    const transcripts = await db.getCallTranscripts(callSid);
-
-    // Parse adaptation data
-    let adaptationData = {};
-    try {
-      if (call.ai_analysis) {
-        const analysis = JSON.parse(call.ai_analysis);
-        adaptationData = analysis.adaptation || {};
+function getInboundHealthContext() {
+  const inboundDefaultSummary = inboundDefaultScript
+    ? {
+        mode: "script",
+        script_id: inboundDefaultScriptId,
+        name: inboundDefaultScript.name,
       }
-    } catch (e) {
-      console.error("Error parsing adaptation data:", e);
-    }
-
-    // Get webhook notifications for this call
-    const webhookNotifications = await new Promise((resolve, reject) => {
-      db.db.all(
-        `SELECT * FROM webhook_notifications WHERE call_sid = ? ORDER BY created_at DESC`,
-        [callSid],
-        (err, rows) => {
-          if (err) reject(err);
-          else resolve(rows || []);
-        },
-      );
-    });
-
-    res.json({
-      call: normalizedCall,
-      transcripts,
-      transcript_count: transcripts.length,
-      adaptation_analytics: adaptationData,
-      business_context: call.business_context
-        ? JSON.parse(call.business_context)
-        : null,
-      webhook_notifications: webhookNotifications,
-      enhanced_features: true,
-    });
-  } catch (error) {
-    console.error("Error fetching enhanced adaptive call details:", error);
-    res.status(500).json({ error: "Failed to fetch call details" });
-  }
-});
-
-// Enhanced call status endpoint with real-time metrics
-app.get("/api/calls/:callSid/status", async (req, res) => {
-  try {
-    const { callSid } = req.params;
-
-    const call = await db.getCall(callSid);
-    if (!call) {
-      return res.status(404).json({ error: "Call not found" });
-    }
-
-    // Get recent call states for detailed progress tracking
-    const recentStates = await db.getCallStates(callSid, { limit: 15 });
-
-    // Get enhanced webhook notification status
-    const notificationStatus = await new Promise((resolve, reject) => {
-      db.db.all(
-        `SELECT notification_type, status, created_at, sent_at, delivery_time_ms, error_message 
-         FROM webhook_notifications 
-         WHERE call_sid = ? 
-         ORDER BY created_at DESC`,
-        [callSid],
-        (err, rows) => {
-          if (err) reject(err);
-          else resolve(rows || []);
-        },
-      );
-    });
-
-    // Calculate enhanced call timing metrics
-    let timingMetrics = {};
-    if (call.created_at) {
-      const now = new Date();
-      const created = new Date(call.created_at);
-      timingMetrics.total_elapsed = Math.round((now - created) / 1000);
-
-      if (call.started_at) {
-        const started = new Date(call.started_at);
-        timingMetrics.time_to_answer = Math.round((started - created) / 1000);
-      }
-
-      if (call.ended_at) {
-        const ended = new Date(call.ended_at);
-        timingMetrics.call_duration =
-          call.duration ||
-          Math.round(
-            (ended - new Date(call.started_at || call.created_at)) / 1000,
-          );
-      }
-
-      // Calculate ring duration if available
-      if (call.ring_duration) {
-        timingMetrics.ring_duration = call.ring_duration;
-      }
-    }
-
-    res.json({
-      call: {
-        ...call,
-        timing_metrics: timingMetrics,
-      },
-      recent_states: recentStates,
-      notification_status: notificationStatus,
-      webhook_service_status: webhookService.getCallStatusStats(),
-      enhanced_tracking: true,
-    });
-  } catch (error) {
-    console.error("Error fetching enhanced call status:", error);
-    res.status(500).json({ error: "Failed to fetch call status" });
-  }
-});
-
-// Call latency diagnostics endpoint (best-effort)
-// Manual notification trigger endpoint (for testing)
-// Get enhanced adaptation analytics dashboard data
-// Enhanced health endpoint with comprehensive system status
-app.get("/health", async (req, res) => {
-  try {
-    const hmacSecret = config.apiAuth?.hmacSecret;
-    const hmacOk = hmacSecret ? verifyHmacSignature(req).ok : false;
-    const adminOk = hasAdminToken(req);
-    if (!hmacOk && !adminOk) {
-      return res.json({
-        status: "healthy",
-        timestamp: new Date().toISOString(),
-        public: true,
-      });
-    }
-
-    const calls = await db.getCallsWithTranscripts(1);
-    const webhookHealth = await webhookService.healthCheck();
-    const callStats = webhookService.getCallStatusStats();
-    const notificationMetrics = await db.getNotificationAnalytics(1);
-    await refreshInboundDefaultScript();
-    const inboundDefaultSummary = inboundDefaultScript
-      ? {
-          mode: "script",
-          script_id: inboundDefaultScriptId,
-          name: inboundDefaultScript.name,
-        }
-      : { mode: "builtin" };
-    const inboundEnvSummary = {
-      prompt: Boolean(config.inbound?.defaultPrompt),
-      first_message: Boolean(config.inbound?.defaultFirstMessage),
-    };
-    const providerHealthSummary = SUPPORTED_PROVIDERS.reduce(
-      (acc, provider) => {
-        const health = providerHealth.get(provider) || {};
-        acc[provider] = {
-          configured: Boolean(getProviderReadiness()[provider]),
-          degraded: isProviderDegraded(provider),
-          last_error_at: health.lastErrorAt || null,
-          last_success_at: health.lastSuccessAt || null,
-        };
-        return acc;
-      },
-      {},
-    );
-    pruneExpiredKeypadProviderOverrides();
-    const keypadOverrideSummary = [...keypadProviderOverrides.entries()].map(
-      ([scopeKey, override]) => ({
-        scope_key: scopeKey,
-        provider: override?.provider || null,
-        expires_at: override?.expiresAt
-          ? new Date(override.expiresAt).toISOString()
-          : null,
-      }),
-    );
-
-    // Check service health logs
-    const recentHealthLogs = await new Promise((resolve, reject) => {
-      db.db.all(
-        `
-        SELECT service_name, status, COUNT(*) as count
-        FROM service_health_logs 
-        WHERE timestamp >= datetime('now', '-1 hour')
-        GROUP BY service_name, status
-        ORDER BY service_name
-      `,
-        (err, rows) => {
-          if (err) reject(err);
-          else resolve(rows || []);
-        },
-      );
-    });
-
-    res.json({
-      status: "healthy",
-      timestamp: new Date().toISOString(),
-      enhanced_features: true,
-      services: {
-        database: {
-          connected: true,
-          recent_calls: calls.length,
-        },
-        webhook_service: webhookHealth,
-        call_tracking: callStats,
-        notification_system: {
-          total_today: notificationMetrics.total_notifications,
-          success_rate: notificationMetrics.overall_success_rate + "%",
-          avg_delivery_time:
-            notificationMetrics.breakdown.length > 0
-              ? notificationMetrics.breakdown[0].avg_delivery_time + "ms"
-              : "N/A",
-        },
-        provider_failover: providerHealthSummary,
-        keypad_guard: {
-          enabled: config.keypadGuard?.enabled === true,
-          active_overrides: keypadOverrideSummary.length,
-          overrides: keypadOverrideSummary,
-        },
-      },
-      active_calls: callConfigurations.size,
-      adaptation_engine: {
-        available_scripts: functionEngine
-          ? functionEngine.getBusinessAnalysis().availableTemplates.length
-          : 0,
-        active_function_systems: callFunctionSystems.size,
-      },
-      inbound_defaults: inboundDefaultSummary,
-      inbound_env_defaults: inboundEnvSummary,
-      system_health: recentHealthLogs,
-    });
-  } catch (error) {
-    console.error("Enhanced health check error:", error);
-    res.status(500).json({
-      status: "unhealthy",
-      timestamp: new Date().toISOString(),
-      enhanced_features: true,
-      error: error.message,
-      services: {
-        database: {
-          connected: false,
-          error: error.message,
-        },
-        webhook_service: {
-          status: "error",
-          reason: "Database connection failed",
-        },
-      },
-    });
-  }
-});
-
-// Enhanced system maintenance endpoint
-// Basic calls list endpoint
-app.get("/api/calls", async (req, res) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit) || 10, 50); // Max 50 calls
-    const offset = parseInt(req.query.offset) || 0;
-
-    console.log(`Fetching calls list: limit=${limit}, offset=${offset}`);
-
-    // Get calls from database using the new method
-    const calls = await db.getRecentCalls(limit, offset);
-    const totalCount = await db.getCallsCount();
-
-    // Format the response with enhanced data
-    const formattedCalls = calls.map((call) => {
-      const normalized = normalizeCallRecordForApi(call);
-      return {
-        ...normalized,
-        transcript_count: call.transcript_count || 0,
-        created_date: new Date(call.created_at).toLocaleDateString(),
-        duration_formatted: call.duration
-          ? `${Math.floor(call.duration / 60)}:${String(call.duration % 60).padStart(2, "0")}`
-          : "N/A",
-        // Parse JSON fields safely
-        business_context: call.business_context
-          ? (() => {
-              try {
-                return JSON.parse(call.business_context);
-              } catch {
-                return null;
-              }
-            })()
-          : null,
-        generated_functions: call.generated_functions
-          ? (() => {
-              try {
-                return JSON.parse(call.generated_functions);
-              } catch {
-                return [];
-              }
-            })()
-          : [],
-      };
-    });
-
-    res.json({
-      success: true,
-      calls: formattedCalls,
-      pagination: {
-        total: totalCount,
-        limit: limit,
-        offset: offset,
-        has_more: offset + limit < totalCount,
-      },
-      enhanced_features: true,
-    });
-  } catch (error) {
-    console.error("Error fetching calls list:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to fetch calls list",
-      details: error.message,
-    });
-  }
-});
-
-// Enhanced calls list endpoint with filters
-app.get("/api/calls/list", async (req, res) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit) || 10, 50);
-    const offset = parseInt(req.query.offset) || 0;
-    const status = req.query.status; // Filter by status
-    const phone = req.query.phone; // Filter by phone number
-    const dateFrom = req.query.date_from; // Filter by date range
-    const dateTo = req.query.date_to;
-
-    let whereClause = "";
-    let queryParams = [];
-
-    // Build dynamic where clause
-    const conditions = [];
-
-    if (status) {
-      conditions.push("c.status = ?");
-      queryParams.push(status);
-    }
-
-    if (phone) {
-      conditions.push("c.phone_number LIKE ?");
-      queryParams.push(`%${phone}%`);
-    }
-
-    if (dateFrom) {
-      conditions.push("c.created_at >= ?");
-      queryParams.push(dateFrom);
-    }
-
-    if (dateTo) {
-      conditions.push("c.created_at <= ?");
-      queryParams.push(dateTo);
-    }
-
-    if (conditions.length > 0) {
-      whereClause = "WHERE " + conditions.join(" AND ");
-    }
-
-    const query = `
-      SELECT 
-        c.*,
-        COUNT(t.id) as transcript_count,
-        GROUP_CONCAT(DISTINCT t.speaker) as speakers,
-        MIN(t.timestamp) as conversation_start,
-        MAX(t.timestamp) as conversation_end
-      FROM calls c
-      LEFT JOIN transcripts t ON c.call_sid = t.call_sid
-      ${whereClause}
-      GROUP BY c.call_sid
-      ORDER BY c.created_at DESC
-      LIMIT ? OFFSET ?
-    `;
-
-    queryParams.push(limit, offset);
-
-    const calls = await new Promise((resolve, reject) => {
-      db.db.all(query, queryParams, (err, rows) => {
-        if (err) {
-          console.error("Database error in enhanced calls query:", err);
-          reject(err);
-        } else {
-          resolve(rows || []);
-        }
-      });
-    });
-
-    // Get filtered count
-    const countQuery = `SELECT COUNT(*) as count FROM calls c ${whereClause}`;
-    const totalCount = await new Promise((resolve, reject) => {
-      db.db.get(countQuery, queryParams.slice(0, -2), (err, row) => {
-        if (err) {
-          console.error("Database error counting filtered calls:", err);
-          resolve(0);
-        } else {
-          resolve(row?.count || 0);
-        }
-      });
-    });
-
-    // Enhanced formatting
-    const enhancedCalls = calls.map((call) => {
-      const hasConversation =
-        call.speakers &&
-        call.speakers.includes("user") &&
-        call.speakers.includes("ai");
-      const conversationDuration =
-        call.conversation_start && call.conversation_end
-          ? Math.round(
-              (new Date(call.conversation_end) -
-                new Date(call.conversation_start)) /
-                1000,
-            )
-          : 0;
-
-      return {
-        call_sid: call.call_sid,
-        phone_number: call.phone_number,
-        status: call.status,
-        twilio_status: call.twilio_status,
-        created_at: call.created_at,
-        started_at: call.started_at,
-        ended_at: call.ended_at,
-        duration: call.duration,
-        transcript_count: call.transcript_count || 0,
-        has_conversation: hasConversation,
-        conversation_duration: conversationDuration,
-        call_summary: call.call_summary,
-        user_chat_id: call.user_chat_id,
-        // Enhanced metadata
-        business_context: call.business_context
-          ? (() => {
-              try {
-                return JSON.parse(call.business_context);
-              } catch {
-                return null;
-              }
-            })()
-          : null,
-        generated_functions_count: call.generated_functions
-          ? (() => {
-              try {
-                return JSON.parse(call.generated_functions).length;
-              } catch {
-                return 0;
-              }
-            })()
-          : 0,
-        // Formatted fields
-        created_date: new Date(call.created_at).toLocaleDateString(),
-        created_time: new Date(call.created_at).toLocaleTimeString(),
-        duration_formatted: call.duration
-          ? `${Math.floor(call.duration / 60)}:${String(call.duration % 60).padStart(2, "0")}`
-          : "N/A",
-        status_icon: getStatusIcon(call.status),
-        enhanced: true,
-      };
-    });
-
-    res.json({
-      success: true,
-      calls: enhancedCalls,
-      filters: {
-        status,
-        phone,
-        date_from: dateFrom,
-        date_to: dateTo,
-      },
-      pagination: {
-        total: totalCount,
-        limit: limit,
-        offset: offset,
-        has_more: offset + limit < totalCount,
-        current_page: Math.floor(offset / limit) + 1,
-        total_pages: Math.ceil(totalCount / limit),
-      },
-      enhanced_features: true,
-    });
-  } catch (error) {
-    console.error("Error in enhanced calls list:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to fetch enhanced calls list",
-      details: error.message,
-    });
-  }
-});
-
-// Helper function for status icons
-function getStatusIcon(status) {
-  const icons = {
-    completed: "✅",
-    "no-answer": "📶",
-    busy: "📞",
-    failed: "❌",
-    canceled: "🎫",
-    "in-progress": "🔄",
-    ringing: "📲",
+    : { mode: "builtin" };
+  const inboundEnvSummary = {
+    prompt: Boolean(config.inbound?.defaultPrompt),
+    first_message: Boolean(config.inbound?.defaultFirstMessage),
   };
-  return icons[status] || "❓";
+  return { inboundDefaultSummary, inboundEnvSummary };
+}
+
+function safeJsonParse(value, fallback = null) {
+  if (value == null || value === "") return fallback;
+  if (typeof value === "object") return value;
+  try {
+    return JSON.parse(value);
+  } catch (_) {
+    return fallback;
+  }
 }
 
 function normalizeCallRecordForApi(call) {
   if (!call || typeof call !== "object") return call;
   const normalized = { ...call };
+  const rawStatus = normalized.status || normalized.twilio_status || "";
+  normalized.status_normalized = normalizeCallStatus(rawStatus);
+  normalized.duration = Number.isFinite(Number(normalized.duration))
+    ? Number(normalized.duration)
+    : 0;
+  normalized.digit_summary =
+    typeof normalized.digit_summary === "string" ? normalized.digit_summary : "";
+  normalized.digit_count = Number.isFinite(Number(normalized.digit_count))
+    ? Number(normalized.digit_count)
+    : 0;
+  normalized.business_context = safeJsonParse(normalized.business_context, null);
+  normalized.generated_functions = safeJsonParse(
+    normalized.generated_functions,
+    [],
+  );
   return normalized;
 }
-
-// Add calls analytics endpoint
-// Search calls endpoint
-app.get("/api/calls/search", async (req, res) => {
-  try {
-    const query = req.query.q;
-    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
-
-    if (!query || query.length < 2) {
-      return res.status(400).json({
-        success: false,
-        error: "Search query must be at least 2 characters",
-      });
-    }
-
-    // Search in calls and transcripts
-    const searchResults = await new Promise((resolve, reject) => {
-      const searchQuery = `
-        SELECT DISTINCT
-          c.*,
-          COUNT(t.id) as transcript_count,
-          GROUP_CONCAT(t.message, ' ') as conversation_text
-        FROM calls c
-        LEFT JOIN transcripts t ON c.call_sid = t.call_sid
-        WHERE 
-          c.phone_number LIKE ? OR
-          c.call_summary LIKE ? OR
-          c.prompt LIKE ? OR
-          c.first_message LIKE ? OR
-          t.message LIKE ?
-        GROUP BY c.call_sid
-        ORDER BY c.created_at DESC
-        LIMIT ?
-      `;
-
-      const searchTerm = `%${query}%`;
-      const params = [
-        searchTerm,
-        searchTerm,
-        searchTerm,
-        searchTerm,
-        searchTerm,
-        limit,
-      ];
-
-      db.db.all(searchQuery, params, (err, rows) => {
-        if (err) {
-          console.error("Search query error:", err);
-          reject(err);
-        } else {
-          resolve(rows || []);
-        }
-      });
-    });
-
-    const formattedResults = searchResults.map((call) => ({
-      call_sid: call.call_sid,
-      phone_number: call.phone_number,
-      status: call.status,
-      created_at: call.created_at,
-      duration: call.duration,
-      transcript_count: call.transcript_count || 0,
-      call_summary: call.call_summary,
-      // Highlight matching text (basic implementation)
-      matching_text: call.conversation_text
-        ? `${digitService ? digitService.maskOtpForExternal(call.conversation_text) : call.conversation_text}`.substring(
-            0,
-            200,
-          ) + "..."
-        : null,
-      created_date: new Date(call.created_at).toLocaleDateString(),
-      duration_formatted: call.duration
-        ? `${Math.floor(call.duration / 60)}:${String(call.duration % 60).padStart(2, "0")}`
-        : "N/A",
-    }));
-
-    res.json({
-      success: true,
-      query: query,
-      results: formattedResults,
-      result_count: formattedResults.length,
-      enhanced_search: true,
-    });
-  } catch (error) {
-    console.error("Error in call search:", error);
-    res.status(500).json({
-      success: false,
-      error: "Search failed",
-      details: error.message,
-    });
-  }
-});
-
-// SMS webhook endpoints
-app.post("/webhook/sms", async (req, res) => {
-  try {
-    if (!requireValidTwilioSignature(req, res, "/webhook/sms")) {
-      return;
-    }
-    const { From, Body, MessageSid, SmsStatus } = req.body;
-
-    console.log("sms_webhook_received", {
-      request_id: req.requestId || null,
-      from: maskPhoneForLog(From),
-      body: maskSmsBodyForLog(Body),
-      message_sid: MessageSid || null,
-    });
-
-    if (digitService?.handleIncomingSms) {
-      const handled = await digitService.handleIncomingSms(From, Body);
-      if (handled?.handled) {
-        res.status(200).send("OK");
-        return;
-      }
-    }
-
-    // Handle incoming SMS with AI
-    const result = await smsService.handleIncomingSMS(From, Body, MessageSid);
-
-    // Save to database if needed
-    if (db) {
-      await db.saveSMSMessage({
-        message_sid: MessageSid,
-        from_number: From,
-        body: Body,
-        status: SmsStatus,
-        direction: "inbound",
-        ai_response: result.ai_response,
-        response_message_sid: result.message_sid,
-      });
-    }
-
-    res.status(200).send("OK");
-  } catch (error) {
-    console.error("SMS webhook error:", error);
-    res.status(500).send("Error");
-  }
-});
-
-app.post("/webhook/sms-status", async (req, res) => {
-  try {
-    if (!requireValidTwilioSignature(req, res, "/webhook/sms-status")) {
-      return;
-    }
-    const { MessageSid, MessageStatus, ErrorCode, ErrorMessage } = req.body;
-
-    console.log(`SMS status update: ${MessageSid} -> ${MessageStatus}`);
-
-    if (db) {
-      await db.updateSMSStatus(MessageSid, {
-        status: MessageStatus,
-        error_code: ErrorCode,
-        error_message: ErrorMessage,
-        updated_at: new Date(),
-      });
-    }
-
-    res.status(200).send("OK");
-  } catch (error) {
-    console.error("SMS status webhook error:", error);
-    res.status(500).send("OK"); // Return OK to prevent retries
-  }
-});
 
 app.get("/webhook/twilio-tts", (req, res) => {
   const key = String(req.query?.key || "").trim();
@@ -11394,53 +9964,6 @@ app.get("/webhook/twilio-tts", (req, res) => {
   );
   res.type(entry.contentType || "audio/wav");
   res.send(entry.buffer);
-});
-
-// Email webhook endpoints
-app.post("/webhook/email", async (req, res) => {
-  try {
-    if (!emailService) {
-      return res
-        .status(500)
-        .json({ success: false, error: "Email service not initialized" });
-    }
-    const result = await emailService.handleProviderEvent(req.body || {});
-    res.json({ success: true, ...result });
-  } catch (error) {
-    console.error("❌ Email webhook error:", error);
-    res.status(500).json({
-      success: false,
-      error: "Email webhook processing failed",
-      details: error.message,
-    });
-  }
-});
-
-app.get("/webhook/email-unsubscribe", async (req, res) => {
-  try {
-    const email = String(req.query?.email || "")
-      .trim()
-      .toLowerCase();
-    const messageId = String(req.query?.message_id || "").trim();
-    if (!email) {
-      return res.status(400).send("Missing email");
-    }
-    await db.setEmailSuppression(email, "unsubscribe", "link");
-    if (messageId) {
-      await db.addEmailEvent(messageId, "complained", {
-        reason: "unsubscribe",
-      });
-      await db.updateEmailMessageStatus(messageId, {
-        status: "complained",
-        failure_reason: "unsubscribe",
-        failed_at: new Date().toISOString(),
-      });
-    }
-    res.send("Unsubscribed");
-  } catch (error) {
-    console.error("❌ Email unsubscribe error:", error);
-    res.status(500).send("Unsubscribe failed");
-  }
 });
 
 const twilioGatherHandler = createTwilioGatherHandler({
@@ -11468,7 +9991,7 @@ const twilioGatherHandler = createTwilioGatherHandler({
 });
 
 // Twilio Gather fallback handler (DTMF)
-app.post("/webhook/twilio-gather", twilioGatherHandler);
+const handleTwilioGatherWebhook = twilioGatherHandler;
 
 // Email API endpoints
 app.post("/email/send", requireOutboundAuthorization, async (req, res) => {
@@ -12553,6 +11076,12 @@ app.get("/api/sms/database-stats", async (req, res) => {
 app.get("/api/sms/status/:messageSid", async (req, res) => {
   try {
     const { messageSid } = req.params;
+    if (!isSafeId(messageSid, { max: 128 })) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid message identifier",
+      });
+    }
 
     const message = await new Promise((resolve, reject) => {
       db.db.get(
@@ -12671,64 +11200,105 @@ app.get(
   },
 );
 
-// SMS webhook delivery status notifications (enhanced)
-app.post("/webhook/sms-delivery", async (req, res) => {
-  try {
-    if (!requireValidTwilioSignature(req, res, "/webhook/sms-delivery")) {
-      return;
-    }
-    const { MessageSid, MessageStatus, ErrorCode, ErrorMessage, To, From } =
-      req.body;
+registerCallRoutes(app, {
+  requireOutboundAuthorization,
+  sendApiError,
+  resolveHost,
+  config,
+  placeOutboundCall,
+  buildErrorDetails,
+  getCurrentProvider: () => currentProvider,
+  getDb: () => db,
+  isSafeId,
+  normalizeCallRecordForApi,
+  buildDigitSummary,
+  parsePagination,
+  normalizeCallStatus,
+  normalizeDateFilter,
+  parseBoundedInteger,
+  getDigitService: () => digitService,
+});
 
-    console.log(`📱 SMS Delivery Status: ${MessageSid} -> ${MessageStatus}`);
+registerStatusRoutes(app, {
+  getDb: () => db,
+  isSafeId,
+  normalizeCallRecordForApi,
+  buildDigitSummary,
+  webhookService,
+  getProviderReadiness,
+  appVersion,
+  getCurrentProvider: () => currentProvider,
+  getCurrentSmsProvider: () => currentSmsProvider,
+  getCurrentEmailProvider: () => currentEmailProvider,
+  callConfigurations,
+  config,
+  verifyHmacSignature,
+  hasAdminToken,
+  refreshInboundDefaultScript,
+  getInboundHealthContext,
+  supportedProviders: SUPPORTED_PROVIDERS,
+  providerHealth,
+  isProviderDegraded,
+  pruneExpiredKeypadProviderOverrides,
+  keypadProviderOverrides,
+  functionEngine,
+  callFunctionSystems,
+});
 
-    // Update message status in database
-    if (db) {
-      await db.updateSMSStatus(MessageSid, {
-        status: MessageStatus,
-        error_code: ErrorCode,
-        error_message: ErrorMessage,
-      });
-
-      // Get the original message to find user_chat_id for notification
-      const message = await new Promise((resolve, reject) => {
-        db.db.get(
-          `SELECT * FROM sms_messages WHERE message_sid = ?`,
-          [MessageSid],
-          (err, row) => {
-            if (err) reject(err);
-            else resolve(row);
-          },
-        );
-      });
-
-      // Create webhook notification if user_chat_id exists
-      if (message && message.user_chat_id) {
-        const notificationType =
-          MessageStatus === "delivered"
-            ? "sms_delivered"
-            : MessageStatus === "failed"
-              ? "sms_failed"
-              : `sms_${MessageStatus}`;
-
-        await db.createEnhancedWebhookNotification(
-          MessageSid,
-          notificationType,
-          message.user_chat_id,
-          MessageStatus === "failed" ? "high" : "normal",
-        );
-
-        console.log(
-          `📨 Created ${notificationType} notification for user ${message.user_chat_id}`,
-        );
-      }
-    }
-
-    res.status(200).send("OK");
-  } catch (error) {
-    console.error("❌ SMS delivery webhook error:", error);
-    res.status(200).send("OK"); // Always return 200 to prevent retries
-  }
+registerWebhookRoutes(app, {
+  handleTwilioGatherWebhook,
+  requireValidTwilioSignature,
+  requireValidAwsWebhook,
+  requireValidVonageWebhook,
+  requireValidTelegramWebhook,
+  processCallStatusWebhookPayload,
+  getDb: () => db,
+  streamStatusDedupe,
+  activeStreamConnections,
+  shouldProcessProviderEvent,
+  recordCallStatus,
+  getVonageCallPayload,
+  getVonageDtmfDigits,
+  resolveVonageCallSid,
+  isOutboundVonageDirection,
+  buildVonageInboundCallSid,
+  refreshInboundDefaultScript,
+  hydrateCallConfigFromDb,
+  ensureCallSetup,
+  ensureCallRecord,
+  normalizePhoneForFlag,
+  shouldRateLimitInbound,
+  rememberVonageCallMapping,
+  handleExternalDtmfInput,
+  clearVonageCallMappings,
+  buildVonageWebsocketUrl,
+  getVonageWebsocketContentType,
+  buildVonageEventWebhookUrl,
+  resolveHost,
+  buildRetrySmsBody,
+  buildRetryPayload,
+  scheduleCallJob,
+  formatContactLabel,
+  placeOutboundCall,
+  buildRecapSmsBody,
+  logConsoleAction,
+  buildInboundSmsBody,
+  buildCallbackPayload,
+  endCallForProvider,
+  webhookService,
+  buildVonageTalkHangupNcco,
+  buildVonageUnavailableNcco,
+  getCallConfigurations: () => callConfigurations,
+  getCallFunctionSystems: () => callFunctionSystems,
+  getCallDirections: () => callDirections,
+  getAwsContactMap: () => awsContactMap,
+  getActiveCalls: () => activeCalls,
+  handleCallEnd,
+  maskPhoneForLog,
+  maskSmsBodyForLog,
+  smsService,
+  getDigitService: () => digitService,
+  getEmailService: () => emailService,
 });
 
 // Get SMS statistics
@@ -12755,8 +11325,16 @@ app.get("/api/sms/stats", async (req, res) => {
 // Bulk SMS status endpoint
 app.get("/api/sms/bulk/status", async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit) || 10, 50);
-    const hours = parseInt(req.query.hours) || 24;
+    const limit = parseBoundedInteger(req.query.limit, {
+      defaultValue: 10,
+      min: 1,
+      max: 50,
+    });
+    const hours = parseBoundedInteger(req.query.hours, {
+      defaultValue: 24,
+      min: 1,
+      max: 24 * 30,
+    });
     const dateFrom = new Date(
       Date.now() - hours * 60 * 60 * 1000,
     ).toISOString();
@@ -12834,6 +11412,16 @@ module.exports = {
   },
 };
 
+process.on("unhandledRejection", (reason) => {
+  const details = buildErrorDetails(reason);
+  console.error("Unhandled promise rejection:", details);
+});
+
+process.on("uncaughtException", (error) => {
+  const details = buildErrorDetails(error);
+  console.error("Uncaught exception:", details);
+});
+
 // Enhanced graceful shutdown with comprehensive cleanup
 process.on("SIGINT", async () => {
   console.log("\n🛑 Shutting down enhanced adaptive system gracefully...");
@@ -12857,6 +11445,8 @@ process.on("SIGINT", async () => {
     keypadDtmfSeen.clear();
     keypadProviderOverrides.clear();
     keypadProviderGuardWarnings.clear();
+    providerEventDedupe.clear();
+    callStatusDedupe.clear();
 
     // Log successful shutdown
     await db.logServiceHealth("system", "shutdown_completed", {
@@ -12895,6 +11485,8 @@ process.on("SIGTERM", async () => {
     keypadDtmfSeen.clear();
     keypadProviderOverrides.clear();
     keypadProviderGuardWarnings.clear();
+    providerEventDedupe.clear();
+    callStatusDedupe.clear();
 
     // Log successful shutdown
     await db.logServiceHealth("system", "shutdown_completed", {

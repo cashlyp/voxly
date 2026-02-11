@@ -93,17 +93,40 @@ class TranscriptionService extends EventEmitter {
    */
   send(payload) {
     if (this.dgConnection.getReadyState() === 1) {
-      if (Buffer.isBuffer(payload)) {
-        this.dgConnection.send(payload);
-      } else {
-        this.dgConnection.send(Buffer.from(payload, 'base64'));
+      try {
+        if (Buffer.isBuffer(payload)) {
+          this.dgConnection.send(payload);
+        } else {
+          this.dgConnection.send(Buffer.from(payload, 'base64'));
+        }
+      } catch (error) {
+        this.emit('error', error);
       }
     }
   }
 
   sendBuffer(buffer) {
     if (this.dgConnection.getReadyState() === 1 && Buffer.isBuffer(buffer)) {
-      this.dgConnection.send(buffer);
+      try {
+        this.dgConnection.send(buffer);
+      } catch (error) {
+        this.emit('error', error);
+      }
+    }
+  }
+
+  close() {
+    try {
+      if (!this.dgConnection) return;
+      if (typeof this.dgConnection.finish === 'function') {
+        this.dgConnection.finish();
+        return;
+      }
+      if (typeof this.dgConnection.requestClose === 'function') {
+        this.dgConnection.requestClose();
+      }
+    } catch (error) {
+      this.emit('error', error);
     }
   }
 }

@@ -2,7 +2,7 @@ const config = require('../config');
 const httpClient = require('../utils/httpClient');
 const { InlineKeyboard } = require('grammy');
 const { getUser } = require('../db/db');
-const { startOperation, ensureOperationActive } = require('../utils/sessionState');
+const { startOperation, ensureOperationActive, OperationCancelledError, guardAgainstCommandInterrupt } = require('../utils/sessionState');
 const { renderMenu, escapeMarkdown, buildLine, section } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 const { getAccessProfile } = require('../utils/capabilities');
@@ -30,6 +30,13 @@ function parseRecentFilter(input = '') {
         return { phone: trimmed };
     }
     return { status: trimmed };
+}
+
+function isSessionCancellationError(error) {
+    if (!error) return false;
+    if (error instanceof OperationCancelledError) return true;
+    const message = String(error.message || '');
+    return /timed out due to inactivity/i.test(message) || /menu expired/i.test(message);
 }
 
 async function fetchRecentCalls({ limit = 10, filter } = {}) {
@@ -113,6 +120,9 @@ async function calllogRecentFlow(conversation, ctx) {
         const update = await conversation.wait();
         ensureActive();
         const raw = update?.message?.text?.trim() || '';
+        if (raw) {
+            await guardAgainstCommandInterrupt(ctx, raw);
+        }
         const parts = raw.split(/\s+/).filter(Boolean);
         const limit = Math.min(parseInt(parts[0], 10) || 10, 30);
         const filter = parts.slice(1).join(' ');
@@ -144,6 +154,9 @@ async function calllogRecentFlow(conversation, ctx) {
             reply_markup: buildMainMenuKeyboard(ctx)
         });
     } catch (error) {
+        if (isSessionCancellationError(error)) {
+            return;
+        }
         await ctx.reply(httpClient.getUserMessage(error, 'Failed to fetch recent calls.'), {
             reply_markup: buildMainMenuKeyboard(ctx)
         });
@@ -164,6 +177,9 @@ async function calllogSearchFlow(conversation, ctx) {
         const update = await conversation.wait();
         ensureActive();
         const query = update?.message?.text?.trim();
+        if (query) {
+            await guardAgainstCommandInterrupt(ctx, query);
+        }
         if (!query || query.length < 2) {
             await ctx.reply('❌ Please provide at least 2 characters.');
             return;
@@ -193,6 +209,9 @@ async function calllogSearchFlow(conversation, ctx) {
             reply_markup: buildMainMenuKeyboard(ctx)
         });
     } catch (error) {
+        if (isSessionCancellationError(error)) {
+            return;
+        }
         await ctx.reply(httpClient.getUserMessage(error, 'Search failed. Please try again later.'), {
             reply_markup: buildMainMenuKeyboard(ctx)
         });
@@ -213,6 +232,9 @@ async function calllogDetailsFlow(conversation, ctx) {
         const update = await conversation.wait();
         ensureActive();
         const callSid = update?.message?.text?.trim();
+        if (callSid) {
+            await guardAgainstCommandInterrupt(ctx, callSid);
+        }
         if (!callSid) {
             await ctx.reply('❌ Call SID is required.');
             return;
@@ -245,6 +267,9 @@ async function calllogDetailsFlow(conversation, ctx) {
             reply_markup: buildMainMenuKeyboard(ctx)
         });
     } catch (error) {
+        if (isSessionCancellationError(error)) {
+            return;
+        }
         await ctx.reply(httpClient.getUserMessage(error, 'Failed to fetch call details.'), {
             reply_markup: buildMainMenuKeyboard(ctx)
         });
@@ -265,6 +290,9 @@ async function calllogEventsFlow(conversation, ctx) {
         const update = await conversation.wait();
         ensureActive();
         const callSid = update?.message?.text?.trim();
+        if (callSid) {
+            await guardAgainstCommandInterrupt(ctx, callSid);
+        }
         if (!callSid) {
             await ctx.reply('❌ Call SID is required.');
             return;
@@ -290,6 +318,9 @@ async function calllogEventsFlow(conversation, ctx) {
             reply_markup: buildMainMenuKeyboard(ctx)
         });
     } catch (error) {
+        if (isSessionCancellationError(error)) {
+            return;
+        }
         await ctx.reply(httpClient.getUserMessage(error, 'Failed to fetch recent events.'), {
             reply_markup: buildMainMenuKeyboard(ctx)
         });

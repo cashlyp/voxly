@@ -1,9 +1,15 @@
 const { InlineKeyboard } = require('grammy');
 const config = require('../config');
 const httpClient = require('./httpClient');
-const { ensureOperationActive, getCurrentOpId } = require('./sessionState');
+const { ensureOperationActive, getCurrentOpId, OperationCancelledError } = require('./sessionState');
 const { sendMenu, clearMenuMessages } = require('./ui');
-const { buildCallbackData, matchesCallbackPrefix, parseCallbackData } = require('./actions');
+const {
+  buildCallbackData,
+  matchesCallbackPrefix,
+  parseCallbackData,
+  validateCallback,
+  isDuplicateAction
+} = require('./actions');
 
 const FALLBACK_PERSONAS = [
   {
@@ -390,20 +396,48 @@ async function askOptionWithButtons(
   });
 
   const message = await sendMenu(ctx, prompt, { parse_mode: 'Markdown', reply_markup: keyboard });
-  const selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {
-    const callbackData = callbackCtx.callbackQuery?.data || '';
-    const callbackMessageId = callbackCtx.callbackQuery?.message?.message_id;
-    if (!callbackMessageId || callbackMessageId !== message.message_id) {
-      return false;
+  let selectionCtx;
+  while (true) {
+    selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {
+      const callbackData = callbackCtx.callbackQuery?.data || '';
+      const callbackMessageId = callbackCtx.callbackQuery?.message?.message_id;
+      if (!callbackMessageId || callbackMessageId !== message.message_id) {
+        return false;
+      }
+      return matchesCallbackPrefix(callbackData, prefixKey);
+    });
+
+    const callbackData = selectionCtx.callbackQuery?.data || '';
+    const validation = validateCallback(ctx, callbackData);
+    if (validation.status !== 'ok') {
+      await selectionCtx.answerCallbackQuery({
+        text: '⌛ This menu expired. Use /menu to start again.',
+        show_alert: false
+      }).catch(() => {});
+      try {
+        await ctx.api.editMessageReplyMarkup(message.chat.id, message.message_id);
+      } catch (_) {
+        // Ignore edit errors for stale/non-editable messages.
+      }
+      throw new OperationCancelledError('Menu expired before selection');
     }
-    return matchesCallbackPrefix(callbackData, prefixKey);
-  });
+
+    const callbackId = selectionCtx.callbackQuery?.id;
+    if (callbackId && isDuplicateAction(ctx, `convcbid:${callbackId}`, 60 * 60 * 1000)) {
+      await selectionCtx.answerCallbackQuery({
+        text: 'Already processed.',
+        show_alert: false
+      }).catch(() => {});
+      continue;
+    }
+    break;
+  }
   const activeChecker = typeof ensureActive === 'function'
     ? ensureActive
     : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
   activeChecker();
 
-  await selectionCtx.answerCallbackQuery();
+  await selectionCtx.answerCallbackQuery().catch(() => {});
   try {
     await ctx.api.deleteMessage(message.chat.id, message.message_id);
   } catch (_) {
@@ -414,7 +448,11 @@ async function askOptionWithButtons(
   const selectionAction = parseCallbackData(selectionCtx.callbackQuery.data).action || selectionCtx.callbackQuery.data;
   const parts = selectionAction.split(':');
   const selectedId = opId ? parts.slice(2).join(':') : parts.slice(1).join(':');
-  return options.find((option) => option.id === selectedId);
+  const selectedOption = options.find((option) => option.id === selectedId);
+  if (!selectedOption) {
+    throw new OperationCancelledError('Menu selection no longer valid');
+  }
+  return selectedOption;
 }
 
 function getOptionLabel(options, id) {

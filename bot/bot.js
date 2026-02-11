@@ -31,11 +31,19 @@ const {
 } = require("./utils/ui");
 const {
   buildCallbackData,
+  parseCallbackData,
   validateCallback,
   isDuplicateAction,
   startActionMetric,
   finishActionMetric,
 } = require("./utils/actions");
+const {
+  parseCallbackAction,
+  resolveConversationFromPrefix,
+  isConversationCallbackStale,
+  buildStaleConversationKey,
+} = require("./utils/callbackRouting");
+const { handleInvalidCallback } = require("./utils/callbackRecovery");
 const { normalizeReply, logCommandError } = require("./utils/ui");
 const {
   getAccessProfile,
@@ -91,6 +99,17 @@ async function waitWithConversationTimeout(waitFactory, ctx, conversationName) {
       /timed out due to inactivity/i.test(error.message || "")
     ) {
       ensureSession(ctx);
+      const expiredOp = ctx.session?.currentOp
+        ? {
+            id: ctx.session.currentOp.id || null,
+            token: ctx.session.currentOp.token || null,
+          }
+        : { id: null, token: null };
+      const priorExpired = ctx.session?.meta?.expiredConversation || null;
+      const alreadyNotified =
+        Boolean(priorExpired?.noticeSent) &&
+        Boolean(priorExpired?.opId) &&
+        priorExpired.opId === expiredOp.id;
       try {
         await cancelActiveFlow(ctx, `timeout:${conversationName}`);
       } catch (_) {}
@@ -98,10 +117,58 @@ async function waitWithConversationTimeout(waitFactory, ctx, conversationName) {
         await clearMenuMessages(ctx);
       } catch (_) {}
       resetSession(ctx);
+      ensureSession(ctx);
+      ctx.session.meta.expiredConversation = {
+        conversation: conversationName,
+        opId: expiredOp.id,
+        token: expiredOp.token,
+        expiredAt: Date.now(),
+        noticeSent: alreadyNotified,
+      };
+      if (!alreadyNotified) {
+        try {
+          await ctx.reply("⌛ Session timed out due to inactivity. Use /menu to start again.");
+          ctx.session.meta.expiredConversation.noticeSent = true;
+        } catch (_) {}
+      }
     }
     throw error;
   } finally {
     clearTimeout(timeoutId);
+  }
+}
+
+async function clearCallbackMessageMarkup(ctx) {
+  const chatId = ctx.callbackQuery?.message?.chat?.id;
+  const messageId = ctx.callbackQuery?.message?.message_id;
+  if (!chatId || !messageId) {
+    return;
+  }
+  try {
+    await ctx.api.editMessageReplyMarkup(chatId, messageId);
+  } catch (_) {
+    // Ignore edit failures for older/non-editable messages.
+  }
+}
+
+function isIgnorableCallbackAckError(error) {
+  const message = String(
+    error?.description || error?.message || error?.response?.description || "",
+  );
+  return /query is too old|query id is invalid|query is already answered/i.test(
+    message,
+  );
+}
+
+async function safeAnswerCallback(ctx, payload = {}) {
+  try {
+    await ctx.answerCallbackQuery(payload);
+    return true;
+  } catch (error) {
+    if (isIgnorableCallbackAckError(error)) {
+      return false;
+    }
+    throw error;
   }
 }
 
@@ -231,6 +298,10 @@ bot.use(async (ctx, next) => {
   try {
     return await next();
   } catch (error) {
+    if (error instanceof OperationCancelledError) {
+      console.log("Command flow cancelled:", error.message);
+      return;
+    }
     logCommandError(ctx, error);
     try {
       const fallback =
@@ -250,6 +321,25 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
   if (parts.length < 3) return;
   const action = parts[1];
   const callSid = parts[2];
+  const callbackId = ctx.callbackQuery?.id;
+  if (
+    callbackId &&
+    isDuplicateAction(ctx, `gcbid:alert:${callbackId}`, 60 * 60 * 1000)
+  ) {
+    await ctx
+      .answerCallbackQuery({ text: "Already processed.", show_alert: false })
+      .catch(() => {});
+    return;
+  }
+  const actionKey = `alert:${action}:${callSid}|${
+    ctx.callbackQuery?.message?.message_id || ""
+  }`;
+  if (isDuplicateAction(ctx, actionKey, 20 * 1000)) {
+    await ctx
+      .answerCallbackQuery({ text: "Already processed.", show_alert: false })
+      .catch(() => {});
+    return;
+  }
 
   try {
     const allowed = await requireCapability(ctx, "call", {
@@ -321,6 +411,22 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
 
 // Live call console actions (proxy to API webhook handler)
 bot.callbackQuery(/^lc:/, async (ctx) => {
+  const callbackId = ctx.callbackQuery?.id;
+  if (callbackId && isDuplicateAction(ctx, `gcbid:lc:${callbackId}`, 60 * 60 * 1000)) {
+    await ctx
+      .answerCallbackQuery({ text: "Already processed.", show_alert: false })
+      .catch(() => {});
+    return;
+  }
+  const actionKey = `lc:${ctx.callbackQuery?.data || ""}|${
+    ctx.callbackQuery?.message?.message_id || ""
+  }`;
+  if (isDuplicateAction(ctx, actionKey, 20 * 1000)) {
+    await ctx
+      .answerCallbackQuery({ text: "Already processed.", show_alert: false })
+      .catch(() => {});
+    return;
+  }
   try {
     const allowed = await requireCapability(ctx, "calllog_view", {
       actionLabel: "Live call console",
@@ -353,14 +459,18 @@ bot.callbackQuery(/^lc:/, async (ctx) => {
 bot.use(conversations());
 
 // Global error handler
-bot.catch((err) => {
+bot.catch(async (err) => {
+  if (err?.error instanceof OperationCancelledError) {
+    console.log("Global cancellation:", err.error.message);
+    return;
+  }
   const errorMessage = `Error while handling update ${err.ctx.update.update_id}:
     ${err.error.message}
     Stack: ${err.error.stack}`;
   console.error(errorMessage);
 
   try {
-    err.ctx.reply("❌ An error occurred. Please try again or contact support.");
+    await err.ctx.reply("❌ An error occurred. Please try again or contact support.");
   } catch (replyError) {
     console.error("Failed to send error message:", replyError);
   }
@@ -527,18 +637,6 @@ registerProviderCommand(bot);
 const API_BASE = config.apiUrl;
 const REQUEST_ACCESS_ACTION = "REQUEST_ACCESS";
 
-function parseCallbackAction(action) {
-  if (!action || !action.includes(":")) {
-    return null;
-  }
-  const parts = action.split(":");
-  const prefix = parts[0];
-  if (parts.length >= 3 && /^[0-9a-fA-F-]{8,}$/.test(parts[1])) {
-    return { prefix, opId: parts[1], value: parts.slice(2).join(":") };
-  }
-  return { prefix, opId: null, value: parts.slice(1).join(":") };
-}
-
 function escapeMarkdownValue(value = "") {
   return String(value).replace(/([_*[\]()`])/g, "\\$1");
 }
@@ -556,29 +654,46 @@ function getTelegramAccountName(from = {}) {
   return "Unknown";
 }
 
-function resolveConversationFromPrefix(prefix) {
-  if (!prefix) return null;
-  if (prefix.startsWith("call-script-")) return "scripts-conversation";
-  if (prefix === "call-script") return "call-conversation";
-  if (prefix.startsWith("sms-script-")) return "scripts-conversation";
-  if (prefix === "sms-script") return "sms-conversation";
-  if (prefix.startsWith("script-") || prefix === "confirm")
-    return "scripts-conversation";
-  if (prefix.startsWith("email-template-"))
-    return "email-templates-conversation";
-  if (prefix.startsWith("bulk-email-")) return "bulk-email-conversation";
-  if (prefix.startsWith("email-")) return "email-conversation";
-  if (prefix.startsWith("bulk-sms-")) return "bulk-sms-conversation";
-  if (prefix.startsWith("sms-")) return "sms-conversation";
-  if (prefix.startsWith("persona-")) return "persona-conversation";
-  if (
-    ["persona", "purpose", "tone", "urgency", "tech", "call-config"].includes(
-      prefix,
-    )
-  ) {
-    return "call-conversation";
+async function reopenFreshMenu(ctx, action = "") {
+  const normalized = String(action || "").toUpperCase();
+  if (isProviderAction(action)) {
+    await handleProviderCallbackAction(ctx, PROVIDER_ACTIONS.HOME);
+    return;
   }
-  return null;
+  if (normalized.startsWith("CALLER_FLAGS")) {
+    await renderCallerFlagsMenu(ctx);
+    return;
+  }
+  if (
+    normalized.startsWith("USERS") ||
+    normalized === "ADDUSER" ||
+    normalized === "PROMOTE" ||
+    normalized === "REMOVE"
+  ) {
+    await renderUsersMenu(ctx);
+    return;
+  }
+  if (normalized.startsWith("CALLLOG")) {
+    await renderCalllogMenu(ctx);
+    return;
+  }
+  if (normalized.startsWith("BULK_SMS")) {
+    await renderBulkSmsMenu(ctx);
+    return;
+  }
+  if (normalized.startsWith("SMS")) {
+    await renderSmsMenu(ctx);
+    return;
+  }
+  if (normalized.startsWith("BULK_EMAIL")) {
+    await renderBulkEmailMenu(ctx);
+    return;
+  }
+  if (normalized.startsWith("EMAIL")) {
+    await renderEmailMenu(ctx);
+    return;
+  }
+  await handleMenu(ctx);
 }
 
 // Start command handler
@@ -698,7 +813,18 @@ bot.on("callback_query:data", async (ctx) => {
     finishActionMetric(metric, status, extra);
   };
   try {
-    if (rawAction && rawAction.startsWith("lc:")) {
+    const callbackId = ctx.callbackQuery?.id;
+    if (
+      callbackId &&
+      isDuplicateAction(ctx, `gcbid:callback:${callbackId}`, 60 * 60 * 1000)
+    ) {
+      await ctx
+        .answerCallbackQuery({ text: "Already processed.", show_alert: false })
+        .catch(() => {});
+      finishMetric("duplicate_callback_id");
+      return;
+    }
+    if (rawAction && (rawAction.startsWith("lc:") || rawAction.startsWith("alert:"))) {
       finishMetric("skipped");
       return;
     }
@@ -710,27 +836,28 @@ bot.on("callback_query:data", async (ctx) => {
       ? { status: "ok", action: rawAction }
       : validateCallback(ctx, rawAction);
     if (validation.status !== "ok") {
-      const staleAction = validation.action || rawAction || "";
-      const shouldReopenProvider = isProviderAction(staleAction);
-      const message =
-        validation.status === "expired"
-          ? "⌛ This menu expired. Opening the latest view…"
-          : "⚠️ This menu is no longer active.";
-      await ctx.answerCallbackQuery({ text: message, show_alert: false });
-      await clearMenuMessages(ctx);
-      if (shouldReopenProvider) {
-        await handleProviderCallbackAction(ctx, PROVIDER_ACTIONS.HOME);
-      } else {
-        await handleMenu(ctx);
-      }
-      finishMetric(validation.status, { reason: validation.reason });
+      const recovery = await handleInvalidCallback({
+        ctx,
+        rawAction,
+        validation,
+        parseCallbackData,
+        isDuplicateAction,
+        safeAnswerCallback,
+        clearCallbackMessageMarkup,
+        clearMenuMessages,
+        isProviderAction,
+        handleProviderCallbackAction,
+        reopenFreshMenu,
+        providerHomeAction: PROVIDER_ACTIONS.HOME,
+      });
+      finishMetric(recovery.metricStatus, recovery.metricExtra || {});
       return;
     }
 
     const action = validation.action;
     const actionKey = `${action}|${ctx.callbackQuery?.message?.message_id || ""}`;
-    if (isDuplicateAction(ctx, actionKey)) {
-      await ctx.answerCallbackQuery({
+    if (isDuplicateAction(ctx, actionKey, 20 * 1000)) {
+      await safeAnswerCallback(ctx, {
         text: "Already processed.",
         show_alert: false,
       });
@@ -739,7 +866,7 @@ bot.on("callback_query:data", async (ctx) => {
     }
 
     // Answer callback query immediately to prevent timeout
-    await ctx.answerCallbackQuery();
+    await safeAnswerCallback(ctx);
     console.log(`Callback query received: ${action} from user ${ctx.from.id}`);
 
     await getAccessProfile(ctx);
@@ -760,6 +887,28 @@ bot.on("callback_query:data", async (ctx) => {
     const menuMessageId = ctx.callbackQuery?.message?.message_id;
     const menuChatId = ctx.callbackQuery?.message?.chat?.id;
     const latestMenuId = getLatestMenuMessageId(ctx, menuChatId);
+    const rawParsed = parseCallbackData(rawAction);
+    if (
+      !isMenuExemptAction &&
+      menuMessageId &&
+      !latestMenuId &&
+      !rawParsed.signed
+    ) {
+      const orphanMenuKey = `orphan_menu:${menuMessageId}`;
+      const firstOrphanNotice = !isDuplicateAction(
+        ctx,
+        orphanMenuKey,
+        60 * 60 * 1000,
+      );
+      await clearCallbackMessageMarkup(ctx);
+      if (firstOrphanNotice) {
+        await ctx.reply("⌛ This menu expired. Opening the latest view…");
+        await clearMenuMessages(ctx);
+        await reopenFreshMenu(ctx, action);
+      }
+      finishMetric("stale", { reason: "orphan_unsigned_menu" });
+      return;
+    }
     if (!isMenuExemptAction && isLatestMenuExpired(ctx, menuChatId)) {
       await clearMenuMessages(ctx);
       if (isProviderAction(action)) {
@@ -864,15 +1013,23 @@ bot.on("callback_query:data", async (ctx) => {
       );
       if (conversationTarget) {
         const currentOpId = ctx.session?.currentOp?.id;
-        if (
-          !parsedCallback.opId ||
-          !currentOpId ||
-          parsedCallback.opId !== currentOpId
-        ) {
+        if (isConversationCallbackStale(parsedCallback, currentOpId)) {
+          const staleConversationKey = buildStaleConversationKey(
+            conversationTarget,
+            parsedCallback.opId,
+          );
+          const firstStaleConversationNotice = !isDuplicateAction(
+            ctx,
+            staleConversationKey,
+            60 * 60 * 1000,
+          );
           await cancelActiveFlow(ctx, `stale_callback:${action}`);
           resetSession(ctx);
-          await ctx.reply("↩️ Reopening the menu so you can continue.");
-          await ctx.conversation.enter(conversationTarget);
+          await clearCallbackMessageMarkup(ctx);
+          if (firstStaleConversationNotice) {
+            await ctx.reply("⌛ This menu expired. Opening a fresh one…");
+            await reopenFreshMenu(ctx, action);
+          }
           finishMetric("stale");
           return;
         }
@@ -1078,10 +1235,20 @@ bot.on("callback_query:data", async (ctx) => {
 
       default:
         if (action.includes(":")) {
-          console.log(`Stale callback action: ${action}`);
-          await ctx.reply(
-            "⚠️ That menu is no longer active. Use /menu to start again.",
+          const staleUnknownKey = `stale_unknown:${action}|${
+            ctx.callbackQuery?.message?.message_id || "unknown"
+          }`;
+          const firstStaleUnknownNotice = !isDuplicateAction(
+            ctx,
+            staleUnknownKey,
+            60 * 60 * 1000,
           );
+          console.log(`Stale callback action: ${action}`);
+          if (firstStaleUnknownNotice) {
+            await ctx.reply(
+              "⚠️ That menu is no longer active. Use /menu to start again.",
+            );
+          }
           finishMetric("stale");
         } else {
           console.log(`Unknown callback action: ${action}`);
@@ -1090,6 +1257,16 @@ bot.on("callback_query:data", async (ctx) => {
         }
     }
   } catch (error) {
+    if (error instanceof OperationCancelledError) {
+      console.log("Callback cancelled:", error.message);
+      await clearCallbackMessageMarkup(ctx);
+      finishMetric("cancelled", { reason: error.message });
+      return;
+    }
+    if (isIgnorableCallbackAckError(error)) {
+      finishMetric("ignored_ack_error", { error: error?.message || String(error) });
+      return;
+    }
     console.error("Callback query error:", error);
     const fallback =
       "❌ An error occurred processing your request. Please try again.";
@@ -1140,9 +1317,22 @@ const TELEGRAM_COMMANDS_USER = [
   { command: "sms", description: "Open SMS center" },
   { command: "email", description: "Open Email center" },
 ];
+const CHAT_COMMAND_SYNC_TTL_MS = 5 * 60 * 1000;
 
 async function syncChatCommands(ctx, access) {
   if (!ctx.chat || ctx.chat.type !== "private") {
+    return;
+  }
+  ensureSession(ctx);
+  const roleKey = access.user ? (access.isAdmin ? "admin" : "user") : "guest";
+  const priorSync = ctx.session?.commandSync || null;
+  const now = Date.now();
+  if (
+    priorSync &&
+    priorSync.chatId === ctx.chat.id &&
+    priorSync.roleKey === roleKey &&
+    now - (priorSync.syncedAt || 0) < CHAT_COMMAND_SYNC_TTL_MS
+  ) {
     return;
   }
   const commands = access.user
@@ -1154,6 +1344,11 @@ async function syncChatCommands(ctx, access) {
     await bot.api.setMyCommands(commands, {
       scope: { type: "chat", chat_id: ctx.chat.id },
     });
+    ctx.session.commandSync = {
+      chatId: ctx.chat.id,
+      roleKey,
+      syncedAt: Date.now(),
+    };
   } catch (error) {
     console.warn("Failed to sync chat commands:", error?.message || error);
   }

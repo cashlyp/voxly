@@ -13,7 +13,8 @@ const {
   startOperation,
   ensureOperationActive,
   registerAbortController,
-  guardAgainstCommandInterrupt
+  guardAgainstCommandInterrupt,
+  OperationCancelledError
 } = require('../utils/sessionState');
 const { section, buildLine, tipLine, escapeMarkdown, emphasize, activateMenuMessage, renderMenu } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
@@ -47,6 +48,13 @@ async function safeReplyMarkdown(ctx, text, options = {}) {
 }
 
 async function replyApiError(ctx, error, fallback) {
+  if (
+    error instanceof OperationCancelledError ||
+    /timed out due to inactivity/i.test(String(error?.message || '')) ||
+    /menu expired/i.test(String(error?.message || ''))
+  ) {
+    return;
+  }
   const message = httpClient.getUserMessage(error, fallback);
   return safeReply(ctx, message);
 }

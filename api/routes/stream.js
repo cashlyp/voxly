@@ -56,28 +56,35 @@ class StreamService extends EventEmitter {
   }
 
   sendAudio (audio) {
+    if (!this.ws || this.ws.readyState !== 1) {
+      return;
+    }
     this.startAudioTicks(audio);
-    this.ws.send(
-      JSON.stringify({
-        streamSid: this.streamSid,
-        event: 'media',
-        media: {
-          payload: audio,
-        },
-      })
-    );
-    // When the media completes you will receive a `mark` message with the label
-    const markLabel = uuid.v4();
-    this.ws.send(
-      JSON.stringify({
-        streamSid: this.streamSid,
-        event: 'mark',
-        mark: {
-          name: markLabel
-        }
-      })
-    );
-    this.emit('audiosent', markLabel);
+    try {
+      this.ws.send(
+        JSON.stringify({
+          streamSid: this.streamSid,
+          event: 'media',
+          media: {
+            payload: audio,
+          },
+        })
+      );
+      // When the media completes you will receive a `mark` message with the label
+      const markLabel = uuid.v4();
+      this.ws.send(
+        JSON.stringify({
+          streamSid: this.streamSid,
+          event: 'mark',
+          mark: {
+            name: markLabel
+          }
+        })
+      );
+      this.emit('audiosent', markLabel);
+    } catch (error) {
+      this.emit('error', error);
+    }
   }
 
   estimateAudioStats (base64 = '') {
@@ -147,6 +154,14 @@ class StreamService extends EventEmitter {
         frames: totalFrames
       });
     }, this.audioTickIntervalMs);
+  }
+
+  close () {
+    if (this.audioTickTimer) {
+      clearInterval(this.audioTickTimer);
+      this.audioTickTimer = null;
+    }
+    this.audioBuffer = {};
   }
 }
 

@@ -44,7 +44,10 @@ const initialSessionState = () => ({
   currentOp: null,
   lastCommand: null,
   pendingControllers: [],
-  meta: {},
+  commandSync: null,
+  meta: {
+    expiredConversation: null
+  },
   flow: null,
   errors: [],
   menuMessages: [],
@@ -57,7 +60,11 @@ function ensureSession(ctx) {
   } else {
     ctx.session.currentOp = ctx.session.currentOp || null;
     ctx.session.pendingControllers = ctx.session.pendingControllers || [];
+    ctx.session.commandSync = ctx.session.commandSync || null;
     ctx.session.meta = ctx.session.meta || {};
+    if (!Object.prototype.hasOwnProperty.call(ctx.session.meta, 'expiredConversation')) {
+      ctx.session.meta.expiredConversation = null;
+    }
     ctx.session.flow = ctx.session.flow || null;
     ctx.session.errors = Array.isArray(ctx.session.errors) ? ctx.session.errors : [];
     ctx.session.menuMessages = Array.isArray(ctx.session.menuMessages) ? ctx.session.menuMessages : [];
@@ -80,6 +87,7 @@ function generateOpId() {
 
 function startOperation(ctx, command, metadata = {}) {
   ensureSession(ctx);
+  ctx.session.meta.expiredConversation = null;
   const opId = generateOpId();
   const opToken = opId.replace(/-/g, '').slice(0, 8);
   ctx.session.currentOp = {

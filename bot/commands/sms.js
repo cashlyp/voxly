@@ -33,7 +33,17 @@ async function smsAlert(ctx, text) {
     await ctx.reply(formatSection('⚠️ SMS Alert', [text]));
 }
 
+function isSessionCancellationError(error) {
+    if (!error) return false;
+    if (error instanceof OperationCancelledError) return true;
+    const message = String(error.message || '');
+    return /timed out due to inactivity/i.test(message) || /menu expired/i.test(message);
+}
+
 async function replyApiError(ctx, error, fallback) {
+    if (isSessionCancellationError(error)) {
+        return;
+    }
     const message = httpClient.getUserMessage(error, fallback);
     await ctx.reply(message);
 }

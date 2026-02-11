@@ -30,6 +30,7 @@ const {
 const { emailTemplatesFlow } = require('./email');
 const { section, buildLine, tipLine } = require('../utils/ui');
 const { attachHmacAuth } = require('../utils/apiAuth');
+const { isDuplicateAction } = require('../utils/actions');
 
 const scriptsApi = axios.create({
   baseURL: config.scriptsApiUrl.replace(/\/+$/, ''),
@@ -97,6 +98,13 @@ async function scriptsApiRequest(options) {
 }
 
 function formatScriptsApiError(error, action) {
+  if (
+    error instanceof OperationCancelledError ||
+    /timed out due to inactivity/i.test(error?.message || '')
+  ) {
+    return '⌛ Session timed out due to inactivity. Use /menu to start again.';
+  }
+
   const baseHelp = 'Ensure the scripts service is reachable or update SCRIPTS_API_URL.';
 
   const apiCode = error.response?.data?.code || error.code;
@@ -143,6 +151,13 @@ function formatScriptsApiError(error, action) {
   }
 
   return `❌ ${action}: ${error.message}`;
+}
+
+function isSessionCancellationError(error) {
+  if (!error) return false;
+  if (error instanceof OperationCancelledError) return true;
+  const message = String(error.message || '');
+  return /timed out due to inactivity/i.test(message) || /menu expired/i.test(message);
 }
 
 const CANCEL_KEYWORDS = new Set(['cancel', 'exit', 'quit']);
@@ -1198,6 +1213,11 @@ async function cloneCallScriptFlow(conversation, ctx, script, ensureActive) {
   }
 
   try {
+    const cloneKey = `scripts-clone:call:${script.id}:${name.toLowerCase()}`;
+    if (isDuplicateAction(ctx, cloneKey, 2 * 60 * 1000)) {
+      await ctx.reply('ℹ️ Clone request already processed. Use list scripts to refresh.');
+      return;
+    }
     const cloned = await cloneCallScript(script.id, {
       name,
       description: description === undefined ? script.description : (description.length ? description : null)
@@ -1284,6 +1304,9 @@ async function showCallScriptVersions(conversation, ctx, script, ensureActive) {
     const updated = await updateCallScript(script.id, payload);
     await ctx.reply(`✅ Script restored to v${versionNumber} (${escapeMarkdown(updated.name)}).`, { parse_mode: 'Markdown' });
   } catch (error) {
+    if (isSessionCancellationError(error)) {
+      return;
+    }
     console.error('Version restore failed:', error);
     await ctx.reply(`❌ Failed to restore version: ${error.message}`);
   }
@@ -1420,10 +1443,16 @@ async function listCallScriptsFlow(conversation, ctx, ensureActive) {
 
       await showCallScriptDetail(conversation, ctx, script, safeEnsureActive);
     } catch (error) {
+      if (error instanceof OperationCancelledError) {
+        throw error;
+      }
       console.error('Failed to load call script details:', error);
       await ctx.reply(formatScriptsApiError(error, 'Failed to load script details'));
     }
   } catch (error) {
+    if (error instanceof OperationCancelledError) {
+      throw error;
+    }
     console.error('Failed to list scripts:', error);
     await ctx.reply(formatScriptsApiError(error, 'Failed to list call scripts'));
   }
@@ -1870,6 +1899,11 @@ async function cloneSmsScriptFlow(conversation, ctx, script) {
   };
 
   try {
+    const cloneKey = `scripts-clone:sms:${script.name}:${name.toLowerCase()}`;
+    if (isDuplicateAction(ctx, cloneKey, 2 * 60 * 1000)) {
+      await ctx.reply('ℹ️ Clone request already processed. Use list scripts to refresh.');
+      return;
+    }
     const cloned = await createSmsScript(payload);
     await ctx.reply(`✅ Script cloned as *${escapeMarkdown(cloned.name)}*.`, { parse_mode: 'Markdown' });
   } catch (error) {
@@ -1946,6 +1980,9 @@ async function showSmsScriptVersions(conversation, ctx, script) {
       script = await fetchSmsScriptByName(script.name, { detailed: true });
     } catch (_) {}
   } catch (error) {
+    if (isSessionCancellationError(error)) {
+      return;
+    }
     console.error('SMS version restore failed:', error);
     await ctx.reply(`❌ Failed to restore version: ${error.message}`);
   }
@@ -2116,6 +2153,11 @@ async function listSmsScriptsFlow(conversation, ctx) {
       { prefix: 'sms-script-select', columns: 1, formatLabel: (option) => option.label }
     );
 
+    if (!selection || !selection.id) {
+      await ctx.reply('⌛ Session expired. Use /menu to start again.');
+      return;
+    }
+
     if (selection.id === 'back') {
       return;
     }
@@ -2129,10 +2171,16 @@ async function listSmsScriptsFlow(conversation, ctx) {
 
       await showSmsScriptDetail(conversation, ctx, script);
     } catch (error) {
+      if (error instanceof OperationCancelledError) {
+        throw error;
+      }
       console.error('Failed to load SMS script details:', error);
       await ctx.reply(formatScriptsApiError(error, 'Failed to load script details'));
     }
   } catch (error) {
+    if (error instanceof OperationCancelledError) {
+      throw error;
+    }
     console.error('Failed to list SMS scripts:', error);
     await ctx.reply(formatScriptsApiError(error, 'Failed to list SMS scripts'));
   }
@@ -2206,6 +2254,11 @@ async function scriptsFlow(conversation, ctx) {
         ],
         { prefix: 'script-channel', columns: 1, ensureActive }
       );
+
+      if (!selection || !selection.id) {
+        await ctx.reply('⌛ Session expired. Use /menu to start again.');
+        return;
+      }
 
       switch (selection.id) {
         case 'call':

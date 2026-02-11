@@ -1,5 +1,6 @@
 require('colors');
 const EventEmitter = require('events');
+const crypto = require('crypto');
 const OpenAI = require('openai');
 const PersonalityEngine = require('../functions/PersonalityEngine');
 const config = require('../config');
@@ -29,6 +30,12 @@ class EnhancedGptService extends EventEmitter {
     this.stallTimeoutMs = 2000;
     this.responseTimeoutMs = config.openRouter.responseTimeoutMs || 25000;
     this.streamIdleTimeoutMs = config.openRouter.streamIdleTimeoutMs || 8000;
+    this.toolExecutionTimeoutMs = Number(config.openRouter.toolExecutionTimeoutMs || 12000);
+    this.toolRetryLimit = Number(config.openRouter.toolRetryLimit || 1);
+    this.toolBudgetPerInteraction = Number(config.openRouter.toolBudgetPerInteraction || 4);
+    this.toolIdempotencyTtlMs = Number(config.openRouter.toolIdempotencyTtlMs || 120000);
+    this.toolIdempotency = new Map();
+    this.toolBudget = new Map();
     this.latencyHistory = [];
     this.maxLatencySamples = 8;
     this.brevityHint = 'Keep spoken replies concise: max 2 sentences, ~200 characters, and avoid rambling.';
@@ -227,6 +234,200 @@ class EnhancedGptService extends EventEmitter {
       }
     }
     return {};
+  }
+
+  hashValue(value) {
+    const body = typeof value === 'string' ? value : JSON.stringify(value || {});
+    return crypto.createHash('sha256').update(body).digest('hex').slice(0, 16);
+  }
+
+  cleanupToolState(now = Date.now()) {
+    for (const [key, entry] of this.toolIdempotency.entries()) {
+      if (!entry?.at || now - entry.at > this.toolIdempotencyTtlMs) {
+        this.toolIdempotency.delete(key);
+      }
+    }
+    for (const [key, entry] of this.toolBudget.entries()) {
+      if (!entry?.at || now - entry.at > this.toolIdempotencyTtlMs) {
+        this.toolBudget.delete(key);
+      }
+    }
+  }
+
+  reserveToolBudget(interactionCount) {
+    const now = Date.now();
+    this.cleanupToolState(now);
+    const budgetKey = `${this.callSid || 'no_call'}:${interactionCount}`;
+    const current = this.toolBudget.get(budgetKey) || { count: 0, at: now };
+    if (current.count >= this.toolBudgetPerInteraction) {
+      return { allowed: false, budgetKey, remaining: 0 };
+    }
+    current.count += 1;
+    current.at = now;
+    this.toolBudget.set(budgetKey, current);
+    return {
+      allowed: true,
+      budgetKey,
+      remaining: Math.max(0, this.toolBudgetPerInteraction - current.count)
+    };
+  }
+
+  isRetryableToolError(error) {
+    const msg = String(error?.message || '').toLowerCase();
+    return msg.includes('timeout')
+      || msg.includes('etimedout')
+      || msg.includes('econnreset')
+      || msg.includes('socket hang up');
+  }
+
+  withToolTimeout(executor, timeoutMs, label = 'tool_timeout') {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(label)), timeoutMs);
+      Promise.resolve()
+        .then(() => executor())
+        .then((result) => {
+          clearTimeout(timer);
+          resolve(result);
+        })
+        .catch((error) => {
+          clearTimeout(timer);
+          reject(error);
+        });
+    });
+  }
+
+  buildToolPlan(functionName, rawArgs, interactionCount, toolCallId) {
+    const parsedArgs = this.validateFunctionArgs(rawArgs);
+    const validatedArgs = parsedArgs && typeof parsedArgs === 'object' && !Array.isArray(parsedArgs)
+      ? parsedArgs
+      : {};
+    const callSid = this.callSid || validatedArgs.callSid || validatedArgs.call_sid || 'unknown';
+    const stepId = validatedArgs.stepId
+      || validatedArgs.step_id
+      || validatedArgs.plan_id
+      || validatedArgs.profile
+      || functionName
+      || 'tool';
+    const attemptId = validatedArgs.attemptId
+      || validatedArgs.attempt_id
+      || validatedArgs.retry
+      || validatedArgs.retries
+      || 1;
+    const inputHash = this.hashValue(validatedArgs);
+    const idempotencyKey = `tool:${callSid}:${stepId}:${attemptId}:${inputHash}`;
+    const normalizedToolCallId = toolCallId
+      || `tool_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    return {
+      functionName,
+      validatedArgs,
+      rawArgs,
+      interactionCount,
+      toolCallId: normalizedToolCallId,
+      idempotencyKey,
+      metadata: {
+        callSid,
+        stepId: String(stepId),
+        attemptId: String(attemptId),
+        inputHash
+      }
+    };
+  }
+
+  validateToolPlan(plan) {
+    if (!plan || !plan.functionName) {
+      return { ok: false, error: 'invalid_tool_plan' };
+    }
+    if (!this.availableFunctions[plan.functionName]) {
+      return { ok: false, error: `Function ${plan.functionName} not available` };
+    }
+    const args = { ...(plan.validatedArgs || {}) };
+    if (plan.functionName === 'collect_digits') {
+      if (Number.isFinite(args.min_digits) && args.min_digits < 1) {
+        args.min_digits = 1;
+      }
+      if (Number.isFinite(args.max_digits) && Number.isFinite(args.min_digits) && args.max_digits < args.min_digits) {
+        args.max_digits = args.min_digits;
+      }
+    }
+    return {
+      ok: true,
+      plan: {
+        ...plan,
+        validatedArgs: args
+      }
+    };
+  }
+
+  async executeToolPlan(plan) {
+    const duplicate = this.toolIdempotency.get(plan.idempotencyKey);
+    const now = Date.now();
+    if (duplicate && now - duplicate.at < this.toolIdempotencyTtlMs) {
+      return {
+        responseText: duplicate.responseText,
+        metadata: {
+          ...plan.metadata,
+          idempotencyKey: plan.idempotencyKey,
+          duplicate: true,
+          cached: true
+        }
+      };
+    }
+
+    const budget = this.reserveToolBudget(plan.interactionCount);
+    if (!budget.allowed) {
+      return {
+        responseText: JSON.stringify({ error: 'tool_budget_exceeded', message: 'Tool execution budget exceeded for this interaction.' }),
+        metadata: {
+          ...plan.metadata,
+          idempotencyKey: plan.idempotencyKey,
+          budget_exceeded: true,
+          budget_remaining: 0
+        }
+      };
+    }
+
+    const functionToCall = this.availableFunctions[plan.functionName];
+    const maxAttempts = Math.max(1, this.toolRetryLimit + 1);
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const startedAt = Date.now();
+        const result = await this.withToolTimeout(
+          () => functionToCall(plan.validatedArgs),
+          this.toolExecutionTimeoutMs,
+          `${plan.functionName}_timeout`
+        );
+        const responseText = typeof result === 'string' ? result : JSON.stringify(result);
+        const metadata = {
+          ...plan.metadata,
+          idempotencyKey: plan.idempotencyKey,
+          attempt,
+          timeout_ms: this.toolExecutionTimeoutMs,
+          retry_limit: this.toolRetryLimit,
+          budget_remaining: budget.remaining,
+          duration_ms: Date.now() - startedAt
+        };
+        this.toolIdempotency.set(plan.idempotencyKey, { at: Date.now(), responseText });
+        return { responseText, metadata };
+      } catch (error) {
+        lastError = error;
+        if (attempt >= maxAttempts || !this.isRetryableToolError(error)) {
+          break;
+        }
+      }
+    }
+    return {
+      responseText: JSON.stringify({ error: 'Function execution failed', details: lastError?.message || 'unknown_error' }),
+      metadata: {
+        ...plan.metadata,
+        idempotencyKey: plan.idempotencyKey,
+        timeout_ms: this.toolExecutionTimeoutMs,
+        retry_limit: this.toolRetryLimit,
+        budget_remaining: budget.remaining,
+        failed: true,
+        error: lastError?.message || 'unknown_error'
+      }
+    };
   }
 
   updateUserContext(name, role, text) {
@@ -467,12 +668,13 @@ class EnhancedGptService extends EventEmitter {
             continue;
           }
 
-          const functionToCall = this.availableFunctions[functionName];
-          const validatedArgs = this.validateFunctionArgs(functionArgs);
-          const toolCallId = functionCallId || `tool_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+          // Step A: Build tool plan from model output.
+          const toolPlan = this.buildToolPlan(functionName, functionArgs, interactionCount, functionCallId);
+          const validation = this.validateToolPlan(toolPlan);
+          const effectivePlan = validation.ok ? validation.plan : toolPlan;
           const toolArgs = functionArgs && String(functionArgs).trim().length > 0
             ? String(functionArgs)
-            : JSON.stringify(validatedArgs || {});
+            : JSON.stringify(effectivePlan.validatedArgs || {});
 
           // Record the assistant tool call so the next tool message is valid
           const toolCallMessage = {
@@ -480,7 +682,7 @@ class EnhancedGptService extends EventEmitter {
             content: null,
             tool_calls: [
               {
-                id: toolCallId,
+                id: effectivePlan.toolCallId,
                 type: 'function',
                 function: {
                   name: functionName,
@@ -503,30 +705,28 @@ class EnhancedGptService extends EventEmitter {
             personalityInfo: this.personalityEngine.getCurrentPersonality()
           }, interactionCount);
 
-          let functionResponse;
-          try {
-            if (!functionToCall) {
-              throw new Error(`Function ${functionName} not available`);
-            }
-            functionResponse = await functionToCall(validatedArgs);
+          let responseText;
+          if (!validation.ok) {
+            responseText = JSON.stringify({
+              error: 'tool_plan_rejected',
+              details: validation.error || 'invalid_tool_plan'
+            });
+          } else {
+            // Step B: Execute validated plan inside deterministic envelope.
+            const execution = await this.executeToolPlan(effectivePlan);
+            responseText = execution.responseText;
             console.log(`🔧 Executed dynamic function: ${functionName}`.green);
-          } catch (functionError) {
-            console.error(`❌ Error executing function ${functionName}:`, functionError);
-            functionResponse = JSON.stringify({ error: 'Function execution failed', details: functionError.message });
+            console.log('🧰 Tool envelope:', execution.metadata);
           }
-
-          const responseText = typeof functionResponse === 'string'
-            ? functionResponse
-            : JSON.stringify(functionResponse);
 
           // For digit collection, wait for user input instead of continuing immediately
           if (functionName === 'collect_digits') {
-            this.updateUserContext(toolCallId, 'tool', responseText);
+            this.updateUserContext(effectivePlan.toolCallId, 'tool', responseText);
             return;
           }
 
           // Continue completion with function response
-          await this.completion(responseText, interactionCount, 'tool', toolCallId);
+          await this.completion(responseText, interactionCount, 'tool', effectivePlan.toolCallId);
         } else {
           completeResponse += content;
           partialResponse += content;
@@ -750,6 +950,8 @@ class EnhancedGptService extends EventEmitter {
     this.conversationHistory = [];
     this.personalityChanges = [];
     this.partialResponseIndex = 0;
+    this.toolIdempotency.clear();
+    this.toolBudget.clear();
     
     // Reset user context but keep the base system prompt and first message
     this.userContext = [

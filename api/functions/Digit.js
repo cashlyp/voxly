@@ -43,6 +43,14 @@ const DEFAULT_CIRCUIT_BREAKER = {
   errorRate: 0.3,
   cooldownMs: 60000
 };
+const DEFAULT_CAPTURE_ADAPTIVE_POLICY = Object.freeze({
+  poorJitterMs: 20,
+  poorRttMs: 250,
+  poorPacketLossPct: 1,
+  severeJitterMs: 35,
+  severeRttMs: 350,
+  severePacketLossPct: 2.5
+});
 const PLAN_STATES = Object.freeze({
   INIT: 'INIT',
   PLAY_FIRST_MESSAGE: 'PLAY_FIRST_MESSAGE',
@@ -51,8 +59,76 @@ const PLAN_STATES = Object.freeze({
   COMPLETE: 'COMPLETE',
   FAIL: 'FAIL'
 });
+const CAPTURE_STATES = Object.freeze({
+  IDLE: 'idle',
+  COLLECTING: 'collecting',
+  RETRYING: 'retrying',
+  FALLBACK_CHANNEL: 'fallback_channel',
+  COMPLETED: 'completed',
+  ABORTED: 'aborted'
+});
+const CAPTURE_EVENTS = Object.freeze({
+  START_COLLECT: 'start_collect',
+  PROMPT_RETRY: 'prompt_retry',
+  RESUME_COLLECT: 'resume_collect',
+  FALLBACK: 'fallback',
+  COMPLETE: 'complete',
+  ABORT: 'abort',
+  RESET: 'reset'
+});
+const CAPTURE_TRANSITIONS = Object.freeze({
+  [CAPTURE_STATES.IDLE]: {
+    [CAPTURE_EVENTS.START_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.RESET]: CAPTURE_STATES.IDLE
+  },
+  [CAPTURE_STATES.COLLECTING]: {
+    [CAPTURE_EVENTS.START_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.PROMPT_RETRY]: CAPTURE_STATES.RETRYING,
+    [CAPTURE_EVENTS.FALLBACK]: CAPTURE_STATES.FALLBACK_CHANNEL,
+    [CAPTURE_EVENTS.COMPLETE]: CAPTURE_STATES.COMPLETED,
+    [CAPTURE_EVENTS.ABORT]: CAPTURE_STATES.ABORTED,
+    [CAPTURE_EVENTS.RESET]: CAPTURE_STATES.IDLE
+  },
+  [CAPTURE_STATES.RETRYING]: {
+    [CAPTURE_EVENTS.START_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.RESUME_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.PROMPT_RETRY]: CAPTURE_STATES.RETRYING,
+    [CAPTURE_EVENTS.FALLBACK]: CAPTURE_STATES.FALLBACK_CHANNEL,
+    [CAPTURE_EVENTS.COMPLETE]: CAPTURE_STATES.COMPLETED,
+    [CAPTURE_EVENTS.ABORT]: CAPTURE_STATES.ABORTED,
+    [CAPTURE_EVENTS.RESET]: CAPTURE_STATES.IDLE
+  },
+  [CAPTURE_STATES.FALLBACK_CHANNEL]: {
+    [CAPTURE_EVENTS.START_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.RESUME_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.COMPLETE]: CAPTURE_STATES.COMPLETED,
+    [CAPTURE_EVENTS.ABORT]: CAPTURE_STATES.ABORTED,
+    [CAPTURE_EVENTS.RESET]: CAPTURE_STATES.IDLE
+  },
+  [CAPTURE_STATES.COMPLETED]: {
+    [CAPTURE_EVENTS.START_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.RESET]: CAPTURE_STATES.IDLE
+  },
+  [CAPTURE_STATES.ABORTED]: {
+    [CAPTURE_EVENTS.START_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.RESET]: CAPTURE_STATES.IDLE
+  }
+});
 const GROUP_MIN_SCORE = 2;
 const GROUP_MIN_CONFIDENCE = 0.75;
+const GLOBAL_IDEMPOTENCY_TTL_MS = 120000;
+const GLOBAL_IDEMPOTENCY_MAX_ENTRIES = 12000;
+const CAPTURE_SESSION_TERMINAL_STATES = new Set(['completed', 'aborted']);
+const CAPTURE_VAULT_MAX_ENTRIES = 5000;
+const CAPTURE_VAULT_DEFAULT_TTL_MS = 10 * 60 * 1000;
+const CHANNEL_SESSION_ROTATE_MIN_MS = 1500;
+const DEFAULT_CAPTURE_SLO = Object.freeze({
+  windowSize: 200,
+  successRateMin: 0.78,
+  medianCaptureMsMax: 45000,
+  duplicateSuppressionRateMax: 0.35,
+  timeoutErrorRateMax: 0.2
+});
 const GROUP_KEYWORDS = {
   banking: {
     positive: {
@@ -152,13 +228,59 @@ function createDigitCollectionService(options = {}) {
     smsFallbackMessage = 'I have sent you a text message. Please reply with the digits to continue.',
     smsFallbackConfirmationMessage = 'Thanks, your reply was received.',
     smsFallbackFailureMessage = 'I could not verify the digits via SMS. Please try again later.',
+    captureVaultTtlMs = CAPTURE_VAULT_DEFAULT_TTL_MS,
+    captureSlo = DEFAULT_CAPTURE_SLO,
+    adaptivePolicy = DEFAULT_CAPTURE_ADAPTIVE_POLICY,
     intentPredictor = null,
     healthThresholds = DEFAULT_HEALTH_THRESHOLDS,
     circuitBreaker = DEFAULT_CIRCUIT_BREAKER
   } = settings;
 
+  const sanitizeMetricValue = (key, value) => {
+    const keyName = String(key || '').toLowerCase();
+    if (value === null || value === undefined) return value;
+    if (typeof value === 'string') {
+      if (
+        keyName.includes('digit')
+        || keyName.includes('otp')
+        || keyName.includes('cvv')
+        || keyName.includes('card')
+        || keyName.includes('ssn')
+        || keyName.includes('phone')
+        || keyName.includes('token')
+        || keyName.includes('raw')
+      ) {
+        if (value.startsWith('vault://')) return value;
+        const trimmed = value.replace(/\s+/g, '');
+        if (/^\d{4,}$/.test(trimmed)) {
+          return `${'*'.repeat(Math.max(2, Math.min(8, trimmed.length - 2)))}${trimmed.slice(-2)}`;
+        }
+      }
+      return value;
+    }
+    if (Array.isArray(value)) {
+      return value.map((entry) => sanitizeMetricValue(key, entry));
+    }
+    if (typeof value === 'object') {
+      const out = {};
+      Object.entries(value).forEach(([childKey, childValue]) => {
+        out[childKey] = sanitizeMetricValue(childKey, childValue);
+      });
+      return out;
+    }
+    return value;
+  };
+
+  const sanitizeMetricPayload = (payload = {}) => {
+    const out = {};
+    Object.entries(payload || {}).forEach(([key, value]) => {
+      out[key] = sanitizeMetricValue(key, value);
+    });
+    return out;
+  };
+
   const logDigitMetric = (event, meta = {}) => {
-    const payload = { event, ...meta };
+    const payload = sanitizeMetricPayload({ event, ...meta });
     try {
       if (logger && typeof logger.info === 'function') {
         logger.info(`[digits] ${event}`, payload);
@@ -204,8 +326,9 @@ function createDigitCollectionService(options = {}) {
     return SUPPORTED_DIGIT_PROFILES.has(normalized);
   }
 
-  function maskDigitsForPreview(digits = '') {
-    if (showRawDigitsLive) return digits || '';
+  function maskDigitsForPreview(digits = '', profile = 'generic') {
+    const sensitive = isSensitiveProfile(profile);
+    if (showRawDigitsLive && !sensitive) return digits || '';
     const len = String(digits || '').length;
     if (!len) return '••';
     const masked = '•'.repeat(Math.max(2, Math.min(6, len)));
@@ -487,6 +610,19 @@ function createDigitCollectionService(options = {}) {
   const digitTimeouts = new Map();
   const digitFallbackStates = new Map();
   const digitCollectionPlans = new Map();
+  const captureLifecycle = new Map();
+  const globalIdempotency = new Map();
+  const captureSessions = new Map();
+  const captureVault = new Map();
+  const captureSloState = {
+    sessions: [],
+    input_events: 0,
+    duplicate_suppressed: 0,
+    timeout_events: 0,
+    error_events: 0,
+    updated_at: Date.now(),
+    lastMitigationAt: 0
+  };
   const lastDtmfTimestamps = new Map();
   const pendingDigits = new Map();
   const recentAccepted = new Map();
@@ -506,6 +642,393 @@ function createDigitCollectionService(options = {}) {
   };
 
   const DUPLICATE_INPUT_TTL_MS = 1500;
+
+  const buildGlobalIdempotencyKey = ({
+    scope = 'digit_capture',
+    callSid = 'unknown',
+    stepId = 'step',
+    attemptId = '0',
+    inputHash = 'na'
+  } = {}) => `${scope}:${callSid}:${stepId}:${attemptId}:${inputHash}`;
+
+  const cleanupGlobalIdempotency = (now = Date.now(), ttlMs = GLOBAL_IDEMPOTENCY_TTL_MS) => {
+    if (globalIdempotency.size < GLOBAL_IDEMPOTENCY_MAX_ENTRIES) return;
+    for (const [key, entry] of globalIdempotency.entries()) {
+      if (!entry?.at || now - entry.at > ttlMs) {
+        globalIdempotency.delete(key);
+      }
+    }
+  };
+
+  const markIdempotentAction = (key, ttlMs = GLOBAL_IDEMPOTENCY_TTL_MS) => {
+    if (!key) return false;
+    const now = Date.now();
+    const existing = globalIdempotency.get(key);
+    if (existing && now - existing.at < ttlMs) {
+      return true;
+    }
+    globalIdempotency.set(key, { at: now });
+    cleanupGlobalIdempotency(now, ttlMs);
+    return false;
+  };
+
+  const clearIdempotencyForCall = (callSid) => {
+    if (!callSid) return;
+    const token = `:${callSid}:`;
+    for (const key of globalIdempotency.keys()) {
+      if (key.includes(token)) {
+        globalIdempotency.delete(key);
+      }
+    }
+  };
+
+  const normalizeCaptureChannel = (source = 'dtmf') => {
+    const value = String(source || '').toLowerCase();
+    if (value === 'sms' || value === 'secure_sms_link' || value === 'link') return 'secure_sms_link';
+    if (value === 'spoken' || value === 'speech' || value === 'voice') return 'spoken';
+    if (value === 'agent' || value === 'handoff') return 'human_agent_handoff';
+    return 'dtmf';
+  };
+
+  const ensureCaptureSession = (callSid, expectation = {}, meta = {}) => {
+    if (!callSid) return null;
+    const existing = captureSessions.get(callSid);
+    const now = Date.now();
+    if (existing && !CAPTURE_SESSION_TERMINAL_STATES.has(existing.status || 'active')) {
+      existing.updated_at = now;
+      existing.last_profile = expectation?.profile || existing.last_profile || 'generic';
+      if (expectation?.plan_id) existing.plan_id = expectation.plan_id;
+      if (Number.isFinite(expectation?.plan_step_index)) existing.plan_step_index = expectation.plan_step_index;
+      if (meta.channel) {
+        const channel = normalizeCaptureChannel(meta.channel);
+        existing.active_channel = channel;
+        if (!existing.channels.includes(channel)) existing.channels.push(channel);
+      }
+      captureSessions.set(callSid, existing);
+      return existing;
+    }
+
+    const channel = normalizeCaptureChannel(meta.channel || expectation?.channel || 'dtmf');
+    const created = {
+      id: `cap_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+      call_sid: callSid,
+      status: 'active',
+      active_channel: channel,
+      channels: [channel],
+      last_profile: expectation?.profile || 'generic',
+      started_at: now,
+      updated_at: now,
+      completed_at: null,
+      duration_ms: null,
+      attempts: 0,
+      duplicate_hits: 0,
+      timeout_count: 0,
+      error_count: 0,
+      fallback_count: 0,
+      policy_overrides: {}
+    };
+    if (expectation?.plan_id) created.plan_id = expectation.plan_id;
+    if (Number.isFinite(expectation?.plan_step_index)) created.plan_step_index = expectation.plan_step_index;
+    captureSessions.set(callSid, created);
+    return created;
+  };
+
+  const updateCaptureSessionChannel = (callSid, channel, meta = {}) => {
+    const session = ensureCaptureSession(callSid, {}, { channel });
+    if (!session) return null;
+    const normalized = normalizeCaptureChannel(channel);
+    session.active_channel = normalized;
+    if (!session.channels.includes(normalized)) session.channels.push(normalized);
+    session.updated_at = Date.now();
+    if (meta.reason) session.last_channel_reason = meta.reason;
+    captureSessions.set(callSid, session);
+    return session;
+  };
+
+  const captureSloWindowSize = Math.max(10, Number(captureSlo?.windowSize || DEFAULT_CAPTURE_SLO.windowSize));
+  const captureSloThresholds = {
+    successRateMin: Number.isFinite(Number(captureSlo?.successRateMin))
+      ? Number(captureSlo.successRateMin)
+      : DEFAULT_CAPTURE_SLO.successRateMin,
+    medianCaptureMsMax: Number.isFinite(Number(captureSlo?.medianCaptureMsMax))
+      ? Number(captureSlo.medianCaptureMsMax)
+      : DEFAULT_CAPTURE_SLO.medianCaptureMsMax,
+    duplicateSuppressionRateMax: Number.isFinite(Number(captureSlo?.duplicateSuppressionRateMax))
+      ? Number(captureSlo.duplicateSuppressionRateMax)
+      : DEFAULT_CAPTURE_SLO.duplicateSuppressionRateMax,
+    timeoutErrorRateMax: Number.isFinite(Number(captureSlo?.timeoutErrorRateMax))
+      ? Number(captureSlo.timeoutErrorRateMax)
+      : DEFAULT_CAPTURE_SLO.timeoutErrorRateMax
+  };
+
+  const computeCaptureSloSnapshot = () => {
+    const sessions = captureSloState.sessions.slice(-captureSloWindowSize);
+    const completed = sessions.length;
+    const successful = sessions.filter((entry) => entry.status === 'completed').length;
+    const durations = sessions
+      .map((entry) => Number(entry.duration_ms))
+      .filter((value) => Number.isFinite(value) && value >= 0)
+      .sort((a, b) => a - b);
+    const mid = Math.floor(durations.length / 2);
+    const medianCaptureMs = durations.length
+      ? (durations.length % 2 === 0 ? Math.round((durations[mid - 1] + durations[mid]) / 2) : durations[mid])
+      : null;
+    const inputEvents = Math.max(1, captureSloState.input_events);
+    const successRate = completed ? successful / completed : 1;
+    const duplicateSuppressionRate = captureSloState.duplicate_suppressed / inputEvents;
+    const timeoutErrorRate = (captureSloState.timeout_events + captureSloState.error_events) / inputEvents;
+    return {
+      windowSize: captureSloWindowSize,
+      sessions: completed,
+      successRate,
+      medianCaptureMs,
+      duplicateSuppressionRate,
+      timeoutErrorRate,
+      thresholds: captureSloThresholds,
+      updatedAt: captureSloState.updated_at
+    };
+  };
+
+  const maybeRecordCaptureSlo = async (callSid, session) => {
+    captureSloState.updated_at = Date.now();
+    const snapshot = computeCaptureSloSnapshot();
+    if (!db?.addCallMetric) return snapshot;
+    try {
+      await db.addCallMetric(callSid, 'capture_success_rate', Number(snapshot.successRate.toFixed(4)), {
+        window: snapshot.windowSize,
+        sessions: snapshot.sessions
+      });
+      if (Number.isFinite(snapshot.medianCaptureMs)) {
+        await db.addCallMetric(callSid, 'capture_median_ms', snapshot.medianCaptureMs, {
+          window: snapshot.windowSize
+        });
+      }
+      await db.addCallMetric(callSid, 'capture_duplicate_suppression_rate', Number(snapshot.duplicateSuppressionRate.toFixed(4)), {
+        window: snapshot.windowSize
+      });
+      await db.addCallMetric(callSid, 'capture_timeout_error_rate', Number(snapshot.timeoutErrorRate.toFixed(4)), {
+        window: snapshot.windowSize
+      });
+    } catch (_) {}
+    if (
+      snapshot.successRate < captureSloThresholds.successRateMin
+      || (Number.isFinite(snapshot.medianCaptureMs) && snapshot.medianCaptureMs > captureSloThresholds.medianCaptureMsMax)
+      || snapshot.duplicateSuppressionRate > captureSloThresholds.duplicateSuppressionRateMax
+      || snapshot.timeoutErrorRate > captureSloThresholds.timeoutErrorRateMax
+    ) {
+      try {
+        await db?.logServiceHealth?.('digit_capture_slo', 'degraded', {
+          call_sid: callSid,
+          session_id: session?.id || null,
+          snapshot
+        });
+      } catch (_) {}
+    }
+    return snapshot;
+  };
+
+  const applySloMitigationPolicy = (callSid, expectation = {}, snapshot = null) => {
+    const current = snapshot || computeCaptureSloSnapshot();
+    const next = { ...expectation };
+    const callConfig = callConfigurations.get(callSid) || {};
+    const mitigation = {};
+
+    if (current.successRate < captureSloThresholds.successRateMin || current.timeoutErrorRate > captureSloThresholds.timeoutErrorRateMax) {
+      next.allow_sms_fallback = true;
+      next.allow_spoken_fallback = false;
+      next.max_retries = Math.min(next.max_retries || 0, 1);
+      mitigation.mode = 'sms_or_agent';
+      mitigation.reason = 'capture_reliability';
+      if (getCurrentProvider && typeof getCurrentProvider === 'function' && String(getCurrentProvider() || '').toLowerCase() !== 'twilio') {
+        mitigation.provider_switch = 'twilio';
+      }
+    }
+    if (Number.isFinite(current.medianCaptureMs) && current.medianCaptureMs > captureSloThresholds.medianCaptureMsMax) {
+      next.prompt = `Please enter the ${buildExpectedLabel(next)} now.`;
+      mitigation.prompt_mode = 'brief';
+    }
+    if (current.duplicateSuppressionRate > captureSloThresholds.duplicateSuppressionRateMax) {
+      next.min_collect_delay_ms = Math.max(next.min_collect_delay_ms || 0, 1400);
+      mitigation.dedupe_mode = 'strict';
+    }
+
+    if (Object.keys(mitigation).length) {
+      callConfig.capture_slo_mitigation = {
+        ...mitigation,
+        updated_at: new Date().toISOString()
+      };
+      callConfigurations.set(callSid, callConfig);
+      const session = captureSessions.get(callSid);
+      if (session) {
+        session.policy_overrides = { ...(session.policy_overrides || {}), ...mitigation };
+        captureSessions.set(callSid, session);
+      }
+      logDigitMetric('capture_slo_mitigation_applied', {
+        callSid,
+        mitigation,
+        snapshot: {
+          successRate: current.successRate,
+          medianCaptureMs: current.medianCaptureMs,
+          duplicateSuppressionRate: current.duplicateSuppressionRate,
+          timeoutErrorRate: current.timeoutErrorRate
+        }
+      });
+    }
+    return next;
+  };
+
+  const updateCaptureSloCounters = (type = 'input') => {
+    captureSloState.input_events += 1;
+    if (type === 'duplicate') captureSloState.duplicate_suppressed += 1;
+    if (type === 'timeout') captureSloState.timeout_events += 1;
+    if (type === 'error') captureSloState.error_events += 1;
+    captureSloState.updated_at = Date.now();
+  };
+
+  const completeCaptureSession = async (callSid, status = 'completed', meta = {}) => {
+    const session = captureSessions.get(callSid);
+    if (!session || CAPTURE_SESSION_TERMINAL_STATES.has(session.status)) return session || null;
+    const endedAt = Date.now();
+    session.status = status;
+    session.completed_at = endedAt;
+    session.updated_at = endedAt;
+    session.duration_ms = Math.max(0, endedAt - (session.started_at || endedAt));
+    if (meta.channel) {
+      const channel = normalizeCaptureChannel(meta.channel);
+      session.active_channel = channel;
+      if (!session.channels.includes(channel)) session.channels.push(channel);
+    }
+    if (meta.reason) session.end_reason = meta.reason;
+    captureSessions.set(callSid, session);
+    captureSloState.sessions.push({
+      id: session.id,
+      call_sid: callSid,
+      status: session.status,
+      duration_ms: session.duration_ms,
+      channels: [...session.channels],
+      ended_at: session.completed_at
+    });
+    if (captureSloState.sessions.length > captureSloWindowSize) {
+      captureSloState.sessions.splice(0, captureSloState.sessions.length - captureSloWindowSize);
+    }
+    await maybeRecordCaptureSlo(callSid, session);
+    return session;
+  };
+
+  const getVaultKey = () => {
+    const source = config?.compliance?.encryptionKey || process.env.DTMF_ENCRYPTION_KEY || 'voxly-local-vault-key';
+    return crypto.createHash('sha256').update(String(source)).digest();
+  };
+
+  const cleanupCaptureVault = (now = Date.now()) => {
+    for (const [token, item] of captureVault.entries()) {
+      if (!item?.expires_at || item.expires_at <= now) {
+        captureVault.delete(token);
+      }
+    }
+    if (captureVault.size > CAPTURE_VAULT_MAX_ENTRIES) {
+      const overBy = captureVault.size - CAPTURE_VAULT_MAX_ENTRIES;
+      const entries = Array.from(captureVault.entries()).sort((a, b) => (a[1]?.created_at || 0) - (b[1]?.created_at || 0));
+      for (let i = 0; i < overBy; i += 1) {
+        captureVault.delete(entries[i][0]);
+      }
+    }
+  };
+
+  const clearVaultForCall = (callSid) => {
+    if (!callSid) return;
+    for (const [token, item] of captureVault.entries()) {
+      if (item?.call_sid === callSid) {
+        captureVault.delete(token);
+      }
+    }
+  };
+
+  const storeSensitiveToken = (callSid, profile, value, meta = {}) => {
+    const raw = String(value || '');
+    if (!raw) return null;
+    const now = Date.now();
+    const iv = crypto.randomBytes(12);
+    const key = getVaultKey();
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    const enc = Buffer.concat([cipher.update(raw, 'utf8'), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    const token = `tok_${Date.now().toString(36)}_${crypto.randomBytes(8).toString('hex')}`;
+    const ttl = Math.max(60000, Number(meta.ttl_ms || captureVaultTtlMs || CAPTURE_VAULT_DEFAULT_TTL_MS));
+    captureVault.set(token, {
+      call_sid: callSid,
+      profile,
+      created_at: now,
+      expires_at: now + ttl,
+      payload: enc.toString('base64'),
+      iv: iv.toString('base64'),
+      tag: tag.toString('base64'),
+      meta: {
+        reason: meta.reason || null,
+        channel: meta.channel || null
+      }
+    });
+    cleanupCaptureVault(now);
+    return {
+      token,
+      ref: `vault://digits/${callSid}/${token}`
+    };
+  };
+
+  const parseSensitiveTokenRef = (tokenRef) => {
+    const raw = String(tokenRef || '').trim();
+    if (!raw) return null;
+    const decoded = (() => {
+      try {
+        return decodeURIComponent(raw);
+      } catch (_) {
+        return raw;
+      }
+    })();
+    if (decoded.startsWith('tok_')) {
+      return { token: decoded, callSid: null };
+    }
+    const match = decoded.match(/^vault:\/\/digits\/([^/]+)\/([^/]+)$/);
+    if (!match) return null;
+    return {
+      callSid: match[1],
+      token: match[2]
+    };
+  };
+
+  const validateSecureCaptureToken = (callSid, tokenRef) => {
+    cleanupCaptureVault();
+    const parsed = parseSensitiveTokenRef(tokenRef);
+    if (!parsed?.token) {
+      return { ok: false, reason: 'invalid_token' };
+    }
+    const entry = captureVault.get(parsed.token);
+    if (!entry) {
+      return { ok: false, reason: 'token_not_found' };
+    }
+    if (!entry.expires_at || entry.expires_at <= Date.now()) {
+      captureVault.delete(parsed.token);
+      return { ok: false, reason: 'token_expired' };
+    }
+    const resolvedCallSid = String(callSid || '').trim() || entry.call_sid;
+    if (!resolvedCallSid) {
+      return { ok: false, reason: 'missing_call_sid' };
+    }
+    if (parsed.callSid && parsed.callSid !== resolvedCallSid) {
+      return { ok: false, reason: 'token_call_mismatch' };
+    }
+    if (entry.call_sid !== resolvedCallSid) {
+      return { ok: false, reason: 'token_call_mismatch' };
+    }
+    return {
+      ok: true,
+      callSid: resolvedCallSid,
+      token: parsed.token,
+      profile: entry.profile || null,
+      expiresAt: entry.expires_at || null,
+      meta: entry.meta || {}
+    };
+  };
 
   const buildInputFingerprint = (callSid, expectation, digits, source) => {
     const planId = expectation?.plan_id || 'no_plan';
@@ -761,6 +1284,54 @@ function createDigitCollectionService(options = {}) {
     return `${collection.profile || 'generic'}|${collection.len || 0}|${stepKey}|${hash}`;
   };
 
+  const resolveCaptureStepId = (expectation = {}, meta = {}) => {
+    const explicitStep = meta.step_id || meta.stepId;
+    if (explicitStep) return String(explicitStep);
+    if (expectation?.plan_id || Number.isFinite(expectation?.plan_step_index)) {
+      return `${expectation.plan_id || 'plan'}:${Number.isFinite(expectation?.plan_step_index) ? expectation.plan_step_index : 'step'}`;
+    }
+    return String(expectation?.profile || 'single');
+  };
+
+  const hashInput = (value = '') => crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, 16);
+
+  const getCaptureState = (callSid) => captureLifecycle.get(callSid)?.state || CAPTURE_STATES.IDLE;
+
+  const transitionCaptureState = (callSid, event, meta = {}) => {
+    if (!callSid || !event) return false;
+    const prev = getCaptureState(callSid);
+    const next = CAPTURE_TRANSITIONS[prev]?.[event];
+    if (!next) {
+      logDigitMetric('capture_state_ignored', {
+        callSid,
+        event,
+        state: prev
+      });
+      return false;
+    }
+    const snapshot = {
+      state: next,
+      previous_state: prev,
+      event,
+      updated_at: Date.now(),
+      reason: meta.reason || null
+    };
+    captureLifecycle.set(callSid, snapshot);
+    logDigitMetric('capture_state_transition', {
+      callSid,
+      from: prev,
+      to: next,
+      event,
+      reason: meta.reason || null
+    });
+    return true;
+  };
+
+  const canAcceptCaptureInput = (callSid) => {
+    const state = getCaptureState(callSid);
+    return state === CAPTURE_STATES.COLLECTING || state === CAPTURE_STATES.RETRYING;
+  };
+
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   const setCaptureActive = (callSid, active, meta = {}) => {
@@ -768,6 +1339,10 @@ function createDigitCollectionService(options = {}) {
     const callConfig = callConfigurations.get(callSid) || {};
     const updatedAt = new Date().toISOString();
     if (active) {
+      ensureCaptureSession(callSid, {}, { channel: meta.channel || 'dtmf' });
+      if (getCaptureState(callSid) === CAPTURE_STATES.IDLE) {
+        transitionCaptureState(callSid, CAPTURE_EVENTS.START_COLLECT, { reason: meta.reason || 'set_active' });
+      }
       callConfig.digit_capture_active = true;
       callConfig.call_mode = 'dtmf_capture';
       callConfig.flow_state = 'capture_active';
@@ -780,6 +1355,10 @@ function createDigitCollectionService(options = {}) {
         callConfig.group_locked = true;
       }
     } else {
+      transitionCaptureState(callSid, CAPTURE_EVENTS.RESET, { reason: meta.reason || 'set_inactive' });
+      if (meta.complete === true) {
+        void completeCaptureSession(callSid, 'completed', { reason: meta.reason || 'set_inactive', channel: meta.channel || null });
+      }
       callConfig.digit_capture_active = false;
       if (callConfig.call_mode === 'dtmf_capture') {
         callConfig.call_mode = 'normal';
@@ -859,6 +1438,87 @@ function createDigitCollectionService(options = {}) {
     } catch (_) {
       return null;
     }
+  };
+
+  const readNumber = (...values) => {
+    for (const value of values) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+  };
+
+  const getChannelConditions = (callSid, source = 'dtmf') => {
+    const callConfig = callConfigurations.get(callSid) || {};
+    const qualityScore = getCallQualityScore(callSid);
+    let jitterMs = null;
+    let rttMs = null;
+    let packetLossPct = null;
+    try {
+      if (webhookService && typeof webhookService.getQualityMetrics === 'function') {
+        const entry = webhookService.liveConsoleByCallSid?.get?.(callSid);
+        if (entry) {
+          const metrics = webhookService.getQualityMetrics(entry) || {};
+          jitterMs = readNumber(metrics.jitterMs, jitterMs);
+          rttMs = readNumber(metrics.latencyMs, metrics.rttMs, rttMs);
+          packetLossPct = readNumber(metrics.packetLossPct, packetLossPct);
+        }
+      }
+    } catch (_) {}
+    const configMetrics = callConfig.channel_metrics || callConfig.network_metrics || callConfig.media_metrics || {};
+    jitterMs = readNumber(jitterMs, configMetrics.jitterMs, configMetrics.jitter_ms);
+    rttMs = readNumber(rttMs, configMetrics.rttMs, configMetrics.rtt_ms, configMetrics.latencyMs, configMetrics.latency_ms);
+    packetLossPct = readNumber(packetLossPct, configMetrics.packetLossPct, configMetrics.packet_loss_pct);
+
+    const thresholds = {
+      ...DEFAULT_CAPTURE_ADAPTIVE_POLICY,
+      ...(adaptivePolicy || {})
+    };
+    const poor = Boolean(
+      (Number.isFinite(jitterMs) && jitterMs >= thresholds.poorJitterMs)
+      || (Number.isFinite(rttMs) && rttMs >= thresholds.poorRttMs)
+      || (Number.isFinite(packetLossPct) && packetLossPct >= thresholds.poorPacketLossPct)
+      || (Number.isFinite(qualityScore) && qualityScore <= 3)
+    );
+    const severe = Boolean(
+      (Number.isFinite(jitterMs) && jitterMs >= thresholds.severeJitterMs)
+      || (Number.isFinite(rttMs) && rttMs >= thresholds.severeRttMs)
+      || (Number.isFinite(packetLossPct) && packetLossPct >= thresholds.severePacketLossPct)
+      || (Number.isFinite(qualityScore) && qualityScore <= 1)
+    );
+    return {
+      source,
+      qualityScore,
+      jitterMs,
+      rttMs,
+      packetLossPct,
+      poor,
+      severe
+    };
+  };
+
+  const buildChannelSessionId = (callSid, source = 'dtmf') => {
+    const sid = String(callSid || 'call').slice(-8);
+    const src = normalizeCaptureChannel(source);
+    return `${src}_${sid}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+  };
+
+  const syncChannelSession = (expectation, source = 'dtmf', options = {}) => {
+    if (!expectation) return null;
+    const now = Date.now();
+    const normalizedSource = normalizeCaptureChannel(source || expectation.channel || 'dtmf');
+    const previous = expectation.channel_session_id || null;
+    const previousSource = normalizeCaptureChannel(expectation.channel || normalizedSource);
+    const rotateBySource = previousSource !== normalizedSource;
+    const rotateByPrompt = options.forceRotate === true;
+    const rotateByAge = Number.isFinite(Number(expectation.channel_session_started_at))
+      && now - Number(expectation.channel_session_started_at) > Math.max(CHANNEL_SESSION_ROTATE_MIN_MS, Number(expectation.timeout_s || 10) * 1000);
+    if (!previous || rotateBySource || rotateByPrompt || rotateByAge) {
+      expectation.channel_session_id = buildChannelSessionId(options.callSid || 'call', normalizedSource);
+      expectation.channel_session_started_at = now;
+    }
+    expectation.channel = normalizedSource;
+    return expectation.channel_session_id;
   };
 
   const applyHealthPolicy = (callSid, expectation) => {
@@ -955,6 +1615,37 @@ function createDigitCollectionService(options = {}) {
     ]).has(normalized);
   };
 
+  const HIGH_RISK_VERTICALS = new Set([
+    'finance',
+    'financial_services',
+    'banking',
+    'fintech',
+    'healthcare',
+    'medical',
+    'government',
+    'public_sector',
+    'insurance'
+  ]);
+
+  const resolveCallVertical = (callConfig = {}) => {
+    const raw = callConfig?.vertical
+      || callConfig?.industry
+      || callConfig?.business_vertical
+      || callConfig?.businessType
+      || '';
+    return String(raw || '').toLowerCase().trim().replace(/[\s-]+/g, '_');
+  };
+
+  const normalizeInputChannel = (value = '') => {
+    const raw = String(value || '').toLowerCase().trim();
+    if (!raw) return 'dtmf';
+    if (raw === 'voice' || raw === 'spoken' || raw === 'speech') return 'speech';
+    if (raw === 'text') return 'sms';
+    if (raw === 'url' || raw === 'web') return 'link';
+    if (raw === 'sms' || raw === 'dtmf' || raw === 'link') return raw;
+    return 'dtmf';
+  };
+
   const updateSessionState = (callSid, updates = {}) => {
     if (!callSid) return null;
     const existing = sessionState.get(callSid) || {
@@ -1020,13 +1711,20 @@ function createDigitCollectionService(options = {}) {
     let applied = false;
     if (signal.score >= thresholds.confirm) {
       expectation.speak_confirmation = true;
-      if (!expectation.confirmation_style || expectation.confirmation_style === 'none') {
-        expectation.confirmation_style = isSensitiveProfile(expectation.profile) ? 'none' : 'last4';
+      if (!expectation.confirmation_locked) {
+        if (isSensitiveProfile(expectation.profile)) {
+          expectation.confirmation_style = signal.score >= thresholds.dtmf_only ? 'last2' : 'last4';
+        } else if (!expectation.confirmation_style || expectation.confirmation_style === 'none') {
+          expectation.confirmation_style = 'last4';
+        }
       }
       applied = true;
     }
     if (signal.score >= thresholds.dtmf_only) {
       expectation.allow_spoken_fallback = false;
+      if (!expectation.confirmation_locked && isSensitiveProfile(expectation.profile)) {
+        expectation.confirmation_style = 'last2';
+      }
       applied = true;
     }
     if (signal.score >= thresholds.route_agent) {
@@ -1047,6 +1745,105 @@ function createDigitCollectionService(options = {}) {
     return expectation;
   };
 
+  const applyCapturePolicy = (callSid, expectation, params = {}) => {
+    if (!expectation) return expectation;
+    const next = { ...expectation };
+    const profile = normalizeProfileId(next.profile) || 'generic';
+    const rules = PROFILE_RULES[profile] || PROFILE_RULES.generic;
+    const callConfig = callConfigurations.get(callSid) || {};
+    const vertical = resolveCallVertical(callConfig);
+    const highRiskVertical = HIGH_RISK_VERTICALS.has(vertical);
+    const callPolicy = callConfig.capture_policy && typeof callConfig.capture_policy === 'object'
+      ? callConfig.capture_policy
+      : {};
+    const allowSensitiveRawPersistence = params.allow_sensitive_raw_persistence === true
+      && params.persist_raw_digits === true
+      && (callPolicy.allow_sensitive_raw_persistence === true || callConfig.allow_sensitive_raw_persistence === true);
+
+    const normalizedMin = Math.max(1, Number(next.min_digits) || 1);
+    const normalizedMax = Math.max(normalizedMin, Number(next.max_digits) || normalizedMin);
+    next.min_digits = normalizedMin;
+    next.max_digits = normalizedMax;
+
+    const requestedChannels = Array.isArray(params.allowed_input_channels)
+      ? params.allowed_input_channels.map((entry) => normalizeInputChannel(entry))
+      : null;
+    const channelPolicy = rules.channel_policy || {};
+    const allowed = {
+      dtmf: channelPolicy.dtmf !== false,
+      sms: channelPolicy.sms !== false && smsFallbackEnabled,
+      speech: channelPolicy.voice !== false && next.allow_spoken_fallback !== false,
+      link: requestedChannels ? requestedChannels.includes('link') : params.allow_link_input === true
+    };
+    if (requestedChannels && requestedChannels.length) {
+      allowed.dtmf = requestedChannels.includes('dtmf') && allowed.dtmf;
+      allowed.sms = requestedChannels.includes('sms') && allowed.sms;
+      allowed.speech = requestedChannels.includes('speech') && allowed.speech;
+    }
+
+    if (highRiskVertical) {
+      allowed.speech = false;
+      next.allow_spoken_fallback = false;
+      next.mask_for_gpt = true;
+      next.storage_class = 'restricted';
+      next.persist_raw_digits = false;
+      next.allow_sensitive_raw_persistence = false;
+      next.escalation_policy = 'route_to_agent';
+      if (allowSensitiveRawPersistence) {
+        next.persist_raw_digits = true;
+        next.allow_sensitive_raw_persistence = true;
+      }
+    } else {
+      next.storage_class = isSensitiveProfile(profile) ? 'sensitive' : 'standard';
+      next.persist_raw_digits = params.persist_raw_digits !== false;
+      next.allow_sensitive_raw_persistence = false;
+      if (isSensitiveProfile(profile) && params.persist_raw_digits !== true) {
+        next.persist_raw_digits = false;
+      }
+    }
+
+    if (rules.mask_strategy === 'masked' || rules.mask_strategy === 'last4') {
+      next.mask_for_gpt = true;
+    }
+    next.mask_strategy = rules.mask_strategy || 'masked';
+    next.allowed_input_channels = allowed;
+    next.allow_sms_fallback = next.allow_sms_fallback === true && allowed.sms;
+    next.allow_spoken_fallback = next.allow_spoken_fallback === true && allowed.speech;
+    next.vertical = vertical || null;
+
+    const preferredChannel = normalizeInputChannel(next.channel || params.channel || 'dtmf');
+    if (allowed[preferredChannel]) {
+      next.channel = preferredChannel;
+    } else if (allowed.dtmf) {
+      next.channel = 'dtmf';
+    } else if (allowed.sms) {
+      next.channel = 'sms';
+    } else if (allowed.speech) {
+      next.channel = 'speech';
+    } else {
+      next.channel = 'dtmf';
+    }
+
+    if (highRiskVertical) {
+      logDigitMetric('capture_policy_high_risk', {
+        callSid,
+        profile,
+        vertical,
+        storage_class: next.storage_class,
+        channel: next.channel
+      });
+      if (next.allow_sensitive_raw_persistence === true) {
+        logDigitMetric('capture_policy_high_risk_override', {
+          callSid,
+          profile,
+          vertical,
+          storage_class: next.storage_class
+        });
+      }
+    }
+    return next;
+  };
+
   const resolveCallPhone = async (callSid) => {
     const callConfig = callConfigurations.get(callSid);
     const direct = callConfig?.phone_number || callConfig?.number || callConfig?.to;
@@ -1062,10 +1859,20 @@ function createDigitCollectionService(options = {}) {
     return null;
   };
 
-  const buildSmsPrompt = (expectation, correlationId = '') => {
+  const buildSecureCaptureLink = (callSid, tokenRef = '') => {
+    const host = config?.server?.hostname;
+    if (!host || !tokenRef) return '';
+    const encodedRef = encodeURIComponent(tokenRef);
+    return `https://${host}/capture/secure?callSid=${encodeURIComponent(callSid)}&token=${encodedRef}`;
+  };
+
+  const buildSmsPrompt = (expectation, correlationId = '', secureLink = '') => {
     const label = buildExpectedLabel(expectation);
     const suffix = correlationId ? ` Ref: ${correlationId}` : '';
-    return `Reply with your ${label} using digits only.${suffix}`;
+    const linkHint = secureLink
+      ? ` You can also use this secure link: ${secureLink}`
+      : '';
+    return `Reply with your ${label} using digits only.${suffix}${linkHint}`;
   };
 
   const buildSmsStepPrompt = (expectation) => {
@@ -1086,13 +1893,20 @@ function createDigitCollectionService(options = {}) {
       return null;
     }
     const correlationId = `SMS-${callSid.slice(-6)}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
-    const prompt = buildSmsPrompt(expectation, correlationId);
+    const secureToken = storeSensitiveToken(callSid, expectation?.profile || 'generic', `${callSid}:${correlationId}`, {
+      reason: 'sms_link_bootstrap',
+      channel: 'secure_sms_link'
+    });
+    const secureLink = buildSecureCaptureLink(callSid, secureToken?.ref || '');
+    const prompt = buildSmsPrompt(expectation, correlationId, secureLink);
     try {
       await smsService.sendSMS(phone, prompt, null, { idempotencyKey: `${callSid}:${correlationId}` });
       const session = {
         callSid,
         phone,
         correlationId,
+        secureLink,
+        secureLinkToken: secureToken?.ref || null,
         expectation: { ...expectation },
         created_at: Date.now(),
         reason,
@@ -1105,11 +1919,14 @@ function createDigitCollectionService(options = {}) {
       if (plan?.active) {
         plan.channel = 'sms';
       }
+      updateCaptureSessionChannel(callSid, 'secure_sms_link', { reason: 'sms_fallback' });
       logDigitMetric('sms_fallback_sent', { callSid, phone, correlationId, profile: expectation.profile });
       await db.updateCallState(callSid, 'digit_collection_sms_sent', {
         phone,
         correlation_id: correlationId,
-        reason
+        reason,
+        fallback_reason_code: buildFallbackReasonCode('sms', reason),
+        secure_link: secureLink || null
       }).catch(() => {});
       return session;
     } catch (err) {
@@ -1155,6 +1972,7 @@ function createDigitCollectionService(options = {}) {
 
   const handleCircuitFallback = async (callSid, expectation, allowCallEnd, deferCallEnd, source = 'system') => {
     const profile = expectation?.profile || 'generic';
+    transitionCaptureState(callSid, CAPTURE_EVENTS.ABORT, { reason: 'circuit_open' });
     await emitAuditEvent(callSid, 'DigitCaptureAborted', {
       profile,
       source,
@@ -1163,6 +1981,7 @@ function createDigitCollectionService(options = {}) {
     if (expectation?.allow_sms_fallback && smsFallbackEnabled) {
       const session = await createSmsSession(callSid, expectation, 'circuit_open');
       if (session) {
+        transitionCaptureState(callSid, CAPTURE_EVENTS.FALLBACK, { reason: 'sms_fallback_circuit' });
         expectation.sms_fallback_used = true;
         expectation.channel = 'sms';
         digitCollectionManager.expectations.set(callSid, expectation);
@@ -1193,6 +2012,8 @@ function createDigitCollectionService(options = {}) {
     const reason = expectation?.risk_reason || 'risk_threshold';
     const message = callEndMessages.risk
       || 'For security reasons, we need to route this request to an agent. Goodbye.';
+    updateCaptureSessionChannel(callSid, 'human_agent_handoff', { reason });
+    transitionCaptureState(callSid, CAPTURE_EVENTS.ABORT, { reason: 'risk_route_to_agent' });
     logDigitMetric('risk_route_agent', { callSid, score, reason });
     void emitAuditEvent(callSid, 'RoutedToAgent', {
       profile: expectation?.profile || collection?.profile || 'generic',
@@ -1204,7 +2025,8 @@ function createDigitCollectionService(options = {}) {
     await db.updateCallState(callSid, 'digit_risk_escalation', {
       score,
       reason,
-      profile: expectation?.profile || collection?.profile || null
+      profile: expectation?.profile || collection?.profile || null,
+      fallback_reason_code: buildFallbackReasonCode('human_agent', reason)
     }).catch(() => {});
     if (allowCallEnd) {
       if (deferCallEnd) {
@@ -1325,14 +2147,127 @@ function createDigitCollectionService(options = {}) {
     };
   };
 
-  const buildRetryPolicy = ({ reason, attempt, source, expectation, affect, session, health, qualityScore }) => {
+  const resolveRejectionCode = (reason = '', profile = 'generic', source = 'dtmf') => {
+    const normalizedReason = String(reason || '').toLowerCase().trim();
+    const normalizedProfile = normalizeProfileId(profile) || 'generic';
+    const normalizedSource = String(source || '').toLowerCase();
+    if (!normalizedReason) return null;
+    if (normalizedReason === 'idempotent_duplicate' || normalizedReason === 'duplicate') return 'DUPLICATE_INPUT';
+    if (normalizedReason === 'stale_channel_session') return 'STALE_CHANNEL_SESSION';
+    if (normalizedReason === 'stale_attempt') return 'STALE_ATTEMPT';
+    if (normalizedReason === 'stale_step' || normalizedReason === 'stale_plan') return 'STALE_PLAN_EVENT';
+    if (normalizedReason === 'invalid_state') return 'INVALID_CAPTURE_STATE';
+    if (normalizedReason === 'too_fast') return 'FRAUD_IMPOSSIBLE_TIMING';
+    if (normalizedReason === 'spam_pattern') return 'FRAUD_BOT_CADENCE';
+    if (normalizedReason === 'low_confidence') return 'MULTI_SIGNAL_LOW_CONFIDENCE';
+    if (normalizedReason.startsWith('invalid_card')) return 'VALIDATION_CARD_NUMBER';
+    if (normalizedReason === 'invalid_cvv') return 'VALIDATION_CVV';
+    if (normalizedReason.startsWith('invalid_expiry')) return 'VALIDATION_EXPIRY';
+    if (normalizedReason === 'invalid_routing') return 'VALIDATION_ROUTING_NUMBER';
+    if (normalizedReason === 'invalid_phone') return 'VALIDATION_PHONE_NUMBER';
+    if (normalizedReason === 'invalid_month' || normalizedReason === 'invalid_day') return 'VALIDATION_DOB';
+    if (normalizedReason === 'invalid_length' || normalizedReason === 'too_short' || normalizedReason === 'too_long' || normalizedReason === 'incomplete') {
+      if (normalizedProfile === 'cvv') return 'VALIDATION_CVV_LENGTH';
+      if (normalizedProfile === 'card_number') return 'VALIDATION_CARD_LENGTH';
+      if (normalizedProfile === 'card_expiry') return 'VALIDATION_EXPIRY_LENGTH';
+      return 'VALIDATION_LENGTH';
+    }
+    if (normalizedReason === 'risk_rejected') {
+      if (normalizedSource === 'spoken') return 'MULTI_SIGNAL_LOW_CONFIDENCE';
+      return 'RISK_SIGNAL_REJECTED';
+    }
+    return `VALIDATION_${normalizedReason.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
+  };
+
+  const buildFallbackReasonCode = (channel, reason = '') => {
+    const normalizedChannel = String(channel || '').toLowerCase().trim();
+    const normalizedReason = String(reason || '').toLowerCase().trim();
+    if (normalizedChannel === 'sms') {
+      if (normalizedReason === 'circuit_open') return 'DIGIT_SMS_FALLBACK_CIRCUIT_OPEN';
+      return `DIGIT_SMS_FALLBACK_${(normalizedReason || 'MAX_RETRIES').toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
+    }
+    if (normalizedChannel === 'human_agent') {
+      return `DIGIT_AGENT_ESCALATION_${(normalizedReason || 'RISK').toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
+    }
+    if (normalizedChannel === 'voice') {
+      return `DIGIT_VOICE_FALLBACK_${(normalizedReason || 'MAX_RETRIES').toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
+    }
+    return `DIGIT_FALLBACK_${(normalizedReason || 'UNKNOWN').toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
+  };
+
+  const evaluateCaptureRisk = ({ callSid, collection, expectation, source = 'dtmf', candidate = null }) => {
+    const profile = normalizeProfileId(collection?.profile || expectation?.profile || 'generic') || 'generic';
+    const callConfig = callConfigurations.get(callSid) || {};
+    const vertical = resolveCallVertical(callConfig);
+    const highRiskVertical = HIGH_RISK_VERTICALS.has(vertical);
+    const sensitive = isSensitiveProfile(profile) || highRiskVertical;
+    const normalizedSource = String(source || '').toLowerCase();
+    const reasons = [];
+    const conditions = getChannelConditions(callSid, normalizedSource);
+    const candidateConfidence = Number.isFinite(candidate?.confidence) ? candidate.confidence : null;
+    const asrConfidence = Number.isFinite(collection?.asr_confidence)
+      ? collection.asr_confidence
+      : (Number.isFinite(candidate?.signals?.asrConfidence) ? candidate.signals.asrConfidence : null);
+    if (Number.isFinite(collection?.dtmf_gap_ms) && collection.dtmf_gap_ms > 0 && collection.dtmf_gap_ms < Math.max(80, Math.round(minDtmfGapMs * 0.55))) {
+      reasons.push('impossible_timing');
+    }
+    if (collection?.reason === 'spam_pattern') {
+      reasons.push('bot_cadence');
+    }
+    if (normalizedSource === 'spoken') {
+      if (!Number.isFinite(asrConfidence) || asrConfidence < 0.65) {
+        reasons.push('low_asr_confidence');
+      }
+      if (Number.isFinite(candidateConfidence) && candidateConfidence < 0.62) {
+        reasons.push('low_candidate_confidence');
+      }
+    }
+    if (sensitive && normalizedSource === 'spoken' && conditions.poor) {
+      reasons.push('poor_channel_for_sensitive_input');
+    }
+    if (sensitive && (profile === 'card_number' || profile === 'cvv') && !['dtmf', 'gather', 'sms', 'link'].includes(normalizedSource)) {
+      reasons.push('blocked_sensitive_channel');
+    }
+
+    if (!reasons.length) {
+      return {
+        reject: false,
+        code: null,
+        reasons: [],
+        conditions
+      };
+    }
+
+    let code = 'RISK_SIGNAL_REJECTED';
+    if (reasons.includes('blocked_sensitive_channel')) code = 'SENSITIVE_CHANNEL_BLOCKED';
+    else if (reasons.includes('bot_cadence')) code = 'FRAUD_BOT_CADENCE';
+    else if (reasons.includes('impossible_timing')) code = 'FRAUD_IMPOSSIBLE_TIMING';
+    else if (reasons.includes('low_asr_confidence') || reasons.includes('low_candidate_confidence')) code = 'MULTI_SIGNAL_LOW_CONFIDENCE';
+
+    const reject = sensitive || reasons.includes('impossible_timing') || reasons.includes('bot_cadence');
+    return {
+      reject,
+      code,
+      reasons,
+      conditions
+    };
+  };
+
+  const buildRetryPolicy = ({ reason, attempt, source, expectation, affect, session, health, qualityScore, conditions = null }) => {
     const label = buildExpectedLabel(expectation || {});
     const patience = affect?.patience || 'high';
     const partial = session?.partialDigits || '';
     const allowPartialReplay = partial && !isSensitiveProfile(expectation?.profile);
     const partialSpoken = allowPartialReplay ? formatDigitsForSpeech(partial) : '';
     const status = health?.status || 'healthy';
-    const poorQuality = Number.isFinite(qualityScore) && qualityScore <= 2;
+    const poorQuality = Boolean(
+      (Number.isFinite(qualityScore) && qualityScore <= 2)
+      || conditions?.poor
+    );
+    const severeQuality = Boolean(
+      (Number.isFinite(qualityScore) && qualityScore <= 1)
+      || conditions?.severe
+    );
     if (status === 'overloaded') {
       return {
         delayMs: 0,
@@ -1349,7 +2284,7 @@ function createDigitCollectionService(options = {}) {
         };
       case 'timeout':
         return {
-          delayMs: 0,
+          delayMs: poorQuality ? 220 : 0,
           prompt: `I did not receive any input. Please enter the ${label} now.`
         };
       case 'spam_pattern':
@@ -1360,7 +2295,7 @@ function createDigitCollectionService(options = {}) {
         };
       case 'low_confidence':
         return {
-          delayMs: 0,
+          delayMs: poorQuality ? 180 : 0,
           prompt: `I may have missed that. Please enter the ${label} again.`
         };
       case 'too_short':
@@ -1377,12 +2312,14 @@ function createDigitCollectionService(options = {}) {
           };
         }
         return {
-          delayMs: 0,
+          delayMs: poorQuality ? 120 : 0,
           prompt: `I only got part of it. Please enter${lenText} now.`
         };
       }
       default:
-        return { delayMs: 0 };
+        return {
+          delayMs: severeQuality ? 240 : (poorQuality ? 120 : 0)
+        };
     }
   };
 
@@ -1661,6 +2598,7 @@ function createDigitCollectionService(options = {}) {
       confirmation_locked: speakConfirmationProvided,
       allow_spoken_fallback: params.allow_spoken_fallback === true || defaults.allow_spoken_fallback === true,
       allow_sms_fallback: allowSmsFallback,
+      reset_on_interrupt: params.reset_on_interrupt === true || defaults.reset_on_interrupt === true,
       mask_for_gpt: maskForGpt,
       speak_confirmation: speakConfirmation,
       end_call_on_success: endCallOnSuccess,
@@ -1692,10 +2630,11 @@ function createDigitCollectionService(options = {}) {
       }
     }
 
-    if (style === 'last4' && collection.digits) {
-      const last4 = collection.digits.slice(-4);
-      if (last4) {
-        return `Thanks, I have the number ending in ${last4}.`;
+    if ((style === 'last4' || style === 'last2') && collection.digits) {
+      const tailSize = style === 'last2' ? 2 : 4;
+      const tail = collection.digits.slice(-tailSize);
+      if (tail) {
+        return `Thanks, I have the number ending in ${tail}.`;
       }
     }
 
@@ -1742,6 +2681,12 @@ function createDigitCollectionService(options = {}) {
   function markDigitPrompted(callSid, gptService = null, interactionCount = 0, source = 'dtmf', options = {}) {
     const expectation = digitCollectionManager.expectations.get(callSid);
     if (!expectation) return false;
+    const channelChanged = normalizeCaptureChannel(expectation.channel || 'dtmf') !== normalizeCaptureChannel(source);
+    syncChannelSession(expectation, source, {
+      callSid,
+      forceRotate: options.reset_buffer === true || channelChanged
+    });
+    updateCaptureSessionChannel(callSid, source, { reason: 'prompted' });
     const now = Date.now();
     const promptText = options?.prompt_text || options?.prompt || '';
     const fallbackPrompt = !promptText
@@ -1767,6 +2712,9 @@ function createDigitCollectionService(options = {}) {
       expectation.soft_timeout_fired = false;
       pendingDigits.delete(callSid);
       updateSessionState(callSid, { partialDigits: '' });
+      transitionCaptureState(callSid, CAPTURE_EVENTS.RESUME_COLLECT, { reason: 'reprompt' });
+    } else if (getCaptureState(callSid) === CAPTURE_STATES.IDLE) {
+      transitionCaptureState(callSid, CAPTURE_EVENTS.START_COLLECT, { reason: 'prompted' });
     }
     digitCollectionManager.expectations.set(callSid, expectation);
     if (gptService) {
@@ -1934,40 +2882,69 @@ function createDigitCollectionService(options = {}) {
   const digitCollectionManager = {
     expectations: new Map(),
     setExpectation(callSid, params = {}) {
-      const normalized = applyHealthPolicy(callSid, applyRiskPolicy(callSid, normalizeDigitExpectation(params)));
-    this.expectations.set(callSid, {
-      ...normalized,
-      plan_id: params.plan_id || null,
-      plan_step_index: Number.isFinite(params.plan_step_index) ? params.plan_step_index : null,
-      plan_total_steps: Number.isFinite(params.plan_total_steps) ? params.plan_total_steps : null,
-      prompted_at: params.prompted_at || null,
-      soft_timeout_fired: false,
-      retries: 0,
-      attempt_count: 0,
-      attempt_id: 1,
-      buffered_at: null,
-      buffer: '',
+      const session = ensureCaptureSession(callSid, params, { channel: params.channel || 'dtmf' });
+      const normalized = applyCapturePolicy(
+        callSid,
+        applyHealthPolicy(callSid, applyRiskPolicy(callSid, normalizeDigitExpectation(params))),
+        params
+      );
+      const withMitigation = applySloMitigationPolicy(callSid, normalized);
+      const channelConditions = getChannelConditions(callSid, withMitigation.channel || 'dtmf');
+      if (channelConditions?.poor) {
+        withMitigation.timeout_s = Math.min(SAFE_TIMEOUT_MAX_S, Math.round((withMitigation.timeout_s || 10) * 1.15));
+      }
+      if (channelConditions?.severe) {
+        withMitigation.timeout_s = Math.min(SAFE_TIMEOUT_MAX_S, Math.round((withMitigation.timeout_s || 10) * 1.3));
+        withMitigation.max_retries = Math.min(SAFE_RETRY_MAX, (withMitigation.max_retries || 0) + 1);
+      }
+      const expectation = {
+        ...withMitigation,
+        plan_id: params.plan_id || null,
+        plan_step_index: Number.isFinite(params.plan_step_index) ? params.plan_step_index : null,
+        plan_total_steps: Number.isFinite(params.plan_total_steps) ? params.plan_total_steps : null,
+        prompted_at: params.prompted_at || null,
+        soft_timeout_fired: false,
+        retries: 0,
+        attempt_count: 0,
+        attempt_id: 1,
+        buffered_at: null,
+        buffer: '',
         collected: [],
         last_masked: null
+      };
+      syncChannelSession(expectation, expectation.channel || params.channel || 'dtmf', {
+        callSid,
+        forceRotate: true
       });
+      this.expectations.set(callSid, expectation);
+      transitionCaptureState(callSid, CAPTURE_EVENTS.START_COLLECT, { reason: 'expectation_set' });
+      if (session) {
+        session.last_profile = withMitigation.profile;
+        session.plan_id = params.plan_id || session.plan_id || null;
+        session.plan_step_index = Number.isFinite(params.plan_step_index) ? params.plan_step_index : session.plan_step_index;
+        session.updated_at = Date.now();
+        captureSessions.set(callSid, session);
+      }
       updateSessionState(callSid, { partialDigits: '' });
       setCallDigitIntent(callSid, { mode: 'dtmf', reason: 'expectation_set', confidence: 1 });
       logDigitMetric('expectation_set', {
         callSid,
-        profile: normalized.profile,
-        min_digits: normalized.min_digits,
-        max_digits: normalized.max_digits,
-        timeout_s: normalized.timeout_s,
-        max_retries: normalized.max_retries,
-        plan_id: normalized.plan_id || null,
-        plan_step_index: normalized.plan_step_index || null,
-        plan_total_steps: normalized.plan_total_steps || null
+        profile: withMitigation.profile,
+        min_digits: withMitigation.min_digits,
+        max_digits: withMitigation.max_digits,
+        timeout_s: withMitigation.timeout_s,
+        max_retries: withMitigation.max_retries,
+        plan_id: withMitigation.plan_id || null,
+        plan_step_index: withMitigation.plan_step_index || null,
+        plan_total_steps: withMitigation.plan_total_steps || null,
+        capture_session_id: session?.id || null,
+        channel_session_id: expectation.channel_session_id || null
       });
       void emitAuditEvent(callSid, 'DigitCaptureStarted', {
-        profile: normalized.profile,
-        len: normalized.max_digits,
-        source: normalized.channel || 'dtmf',
-        reason: normalized.reason || null
+        profile: withMitigation.profile,
+        len: withMitigation.max_digits,
+        source: withMitigation.channel || 'dtmf',
+        reason: withMitigation.reason || null
       });
     },
     recordDigits(callSid, digits = '', meta = {}) {
@@ -1975,6 +2952,36 @@ function createDigitCollectionService(options = {}) {
       const exp = this.expectations.get(callSid);
       if (!exp) return { accepted: false, reason: 'no_expectation' };
       const source = meta.source || 'dtmf';
+      const expectedChannelSessionId = exp.channel_session_id
+        || syncChannelSession(exp, source, { callSid, forceRotate: false });
+      const metaChannelSessionId = meta.channel_session_id
+        ? String(meta.channel_session_id).trim()
+        : null;
+      if (metaChannelSessionId && expectedChannelSessionId && metaChannelSessionId !== expectedChannelSessionId) {
+        return {
+          accepted: false,
+          reason: 'stale_channel_session',
+          rejection_code: 'STALE_CHANNEL_SESSION',
+          ignore: true,
+          profile: exp.profile,
+          mask_for_gpt: exp.mask_for_gpt,
+          source
+        };
+      }
+      updateCaptureSessionChannel(callSid, source, { reason: 'input_received' });
+      updateCaptureSloCounters('input');
+      if (!canAcceptCaptureInput(callSid)) {
+        return {
+          accepted: false,
+          reason: 'invalid_state',
+          rejection_code: 'INVALID_CAPTURE_STATE',
+          ignore: true,
+          profile: exp.profile,
+          mask_for_gpt: exp.mask_for_gpt,
+          source,
+          capture_state: getCaptureState(callSid)
+        };
+      }
       const metaPlanId = meta.plan_id ? String(meta.plan_id) : null;
       const metaStepIndex = Number.isFinite(Number(meta.plan_step_index))
         ? Number(meta.plan_step_index)
@@ -1987,6 +2994,7 @@ function createDigitCollectionService(options = {}) {
         return {
           accepted: false,
           reason: 'stale_plan',
+          rejection_code: 'STALE_PLAN_EVENT',
           ignore: true,
           profile: exp.profile,
           mask_for_gpt: exp.mask_for_gpt,
@@ -1997,6 +3005,7 @@ function createDigitCollectionService(options = {}) {
         return {
           accepted: false,
           reason: 'stale_step',
+          rejection_code: 'STALE_PLAN_EVENT',
           ignore: true,
           profile: exp.profile,
           mask_for_gpt: exp.mask_for_gpt,
@@ -2007,6 +3016,7 @@ function createDigitCollectionService(options = {}) {
         return {
           accepted: false,
           reason: 'stale_attempt',
+          rejection_code: 'STALE_ATTEMPT',
           ignore: true,
           profile: exp.profile,
           mask_for_gpt: exp.mask_for_gpt,
@@ -2024,14 +3034,53 @@ function createDigitCollectionService(options = {}) {
       const isFullInput = meta.full_input === true
         || source === 'gather'
         || source === 'sms'
+        || source === 'link'
         || source === 'spoken';
+      const attemptId = Number.isFinite(Number(meta.attempt_id))
+        ? Number(meta.attempt_id)
+        : (Number.isFinite(Number(exp.attempt_id)) ? Number(exp.attempt_id) : 1);
+      const stepId = resolveCaptureStepId(exp, meta);
+      const inputHash = hashInput(cleanDigitsTemp || digits);
+      const idempotencyKey = buildGlobalIdempotencyKey({
+        scope: 'digit_capture',
+        callSid,
+        stepId,
+        attemptId,
+        inputHash
+      });
+
+      if (isFullInput && markIdempotentAction(idempotencyKey)) {
+        updateCaptureSloCounters('duplicate');
+        const session = captureSessions.get(callSid);
+        if (session) {
+          session.duplicate_hits = (session.duplicate_hits || 0) + 1;
+          session.updated_at = Date.now();
+          captureSessions.set(callSid, session);
+        }
+        return {
+          accepted: false,
+          reason: 'idempotent_duplicate',
+          rejection_code: 'DUPLICATE_INPUT',
+          ignore: true,
+          profile: exp.profile,
+          mask_for_gpt: exp.mask_for_gpt,
+          source,
+          idempotency_key: idempotencyKey
+        };
+      }
       if (isFullInput && exp.buffer) {
-        exp.buffer = '';
+        const preservePartial = exp.reset_on_interrupt !== true
+          && (source === 'dtmf' || source === 'gather')
+          && String(exp.buffer || '').length < Math.max(1, Number(exp.max_digits) || 1);
+        if (!preservePartial) {
+          exp.buffer = '';
+        }
       }
       if (isFullInput && isDuplicateInput(callSid, exp, cleanDigitsTemp, source)) {
         return {
           accepted: false,
           reason: 'duplicate',
+          rejection_code: 'DUPLICATE_INPUT',
           ignore: true,
           profile: exp.profile,
           mask_for_gpt: exp.mask_for_gpt,
@@ -2042,7 +3091,12 @@ function createDigitCollectionService(options = {}) {
       const result = {
         profile: exp.profile,
         mask_for_gpt: exp.mask_for_gpt,
-        source
+        source,
+        channel_session_id: expectedChannelSessionId || null,
+        step_id: stepId,
+        attempt_id: attemptId,
+        input_hash: inputHash,
+        idempotency_key: idempotencyKey
       };
       const hasTerminator = exp.allow_terminator && digits.includes(exp.terminator_char || '#');
       const cleanDigits = cleanDigitsTemp;
@@ -2114,10 +3168,20 @@ function createDigitCollectionService(options = {}) {
         accepted,
         reason
       });
+      if (result.reason) {
+        result.rejection_code = resolveRejectionCode(result.reason, exp.profile, source);
+      }
 
       exp.collected.push(result.digits);
       exp.last_masked = masked;
       exp.last_input_at = meta.timestamp || Date.now();
+      const session = captureSessions.get(callSid);
+      if (session) {
+        session.attempts = (session.attempts || 0) + 1;
+        session.updated_at = Date.now();
+        session.last_profile = exp.profile || session.last_profile;
+        captureSessions.set(callSid, session);
+      }
 
       if (result.accepted) {
         if (isRepeating(currentBuffer) || isAscending(currentBuffer)) {
@@ -2132,10 +3196,12 @@ function createDigitCollectionService(options = {}) {
           if (exp.retries > exp.max_retries) {
             result.fallback = true;
           }
+          exp.attempt_id = (exp.attempt_id || 1) + 1;
           this.expectations.set(callSid, exp);
           return result;
         }
         exp.buffer = '';
+        exp.attempt_id = (exp.attempt_id || 1) + 1;
         if (hasTerminator) {
           exp.terminated = true;
         }
@@ -2146,6 +3212,7 @@ function createDigitCollectionService(options = {}) {
           result.retries = exp.retries;
           exp.attempt_count = (exp.attempt_count || 0) + 1;
           result.attempt_count = exp.attempt_count;
+          exp.attempt_id = (exp.attempt_id || 1) + 1;
           if (exp.retries > exp.max_retries) {
             result.fallback = true;
           }
@@ -2180,10 +3247,16 @@ function createDigitCollectionService(options = {}) {
       digitCollectionManager.expectations.set(callSid, exp);
     }
 
-    const qualityScore = getCallQualityScore(callSid);
-    const timeoutMultiplier = Number.isFinite(qualityScore)
-      ? (qualityScore <= 2 ? 1.25 : qualityScore <= 3 ? 1.1 : 1)
-      : 1;
+    const channelConditions = getChannelConditions(callSid, exp.channel || 'dtmf');
+    const timeoutMultiplier = (() => {
+      let multiplier = 1;
+      if (channelConditions?.poor) multiplier += 0.15;
+      if (channelConditions?.severe) multiplier += 0.15;
+      if (Number.isFinite(channelConditions?.jitterMs) && channelConditions.jitterMs > 35) multiplier += 0.05;
+      if (Number.isFinite(channelConditions?.rttMs) && channelConditions.rttMs > 320) multiplier += 0.05;
+      if (Number.isFinite(channelConditions?.packetLossPct) && channelConditions.packetLossPct > 2) multiplier += 0.05;
+      return Math.min(1.45, multiplier);
+    })();
     const timeoutMs = Math.max(5000, (exp.timeout_s || 10) * 1000 * timeoutMultiplier);
     const softPromptMs = Number.isFinite(exp.soft_timeout_s)
       ? Math.max(1000, exp.soft_timeout_s * 1000)
@@ -2224,6 +3297,13 @@ function createDigitCollectionService(options = {}) {
         attempt: (current.retries || 0) + 1,
         max_retries: current.max_retries
       });
+      updateCaptureSloCounters('timeout');
+      const session = captureSessions.get(callSid);
+      if (session) {
+        session.timeout_count = (session.timeout_count || 0) + 1;
+        session.updated_at = Date.now();
+        captureSessions.set(callSid, session);
+      }
 
       try {
         await db.addCallDigitEvent({
@@ -2235,6 +3315,7 @@ function createDigitCollectionService(options = {}) {
           accepted: false,
           reason: 'timeout',
           metadata: {
+            rejection_code: 'TIMEOUT',
             attempt: (current.retries || 0) + 1,
             max_retries: current.max_retries,
             attempt_count: Number(current.attempt_count) || (current.retries || 0) + 1,
@@ -2270,11 +3351,16 @@ function createDigitCollectionService(options = {}) {
           step_index: current.plan_step_index,
           reason: 'timeout'
         });
+        transitionCaptureState(callSid, CAPTURE_EVENTS.ABORT, { reason: 'plan_timeout' });
         digitCollectionManager.expectations.delete(callSid);
         clearDigitTimeout(callSid);
         clearDigitFallbackState(callSid);
         clearDigitPlan(callSid);
         setCaptureActive(callSid, false);
+        await completeCaptureSession(callSid, 'aborted', {
+          reason: 'group_plan_timeout',
+          channel: current.channel || 'dtmf'
+        });
         await speakAndEndCall(callSid, timeoutMessage, 'digit_collection_timeout');
         return;
       }
@@ -2286,6 +3372,7 @@ function createDigitCollectionService(options = {}) {
             prompt: queuePendingDigitAction ? '' : fallbackPrompt
           });
           if (usedFallback) {
+            transitionCaptureState(callSid, CAPTURE_EVENTS.FALLBACK, { reason: 'twilio_gather_fallback' });
             if (queuePendingDigitAction && fallbackPrompt) {
               queuePendingDigitAction(callSid, { type: 'reprompt', text: fallbackPrompt, scheduleTimeout: true });
             }
@@ -2297,30 +3384,39 @@ function createDigitCollectionService(options = {}) {
       }
 
       current.retries = (current.retries || 0) + 1;
+      current.attempt_id = (current.attempt_id || 1) + 1;
+      transitionCaptureState(callSid, CAPTURE_EVENTS.PROMPT_RETRY, { reason: 'timeout' });
       digitCollectionManager.expectations.set(callSid, current);
 
-      const qualityRetryBonus = Number.isFinite(qualityScore) && qualityScore <= 2 ? 1 : 0;
+      const qualityRetryBonus = channelConditions?.severe ? 1 : 0;
       const maxRetries = current.max_retries + qualityRetryBonus;
       if (current.retries > maxRetries) {
+        transitionCaptureState(callSid, CAPTURE_EVENTS.ABORT, { reason: 'max_retries_timeout' });
         digitCollectionManager.expectations.delete(callSid);
         clearDigitTimeout(callSid);
         clearDigitFallbackState(callSid);
         clearDigitPlan(callSid);
+        await completeCaptureSession(callSid, 'aborted', {
+          reason: 'timeout',
+          channel: current.channel || 'dtmf'
+        });
         const finalTimeoutMessage = current.timeout_failure_message || callEndMessages.no_response;
         await speakAndEndCall(callSid, finalTimeoutMessage, 'digit_collection_timeout');
         return;
       }
 
       const affect = recordCallerAffect(callSid, 'timeout');
-      const policy = buildRetryPolicy({
-        reason: 'timeout',
-        attempt: current.retries || 1,
-        source: 'dtmf',
-        expectation: current,
-        affect,
-        session: getSessionState(callSid),
-        health: getSystemHealth(callSid)
-      });
+        const policy = buildRetryPolicy({
+          reason: 'timeout',
+          attempt: current.retries || 1,
+          source: 'dtmf',
+          expectation: current,
+          affect,
+          session: getSessionState(callSid),
+          health: getSystemHealth(callSid),
+          qualityScore: channelConditions?.qualityScore ?? null,
+          conditions: channelConditions
+        });
       const prompt = policy.prompt || buildTimeoutPrompt(current, current.retries);
 
       const personalityInfo = gptService?.personalityEngine?.getCurrentPersonality();
@@ -2331,13 +3427,16 @@ function createDigitCollectionService(options = {}) {
         adaptationHistory: gptService?.personalityChanges?.slice(-3) || []
       };
 
-      if (gptService) {
-        gptService.emit('gptreply', reply, interactionCount);
-        try {
-          gptService.updateUserContext('digit_timeout', 'system', `Digit timeout retry ${current.retries}/${current.max_retries}`);
-        } catch (_) {}
-        markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', { prompt_text: prompt, reset_buffer: true });
-      }
+        if (gptService) {
+          gptService.emit('gptreply', reply, interactionCount);
+          try {
+            gptService.updateUserContext('digit_timeout', 'system', `Digit timeout retry ${current.retries}/${current.max_retries}`);
+          } catch (_) {}
+          markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', {
+            prompt_text: prompt,
+            reset_buffer: current.reset_on_interrupt === true
+          });
+        }
 
       webhookService.addLiveEvent(callSid, `⏳ Awaiting digits retry ${current.retries}/${current.max_retries}`, { force: true });
 
@@ -2361,6 +3460,9 @@ function createDigitCollectionService(options = {}) {
     }
     if (Number.isFinite(expectation?.plan_step_index)) {
       queryParams.set('stepIndex', String(expectation.plan_step_index));
+    }
+    if (expectation?.channel_session_id) {
+      queryParams.set('channelSessionId', String(expectation.channel_session_id));
     }
     const actionUrl = `https://${host}/webhook/twilio-gather?${queryParams.toString()}`;
     const gatherOptions = {
@@ -2459,6 +3561,8 @@ function createDigitCollectionService(options = {}) {
       attempts: (state?.attempts || 0) + 1,
       lastAt: new Date().toISOString()
     });
+    updateCaptureSessionChannel(callSid, 'dtmf', { reason: 'gather_fallback' });
+    transitionCaptureState(callSid, CAPTURE_EVENTS.FALLBACK, { reason: 'gather_fallback' });
 
     webhookService.addLiveEvent(callSid, '📟 Capturing Mode', { force: true });
     return true;
@@ -3403,13 +4507,25 @@ function createDigitCollectionService(options = {}) {
       const allowCallEnd = options.allowCallEnd === true;
       const deferCallEnd = options.deferCallEnd === true;
       const expectation = digitCollectionManager.expectations.get(callSid);
+      const storageClass = expectation?.storage_class || 'standard';
+      const persistRawDigits = expectation?.persist_raw_digits !== false;
+      const allowSensitiveRawPersistence = expectation?.allow_sensitive_raw_persistence === true && persistRawDigits;
+      const sensitive = isSensitiveProfile(collection?.profile || expectation?.profile);
       const shouldEndCall = allowCallEnd && expectation?.end_call_on_success !== false;
       const expectedLabel = expectation ? buildExpectedLabel(expectation) : 'the code';
       const stepTitle = formatPlanStepLabel(expectation);
       const stepPrefix = stepTitle ? `${stepTitle} — ` : '';
+      const resolvedSource = collection.source || source || 'dtmf';
+      updateCaptureSessionChannel(callSid, resolvedSource, { reason: 'collection_result' });
+      const secretToken = sensitive && !allowSensitiveRawPersistence
+        ? storeSensitiveToken(callSid, collection?.profile || expectation?.profile || 'generic', collection?.digits || '', {
+          reason: collection?.accepted ? 'capture_accepted' : 'capture_attempt',
+          channel: resolvedSource
+        })
+        : null;
       const payload = {
         profile: collection.profile,
-        raw_digits: collection.digits,
+        raw_digits: secretToken?.ref || (persistRawDigits ? collection.digits : null),
         masked: collection.masked,
         len: collection.len,
         route: collection.route || null,
@@ -3417,10 +4533,14 @@ function createDigitCollectionService(options = {}) {
         retries: collection.retries || 0,
         fallback: !!collection.fallback,
         reason: collection.reason || null,
-        heuristic: collection.heuristic || null
+        heuristic: collection.heuristic || null,
+        storage_class: storageClass,
+        secret_token_ref: secretToken?.ref || null,
+        rejection_code: null
       };
-
-      const resolvedSource = collection.source || source || 'dtmf';
+      if (!collection.accepted && collection.reason && collection.reason !== 'incomplete' && collection.reason !== 'timeout') {
+        updateCaptureSloCounters('error');
+      }
       const attemptCount = Math.max(
         1,
         Number.isFinite(collection.attempt_count)
@@ -3457,10 +4577,30 @@ function createDigitCollectionService(options = {}) {
         masked: collection.masked
       });
 
+    const riskCheck = evaluateCaptureRisk({
+      callSid,
+      collection,
+      expectation,
+      source: resolvedSource,
+      candidate
+    });
     const confidenceSensitiveSources = new Set(['spoken']);
-    if (collection.accepted && candidate.confidence < 0.45 && confidenceSensitiveSources.has(resolvedSource)) {
+    const lowConfidenceReject = collection.accepted
+      && candidate.confidence < 0.45
+      && confidenceSensitiveSources.has(resolvedSource);
+    const shouldRiskReject = collection.accepted && riskCheck.reject;
+    if (lowConfidenceReject || shouldRiskReject) {
       collection.accepted = false;
-      collection.reason = 'low_confidence';
+      collection.reason = lowConfidenceReject ? 'low_confidence' : 'risk_rejected';
+      collection.rejection_code = lowConfidenceReject
+        ? 'MULTI_SIGNAL_LOW_CONFIDENCE'
+        : (riskCheck.code || 'RISK_SIGNAL_REJECTED');
+      if (Array.isArray(riskCheck.reasons) && riskCheck.reasons.length) {
+        collection.confidence_reason_codes = [
+          ...(collection.confidence_reason_codes || []),
+          ...riskCheck.reasons
+        ];
+      }
       const exp = digitCollectionManager.expectations.get(callSid);
       if (exp) {
         exp.retries = (exp.retries || 0) + 1;
@@ -3470,6 +4610,13 @@ function createDigitCollectionService(options = {}) {
         }
         digitCollectionManager.expectations.set(callSid, exp);
       }
+      logDigitMetric('capture_rejected_multi_signal', {
+        callSid,
+        profile: collection.profile,
+        source: resolvedSource,
+        rejection_code: collection.rejection_code,
+        reasons: riskCheck.reasons || []
+      });
     }
 
     if (collection.accepted) {
@@ -3486,6 +4633,15 @@ function createDigitCollectionService(options = {}) {
       }
       recentAccepted.set(callSid, { fingerprint, at: Date.now() });
     }
+    if (!collection.accepted) {
+      collection.rejection_code = collection.rejection_code
+        || resolveRejectionCode(collection.reason, collection.profile || expectation?.profile, resolvedSource);
+    }
+    payload.accepted = !!collection.accepted;
+    payload.reason = collection.reason || null;
+    payload.retries = collection.retries || 0;
+    payload.fallback = !!collection.fallback;
+    payload.rejection_code = collection.rejection_code || null;
 
     try {
       await db.updateCallState(callSid, 'digits_collected', {
@@ -3496,7 +4652,7 @@ function createDigitCollectionService(options = {}) {
         call_sid: callSid,
         source: resolvedSource,
         profile: collection.profile,
-        digits: collection.digits,
+        digits: secretToken?.ref || (persistRawDigits ? collection.digits : null),
         len: collection.len,
         accepted: collection.accepted,
         reason: collection.reason,
@@ -3509,9 +4665,15 @@ function createDigitCollectionService(options = {}) {
           confidence: collection.confidence,
           confidence_signals: collection.confidence_signals,
           confidence_reasons: collection.confidence_reason_codes,
+          rejection_code: collection.rejection_code || null,
+          channel_session_id: collection.channel_session_id || expectation?.channel_session_id || null,
           plan_id: expectation?.plan_id || null,
           plan_step_index: expectation?.plan_step_index || null,
           plan_total_steps: expectation?.plan_total_steps || null,
+          storage_class: storageClass,
+          secret_token_ref: secretToken?.ref || null,
+          idempotency_key: collection.idempotency_key || null,
+          input_hash: collection.input_hash || null,
           step_label: formatPlanStepLabel(expectation) || null,
           prompted_at: expectation?.prompted_at || null,
           event_timestamp: new Date().toISOString()
@@ -3527,12 +4689,13 @@ function createDigitCollectionService(options = {}) {
       len: collection.len,
       accepted: collection.accepted,
       reason: collection.reason || null,
+      rejection_code: collection.rejection_code || null,
       retries: collection.retries || 0,
       source: resolvedSource,
       confidence: collection.confidence
     });
 
-    const liveMasked = maskDigitsForPreview(collection.digits || collection.masked || '');
+    const liveMasked = maskDigitsForPreview(collection.digits || collection.masked || '', collection.profile || expectation?.profile || 'generic');
     const liveLabel = labelForProfile(collection.profile);
     if (collection.reason === 'incomplete') {
       const progressMax = expectation?.max_digits || '';
@@ -3615,6 +4778,7 @@ function createDigitCollectionService(options = {}) {
       });
       recordIntentHistory(callSid, collection.profile);
       const riskAction = expectation?.risk_action === 'route_to_agent';
+      transitionCaptureState(callSid, CAPTURE_EVENTS.COMPLETE, { reason: 'digits_accepted' });
       clearDigitTimeout(callSid);
       clearDigitFallbackState(callSid);
       digitCollectionManager.expectations.delete(callSid);
@@ -3634,8 +4798,9 @@ function createDigitCollectionService(options = {}) {
             masked: collection.masked
           }).catch(() => {});
           await db.updateCallStatus(callSid, 'in-progress', {
-            last_otp: collection.digits,
-            last_otp_masked: collection.masked
+            last_otp: secretToken?.ref || (persistRawDigits ? collection.digits : null),
+            last_otp_masked: collection.masked,
+            last_otp_token: secretToken?.ref || null
           }).catch(() => {});
           await db.updateCallState(callSid, 'otp_captured', {
             masked: collection.masked,
@@ -3677,26 +4842,30 @@ function createDigitCollectionService(options = {}) {
           webhookService.addLiveEvent(callSid, `📞 Callback number confirmed (ending ${collection.masked.slice(-4)})`, { force: true });
           await db.updateCallState(callSid, 'callback_confirmed', {
             masked_last4: collection.masked,
-            raw_digits: collection.digits
+            raw_digits: secretToken?.ref || collection.digits,
+            secret_token_ref: secretToken?.ref || null
           }).catch(() => {});
           break;
         case 'card_number':
           webhookService.addLiveEvent(callSid, `💳 Card number captured (${collection.len})`, { force: true });
           await db.updateCallState(callSid, 'card_number_captured', {
-            card_number: collection.digits,
+            card_number: secretToken?.ref || null,
+            card_number_token: secretToken?.ref || null,
             last4: collection.digits ? collection.digits.slice(-4) : null
           }).catch(() => {});
           break;
         case 'cvv':
           webhookService.addLiveEvent(callSid, `🔐 CVV captured (${collection.len})`, { force: true });
           await db.updateCallState(callSid, 'cvv_captured', {
-            cvv: collection.digits
+            cvv: secretToken?.ref || null,
+            cvv_token: secretToken?.ref || null
           }).catch(() => {});
           break;
         case 'card_expiry':
-          webhookService.addLiveEvent(callSid, `📅 Expiry captured (${collection.digits})`, { force: true });
+          webhookService.addLiveEvent(callSid, `📅 Expiry captured (${collection.masked || 'masked'})`, { force: true });
           await db.updateCallState(callSid, 'card_expiry_captured', {
-            expiry: collection.digits
+            expiry: secretToken?.ref || null,
+            expiry_token: secretToken?.ref || null
           }).catch(() => {});
           break;
         case 'ssn':
@@ -3813,6 +4982,10 @@ function createDigitCollectionService(options = {}) {
           }
           digitCollectionPlans.delete(callSid);
           setCaptureActive(callSid, false);
+          await completeCaptureSession(callSid, 'completed', {
+            reason: 'plan_completed',
+            channel: resolvedSource
+          });
           webhookService.addLiveEvent(callSid, '✅ Digit collection plan completed', { force: true });
           await db.updateCallState(callSid, 'digit_collection_plan_completed', {
             steps: plan.steps.length,
@@ -3843,10 +5016,19 @@ function createDigitCollectionService(options = {}) {
       }
 
       if (riskAction) {
+        transitionCaptureState(callSid, CAPTURE_EVENTS.ABORT, { reason: 'risk_escalation' });
+        await completeCaptureSession(callSid, 'aborted', {
+          reason: 'risk_escalation',
+          channel: 'human_agent_handoff'
+        });
         await routeToAgentOnRisk(callSid, expectation, collection, allowCallEnd, deferCallEnd);
         return;
       }
       if (shouldEndCall) {
+        await completeCaptureSession(callSid, 'completed', {
+          reason: 'end_call_on_success',
+          channel: resolvedSource
+        });
         if (deferCallEnd) {
           return;
         }
@@ -3859,6 +5041,10 @@ function createDigitCollectionService(options = {}) {
         return;
       }
       clearDigitIntent(callSid);
+      await completeCaptureSession(callSid, 'completed', {
+        reason: 'capture_confirmed',
+        channel: resolvedSource
+      });
       const confirmation = buildConfirmationMessage(expectation || {}, collection);
       if (confirmation) {
         emitReply(confirmation);
@@ -3882,9 +5068,16 @@ function createDigitCollectionService(options = {}) {
       const reasonHint = collection.reason ? ` (${collection.reason.replace(/_/g, ' ')})` : '';
       webhookService.addLiveEvent(callSid, `⚠️ Invalid digits (${collection.len})${reasonHint}; retry ${collection.retries}/${digitCollectionManager.expectations.get(callSid)?.max_retries || 0}`, { force: true });
       if (collection.fallback) {
+        const session = captureSessions.get(callSid);
+        if (session) {
+          session.fallback_count = (session.fallback_count || 0) + 1;
+          session.updated_at = Date.now();
+          captureSessions.set(callSid, session);
+        }
         if (expectation?.allow_sms_fallback && shouldUseSmsFallback(expectation, collection)) {
-          const session = await createSmsSession(callSid, expectation, collection.reason || 'fallback');
-          if (session) {
+          const smsSession = await createSmsSession(callSid, expectation, collection.reason || 'fallback');
+          if (smsSession) {
+            transitionCaptureState(callSid, CAPTURE_EVENTS.FALLBACK, { reason: 'sms_fallback' });
             expectation.sms_fallback_used = true;
             expectation.channel = 'sms';
             digitCollectionManager.expectations.set(callSid, expectation);
@@ -3904,6 +5097,20 @@ function createDigitCollectionService(options = {}) {
             return;
           }
         }
+        if (expectation?.escalation_policy === 'route_to_agent') {
+          await completeCaptureSession(callSid, 'aborted', {
+            reason: 'high_risk_policy',
+            channel: 'human_agent_handoff'
+          });
+          await routeToAgentOnRisk(
+            callSid,
+            { ...expectation, risk_reason: 'high_risk_policy' },
+            collection,
+            allowCallEnd,
+            deferCallEnd
+          );
+          return;
+        }
         const failureMessage = expectation?.failure_message || callEndMessages.failure || 'I could not verify the digits. Thank you for your time.';
         const allowSpokenFallback = expectation?.allow_spoken_fallback !== false;
         const shouldFallbackToVoice = fallbackToVoiceOnFailure && allowSpokenFallback;
@@ -3911,10 +5118,26 @@ function createDigitCollectionService(options = {}) {
           ? 'I could not verify the digits. I will continue the call without keypad entry.'
           : failureMessage;
         webhookService.addLiveEvent(callSid, `⏳ No valid digits; ${shouldFallbackToVoice ? 'switching to voice' : 'ending call'}`, { force: true });
+        transitionCaptureState(callSid, CAPTURE_EVENTS.ABORT, {
+          reason: shouldFallbackToVoice ? 'voice_fallback' : 'max_retries'
+        });
         digitCollectionManager.expectations.delete(callSid);
         clearDigitTimeout(callSid);
         clearDigitFallbackState(callSid);
         clearDigitPlan(callSid);
+        await completeCaptureSession(callSid, 'aborted', {
+          reason: shouldFallbackToVoice ? 'voice_fallback' : 'max_retries',
+          channel: shouldFallbackToVoice ? 'spoken' : resolvedSource
+        });
+        await db.updateCallState(callSid, 'digit_collection_fallback', {
+          profile: expectation?.profile || collection?.profile || null,
+          source: resolvedSource,
+          reason: shouldFallbackToVoice ? 'voice_fallback' : 'max_retries',
+          fallback_reason_code: buildFallbackReasonCode(
+            shouldFallbackToVoice ? 'voice' : resolvedSource,
+            shouldFallbackToVoice ? 'voice_fallback' : 'max_retries'
+          )
+        }).catch(() => {});
         void emitAuditEvent(callSid, 'DigitCaptureAborted', {
           profile: expectation?.profile || collection.profile,
           source: resolvedSource,
@@ -3934,8 +5157,12 @@ function createDigitCollectionService(options = {}) {
         }
         emitReply(fallbackMsg);
       } else {
+        transitionCaptureState(callSid, CAPTURE_EVENTS.PROMPT_RETRY, {
+          reason: collection.reason || 'invalid'
+        });
         const affect = recordCallerAffect(callSid, collection.reason || 'invalid');
-        const qualityScore = getCallQualityScore(callSid);
+        const channelConditions = getChannelConditions(callSid, resolvedSource);
+        const qualityScore = channelConditions?.qualityScore ?? null;
         const policy = buildRetryPolicy({
           reason: collection.reason || 'invalid',
           attempt: attemptCount || collection.retries || 1,
@@ -3944,7 +5171,8 @@ function createDigitCollectionService(options = {}) {
           affect,
           session: getSessionState(callSid),
           health: getSystemHealth(callSid),
-          qualityScore
+          qualityScore,
+          conditions: channelConditions
         });
         const pacingDelay = attemptCount >= 2 ? 250 : 0;
         if (pacingDelay > 0) {
@@ -3953,7 +5181,7 @@ function createDigitCollectionService(options = {}) {
         if (affect?.patience === 'low') {
           policy.delayMs = Math.max(policy.delayMs || 0, 350);
         }
-        if (Number.isFinite(qualityScore) && qualityScore <= 2) {
+        if (channelConditions?.poor) {
           policy.delayMs = Math.max(policy.delayMs || 0, 400);
           if (policy.prompt && !/connection/i.test(policy.prompt)) {
             policy.prompt = `I may be losing you. ${policy.prompt}`;
@@ -3985,7 +5213,12 @@ function createDigitCollectionService(options = {}) {
         }
         emitReply(prompt);
         if (gptService) {
-          markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', { prompt_text: prompt, reset_buffer: true });
+          const resetBufferOnReprompt = expectation?.reset_on_interrupt === true
+            || ['spam_pattern', 'too_long'].includes(String(collection.reason || '').toLowerCase());
+          markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', {
+            prompt_text: prompt,
+            reset_buffer: resetBufferOnReprompt
+          });
           scheduleDigitTimeout(callSid, gptService, interactionCount + 1);
         }
       }
@@ -4009,6 +5242,9 @@ function createDigitCollectionService(options = {}) {
   }
 
   function clearCallState(callSid) {
+    void completeCaptureSession(callSid, 'aborted', { reason: 'call_state_cleared' });
+    transitionCaptureState(callSid, CAPTURE_EVENTS.RESET, { reason: 'call_clear' });
+    captureLifecycle.delete(callSid);
     digitCollectionManager.expectations.delete(callSid);
     clearDigitPlan(callSid);
     clearDigitTimeout(callSid);
@@ -4021,6 +5257,9 @@ function createDigitCollectionService(options = {}) {
         recentInputEvents.delete(key);
       }
     }
+    clearIdempotencyForCall(callSid);
+    clearVaultForCall(callSid);
+    captureSessions.delete(callSid);
     sessionState.delete(callSid);
     intentHistory.delete(callSid);
     riskSignals.delete(callSid);
@@ -4047,6 +5286,7 @@ function createDigitCollectionService(options = {}) {
     if (!session || !session.active) {
       return { handled: false };
     }
+    updateCaptureSessionChannel(session.callSid, 'secure_sms_link', { reason: 'sms_reply' });
     const digits = parseDigitsFromText(body);
     if (!digits) {
       if (smsService) {
@@ -4069,7 +5309,8 @@ function createDigitCollectionService(options = {}) {
       full_input: true,
       attempt_id: attemptId,
       plan_id: session.expectation?.plan_id || null,
-      plan_step_index: session.expectation?.plan_step_index || null
+      plan_step_index: session.expectation?.plan_step_index || null,
+      channel_session_id: digitCollectionManager.expectations.get(callSid)?.channel_session_id || null
     });
     await handleCollectionResult(callSid, collection, null, 0, 'sms', { allowCallEnd: false, deferCallEnd: true });
     session.attempts += 1;
@@ -4092,6 +5333,98 @@ function createDigitCollectionService(options = {}) {
     return { handled: true, collection };
   }
 
+  async function handleSecureCaptureInput({ callSid, tokenRef, digits, source = 'link' } = {}) {
+    const validation = validateSecureCaptureToken(callSid, tokenRef);
+    if (!validation.ok) {
+      return {
+        ok: false,
+        status: validation.reason === 'token_expired' ? 410 : 401,
+        code: validation.reason
+      };
+    }
+    const resolvedCallSid = validation.callSid;
+    const cleanedDigits = parseDigitsFromText(digits);
+    if (!cleanedDigits) {
+      return {
+        ok: false,
+        status: 400,
+        code: 'invalid_digits'
+      };
+    }
+
+    let expectation = digitCollectionManager.expectations.get(resolvedCallSid);
+    if (!expectation) {
+      const smsSession = smsSessions.get(resolvedCallSid);
+      if (smsSession?.active && smsSession.expectation) {
+        digitCollectionManager.setExpectation(resolvedCallSid, {
+          ...smsSession.expectation,
+          channel: 'link'
+        });
+        expectation = digitCollectionManager.expectations.get(resolvedCallSid);
+      }
+    }
+
+    if (!expectation) {
+      return {
+        ok: false,
+        status: 410,
+        code: 'session_expired'
+      };
+    }
+
+    if (!canAcceptCaptureInput(resolvedCallSid)) {
+      transitionCaptureState(resolvedCallSid, CAPTURE_EVENTS.START_COLLECT, {
+        reason: 'secure_link_resume'
+      });
+    }
+    updateCaptureSessionChannel(resolvedCallSid, 'secure_sms_link', {
+      reason: 'secure_link_submit'
+    });
+    const collection = digitCollectionManager.recordDigits(resolvedCallSid, cleanedDigits, {
+      source,
+      timestamp: Date.now(),
+      full_input: true,
+      attempt_id: expectation?.attempt_id || null,
+      plan_id: expectation?.plan_id || null,
+      plan_step_index: expectation?.plan_step_index || null,
+      channel_session_id: expectation?.channel_session_id || null
+    });
+    if (collection?.ignore) {
+      return {
+        ok: true,
+        duplicate: collection.reason === 'idempotent_duplicate',
+        state: getCaptureState(resolvedCallSid),
+        accepted: false,
+        code: collection.reason || 'ignored'
+      };
+    }
+    await handleCollectionResult(
+      resolvedCallSid,
+      collection,
+      null,
+      0,
+      source,
+      { allowCallEnd: false, deferCallEnd: true }
+    );
+    if (collection.accepted) {
+      const plan = digitCollectionPlans.get(resolvedCallSid);
+      if (!plan || !plan.active) {
+        clearSmsSession(resolvedCallSid);
+      }
+    }
+    if (collection.fallback) {
+      clearSmsSession(resolvedCallSid);
+    }
+    return {
+      ok: true,
+      accepted: collection.accepted === true,
+      fallback: collection.fallback === true,
+      retries: collection.retries || 0,
+      reason: collection.reason || null,
+      state: getCaptureState(resolvedCallSid)
+    };
+  }
+
   return {
     expectations: digitCollectionManager.expectations,
     buildAdaptiveReprompt,
@@ -4109,9 +5442,14 @@ function createDigitCollectionService(options = {}) {
     formatDigitsGeneral,
     formatOtpForDisplay,
     getExpectation: (callSid) => digitCollectionManager.expectations.get(callSid),
+    getCaptureSession: (callSid) => captureSessions.get(callSid) || null,
+    getCaptureSloSnapshot: () => computeCaptureSloSnapshot(),
+    validateSecureCaptureToken,
+    handleSecureCaptureInput,
     getOtpContext,
     handleCollectionResult,
     hasExpectation: (callSid) => digitCollectionManager.expectations.has(callSid),
+    getCaptureState,
     inferDigitExpectationFromText,
     markDigitPrompted,
     updatePromptDelay,
