@@ -404,37 +404,24 @@ async function askOptionWithButtons(
       if (!callbackMessageId || callbackMessageId !== message.message_id) {
         return false;
       }
-      return matchesCallbackPrefix(callbackData, prefixKey);
+      return (
+        matchesCallbackPrefix(callbackData, prefixKey) ||
+        matchesCallbackPrefix(callbackData, basePrefix)
+      );
     });
 
     const callbackData = selectionCtx.callbackQuery?.data || '';
     const parsedCallbackData = parseCallbackData(callbackData);
-    if (parsedCallbackData.signed && !parsedCallbackData.valid) {
-      await selectionCtx
-        .answerCallbackQuery({
-          text: '⚠️ Action no longer valid.',
-          show_alert: false
-        })
-        .catch(() => {});
-      continue;
-    }
-
     const selectionAction = parsedCallbackData.action || callbackData;
-    const selectionPrefix = `${prefixKey}:`;
     let selectedId = null;
-    if (selectionAction.startsWith(selectionPrefix)) {
-      selectedId = selectionAction.slice(selectionPrefix.length);
-    } else {
-      const fallbackPrefix = `${basePrefix}:`;
-      if (selectionAction.startsWith(fallbackPrefix)) {
-        const actionParts = selectionAction.split(':');
-        selectedId = actionParts[actionParts.length - 1] || null;
-      }
+    const actionParts = selectionAction.split(':');
+    if (actionParts.length > 1) {
+      selectedId = actionParts[actionParts.length - 1] || null;
     }
     if (!selectedId) {
       await selectionCtx
         .answerCallbackQuery({
-          text: '⚠️ Action no longer valid.',
+          text: '⚠️ Selection unavailable.',
           show_alert: false
         })
         .catch(() => {});
@@ -444,7 +431,7 @@ async function askOptionWithButtons(
     if (!selectedOption) {
       await selectionCtx
         .answerCallbackQuery({
-          text: '⚠️ Action no longer valid.',
+          text: '⚠️ Selection unavailable.',
           show_alert: false
         })
         .catch(() => {});

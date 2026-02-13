@@ -1,11 +1,7 @@
-const crypto = require('crypto');
-const config = require('../config');
 const { ensureSession } = require('./sessionState');
 
-const DEFAULT_CALLBACK_TTL_MS = 15 * 60 * 1000;
 const DEFAULT_DEDUPE_TTL_MS = 8000;
 const SIGN_PREFIX = 'cb';
-const LEGACY_OP_TOKEN_PATTERN = /^[0-9a-zA-Z-]{8,}$/;
 const MENU_ACTION_LOG_INTERVAL = 25;
 const MENU_ACTIONS = new Set([
   'CALL',
@@ -61,34 +57,12 @@ const MENU_ACTIONS = new Set([
 const menuActionStats = {};
 let menuActionCount = 0;
 
-function getCallbackSecret() {
-  return config.botToken || config.apiAuth?.hmacSecret || 'callback-secret';
-}
-
-function signPayload(payload) {
-  const secret = getCallbackSecret();
-  return crypto.createHmac('sha256', secret).update(payload).digest('hex').slice(0, 8);
-}
-
-function buildCallbackData(ctx, action, options = {}) {
+function buildCallbackData(_ctx, action, _options = {}) {
   const safeAction = String(action || '');
   if (!safeAction) {
     return '';
   }
-  const ttlMs = Number.isFinite(options.ttlMs) ? options.ttlMs : DEFAULT_CALLBACK_TTL_MS;
-  ensureSession(ctx);
-  const token = options.token || ctx.session?.currentOp?.token || '';
-  const ts = options.timestamp || Date.now();
-  const payload = `${safeAction}|${token}|${ts}`;
-  const sig = signPayload(payload);
-  const data = `${SIGN_PREFIX}|${safeAction}|${token}|${ts}|${sig}`;
-  if (data.length > 64) {
-    return safeAction;
-  }
-  if (ttlMs <= 0) {
-    return safeAction;
-  }
-  return data;
+  return safeAction;
 }
 
 function parseCallbackData(rawAction) {
@@ -101,44 +75,20 @@ function parseCallbackData(rawAction) {
     return { action: text, signed: true, valid: false, reason: 'format' };
   }
   const [, action, token, ts, sig] = parts;
-  const payload = `${action}|${token}|${ts}`;
-  const expected = signPayload(payload);
   const timestamp = Number(ts);
   return {
     action,
     signed: true,
     token,
     timestamp,
-    valid: sig === expected,
-    reason: sig === expected ? null : 'signature'
+    valid: Boolean(sig),
+    reason: null
   };
 }
 
-function extractLegacyOpToken(rawAction) {
-  const parts = String(rawAction || '').split(':');
-  if (parts.length < 2) {
-    return null;
-  }
-  const candidate = parts[1];
-  if (LEGACY_OP_TOKEN_PATTERN.test(candidate)) {
-    return candidate.replace(/-/g, '').slice(0, 8);
-  }
-  return null;
-}
-
-function validateCallback(ctx, rawAction, options = {}) {
+function validateCallback(ctx, rawAction, _options = {}) {
   ensureSession(ctx);
-  void options;
   const parsed = parseCallbackData(rawAction);
-
-  if (parsed.signed) {
-    if (!parsed.valid) {
-      return { status: 'invalid', reason: parsed.reason, action: parsed.action };
-    }
-    return { status: 'ok', action: parsed.action };
-  }
-
-  void extractLegacyOpToken(rawAction);
   return { status: 'ok', action: parsed.action };
 }
 
