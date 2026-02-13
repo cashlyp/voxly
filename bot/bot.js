@@ -25,20 +25,21 @@ const config = require("./config");
 const { attachHmacAuth } = require("./utils/apiAuth");
 const {
   clearMenuMessages,
+  getLatestMenuMessageId,
+  isLatestMenuExpired,
   renderMenu,
 } = require("./utils/ui");
 const {
   buildCallbackData,
-  parseCallbackData,
   validateCallback,
   isDuplicateAction,
   startActionMetric,
   finishActionMetric,
 } = require("./utils/actions");
 const {
-  parseCallbackAction,
-  resolveConversationFromPrefix,
-} = require("./utils/callbackRouting");
+  getConversationRecoveryTarget,
+  recoverConversationFromCallback,
+} = require("./utils/conversationRecovery");
 const { normalizeReply, logCommandError } = require("./utils/ui");
 const {
   getAccessProfile,
@@ -73,40 +74,6 @@ const {
 const token = config.botToken;
 const bot = new Bot(token);
 
-async function clearCallbackMessageMarkup(ctx) {
-  const chatId = ctx.callbackQuery?.message?.chat?.id;
-  const messageId = ctx.callbackQuery?.message?.message_id;
-  if (!chatId || !messageId) {
-    return;
-  }
-  try {
-    await ctx.api.editMessageReplyMarkup(chatId, messageId);
-  } catch (_) {
-    // Ignore edit failures for older/non-editable messages.
-  }
-}
-
-function isIgnorableCallbackAckError(error) {
-  const message = String(
-    error?.description || error?.message || error?.response?.description || "",
-  );
-  return /query is too old|query id is invalid|query is already answered/i.test(
-    message,
-  );
-}
-
-async function safeAnswerCallback(ctx, payload = {}) {
-  try {
-    await ctx.answerCallbackQuery(payload);
-    return true;
-  } catch (error) {
-    if (isIgnorableCallbackAckError(error)) {
-      return false;
-    }
-    throw error;
-  }
-}
-
 // Initialize conversations with error handling wrapper
 function wrapConversation(handler, name) {
   return createConversation(async (conversation, ctx) => {
@@ -122,6 +89,11 @@ function wrapConversation(handler, name) {
         "❌ An error occurred during the conversation. Please try again.";
       const message = error?.userMessage || fallback;
       await ctx.reply(message);
+    } finally {
+      // Prevent stale operations from trapping later callbacks in "in-progress" state.
+      if (ctx.session?.currentOp?.id) {
+        ctx.session.currentOp = null;
+      }
     }
   }, name);
 }
@@ -223,10 +195,6 @@ bot.use(async (ctx, next) => {
   try {
     return await next();
   } catch (error) {
-    if (error instanceof OperationCancelledError) {
-      console.log("Command flow cancelled:", error.message);
-      return;
-    }
     logCommandError(ctx, error);
     try {
       const fallback =
@@ -246,25 +214,6 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
   if (parts.length < 3) return;
   const action = parts[1];
   const callSid = parts[2];
-  const callbackId = ctx.callbackQuery?.id;
-  if (
-    callbackId &&
-    isDuplicateAction(ctx, `gcbid:alert:${callbackId}`, 60 * 60 * 1000)
-  ) {
-    await ctx
-      .answerCallbackQuery({ text: "Already processed.", show_alert: false })
-      .catch(() => {});
-    return;
-  }
-  const actionKey = `alert:${action}:${callSid}|${
-    ctx.callbackQuery?.message?.message_id || ""
-  }`;
-  if (isDuplicateAction(ctx, actionKey, 20 * 1000)) {
-    await ctx
-      .answerCallbackQuery({ text: "Already processed.", show_alert: false })
-      .catch(() => {});
-    return;
-  }
 
   try {
     const allowed = await requireCapability(ctx, "call", {
@@ -323,12 +272,8 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
     }
   } catch (error) {
     console.error("Operator action error:", error?.message || error);
-    const callbackText =
-      error?.response?.status === 404
-        ? "⚠️ Operator action endpoint is unavailable."
-        : "⚠️ Failed to execute action";
     await ctx.answerCallbackQuery({
-      text: callbackText,
+      text: "⚠️ Failed to execute action",
       show_alert: false,
     });
   }
@@ -336,22 +281,6 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
 
 // Live call console actions (proxy to API webhook handler)
 bot.callbackQuery(/^lc:/, async (ctx) => {
-  const callbackId = ctx.callbackQuery?.id;
-  if (callbackId && isDuplicateAction(ctx, `gcbid:lc:${callbackId}`, 60 * 60 * 1000)) {
-    await ctx
-      .answerCallbackQuery({ text: "Already processed.", show_alert: false })
-      .catch(() => {});
-    return;
-  }
-  const actionKey = `lc:${ctx.callbackQuery?.data || ""}|${
-    ctx.callbackQuery?.message?.message_id || ""
-  }`;
-  if (isDuplicateAction(ctx, actionKey, 20 * 1000)) {
-    await ctx
-      .answerCallbackQuery({ text: "Already processed.", show_alert: false })
-      .catch(() => {});
-    return;
-  }
   try {
     const allowed = await requireCapability(ctx, "calllog_view", {
       actionLabel: "Live call console",
@@ -384,18 +313,14 @@ bot.callbackQuery(/^lc:/, async (ctx) => {
 bot.use(conversations());
 
 // Global error handler
-bot.catch(async (err) => {
-  if (err?.error instanceof OperationCancelledError) {
-    console.log("Global cancellation:", err.error.message);
-    return;
-  }
+bot.catch((err) => {
   const errorMessage = `Error while handling update ${err.ctx.update.update_id}:
     ${err.error.message}
     Stack: ${err.error.stack}`;
   console.error(errorMessage);
 
   try {
-    await err.ctx.reply("❌ An error occurred. Please try again or contact support.");
+    err.ctx.reply("❌ An error occurred. Please try again or contact support.");
   } catch (replyError) {
     console.error("Failed to send error message:", replyError);
   }
@@ -480,9 +405,8 @@ const {
 } = require("./commands/calllog");
 const {
   registerProviderCommand,
-  handleProviderCallbackAction,
-  isProviderAction,
-  PROVIDER_ACTIONS,
+  handleProviderSwitch,
+  renderProviderMenu,
 } = require("./commands/provider");
 const {
   addUserFlow,
@@ -560,55 +484,26 @@ registerGuideCommand(bot);
 registerApiCommands(bot);
 registerProviderCommand(bot);
 const API_BASE = config.apiUrl;
-const REQUEST_ACCESS_ACTION = "REQUEST_ACCESS";
-
-function escapeMarkdownValue(value = "") {
-  return String(value).replace(/([_*[\]()`])/g, "\\$1");
-}
-
-function getTelegramAccountName(from = {}) {
-  const firstName = String(from?.first_name || "").trim();
-  const lastName = String(from?.last_name || "").trim();
-  const fullName = [firstName, lastName].filter(Boolean).join(" ").trim();
-  if (fullName) {
-    return fullName;
-  }
-  if (from?.username) {
-    return `@${from.username}`;
-  }
-  return "Unknown";
-}
 
 // Start command handler
 bot.command("start", async (ctx) => {
   try {
-    ensureSession(ctx);
     expireInactiveUsers();
 
     const access = await getAccessProfile(ctx);
     const isOwner = access.isAdmin;
     await syncChatCommands(ctx, access);
 
-    const accountName = escapeMarkdownValue(getTelegramAccountName(ctx.from));
-    const usernameValue = ctx.from?.username
-      ? `@${escapeMarkdownValue(ctx.from.username)}`
-      : "none";
-
     const userStats = access.user
       ? `👤 *User Information*
-• Account Name: ${accountName}
 • ID: \`${ctx.from.id}\`
-• Username: ${usernameValue}
+• Username: @${ctx.from.username || "none"}
 • Role: ${access.user.role}
 • Joined: ${new Date(access.user.timestamp).toLocaleDateString()}`
-      : [
-          `👤 *Guest Access*`,
-          `• Account Name: ${accountName}`,
-          `• ID: \`${ctx.from.id}\``,
-          ctx.from?.username ? `• Username: ${usernameValue}` : null,
-        ]
-          .filter(Boolean)
-          .join("\n");
+      : `👤 *Guest Access*
+• ID: \`${ctx.from.id}\`
+• Username: @${ctx.from.username || "none"}
+• Role: Guest`;
 
     const welcomeText = access.user
       ? isOwner
@@ -651,7 +546,7 @@ bot.command("start", async (ctx) => {
         .text("📵 Caller Flags", buildCallbackData(ctx, "CALLER_FLAGS"))
         .row()
         .text("🧰 Scripts", buildCallbackData(ctx, "SCRIPTS"))
-        .text("☎️ Provider", buildCallbackData(ctx, PROVIDER_ACTIONS.HOME))
+        .text("☎️ Provider", buildCallbackData(ctx, "PROVIDER_STATUS"))
         .row()
         .text("🔍 Status", buildCallbackData(ctx, "STATUS"))
         .row();
@@ -659,14 +554,13 @@ bot.command("start", async (ctx) => {
 
     // REQUEST ACCESS: For guests (admin-only)
     if (!access.user) {
-      kb.text("📩 Request Access", buildCallbackData(ctx, REQUEST_ACCESS_ACTION));
+      const adminUsername = (config.admin.username || "").replace(/^@/, "");
+      if (adminUsername) {
+        kb.url("📱 Request Access", `https://t.me/${adminUsername}`);
+      }
     }
 
-    const tips = ["Tip: SMS and Email actions are grouped under /sms and /email."];
-    if (isOwner) {
-      tips.push("Admin tip: Provider actions are grouped under /provider.");
-    }
-    const message = `${welcomeText}\n\n${userStats}\n\n${tips.join("\n")}\n\nUse the buttons below or type /help for available commands.`;
+    const message = `${welcomeText}\n\n${userStats}\n\nTip: SMS and Email actions are grouped under /sms and /email.\n\nUse the buttons below or type /help for available commands.`;
     await renderMenu(ctx, message, kb, { parseMode: "Markdown" });
   } catch (error) {
     console.error("Start command error:", error);
@@ -676,47 +570,15 @@ bot.command("start", async (ctx) => {
   }
 });
 
-bot.command("cancel", async (ctx) => {
-  try {
-    await cancelActiveFlow(ctx, "command:/cancel");
-    resetSession(ctx);
-    await clearMenuMessages(ctx);
-    await ctx.reply("✅ Current operation cancelled.\n📋 Use /menu to start again.");
-  } catch (error) {
-    console.error("Cancel command error:", error?.message || error);
-    await ctx.reply("⚠️ Could not cancel the current operation. Please try /menu.");
-  }
-});
-
 // Enhanced callback query handler
 bot.on("callback_query:data", async (ctx) => {
   const rawAction = ctx.callbackQuery.data;
-  const rawParsedAction = parseCallbackData(rawAction);
-  const resolvedRawAction = rawParsedAction.action || rawAction;
-  const rawParsedCallback = parseCallbackAction(resolvedRawAction);
-  const rawConversationTarget = rawParsedCallback
-    ? resolveConversationFromPrefix(
-        rawParsedCallback.prefix,
-        ctx.session?.currentOp?.command || null,
-      )
-    : null;
   const metric = startActionMetric(ctx, "callback", { raw_action: rawAction });
   const finishMetric = (status, extra = {}) => {
     finishActionMetric(metric, status, extra);
   };
   try {
-    const callbackId = ctx.callbackQuery?.id;
-    if (
-      callbackId &&
-      isDuplicateAction(ctx, `gcbid:callback:${callbackId}`, 60 * 60 * 1000)
-    ) {
-      await ctx
-        .answerCallbackQuery({ text: "Already processed.", show_alert: false })
-        .catch(() => {});
-      finishMetric("duplicate_callback_id");
-      return;
-    }
-    if (rawAction && (rawAction.startsWith("lc:") || rawAction.startsWith("alert:"))) {
+    if (rawAction && rawAction.startsWith("lc:")) {
       finishMetric("skipped");
       return;
     }
@@ -728,27 +590,21 @@ bot.on("callback_query:data", async (ctx) => {
       ? { status: "ok", action: rawAction }
       : validateCallback(ctx, rawAction);
     if (validation.status !== "ok") {
-      if (rawConversationTarget) {
-        await safeAnswerCallback(ctx).catch(() => {});
-        finishMetric("routed", {
-          reason: validation.reason || null,
-          conversation: rawConversationTarget,
-        });
-        return;
-      }
-      await clearCallbackMessageMarkup(ctx);
-      await safeAnswerCallback(ctx, {
-        text: "⚠️ Action no longer valid.",
-        show_alert: false,
-      });
-      finishMetric("invalid", { reason: validation.reason || null });
+      const message =
+        validation.status === "expired"
+          ? "⌛ This menu expired. Opening the latest view…"
+          : "⚠️ This menu is no longer active.";
+      await ctx.answerCallbackQuery({ text: message, show_alert: false });
+      await clearMenuMessages(ctx);
+      await handleMenu(ctx);
+      finishMetric(validation.status, { reason: validation.reason });
       return;
     }
 
     const action = validation.action;
     const actionKey = `${action}|${ctx.callbackQuery?.message?.message_id || ""}`;
-    if (isDuplicateAction(ctx, actionKey, 20 * 1000)) {
-      await safeAnswerCallback(ctx, {
+    if (isDuplicateAction(ctx, actionKey)) {
+      await ctx.answerCallbackQuery({
         text: "Already processed.",
         show_alert: false,
       });
@@ -757,7 +613,7 @@ bot.on("callback_query:data", async (ctx) => {
     }
 
     // Answer callback query immediately to prevent timeout
-    await safeAnswerCallback(ctx);
+    await ctx.answerCallbackQuery();
     console.log(`Callback query received: ${action} from user ${ctx.from.id}`);
 
     await getAccessProfile(ctx);
@@ -772,15 +628,27 @@ bot.on("callback_query:data", async (ctx) => {
       }
     }
 
-    const parsedCallback = parseCallbackAction(action);
-    const conversationTarget = parsedCallback
-      ? resolveConversationFromPrefix(
-          parsedCallback.prefix,
-          ctx.session?.currentOp?.command || null,
-        )
-      : null;
-    if (parsedCallback && conversationTarget) {
-      finishMetric("routed");
+    const isMenuExemptAction = menuExemptPrefixes.some((prefix) =>
+      action.startsWith(prefix),
+    );
+    const menuMessageId = ctx.callbackQuery?.message?.message_id;
+    const menuChatId = ctx.callbackQuery?.message?.chat?.id;
+    const latestMenuId = getLatestMenuMessageId(ctx, menuChatId);
+    if (!isMenuExemptAction && isLatestMenuExpired(ctx, menuChatId)) {
+      await clearMenuMessages(ctx);
+      await handleMenu(ctx);
+      finishMetric("expired");
+      return;
+    }
+    if (
+      !isMenuExemptAction &&
+      menuMessageId &&
+      latestMenuId &&
+      menuMessageId !== latestMenuId
+    ) {
+      await clearMenuMessages(ctx);
+      await handleMenu(ctx);
+      finishMetric("stale");
       return;
     }
 
@@ -797,18 +665,11 @@ bot.on("callback_query:data", async (ctx) => {
       return;
     }
 
-    const isProviderCallbackAction = isProviderAction(action);
-    if (isProviderCallbackAction) {
+    if (action.startsWith("PROVIDER_SET:")) {
+      const [, provider] = action.split(":");
       await cancelActiveFlow(ctx, `callback:${action}`);
       resetSession(ctx);
-      await clearMenuMessages(ctx);
-      await handleProviderCallbackAction(ctx, action);
-      finishMetric("ok");
-      return;
-    }
-
-    if (action === REQUEST_ACCESS_ACTION) {
-      await handleRequestAccess(ctx);
+      await handleProviderSwitch(ctx, provider?.toLowerCase());
       finishMetric("ok");
       return;
     }
@@ -852,6 +713,20 @@ bot.on("callback_query:data", async (ctx) => {
       }
       await sendBulkStatusCard(ctx, jobId);
       finishMetric("ok");
+      return;
+    }
+
+    const recoveryTarget = getConversationRecoveryTarget(action);
+    if (recoveryTarget) {
+      // If a conversation callback reaches this global handler, the flow is out of sync.
+      // Recover by restarting the expected conversation instead of silently swallowing input.
+      await recoverConversationFromCallback(
+        ctx,
+        action,
+        recoveryTarget.conversationTarget,
+        { cancelActiveFlow, resetSession, clearMenuMessages },
+      );
+      finishMetric("recovered");
       return;
     }
 
@@ -1000,6 +875,11 @@ bot.on("callback_query:data", async (ctx) => {
         finishMetric("ok");
         break;
 
+      case "PROVIDER_STATUS":
+        await renderProviderMenu(ctx, { forceRefresh: true });
+        finishMetric("ok");
+        break;
+
       case "CALLLOG":
         await renderCalllogMenu(ctx);
         finishMetric("ok");
@@ -1052,8 +932,11 @@ bot.on("callback_query:data", async (ctx) => {
 
       default:
         if (action.includes(":")) {
-          console.log(`Unknown namespaced callback action: ${action}`);
-          finishMetric("invalid", { reason: "unknown_namespaced_action" });
+          console.log(`Stale callback action: ${action}`);
+          await ctx.reply(
+            "⚠️ That menu is no longer active. Use /menu to start again.",
+          );
+          finishMetric("stale");
         } else {
           console.log(`Unknown callback action: ${action}`);
           await ctx.reply("❌ Unknown action. Please try again.");
@@ -1061,16 +944,6 @@ bot.on("callback_query:data", async (ctx) => {
         }
     }
   } catch (error) {
-    if (error instanceof OperationCancelledError) {
-      console.log("Callback cancelled:", error.message);
-      await clearCallbackMessageMarkup(ctx);
-      finishMetric("cancelled", { reason: error.message });
-      return;
-    }
-    if (isIgnorableCallbackAckError(error)) {
-      finishMetric("ignored_ack_error", { error: error?.message || String(error) });
-      return;
-    }
     console.error("Callback query error:", error);
     const fallback =
       "❌ An error occurred processing your request. Please try again.";
@@ -1082,7 +955,6 @@ bot.on("callback_query:data", async (ctx) => {
 
 const TELEGRAM_COMMANDS = [
   { command: "start", description: "Start or restart the bot" },
-  { command: "cancel", description: "Cancel the current operation" },
   { command: "help", description: "Show available commands" },
   { command: "menu", description: "Show quick action menu" },
   { command: "guide", description: "Show detailed usage guide" },
@@ -1095,7 +967,7 @@ const TELEGRAM_COMMANDS = [
   { command: "mailer", description: "Bulk email center (admin only)" },
   { command: "scripts", description: "Manage call & SMS scripts (admin only)" },
   { command: "persona", description: "Manage personas (admin only)" },
-  { command: "provider", description: "Manage providers (admin only)" },
+  { command: "provider", description: "Manage call provider (admin only)" },
   { command: "callerflags", description: "Manage caller flags (admin only)" },
   { command: "users", description: "Manage users (admin only)" },
   { command: "status", description: "System status (admin only)" },
@@ -1103,7 +975,6 @@ const TELEGRAM_COMMANDS = [
 
 const TELEGRAM_COMMANDS_GUEST = [
   { command: "start", description: "Start or restart the bot" },
-  { command: "cancel", description: "Cancel the current operation" },
   { command: "help", description: "Learn how the bot works" },
   { command: "menu", description: "Browse the feature menu" },
   { command: "guide", description: "View the user guide" },
@@ -1111,7 +982,6 @@ const TELEGRAM_COMMANDS_GUEST = [
 
 const TELEGRAM_COMMANDS_USER = [
   { command: "start", description: "Start or restart the bot" },
-  { command: "cancel", description: "Cancel the current operation" },
   { command: "help", description: "Show available commands" },
   { command: "menu", description: "Show quick action menu" },
   { command: "guide", description: "Show detailed usage guide" },
@@ -1121,22 +991,9 @@ const TELEGRAM_COMMANDS_USER = [
   { command: "sms", description: "Open SMS center" },
   { command: "email", description: "Open Email center" },
 ];
-const CHAT_COMMAND_SYNC_TTL_MS = 5 * 60 * 1000;
 
 async function syncChatCommands(ctx, access) {
   if (!ctx.chat || ctx.chat.type !== "private") {
-    return;
-  }
-  ensureSession(ctx);
-  const roleKey = access.user ? (access.isAdmin ? "admin" : "user") : "guest";
-  const priorSync = ctx.session?.commandSync || null;
-  const now = Date.now();
-  if (
-    priorSync &&
-    priorSync.chatId === ctx.chat.id &&
-    priorSync.roleKey === roleKey &&
-    now - (priorSync.syncedAt || 0) < CHAT_COMMAND_SYNC_TTL_MS
-  ) {
     return;
   }
   const commands = access.user
@@ -1148,11 +1005,6 @@ async function syncChatCommands(ctx, access) {
     await bot.api.setMyCommands(commands, {
       scope: { type: "chat", chat_id: ctx.chat.id },
     });
-    ctx.session.commandSync = {
-      chatId: ctx.chat.id,
-      roleKey,
-      syncedAt: Date.now(),
-    };
   } catch (error) {
     console.warn("Failed to sync chat commands:", error?.message || error);
   }
@@ -1174,45 +1026,6 @@ bot.on("message:text", async (ctx) => {
     );
   }
 });
-
-async function handleRequestAccess(ctx) {
-  try {
-    const configuredAdmin =
-      config.admin && (config.admin.id || config.admin.telegramId || config.admin.userId)
-        ? (config.admin.id || config.admin.telegramId || config.admin.userId)
-        : (process.env.ADMIN_TELEGRAM_ID ? Number(process.env.ADMIN_TELEGRAM_ID) : null);
-    const adminId =
-      configuredAdmin !== null && configuredAdmin !== undefined && /^\-?\d+$/.test(String(configuredAdmin))
-        ? Number(configuredAdmin)
-        : null;
-
-    const username = ctx.from?.username ? `@${ctx.from.username}` : "none";
-    const displayName =
-      [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(" ") ||
-      username ||
-      "Unknown";
-
-    const message =
-      "📥 New access request\n\n" +
-      "👤 Guest Information\n" +
-      `• Name: ${displayName}\n` +
-      `• ID: ${ctx.from?.id}\n` +
-      `• Username: ${username}\n` +
-      (ctx.from?.language_code ? `• Language: ${ctx.from.language_code}\n` : "") +
-      `• Requested at: ${new Date().toISOString()}`;
-
-    if (adminId) {
-      await ctx.api.sendMessage(adminId, message);
-    } else {
-      console.warn("No admin Telegram ID configured; cannot forward access request.");
-    }
-
-    await ctx.reply("✅ Your access request has been sent to the administrator.");
-  } catch (error) {
-    console.error("Request access handler error:", error?.message || error);
-    await ctx.reply("⚠️ Failed to send access request. Please contact the administrator directly.");
-  }
-}
 
 async function bootstrap() {
   try {

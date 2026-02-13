@@ -44,10 +44,7 @@ const initialSessionState = () => ({
   currentOp: null,
   lastCommand: null,
   pendingControllers: [],
-  commandSync: null,
-  meta: {
-    expiredConversation: null
-  },
+  meta: {},
   flow: null,
   errors: [],
   menuMessages: [],
@@ -59,12 +56,10 @@ function ensureSession(ctx) {
     ctx.session = initialSessionState();
   } else {
     ctx.session.currentOp = ctx.session.currentOp || null;
-    ctx.session.pendingControllers = ctx.session.pendingControllers || [];
-    ctx.session.commandSync = ctx.session.commandSync || null;
+    ctx.session.pendingControllers = Array.isArray(ctx.session.pendingControllers)
+      ? ctx.session.pendingControllers
+      : [];
     ctx.session.meta = ctx.session.meta || {};
-    if (!Object.prototype.hasOwnProperty.call(ctx.session.meta, 'expiredConversation')) {
-      ctx.session.meta.expiredConversation = null;
-    }
     ctx.session.flow = ctx.session.flow || null;
     ctx.session.errors = Array.isArray(ctx.session.errors) ? ctx.session.errors : [];
     ctx.session.menuMessages = Array.isArray(ctx.session.menuMessages) ? ctx.session.menuMessages : [];
@@ -87,25 +82,6 @@ function generateOpId() {
 
 function startOperation(ctx, command, metadata = {}) {
   ensureSession(ctx);
-  ctx.session.meta.expiredConversation = null;
-  const existingOp = ctx.session.currentOp;
-  if (
-    existingOp &&
-    existingOp.command === command &&
-    typeof existingOp.id === 'string' &&
-    existingOp.id.length > 0
-  ) {
-    const now = Date.now();
-    existingOp.token = existingOp.token || existingOp.id.replace(/-/g, '').slice(0, 8);
-    existingOp.startedAt = now;
-    existingOp.metadata = {
-      ...(existingOp.metadata || {}),
-      ...(metadata || {})
-    };
-    ctx.session.currentOp = existingOp;
-    ctx.session.lastCommand = command;
-    return existingOp.id;
-  }
   const opId = generateOpId();
   const opToken = opId.replace(/-/g, '').slice(0, 8);
   ctx.session.currentOp = {
@@ -172,8 +148,6 @@ function resetSession(ctx) {
   ctx.session.pendingControllers = [];
   ctx.session.flow = null;
   ctx.session.errors = [];
-  ctx.session.callDetailsCache = {};
-  ctx.session.callDetailsKeys = [];
 }
 
 function ensureOperationActive(ctx, opId) {
@@ -214,8 +188,8 @@ function ensureFlow(ctx, name, options = {}) {
 
 async function safeReset(ctx, reason = 'reset', options = {}) {
   const {
-    message = '⚠️ Session expired. Restarting call setup...',
-    menuHint = '📋 Use /menu to start again.',
+    message = 'â ï¸ Session expired. Restarting call setup...',
+    menuHint = 'ð Use /menu to start again.',
     notify = true
   } = options;
 
