@@ -3,12 +3,7 @@ const config = require('../config');
 const httpClient = require('./httpClient');
 const { ensureOperationActive, getCurrentOpId } = require('./sessionState');
 const { sendMenu, clearMenuMessages } = require('./ui');
-const {
-  buildCallbackData,
-  matchesCallbackPrefix,
-  parseCallbackData,
-  isDuplicateAction
-} = require('./actions');
+const { buildCallbackData, matchesCallbackPrefix, parseCallbackData } = require('./actions');
 
 const FALLBACK_PERSONAS = [
   {
@@ -395,61 +390,15 @@ async function askOptionWithButtons(
   });
 
   const message = await sendMenu(ctx, prompt, { parse_mode: 'Markdown', reply_markup: keyboard });
-  let selectionCtx;
-  let selectedOption = null;
-  while (true) {
-    selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {
-      const callbackData = callbackCtx.callbackQuery?.data || '';
-      return (
-        matchesCallbackPrefix(callbackData, prefixKey) ||
-        matchesCallbackPrefix(callbackData, basePrefix)
-      );
-    });
-
-    const callbackData = selectionCtx.callbackQuery?.data || '';
-    const parsedCallbackData = parseCallbackData(callbackData);
-    const selectionAction = parsedCallbackData.action || callbackData;
-    let selectedId = null;
-    const actionParts = selectionAction.split(':');
-    if (actionParts.length > 1) {
-      selectedId = actionParts[actionParts.length - 1] || null;
-    }
-    if (!selectedId) {
-      await selectionCtx
-        .answerCallbackQuery({
-          text: '⚠️ Selection unavailable.',
-          show_alert: false
-        })
-        .catch(() => {});
-      continue;
-    }
-    selectedOption = options.find((option) => String(option.id) === String(selectedId));
-    if (!selectedOption) {
-      await selectionCtx
-        .answerCallbackQuery({
-          text: '⚠️ Selection unavailable.',
-          show_alert: false
-        })
-        .catch(() => {});
-      continue;
-    }
-
-    const callbackId = selectionCtx.callbackQuery?.id;
-    if (callbackId && isDuplicateAction(ctx, `convcbid:${callbackId}`, 60 * 60 * 1000)) {
-      await selectionCtx.answerCallbackQuery({
-        text: 'Already processed.',
-        show_alert: false
-      }).catch(() => {});
-      continue;
-    }
-    break;
-  }
+  const selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {
+    return matchesCallbackPrefix(callbackCtx.callbackQuery.data, prefixKey);
+  });
   const activeChecker = typeof ensureActive === 'function'
     ? ensureActive
     : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
   activeChecker();
 
-  await selectionCtx.answerCallbackQuery().catch(() => {});
+  await selectionCtx.answerCallbackQuery();
   try {
     await ctx.api.deleteMessage(message.chat.id, message.message_id);
   } catch (_) {
@@ -457,7 +406,10 @@ async function askOptionWithButtons(
   }
   await clearMenuMessages(ctx);
 
-  return selectedOption;
+  const selectionAction = parseCallbackData(selectionCtx.callbackQuery.data).action || selectionCtx.callbackQuery.data;
+  const parts = selectionAction.split(':');
+  const selectedId = opId ? parts.slice(2).join(':') : parts.slice(1).join(':');
+  return options.find((option) => option.id === selectedId);
 }
 
 function getOptionLabel(options, id) {

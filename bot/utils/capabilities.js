@@ -1,6 +1,7 @@
 const { InlineKeyboard } = require('grammy');
 const fs = require('fs');
 const path = require('path');
+const config = require('../config');
 const { getUser, isAdmin } = require('../db/db');
 const { buildCallbackData } = require('./actions');
 const { ensureSession } = require('./sessionState');
@@ -68,7 +69,6 @@ const ACTION_CAPABILITIES = [
   { match: (action) => action === 'HELP', cap: 'view_help' },
   { match: (action) => action === 'GUIDE', cap: 'view_guide' },
   { match: (action) => action === 'MENU', cap: 'view_menu' },
-  { match: (action) => action === 'REQUEST_ACCESS', cap: 'view_menu' },
   { match: (action) => action === 'HEALTH', cap: 'health' },
   { match: (action) => action === 'STATUS', cap: 'status_admin' },
   { match: (action) => action === 'CALL', cap: 'call' },
@@ -89,18 +89,8 @@ const ACTION_CAPABILITIES = [
   { match: (action) => action.startsWith('BULK_EMAIL_'), cap: 'bulk_email' },
   { match: (action) => action === 'SCRIPTS', cap: 'scripts_manage' },
   { match: (action) => action === 'PERSONA', cap: 'persona_manage' },
-  { match: (action) => action === 'PROVIDER:HOME', cap: 'provider_manage' },
-  { match: (action) => action === 'PROVIDER:CALL', cap: 'provider_manage' },
-  { match: (action) => action === 'PROVIDER:SMS', cap: 'provider_manage' },
-  { match: (action) => action === 'PROVIDER:EMAIL', cap: 'provider_manage' },
-  { match: (action) => action.startsWith('PROVIDER:BACK:'), cap: 'provider_manage' },
-  { match: (action) => action.startsWith('PROVIDER_STATUS:'), cap: 'provider_manage' },
-  { match: (action) => action.startsWith('PROVIDER_SET:'), cap: 'provider_manage' },
   { match: (action) => action === 'PROVIDER_STATUS', cap: 'provider_manage' },
-  { match: (action) => action.startsWith('PROVIDER_STATUS_CH:'), cap: 'provider_manage' },
-  { match: (action) => action === 'PROVIDER_OVERRIDES', cap: 'provider_manage' },
-  { match: (action) => action.startsWith('PROVIDER_CLEAR_OVERRIDES:'), cap: 'provider_manage' },
-  { match: (action) => action.startsWith('PROVIDER_SET_CH:'), cap: 'provider_manage' },
+  { match: (action) => action.startsWith('PROVIDER_SET:'), cap: 'provider_manage' },
   { match: (action) => ['USERS', 'USERS_LIST', 'ADDUSER', 'PROMOTE', 'REMOVE'].includes(action), cap: 'users_manage' },
   { match: (action) => ['CALLER_FLAGS', 'CALLER_FLAGS_LIST', 'CALLER_FLAGS_ALLOW', 'CALLER_FLAGS_BLOCK', 'CALLER_FLAGS_SPAM'].includes(action), cap: 'caller_flags_manage' },
   { match: (action) => action.startsWith('CALL_DETAILS:'), cap: 'calllog_view' },
@@ -162,9 +152,12 @@ function getCapabilityForAction(action = '') {
 }
 
 function buildAccessKeyboard(ctx) {
+  const adminUsername = (config.admin.username || '').replace(/^@/, '');
   const keyboard = new InlineKeyboard()
-    .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
-  keyboard.row().text('📩 Request Access', buildCallbackData(ctx, 'REQUEST_ACCESS'));
+    .text('â¬ï¸ Main Menu', buildCallbackData(ctx, 'MENU'));
+  if (adminUsername) {
+    keyboard.row().url('ð± Request Access', `https://t.me/${adminUsername}`);
+  }
   return keyboard;
 }
 
@@ -241,7 +234,7 @@ function getDeniedAuditSummary() {
 async function sendAccessDenied(ctx, capability, options = {}) {
   const actionLabel = options.actionLabel ? `\n\nAction: ${options.actionLabel}` : '';
   const message =
-    `🔒 Access required to use this action.` +
+    `ð Access required to use this action.` +
     `\n\nYou can explore menus, but execution is disabled without approval.` +
     `${actionLabel}`;
   await ctx.reply(message, { reply_markup: buildAccessKeyboard(ctx) });
@@ -262,7 +255,7 @@ async function requireCapability(ctx, capability, options = {}) {
   });
   console.warn(`Access denied for user ${userId} (${profile.role}) on capability ${capability}${options.action ? ` via ${options.action}` : ''}`);
   if (isRateLimited(userId)) {
-    await ctx.reply('⏳ Too many access attempts. Please wait a moment and try again.', {
+    await ctx.reply('â³ Too many access attempts. Please wait a moment and try again.', {
       reply_markup: buildAccessKeyboard(ctx)
     });
     return false;
@@ -271,7 +264,7 @@ async function requireCapability(ctx, capability, options = {}) {
     const lastNotice = lastCooldownNotice.get(userId) || 0;
     if (Date.now() - lastNotice > COOLDOWN_MS) {
       lastCooldownNotice.set(userId, Date.now());
-      await ctx.reply('⏳ Please wait 30 seconds before retrying locked actions.', {
+      await ctx.reply('â³ Please wait 30 seconds before retrying locked actions.', {
         reply_markup: buildAccessKeyboard(ctx)
       });
       return false;

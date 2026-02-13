@@ -661,10 +661,20 @@ async function callFlow(conversation, ctx) {
         inline_keyboard: [[{ text: 'ℹ️ Details', callback_data: buildCallbackData(ctx, `CALL_DETAILS:${detailsKey}`) }]]
       };
     }
+    if (!replyOptions.reply_markup) {
+      replyOptions.reply_markup = buildMainMenuReplyMarkup(ctx);
+    } else if (replyOptions.reply_markup.inline_keyboard) {
+      replyOptions.reply_markup.inline_keyboard.push([
+        { text: '⬅️ Main Menu', callback_data: buildCallbackData(ctx, 'MENU') }
+      ]);
+    }
+
     await renderMenu(ctx, section('🔍 Call Brief', detailLines), replyOptions.reply_markup, {
       payload: { parse_mode: 'Markdown' }
     });
-    await ctx.reply('⏳ Making the call…');
+    await ctx.reply('⏳ Making the call…', {
+      reply_markup: buildMainMenuReplyMarkup(ctx)
+    });
 
     const payloadForLog = { ...payload };
     if (payloadForLog.prompt) {
@@ -698,8 +708,7 @@ async function callFlow(conversation, ctx) {
     }
   } catch (error) {
     if (error instanceof OperationCancelledError || error?.name === 'AbortError' || error?.name === 'CanceledError') {
-      const reason = error?.message || error?.name || 'cancelled';
-      console.log(`Call flow cancelled: ${reason}`);
+      console.log('Call flow cancelled');
       return;
     }
 

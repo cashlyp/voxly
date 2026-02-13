@@ -1,5 +1,8 @@
+const crypto = require('crypto');
+const config = require('../config');
 const { ensureSession } = require('./sessionState');
 
+const DEFAULT_CALLBACK_TTL_MS = 15 * 60 * 1000;
 const DEFAULT_DEDUPE_TTL_MS = 8000;
 const SIGN_PREFIX = 'cb';
 const MENU_ACTION_LOG_INTERVAL = 25;
@@ -33,18 +36,7 @@ const MENU_ACTIONS = new Set([
   'BULK_EMAIL_LIST',
   'BULK_EMAIL_STATS',
   'SCRIPTS',
-  'PROVIDER:HOME',
-  'PROVIDER:CALL',
-  'PROVIDER:SMS',
-  'PROVIDER:EMAIL',
-  'PROVIDER:BACK:HOME',
-  'PROVIDER_STATUS:CALL',
-  'PROVIDER_STATUS:SMS',
-  'PROVIDER_STATUS:EMAIL',
   'PROVIDER_STATUS',
-  'PROVIDER_OVERRIDES',
-  'PROVIDER_CLEAR_OVERRIDES',
-  'REQUEST_ACCESS',
   'STATUS',
   'USERS',
   'USERS_LIST',
@@ -57,12 +49,34 @@ const MENU_ACTIONS = new Set([
 const menuActionStats = {};
 let menuActionCount = 0;
 
-function buildCallbackData(_ctx, action, _options = {}) {
+function getCallbackSecret() {
+  return config.botToken || config.apiAuth?.hmacSecret || 'callback-secret';
+}
+
+function signPayload(payload) {
+  const secret = getCallbackSecret();
+  return crypto.createHmac('sha256', secret).update(payload).digest('hex').slice(0, 8);
+}
+
+function buildCallbackData(ctx, action, options = {}) {
   const safeAction = String(action || '');
   if (!safeAction) {
     return '';
   }
-  return safeAction;
+  const ttlMs = Number.isFinite(options.ttlMs) ? options.ttlMs : DEFAULT_CALLBACK_TTL_MS;
+  ensureSession(ctx);
+  const token = options.token || ctx.session?.currentOp?.token || '';
+  const ts = options.timestamp || Date.now();
+  const payload = `${safeAction}|${token}|${ts}`;
+  const sig = signPayload(payload);
+  const data = `${SIGN_PREFIX}|${safeAction}|${token}|${ts}|${sig}`;
+  if (data.length > 64) {
+    return safeAction;
+  }
+  if (ttlMs <= 0) {
+    return safeAction;
+  }
+  return data;
 }
 
 function parseCallbackData(rawAction) {
@@ -75,20 +89,60 @@ function parseCallbackData(rawAction) {
     return { action: text, signed: true, valid: false, reason: 'format' };
   }
   const [, action, token, ts, sig] = parts;
+  const payload = `${action}|${token}|${ts}`;
+  const expected = signPayload(payload);
   const timestamp = Number(ts);
   return {
     action,
     signed: true,
     token,
     timestamp,
-    valid: Boolean(sig),
-    reason: null
+    valid: sig === expected,
+    reason: sig === expected ? null : 'signature'
   };
 }
 
-function validateCallback(ctx, rawAction, _options = {}) {
+function extractLegacyOpToken(rawAction) {
+  const parts = String(rawAction || '').split(':');
+  if (parts.length < 2) {
+    return null;
+  }
+  const candidate = parts[1];
+  if (/^[0-9a-fA-F-]{8,}$/.test(candidate)) {
+    return candidate.replace(/-/g, '').slice(0, 8);
+  }
+  return null;
+}
+
+function validateCallback(ctx, rawAction, options = {}) {
   ensureSession(ctx);
+  const ttlMs = Number.isFinite(options.ttlMs) ? options.ttlMs : DEFAULT_CALLBACK_TTL_MS;
   const parsed = parseCallbackData(rawAction);
+  const now = Date.now();
+
+  if (parsed.signed) {
+    if (!parsed.valid) {
+      return { status: 'invalid', reason: parsed.reason, action: parsed.action };
+    }
+    if (parsed.timestamp && now - parsed.timestamp > ttlMs) {
+      return { status: 'expired', reason: 'ttl', action: parsed.action };
+    }
+    const currentToken = ctx.session?.currentOp?.token;
+    if (parsed.token && currentToken && parsed.token !== currentToken) {
+      return { status: 'stale', reason: 'token_mismatch', action: parsed.action };
+    }
+    return { status: 'ok', action: parsed.action };
+  }
+
+  const legacyToken = extractLegacyOpToken(rawAction);
+  const currentToken = ctx.session?.currentOp?.token;
+  if (legacyToken && currentToken && legacyToken !== currentToken) {
+    return { status: 'stale', reason: 'token_mismatch', action: parsed.action };
+  }
+  const startedAt = ctx.session?.currentOp?.startedAt;
+  if (startedAt && now - startedAt > ttlMs) {
+    return { status: 'expired', reason: 'ttl', action: parsed.action };
+  }
   return { status: 'ok', action: parsed.action };
 }
 
@@ -170,7 +224,7 @@ function finishActionMetric(metric, status = 'ok', extra = {}) {
           .slice(0, 5)
           .map((row) => `${row.action}: ${row.errorRate}% (${row.total})`)
           .join(' | ');
-        console.log(`📊 Menu action health: ${summary}`);
+        console.log(`ð Menu action health: ${summary}`);
       }
     }
   }
