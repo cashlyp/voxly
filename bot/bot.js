@@ -691,6 +691,15 @@ bot.command("cancel", async (ctx) => {
 // Enhanced callback query handler
 bot.on("callback_query:data", async (ctx) => {
   const rawAction = ctx.callbackQuery.data;
+  const rawParsedAction = parseCallbackData(rawAction);
+  const resolvedRawAction = rawParsedAction.action || rawAction;
+  const rawParsedCallback = parseCallbackAction(resolvedRawAction);
+  const rawConversationTarget = rawParsedCallback
+    ? resolveConversationFromPrefix(
+        rawParsedCallback.prefix,
+        ctx.session?.currentOp?.command || null,
+      )
+    : null;
   const metric = startActionMetric(ctx, "callback", { raw_action: rawAction });
   const finishMetric = (status, extra = {}) => {
     finishActionMetric(metric, status, extra);
@@ -719,6 +728,14 @@ bot.on("callback_query:data", async (ctx) => {
       ? { status: "ok", action: rawAction }
       : validateCallback(ctx, rawAction);
     if (validation.status !== "ok") {
+      if (rawConversationTarget) {
+        await safeAnswerCallback(ctx).catch(() => {});
+        finishMetric("routed", {
+          reason: validation.reason || null,
+          conversation: rawConversationTarget,
+        });
+        return;
+      }
       await clearCallbackMessageMarkup(ctx);
       await safeAnswerCallback(ctx, {
         text: "⚠️ Action no longer valid.",
