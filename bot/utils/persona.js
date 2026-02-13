@@ -400,10 +400,6 @@ async function askOptionWithButtons(
   while (true) {
     selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {
       const callbackData = callbackCtx.callbackQuery?.data || '';
-      const callbackMessageId = callbackCtx.callbackQuery?.message?.message_id;
-      if (!callbackMessageId || callbackMessageId !== message.message_id) {
-        return false;
-      }
       return (
         matchesCallbackPrefix(callbackData, prefixKey) ||
         matchesCallbackPrefix(callbackData, basePrefix)
