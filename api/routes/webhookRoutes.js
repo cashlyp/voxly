@@ -69,18 +69,51 @@ function renderSecureCapturePage({
 
 function createSecureCaptureViewHandler(ctx = {}) {
   return async function handleSecureCaptureView(req, res) {
-    const callSid = String(req.query?.callSid || "").trim();
-    const token = String(req.query?.token || "").trim();
-    if (!callSid || !token) {
+    try {
+      const callSid = String(req.query?.callSid || "").trim();
+      const token = String(req.query?.token || "").trim();
+      if (!callSid || !token || callSid.length > 128 || token.length > 256) {
+        const page = renderSecureCapturePage({
+          title: "Secure session invalid",
+          message: "The secure capture link is missing required parameters.",
+          statusCode: 400,
+        });
+        return res.status(page.statusCode).type("html").send(page.body);
+      }
+      const digitService = getDigitService(ctx);
+      if (!digitService?.validateSecureCaptureToken) {
+        const page = renderSecureCapturePage({
+          title: "Service unavailable",
+          message: "Secure capture is temporarily unavailable. Please try again.",
+          statusCode: 503,
+        });
+        return res.status(page.statusCode).type("html").send(page.body);
+      }
+      const validation = digitService.validateSecureCaptureToken(callSid, token);
+      if (!validation.ok) {
+        const expired = validation.reason === "token_expired" || validation.reason === "token_not_found";
+        const page = renderSecureCapturePage({
+          title: expired ? "Session expired" : "Unauthorized session",
+          message: expired
+            ? "This secure menu has expired. Request a new capture session from the call flow."
+            : "This secure menu is no longer valid.",
+          statusCode: expired ? 410 : 401,
+        });
+        return res.status(page.statusCode).type("html").send(page.body);
+      }
+      const expectation = digitService.getExpectation ? digitService.getExpectation(callSid) : null;
       const page = renderSecureCapturePage({
-        title: "Secure session invalid",
-        message: "The secure capture link is missing required parameters.",
-        statusCode: 400,
+        title: "Secure digit capture",
+        message: "Enter digits to continue your verification flow.",
+        callSid,
+        token,
+        includeForm: true,
+        profile: expectation?.profile || validation.profile || "verification",
+        statusCode: 200,
       });
       return res.status(page.statusCode).type("html").send(page.body);
-    }
-    const digitService = getDigitService(ctx);
-    if (!digitService?.validateSecureCaptureToken) {
+    } catch (error) {
+      console.error("Secure capture view handler error:", error);
       const page = renderSecureCapturePage({
         title: "Service unavailable",
         message: "Secure capture is temporarily unavailable. Please try again.",
@@ -88,47 +121,101 @@ function createSecureCaptureViewHandler(ctx = {}) {
       });
       return res.status(page.statusCode).type("html").send(page.body);
     }
-    const validation = digitService.validateSecureCaptureToken(callSid, token);
-    if (!validation.ok) {
-      const expired = validation.reason === "token_expired" || validation.reason === "token_not_found";
-      const page = renderSecureCapturePage({
-        title: expired ? "Session expired" : "Unauthorized session",
-        message: expired
-          ? "This secure menu has expired. Request a new capture session from the call flow."
-          : "This secure menu is no longer valid.",
-        statusCode: expired ? 410 : 401,
-      });
-      return res.status(page.statusCode).type("html").send(page.body);
-    }
-    const expectation = digitService.getExpectation ? digitService.getExpectation(callSid) : null;
-    const page = renderSecureCapturePage({
-      title: "Secure digit capture",
-      message: "Enter digits to continue your verification flow.",
-      callSid,
-      token,
-      includeForm: true,
-      profile: expectation?.profile || validation.profile || "verification",
-      statusCode: 200,
-    });
-    return res.status(page.statusCode).type("html").send(page.body);
   };
 }
 
 function createSecureCaptureSubmitHandler(ctx = {}) {
   return async function handleSecureCaptureSubmit(req, res) {
-    const callSid = String(req.body?.callSid || req.query?.callSid || "").trim();
-    const token = String(req.body?.token || req.query?.token || "").trim();
-    const digits = String(req.body?.digits || "").trim();
-    if (!callSid || !token) {
-      const page = renderSecureCapturePage({
-        title: "Secure session invalid",
-        message: "Missing call session details. Open a fresh secure link.",
-        statusCode: 400,
+    try {
+      const callSid = String(req.body?.callSid || req.query?.callSid || "").trim();
+      const token = String(req.body?.token || req.query?.token || "").trim();
+      const digits = String(req.body?.digits || "").trim();
+      if (!callSid || !token || callSid.length > 128 || token.length > 256) {
+        const page = renderSecureCapturePage({
+          title: "Secure session invalid",
+          message: "Missing call session details. Open a fresh secure link.",
+          statusCode: 400,
+        });
+        return res.status(page.statusCode).type("html").send(page.body);
+      }
+      if (digits.length > 64) {
+        const page = renderSecureCapturePage({
+          title: "Secure capture failed",
+          message: "Please enter digits only.",
+          callSid,
+          token,
+          includeForm: true,
+          statusCode: 400,
+        });
+        return res.status(page.statusCode).type("html").send(page.body);
+      }
+      const digitService = getDigitService(ctx);
+      if (!digitService?.handleSecureCaptureInput) {
+        const page = renderSecureCapturePage({
+          title: "Service unavailable",
+          message: "Secure capture is temporarily unavailable. Please try again.",
+          statusCode: 503,
+        });
+        return res.status(page.statusCode).type("html").send(page.body);
+      }
+      const result = await digitService.handleSecureCaptureInput({
+        callSid,
+        tokenRef: token,
+        digits,
+        source: "link",
       });
-      return res.status(page.statusCode).type("html").send(page.body);
-    }
-    const digitService = getDigitService(ctx);
-    if (!digitService?.handleSecureCaptureInput) {
+      if (!result?.ok) {
+        const expired = result?.code === "session_expired" || result?.code === "token_expired";
+        const invalidDigits = result?.code === "invalid_digits";
+        const page = renderSecureCapturePage({
+          title: expired ? "Session expired" : "Secure capture failed",
+          message: expired
+            ? "This secure menu expired. Request a fresh capture prompt."
+            : invalidDigits
+              ? "Please enter digits only."
+              : "Unable to submit digits for this session.",
+          callSid,
+          token,
+          includeForm: invalidDigits,
+          statusCode: Number(result?.status) || (expired ? 410 : 400),
+        });
+        return res.status(page.statusCode).type("html").send(page.body);
+      }
+      if (result.duplicate) {
+        const page = renderSecureCapturePage({
+          title: "Already processed",
+          message: "This input was already processed. You can close this page.",
+          statusCode: 200,
+        });
+        return res.status(200).type("html").send(page.body);
+      }
+      if (result.accepted) {
+        const page = renderSecureCapturePage({
+          title: "Code accepted",
+          message: "Your secure input was received successfully.",
+          statusCode: 200,
+        });
+        return res.status(200).type("html").send(page.body);
+      }
+      if (result.fallback) {
+        const page = renderSecureCapturePage({
+          title: "Need additional help",
+          message: "We could not verify that input. The call flow will continue with fallback handling.",
+          statusCode: 200,
+        });
+        return res.status(200).type("html").send(page.body);
+      }
+      const page = renderSecureCapturePage({
+        title: "Try again",
+        message: "That input was not accepted yet. Enter digits again to continue.",
+        callSid,
+        token,
+        includeForm: true,
+        statusCode: 200,
+      });
+      return res.status(200).type("html").send(page.body);
+    } catch (error) {
+      console.error("Secure capture submit handler error:", error);
       const page = renderSecureCapturePage({
         title: "Service unavailable",
         message: "Secure capture is temporarily unavailable. Please try again.",
@@ -136,62 +223,6 @@ function createSecureCaptureSubmitHandler(ctx = {}) {
       });
       return res.status(page.statusCode).type("html").send(page.body);
     }
-    const result = await digitService.handleSecureCaptureInput({
-      callSid,
-      tokenRef: token,
-      digits,
-      source: "link",
-    });
-    if (!result?.ok) {
-      const expired = result?.code === "session_expired" || result?.code === "token_expired";
-      const invalidDigits = result?.code === "invalid_digits";
-      const page = renderSecureCapturePage({
-        title: expired ? "Session expired" : "Secure capture failed",
-        message: expired
-          ? "This secure menu expired. Request a fresh capture prompt."
-          : invalidDigits
-            ? "Please enter digits only."
-            : "Unable to submit digits for this session.",
-        callSid,
-        token,
-        includeForm: invalidDigits,
-        statusCode: Number(result?.status) || (expired ? 410 : 400),
-      });
-      return res.status(page.statusCode).type("html").send(page.body);
-    }
-    if (result.duplicate) {
-      const page = renderSecureCapturePage({
-        title: "Already processed",
-        message: "This input was already processed. You can close this page.",
-        statusCode: 200,
-      });
-      return res.status(200).type("html").send(page.body);
-    }
-    if (result.accepted) {
-      const page = renderSecureCapturePage({
-        title: "Code accepted",
-        message: "Your secure input was received successfully.",
-        statusCode: 200,
-      });
-      return res.status(200).type("html").send(page.body);
-    }
-    if (result.fallback) {
-      const page = renderSecureCapturePage({
-        title: "Need additional help",
-        message: "We could not verify that input. The call flow will continue with fallback handling.",
-        statusCode: 200,
-      });
-      return res.status(200).type("html").send(page.body);
-    }
-    const page = renderSecureCapturePage({
-      title: "Try again",
-      message: "That input was not accepted yet. Enter digits again to continue.",
-      callSid,
-      token,
-      includeForm: true,
-      statusCode: 200,
-    });
-    return res.status(200).type("html").send(page.body);
   };
 }
 

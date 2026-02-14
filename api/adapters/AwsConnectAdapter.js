@@ -1,5 +1,12 @@
 const { ConnectClient, StartOutboundVoiceContactCommand, StopContactCommand, UpdateContactAttributesCommand } = require('@aws-sdk/client-connect');
 
+function maskPhoneForLog(value) {
+  const digits = String(value || '').replace(/\D/g, '');
+  if (!digits) return null;
+  if (digits.length <= 4) return '*'.repeat(digits.length);
+  return `${'*'.repeat(Math.max(2, digits.length - 4))}${digits.slice(-4)}`;
+}
+
 /**
  * AwsConnectAdapter encapsulates interaction with Amazon Connect for originating calls
  * and instructing the active contact flow to play synthesized prompts.
@@ -29,6 +36,28 @@ class AwsConnectAdapter {
     this.config = config;
     this.logger = logger;
     this.client = new ConnectClient({ region: config.region });
+    const timeoutMs = Number(config?.connect?.requestTimeoutMs || config?.requestTimeoutMs);
+    this.requestTimeoutMs =
+      Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 15000;
+  }
+
+  withTimeout(promise, label = 'aws_connect_timeout') {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const timeoutError = new Error(label);
+        timeoutError.code = 'aws_connect_timeout';
+        reject(timeoutError);
+      }, this.requestTimeoutMs);
+      Promise.resolve(promise)
+        .then((result) => {
+          clearTimeout(timer);
+          resolve(result);
+        })
+        .catch((error) => {
+          clearTimeout(timer);
+          reject(error);
+        });
+    });
   }
 
   /**
@@ -65,13 +94,16 @@ class AwsConnectAdapter {
     }
 
     this.logger.info?.('Calling Amazon Connect StartOutboundVoiceContact', {
-      destinationPhoneNumber,
+      destinationPhoneNumber: maskPhoneForLog(destinationPhoneNumber),
       clientToken,
       contactFlowId: this.config.connect.contactFlowId,
     });
 
     const command = new StartOutboundVoiceContactCommand(params);
-    const response = await this.client.send(command);
+    const response = await this.withTimeout(
+      this.client.send(command),
+      'aws_connect_start_outbound_timeout',
+    );
     this.logger.info?.('Amazon Connect outbound contact started', {
       contactId: response.ContactId,
       clientToken,
@@ -97,7 +129,10 @@ class AwsConnectAdapter {
     };
 
     const command = new StopContactCommand(params);
-    await this.client.send(command);
+    await this.withTimeout(
+      this.client.send(command),
+      'aws_connect_stop_contact_timeout',
+    );
     this.logger.info?.('Amazon Connect contact stopped', params);
   }
 
@@ -132,7 +167,10 @@ class AwsConnectAdapter {
       Attributes: attributes,
     });
 
-    await this.client.send(command);
+    await this.withTimeout(
+      this.client.send(command),
+      'aws_connect_update_contact_attributes_timeout',
+    );
     this.logger.info?.('Updated contact attributes for audio playback', {
       contactId,
       audioKey,

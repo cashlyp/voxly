@@ -5347,66 +5347,70 @@ async function ensureAwsSession(callSid) {
   };
 
   gptService.on("gptreply", async (gptReply, icount) => {
-    if (session?.ending) {
-      return;
-    }
-    const personalityInfo = gptReply.personalityInfo || {};
-
-    webhookService.recordTranscriptTurn(
-      callSid,
-      "agent",
-      gptReply.partialResponse,
-    );
-    webhookService
-      .setLiveCallPhase(callSid, "agent_responding")
-      .catch(() => {});
-
     try {
-      await db.addTranscript({
-        call_sid: callSid,
-        speaker: "ai",
-        message: gptReply.partialResponse,
-        interaction_count: icount,
-        personality_used: personalityInfo.name || "default",
-        adaptation_data: JSON.stringify(gptReply.adaptationHistory || []),
-      });
-
-      await db.updateCallState(callSid, "ai_responded", {
-        message: gptReply.partialResponse,
-        interaction_count: icount,
-        personality: personalityInfo.name,
-      });
-    } catch (dbError) {
-      console.error("Database error adding AI transcript:", dbError);
-    }
-
-    try {
-      const ttsAdapter = getAwsTtsAdapter();
-      const voiceId = resolveVoiceModel(callConfig);
-      const { key } = await ttsAdapter.synthesizeToS3(
-        gptReply.partialResponse,
-        voiceId ? { voiceId } : {},
-      );
-      const contactId = callConfig?.provider_metadata?.contact_id;
-      if (contactId) {
-        const awsAdapter = getAwsConnectAdapter();
-        await awsAdapter.enqueueAudioPlayback({
-          contactId,
-          audioKey: key,
-        });
-        webhookService
-          .setLiveCallPhase(callSid, "agent_speaking")
-          .catch(() => {});
-        scheduleSpeechTicks(
-          callSid,
-          "agent_speaking",
-          estimateSpeechDurationMs(gptReply.partialResponse),
-          0.55,
-        );
-        scheduleSilenceTimer(callSid);
+      if (session?.ending) {
+        return;
       }
-    } catch (ttsError) {
-      console.error("AWS TTS playback error:", ttsError);
+      const personalityInfo = gptReply.personalityInfo || {};
+
+      webhookService.recordTranscriptTurn(
+        callSid,
+        "agent",
+        gptReply.partialResponse,
+      );
+      webhookService
+        .setLiveCallPhase(callSid, "agent_responding")
+        .catch(() => {});
+
+      try {
+        await db.addTranscript({
+          call_sid: callSid,
+          speaker: "ai",
+          message: gptReply.partialResponse,
+          interaction_count: icount,
+          personality_used: personalityInfo.name || "default",
+          adaptation_data: JSON.stringify(gptReply.adaptationHistory || []),
+        });
+
+        await db.updateCallState(callSid, "ai_responded", {
+          message: gptReply.partialResponse,
+          interaction_count: icount,
+          personality: personalityInfo.name,
+        });
+      } catch (dbError) {
+        console.error("Database error adding AI transcript:", dbError);
+      }
+
+      try {
+        const ttsAdapter = getAwsTtsAdapter();
+        const voiceId = resolveVoiceModel(callConfig);
+        const { key } = await ttsAdapter.synthesizeToS3(
+          gptReply.partialResponse,
+          voiceId ? { voiceId } : {},
+        );
+        const contactId = callConfig?.provider_metadata?.contact_id;
+        if (contactId) {
+          const awsAdapter = getAwsConnectAdapter();
+          await awsAdapter.enqueueAudioPlayback({
+            contactId,
+            audioKey: key,
+          });
+          webhookService
+            .setLiveCallPhase(callSid, "agent_speaking")
+            .catch(() => {});
+          scheduleSpeechTicks(
+            callSid,
+            "agent_speaking",
+            estimateSpeechDurationMs(gptReply.partialResponse),
+            0.55,
+          );
+          scheduleSilenceTimer(callSid);
+        }
+      } catch (ttsError) {
+        console.error("AWS TTS playback error:", ttsError);
+      }
+    } catch (gptReplyError) {
+      console.error("AWS session GPT reply handler error:", gptReplyError);
     }
   });
 
@@ -5677,10 +5681,14 @@ app.ws("/connection", (ws, req) => {
     };
 
     transcriptionService.on("error", (error) => {
-      handleSttFailure("stt_error", error);
+      void handleSttFailure("stt_error", error).catch((sttFailureError) => {
+        console.error("STT fallback activation error:", sttFailureError);
+      });
     });
     transcriptionService.on("close", () => {
-      handleSttFailure("stt_closed");
+      void handleSttFailure("stt_closed").catch((sttFailureError) => {
+        console.error("STT fallback activation error:", sttFailureError);
+      });
     });
 
     ws.on("message", async function message(data) {
@@ -5910,48 +5918,52 @@ app.ws("/connection", (ws, req) => {
 
           // Set up GPT reply handler with personality tracking
           gptService.on("gptreply", async (gptReply, icount) => {
-            gptErrorCount = 0;
-            const activeSession = activeCalls.get(callSid);
-            if (activeSession?.ending) {
-              return;
-            }
-            const personalityInfo = gptReply.personalityInfo || {};
-            console.log(
-              `${personalityInfo.name || "Default"} Personality: ${gptReply.partialResponse.substring(0, 50)}...`,
-            );
-            webhookService.recordTranscriptTurn(
-              callSid,
-              "agent",
-              gptReply.partialResponse,
-            );
-            webhookService
-              .setLiveCallPhase(callSid, "agent_responding")
-              .catch(() => {});
-
-            // Save AI response to database with personality context
             try {
-              await db.addTranscript({
-                call_sid: callSid,
-                speaker: "ai",
-                message: gptReply.partialResponse,
-                interaction_count: icount,
-                personality_used: personalityInfo.name || "default",
-                adaptation_data: JSON.stringify(
-                  gptReply.adaptationHistory || [],
-                ),
-              });
+              gptErrorCount = 0;
+              const activeSession = activeCalls.get(callSid);
+              if (activeSession?.ending) {
+                return;
+              }
+              const personalityInfo = gptReply.personalityInfo || {};
+              console.log(
+                `${personalityInfo.name || "Default"} Personality: ${gptReply.partialResponse.substring(0, 50)}...`,
+              );
+              webhookService.recordTranscriptTurn(
+                callSid,
+                "agent",
+                gptReply.partialResponse,
+              );
+              webhookService
+                .setLiveCallPhase(callSid, "agent_responding")
+                .catch(() => {});
 
-              await db.updateCallState(callSid, "ai_responded", {
-                message: gptReply.partialResponse,
-                interaction_count: icount,
-                personality: personalityInfo.name,
-              });
-            } catch (dbError) {
-              console.error("Database error adding AI transcript:", dbError);
+              // Save AI response to database with personality context
+              try {
+                await db.addTranscript({
+                  call_sid: callSid,
+                  speaker: "ai",
+                  message: gptReply.partialResponse,
+                  interaction_count: icount,
+                  personality_used: personalityInfo.name || "default",
+                  adaptation_data: JSON.stringify(
+                    gptReply.adaptationHistory || [],
+                  ),
+                });
+
+                await db.updateCallState(callSid, "ai_responded", {
+                  message: gptReply.partialResponse,
+                  interaction_count: icount,
+                  personality: personalityInfo.name,
+                });
+              } catch (dbError) {
+                console.error("Database error adding AI transcript:", dbError);
+              }
+
+              ttsService.generate(gptReply, icount);
+              scheduleSilenceTimer(callSid);
+            } catch (gptReplyError) {
+              console.error("Twilio GPT reply handler error:", gptReplyError);
             }
-
-            ttsService.generate(gptReply, icount);
-            scheduleSilenceTimer(callSid);
           });
 
           gptService.on("stall", (fillerText) => {
@@ -5973,17 +5985,21 @@ app.ws("/connection", (ws, req) => {
           });
 
           gptService.on("gpterror", async (err) => {
-            gptErrorCount += 1;
-            const message = err?.message || "GPT error";
-            webhookService.addLiveEvent(callSid, `⚠️ GPT error: ${message}`, {
-              force: true,
-            });
-            if (gptErrorCount >= 2) {
-              await speakAndEndCall(
-                callSid,
-                CALL_END_MESSAGES.error,
-                "gpt_error",
-              );
+            try {
+              gptErrorCount += 1;
+              const message = err?.message || "GPT error";
+              webhookService.addLiveEvent(callSid, `⚠️ GPT error: ${message}`, {
+                force: true,
+              });
+              if (gptErrorCount >= 2) {
+                await speakAndEndCall(
+                  callSid,
+                  CALL_END_MESSAGES.error,
+                  "gpt_error",
+                );
+              }
+            } catch (gptHandlerError) {
+              console.error("GPT error handler failure:", gptHandlerError);
             }
           });
 
@@ -6586,7 +6602,7 @@ app.ws("/connection", (ws, req) => {
       }
     });
 
-    transcriptionService.on("utterance", async (text) => {
+    transcriptionService.on("utterance", (text) => {
       clearSilenceTimer(callSid);
       if (callSid) {
         sttLastFrameAt.set(callSid, Date.now());
@@ -6598,146 +6614,154 @@ app.ws("/connection", (ws, req) => {
       }
       if (marks.length > 0 && text?.length > 5) {
         console.log("Interruption detected, clearing stream".red);
-        ws.send(
-          JSON.stringify({
-            streamSid,
-            event: "clear",
-          }),
-        );
+        try {
+          ws.send(
+            JSON.stringify({
+              streamSid,
+              event: "clear",
+            }),
+          );
+        } catch (error) {
+          console.error("WebSocket clear event send error:", error);
+        }
       }
     });
 
     transcriptionService.on("transcription", async (text) => {
-      if (!text || !gptService || !isInitialized) {
-        return;
-      }
-      clearSilenceTimer(callSid);
-      if (callSid) {
-        sttLastFrameAt.set(callSid, Date.now());
-      }
-
-      const callConfig = callConfigurations.get(callSid);
-      const isDigitIntent = callConfig?.digit_intent?.mode === "dtmf";
-      const captureActive = isCaptureActiveConfig(callConfig);
-      const otpContext = digitService.getOtpContext(text, callSid);
-      console.log(`Customer: ${otpContext.maskedForLogs}`);
-
-      // Save user transcript with enhanced context
       try {
-        await db.addTranscript({
-          call_sid: callSid,
-          speaker: "user",
-          message: otpContext.raw,
-          interaction_count: interactionCount,
-        });
-
-        await db.updateCallState(callSid, "user_spoke", {
-          message: otpContext.raw,
-          interaction_count: interactionCount,
-          otp_detected: otpContext.otpDetected,
-          last_collected_code: otpContext.codes?.slice(-1)[0] || null,
-          collected_codes: otpContext.codes?.join(", ") || null,
-        });
-      } catch (dbError) {
-        console.error("Database error adding user transcript:", dbError);
-      }
-
-      webhookService.recordTranscriptTurn(callSid, "user", otpContext.raw);
-      if (
-        (isDigitIntent || captureActive) &&
-        otpContext.codes &&
-        otpContext.codes.length &&
-        digitService?.hasExpectation(callSid)
-      ) {
-        const activeExpectation = digitService.getExpectation(callSid);
-        const progress = digitService.formatOtpForDisplay(
-          otpContext.codes[otpContext.codes.length - 1],
-          "progress",
-          activeExpectation?.max_digits,
-        );
-        webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
-        const collection = digitService.recordDigits(
-          callSid,
-          otpContext.codes[otpContext.codes.length - 1],
-          {
-            timestamp: Date.now(),
-            source: "spoken",
-            full_input: true,
-            attempt_id: activeExpectation?.attempt_id || null,
-            plan_id: activeExpectation?.plan_id || null,
-            plan_step_index: activeExpectation?.plan_step_index || null,
-            channel_session_id: activeExpectation?.channel_session_id || null,
-          },
-        );
-        await digitService.handleCollectionResult(
-          callSid,
-          collection,
-          gptService,
-          interactionCount,
-          "spoken",
-          { allowCallEnd: true },
-        );
-      }
-      if (captureActive) {
-        return;
-      }
-
-      if (!otpContext.maskedForGpt || !otpContext.maskedForGpt.trim()) {
-        interactionCount += 1;
-        const session = activeCalls.get(callSid);
-        if (session) {
-          session.interactionCount = interactionCount;
+        if (!text || !gptService || !isInitialized) {
+          return;
         }
-        return;
-      }
-
-      if (
-        shouldCloseConversation(otpContext.maskedForGpt) &&
-        interactionCount >= 1
-      ) {
-        await speakAndEndCall(
-          callSid,
-          CALL_END_MESSAGES.user_goodbye,
-          "user_goodbye",
-        );
-        interactionCount += 1;
-        const session = activeCalls.get(callSid);
-        if (session) {
-          session.interactionCount = interactionCount;
+        clearSilenceTimer(callSid);
+        if (callSid) {
+          sttLastFrameAt.set(callSid, Date.now());
         }
-        return;
-      }
 
-      const getInteractionCount = () => interactionCount;
-      const setInteractionCount = (nextCount) => {
-        interactionCount = nextCount;
-        const session = activeCalls.get(callSid);
-        if (session) {
-          session.interactionCount = nextCount;
+        const callConfig = callConfigurations.get(callSid);
+        const isDigitIntent = callConfig?.digit_intent?.mode === "dtmf";
+        const captureActive = isCaptureActiveConfig(callConfig);
+        const otpContext = digitService.getOtpContext(text, callSid);
+        console.log(`Customer: ${otpContext.maskedForLogs}`);
+
+        // Save user transcript with enhanced context
+        try {
+          await db.addTranscript({
+            call_sid: callSid,
+            speaker: "user",
+            message: otpContext.raw,
+            interaction_count: interactionCount,
+          });
+
+          await db.updateCallState(callSid, "user_spoke", {
+            message: otpContext.raw,
+            interaction_count: interactionCount,
+            otp_detected: otpContext.otpDetected,
+            last_collected_code: otpContext.codes?.slice(-1)[0] || null,
+            collected_codes: otpContext.codes?.join(", ") || null,
+          });
+        } catch (dbError) {
+          console.error("Database error adding user transcript:", dbError);
         }
-      };
-      if (isDigitIntent) {
-        await enqueueGptTask(callSid, async () => {
-          const currentCount = interactionCount;
-          try {
-            await gptService.completion(otpContext.maskedForGpt, currentCount);
-          } catch (gptError) {
-            console.error("GPT completion error:", gptError);
-            webhookService.addLiveEvent(callSid, "⚠️ GPT error, retrying", {
-              force: true,
-            });
+
+        webhookService.recordTranscriptTurn(callSid, "user", otpContext.raw);
+        if (
+          (isDigitIntent || captureActive) &&
+          otpContext.codes &&
+          otpContext.codes.length &&
+          digitService?.hasExpectation(callSid)
+        ) {
+          const activeExpectation = digitService.getExpectation(callSid);
+          const progress = digitService.formatOtpForDisplay(
+            otpContext.codes[otpContext.codes.length - 1],
+            "progress",
+            activeExpectation?.max_digits,
+          );
+          webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
+          const collection = digitService.recordDigits(
+            callSid,
+            otpContext.codes[otpContext.codes.length - 1],
+            {
+              timestamp: Date.now(),
+              source: "spoken",
+              full_input: true,
+              attempt_id: activeExpectation?.attempt_id || null,
+              plan_id: activeExpectation?.plan_id || null,
+              plan_step_index: activeExpectation?.plan_step_index || null,
+              channel_session_id: activeExpectation?.channel_session_id || null,
+            },
+          );
+          await digitService.handleCollectionResult(
+            callSid,
+            collection,
+            gptService,
+            interactionCount,
+            "spoken",
+            { allowCallEnd: true },
+          );
+        }
+        if (captureActive) {
+          return;
+        }
+
+        if (!otpContext.maskedForGpt || !otpContext.maskedForGpt.trim()) {
+          interactionCount += 1;
+          const session = activeCalls.get(callSid);
+          if (session) {
+            session.interactionCount = interactionCount;
           }
-          setInteractionCount(currentCount + 1);
-        });
-        return;
+          return;
+        }
+
+        if (
+          shouldCloseConversation(otpContext.maskedForGpt) &&
+          interactionCount >= 1
+        ) {
+          await speakAndEndCall(
+            callSid,
+            CALL_END_MESSAGES.user_goodbye,
+            "user_goodbye",
+          );
+          interactionCount += 1;
+          const session = activeCalls.get(callSid);
+          if (session) {
+            session.interactionCount = interactionCount;
+          }
+          return;
+        }
+
+        const getInteractionCount = () => interactionCount;
+        const setInteractionCount = (nextCount) => {
+          interactionCount = nextCount;
+          const session = activeCalls.get(callSid);
+          if (session) {
+            session.interactionCount = nextCount;
+          }
+        };
+        if (isDigitIntent) {
+          await enqueueGptTask(callSid, async () => {
+            const currentCount = interactionCount;
+            try {
+              await gptService.completion(otpContext.maskedForGpt, currentCount);
+            } catch (gptError) {
+              console.error("GPT completion error:", gptError);
+              webhookService.addLiveEvent(callSid, "⚠️ GPT error, retrying", {
+                force: true,
+              });
+            }
+            setInteractionCount(currentCount + 1);
+          });
+          return;
+        }
+        await processNormalFlowTranscript(
+          callSid,
+          otpContext.maskedForGpt,
+          gptService,
+          getInteractionCount,
+          setInteractionCount,
+        );
+      } catch (transcriptionError) {
+        console.error("Transcription handler error:", transcriptionError);
       }
-      await processNormalFlowTranscript(
-        callSid,
-        otpContext.maskedForGpt,
-        gptService,
-        getInteractionCount,
-        setInteractionCount,
-      );
     });
 
     ttsService.on("speech", (responseIndex, audio, label, icount) => {
@@ -6953,10 +6977,14 @@ app.ws("/vonage/stream", async (ws, req) => {
     };
 
     transcriptionService.on("error", (error) => {
-      handleSttFailure("stt_error", error);
+      void handleSttFailure("stt_error", error).catch((sttFailureError) => {
+        console.error("STT fallback activation error:", sttFailureError);
+      });
     });
     transcriptionService.on("close", () => {
-      handleSttFailure("stt_closed");
+      void handleSttFailure("stt_closed").catch((sttFailureError) => {
+        console.error("STT fallback activation error:", sttFailureError);
+      });
     });
 
     let gptService;
@@ -7000,38 +7028,42 @@ app.ws("/vonage/stream", async (ws, req) => {
 
     let gptErrorCount = 0;
     gptService.on("gptreply", async (gptReply, icount) => {
-      gptErrorCount = 0;
-      const activeSession = activeCalls.get(callSid);
-      if (activeSession?.ending) {
-        return;
-      }
-      webhookService.recordTranscriptTurn(
-        callSid,
-        "agent",
-        gptReply.partialResponse,
-      );
-      webhookService
-        .setLiveCallPhase(callSid, "agent_responding")
-        .catch(() => {});
       try {
-        await db.addTranscript({
-          call_sid: callSid,
-          speaker: "ai",
-          message: gptReply.partialResponse,
-          interaction_count: icount,
-          personality_used: gptReply.personalityInfo?.name || "default",
-          adaptation_data: JSON.stringify(gptReply.adaptationHistory || []),
-        });
-        await db.updateCallState(callSid, "ai_responded", {
-          message: gptReply.partialResponse,
-          interaction_count: icount,
-        });
-      } catch (dbError) {
-        console.error("Database error adding AI transcript:", dbError);
-      }
+        gptErrorCount = 0;
+        const activeSession = activeCalls.get(callSid);
+        if (activeSession?.ending) {
+          return;
+        }
+        webhookService.recordTranscriptTurn(
+          callSid,
+          "agent",
+          gptReply.partialResponse,
+        );
+        webhookService
+          .setLiveCallPhase(callSid, "agent_responding")
+          .catch(() => {});
+        try {
+          await db.addTranscript({
+            call_sid: callSid,
+            speaker: "ai",
+            message: gptReply.partialResponse,
+            interaction_count: icount,
+            personality_used: gptReply.personalityInfo?.name || "default",
+            adaptation_data: JSON.stringify(gptReply.adaptationHistory || []),
+          });
+          await db.updateCallState(callSid, "ai_responded", {
+            message: gptReply.partialResponse,
+            interaction_count: icount,
+          });
+        } catch (dbError) {
+          console.error("Database error adding AI transcript:", dbError);
+        }
 
-      await ttsService.generate(gptReply, icount);
-      scheduleSilenceTimer(callSid);
+        await ttsService.generate(gptReply, icount);
+        scheduleSilenceTimer(callSid);
+      } catch (gptReplyError) {
+        console.error("Vonage GPT reply handler error:", gptReplyError);
+      }
     });
 
     gptService.on("stall", (fillerText) => {
@@ -7051,13 +7083,17 @@ app.ws("/vonage/stream", async (ws, req) => {
     });
 
     gptService.on("gpterror", async (err) => {
-      gptErrorCount += 1;
-      const message = err?.message || "GPT error";
-      webhookService.addLiveEvent(callSid, `⚠️ GPT error: ${message}`, {
-        force: true,
-      });
-      if (gptErrorCount >= 2) {
-        await speakAndEndCall(callSid, CALL_END_MESSAGES.error, "gpt_error");
+      try {
+        gptErrorCount += 1;
+        const message = err?.message || "GPT error";
+        webhookService.addLiveEvent(callSid, `⚠️ GPT error: ${message}`, {
+          force: true,
+        });
+        if (gptErrorCount >= 2) {
+          await speakAndEndCall(callSid, CALL_END_MESSAGES.error, "gpt_error");
+        }
+      } catch (gptHandlerError) {
+        console.error("GPT error handler failure:", gptHandlerError);
       }
     });
 
@@ -7099,122 +7135,126 @@ app.ws("/vonage/stream", async (ws, req) => {
     });
 
     transcriptionService.on("transcription", async (text) => {
-      if (!text) return;
-      clearSilenceTimer(callSid);
-      const callConfig = callConfigurations.get(callSid);
-      const isDigitIntent = callConfig?.digit_intent?.mode === "dtmf";
-      const captureActive = isCaptureActiveConfig(callConfig);
-      const otpContext = digitService.getOtpContext(text, callSid);
       try {
-        await db.addTranscript({
-          call_sid: callSid,
-          speaker: "user",
-          message: otpContext.raw,
-          interaction_count: interactionCount,
-        });
-        await db.updateCallState(callSid, "user_spoke", {
-          message: otpContext.raw,
-          interaction_count: interactionCount,
-          otp_detected: otpContext.otpDetected,
-          last_collected_code: otpContext.codes?.slice(-1)[0] || null,
-          collected_codes: otpContext.codes?.join(", ") || null,
-        });
-      } catch (dbError) {
-        console.error("Database error adding user transcript:", dbError);
-      }
-      webhookService.recordTranscriptTurn(callSid, "user", otpContext.raw);
-      if (
-        (isDigitIntent || captureActive) &&
-        otpContext.codes &&
-        otpContext.codes.length &&
-        digitService?.hasExpectation(callSid)
-      ) {
-        const activeExpectation = digitService.getExpectation(callSid);
-        const progress = digitService.formatOtpForDisplay(
-          otpContext.codes[otpContext.codes.length - 1],
-          "progress",
-          activeExpectation?.max_digits,
-        );
-        webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
-        const collection = digitService.recordDigits(
-          callSid,
-          otpContext.codes[otpContext.codes.length - 1],
-          {
-            timestamp: Date.now(),
-            source: "spoken",
-            full_input: true,
-            attempt_id: activeExpectation?.attempt_id || null,
-            plan_id: activeExpectation?.plan_id || null,
-            plan_step_index: activeExpectation?.plan_step_index || null,
-            channel_session_id: activeExpectation?.channel_session_id || null,
-          },
-        );
-        await digitService.handleCollectionResult(
-          callSid,
-          collection,
-          gptService,
-          interactionCount,
-          "spoken",
-          { allowCallEnd: true },
-        );
-      }
-      if (captureActive) {
-        return;
-      }
-      if (!otpContext.maskedForGpt || !otpContext.maskedForGpt.trim()) {
-        interactionCount += 1;
-        const session = activeCalls.get(callSid);
-        if (session) {
-          session.interactionCount = interactionCount;
+        if (!text) return;
+        clearSilenceTimer(callSid);
+        const callConfig = callConfigurations.get(callSid);
+        const isDigitIntent = callConfig?.digit_intent?.mode === "dtmf";
+        const captureActive = isCaptureActiveConfig(callConfig);
+        const otpContext = digitService.getOtpContext(text, callSid);
+        try {
+          await db.addTranscript({
+            call_sid: callSid,
+            speaker: "user",
+            message: otpContext.raw,
+            interaction_count: interactionCount,
+          });
+          await db.updateCallState(callSid, "user_spoke", {
+            message: otpContext.raw,
+            interaction_count: interactionCount,
+            otp_detected: otpContext.otpDetected,
+            last_collected_code: otpContext.codes?.slice(-1)[0] || null,
+            collected_codes: otpContext.codes?.join(", ") || null,
+          });
+        } catch (dbError) {
+          console.error("Database error adding user transcript:", dbError);
         }
-        return;
-      }
-      if (
-        shouldCloseConversation(otpContext.maskedForGpt) &&
-        interactionCount >= 1
-      ) {
-        await speakAndEndCall(
-          callSid,
-          CALL_END_MESSAGES.user_goodbye,
-          "user_goodbye",
-        );
-        interactionCount += 1;
-        const session = activeCalls.get(callSid);
-        if (session) {
-          session.interactionCount = interactionCount;
+        webhookService.recordTranscriptTurn(callSid, "user", otpContext.raw);
+        if (
+          (isDigitIntent || captureActive) &&
+          otpContext.codes &&
+          otpContext.codes.length &&
+          digitService?.hasExpectation(callSid)
+        ) {
+          const activeExpectation = digitService.getExpectation(callSid);
+          const progress = digitService.formatOtpForDisplay(
+            otpContext.codes[otpContext.codes.length - 1],
+            "progress",
+            activeExpectation?.max_digits,
+          );
+          webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
+          const collection = digitService.recordDigits(
+            callSid,
+            otpContext.codes[otpContext.codes.length - 1],
+            {
+              timestamp: Date.now(),
+              source: "spoken",
+              full_input: true,
+              attempt_id: activeExpectation?.attempt_id || null,
+              plan_id: activeExpectation?.plan_id || null,
+              plan_step_index: activeExpectation?.plan_step_index || null,
+              channel_session_id: activeExpectation?.channel_session_id || null,
+            },
+          );
+          await digitService.handleCollectionResult(
+            callSid,
+            collection,
+            gptService,
+            interactionCount,
+            "spoken",
+            { allowCallEnd: true },
+          );
         }
-        return;
-      }
-      const getInteractionCount = () => interactionCount;
-      const setInteractionCount = (nextCount) => {
-        interactionCount = nextCount;
-        const session = activeCalls.get(callSid);
-        if (session) {
-          session.interactionCount = nextCount;
+        if (captureActive) {
+          return;
         }
-      };
-      if (isDigitIntent) {
-        await enqueueGptTask(callSid, async () => {
-          const currentCount = interactionCount;
-          try {
-            await gptService.completion(otpContext.maskedForGpt, currentCount);
-          } catch (gptError) {
-            console.error("GPT completion error:", gptError);
-            webhookService.addLiveEvent(callSid, "⚠️ GPT error, retrying", {
-              force: true,
-            });
+        if (!otpContext.maskedForGpt || !otpContext.maskedForGpt.trim()) {
+          interactionCount += 1;
+          const session = activeCalls.get(callSid);
+          if (session) {
+            session.interactionCount = interactionCount;
           }
-          setInteractionCount(currentCount + 1);
-        });
-        return;
+          return;
+        }
+        if (
+          shouldCloseConversation(otpContext.maskedForGpt) &&
+          interactionCount >= 1
+        ) {
+          await speakAndEndCall(
+            callSid,
+            CALL_END_MESSAGES.user_goodbye,
+            "user_goodbye",
+          );
+          interactionCount += 1;
+          const session = activeCalls.get(callSid);
+          if (session) {
+            session.interactionCount = interactionCount;
+          }
+          return;
+        }
+        const getInteractionCount = () => interactionCount;
+        const setInteractionCount = (nextCount) => {
+          interactionCount = nextCount;
+          const session = activeCalls.get(callSid);
+          if (session) {
+            session.interactionCount = nextCount;
+          }
+        };
+        if (isDigitIntent) {
+          await enqueueGptTask(callSid, async () => {
+            const currentCount = interactionCount;
+            try {
+              await gptService.completion(otpContext.maskedForGpt, currentCount);
+            } catch (gptError) {
+              console.error("GPT completion error:", gptError);
+              webhookService.addLiveEvent(callSid, "⚠️ GPT error, retrying", {
+                force: true,
+              });
+            }
+            setInteractionCount(currentCount + 1);
+          });
+          return;
+        }
+        await processNormalFlowTranscript(
+          callSid,
+          otpContext.maskedForGpt,
+          gptService,
+          getInteractionCount,
+          setInteractionCount,
+        );
+      } catch (transcriptionError) {
+        console.error("Vonage transcription handler error:", transcriptionError);
       }
-      await processNormalFlowTranscript(
-        callSid,
-        otpContext.maskedForGpt,
-        gptService,
-        getInteractionCount,
-        setInteractionCount,
-      );
     });
 
     ws.on("message", (data) => {
@@ -7248,21 +7288,26 @@ app.ws("/vonage/stream", async (ws, req) => {
 
     ws.on("close", async () => {
       transcriptionService.close();
-      const session = activeCalls.get(callSid);
-      if (session?.startTime) {
-        await handleCallEnd(callSid, session.startTime);
+      try {
+        const session = activeCalls.get(callSid);
+        if (session?.startTime) {
+          await handleCallEnd(callSid, session.startTime);
+        }
+      } catch (closeError) {
+        console.error("Vonage websocket close handler error:", closeError);
+      } finally {
+        activeCalls.delete(callSid);
+        if (digitService) {
+          digitService.clearCallState(callSid);
+        }
+        clearSpeechTicks(callSid);
+        clearGptQueue(callSid);
+        clearNormalFlowState(callSid);
+        clearCallEndLock(callSid);
+        clearSilenceTimer(callSid);
+        sttFallbackCalls.delete(callSid);
+        streamTimeoutCalls.delete(callSid);
       }
-      activeCalls.delete(callSid);
-      if (digitService) {
-        digitService.clearCallState(callSid);
-      }
-      clearSpeechTicks(callSid);
-      clearGptQueue(callSid);
-      clearNormalFlowState(callSid);
-      clearCallEndLock(callSid);
-      clearSilenceTimer(callSid);
-      sttFallbackCalls.delete(callSid);
-      streamTimeoutCalls.delete(callSid);
     });
 
     // Send first message once stream is ready
@@ -7360,13 +7405,23 @@ app.ws("/aws/stream", (ws, req) => {
     };
 
     transcriptionService.on("error", (error) => {
-      handleSttFailure("stt_error", error);
+      void handleSttFailure("stt_error", error).catch((sttFailureError) => {
+        console.error("STT fallback activation error:", sttFailureError);
+      });
     });
     transcriptionService.on("close", () => {
-      handleSttFailure("stt_closed");
+      void handleSttFailure("stt_closed").catch((sttFailureError) => {
+        console.error("STT fallback activation error:", sttFailureError);
+      });
     });
 
-    const sessionPromise = ensureAwsSession(callSid);
+    const sessionPromise = ensureAwsSession(callSid).catch((sessionError) => {
+      console.error("Failed to initialize AWS call session:", sessionError);
+      try {
+        ws.close();
+      } catch {}
+      return null;
+    });
     let interactionCount = 0;
 
     transcriptionService.on("utterance", (text) => {
@@ -7379,118 +7434,121 @@ app.ws("/aws/stream", (ws, req) => {
     });
 
     transcriptionService.on("transcription", async (text) => {
-      if (!text) return;
-      clearSilenceTimer(callSid);
-      const session = await sessionPromise;
-      const isDigitIntent = session?.callConfig?.digit_intent?.mode === "dtmf";
-      const captureActive = isCaptureActiveConfig(session?.callConfig);
-      const otpContext = digitService.getOtpContext(text, callSid);
       try {
-        await db.addTranscript({
-          call_sid: callSid,
-          speaker: "user",
-          message: otpContext.raw,
-          interaction_count: interactionCount,
-        });
-        await db.updateCallState(callSid, "user_spoke", {
-          message: otpContext.raw,
-          interaction_count: interactionCount,
-          otp_detected: otpContext.otpDetected,
-          last_collected_code: otpContext.codes?.slice(-1)[0] || null,
-          collected_codes: otpContext.codes?.join(", ") || null,
-        });
-      } catch (dbError) {
-        console.error("Database error adding user transcript:", dbError);
-      }
+        if (!text) return;
+        clearSilenceTimer(callSid);
+        const session = await sessionPromise;
+        if (!session?.gptService) {
+          return;
+        }
+        const isDigitIntent = session?.callConfig?.digit_intent?.mode === "dtmf";
+        const captureActive = isCaptureActiveConfig(session?.callConfig);
+        const otpContext = digitService.getOtpContext(text, callSid);
+        try {
+          await db.addTranscript({
+            call_sid: callSid,
+            speaker: "user",
+            message: otpContext.raw,
+            interaction_count: interactionCount,
+          });
+          await db.updateCallState(callSid, "user_spoke", {
+            message: otpContext.raw,
+            interaction_count: interactionCount,
+            otp_detected: otpContext.otpDetected,
+            last_collected_code: otpContext.codes?.slice(-1)[0] || null,
+            collected_codes: otpContext.codes?.join(", ") || null,
+          });
+        } catch (dbError) {
+          console.error("Database error adding user transcript:", dbError);
+        }
 
-      webhookService.recordTranscriptTurn(callSid, "user", otpContext.raw);
-      if (
-        (isDigitIntent || captureActive) &&
-        otpContext.codes &&
-        otpContext.codes.length &&
-        digitService?.hasExpectation(callSid)
-      ) {
-        const activeExpectation = digitService.getExpectation(callSid);
-        const progress = digitService.formatOtpForDisplay(
-          otpContext.codes[otpContext.codes.length - 1],
-          "progress",
-          activeExpectation?.max_digits,
-        );
-        webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
-        const collection = digitService.recordDigits(
-          callSid,
-          otpContext.codes[otpContext.codes.length - 1],
-          {
-            timestamp: Date.now(),
-            source: "spoken",
-            full_input: true,
-            attempt_id: activeExpectation?.attempt_id || null,
-            plan_id: activeExpectation?.plan_id || null,
-            plan_step_index: activeExpectation?.plan_step_index || null,
-            channel_session_id: activeExpectation?.channel_session_id || null,
-          },
-        );
-        await digitService.handleCollectionResult(
-          callSid,
-          collection,
-          session.gptService,
-          interactionCount,
-          "spoken",
-          { allowCallEnd: true },
-        );
-      }
-      if (captureActive) {
-        return;
-      }
+        webhookService.recordTranscriptTurn(callSid, "user", otpContext.raw);
+        if (
+          (isDigitIntent || captureActive) &&
+          otpContext.codes &&
+          otpContext.codes.length &&
+          digitService?.hasExpectation(callSid)
+        ) {
+          const activeExpectation = digitService.getExpectation(callSid);
+          const progress = digitService.formatOtpForDisplay(
+            otpContext.codes[otpContext.codes.length - 1],
+            "progress",
+            activeExpectation?.max_digits,
+          );
+          webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
+          const collection = digitService.recordDigits(
+            callSid,
+            otpContext.codes[otpContext.codes.length - 1],
+            {
+              timestamp: Date.now(),
+              source: "spoken",
+              full_input: true,
+              attempt_id: activeExpectation?.attempt_id || null,
+              plan_id: activeExpectation?.plan_id || null,
+              plan_step_index: activeExpectation?.plan_step_index || null,
+              channel_session_id: activeExpectation?.channel_session_id || null,
+            },
+          );
+          await digitService.handleCollectionResult(
+            callSid,
+            collection,
+            session.gptService,
+            interactionCount,
+            "spoken",
+            { allowCallEnd: true },
+          );
+        }
+        if (captureActive) {
+          return;
+        }
 
-      if (
-        shouldCloseConversation(otpContext.maskedForGpt) &&
-        interactionCount >= 1
-      ) {
-        await speakAndEndCall(
-          callSid,
-          CALL_END_MESSAGES.user_goodbye,
-          "user_goodbye",
-        );
-        interactionCount += 1;
-        if (session) {
+        if (
+          shouldCloseConversation(otpContext.maskedForGpt) &&
+          interactionCount >= 1
+        ) {
+          await speakAndEndCall(
+            callSid,
+            CALL_END_MESSAGES.user_goodbye,
+            "user_goodbye",
+          );
+          interactionCount += 1;
           session.interactionCount = interactionCount;
+          return;
         }
-        return;
-      }
 
-      const getInteractionCount = () => interactionCount;
-      const setInteractionCount = (nextCount) => {
-        interactionCount = nextCount;
-        if (session) {
+        const getInteractionCount = () => interactionCount;
+        const setInteractionCount = (nextCount) => {
+          interactionCount = nextCount;
           session.interactionCount = nextCount;
+        };
+        if (isDigitIntent) {
+          await enqueueGptTask(callSid, async () => {
+            const currentCount = interactionCount;
+            try {
+              await session.gptService.completion(
+                otpContext.maskedForGpt,
+                currentCount,
+              );
+            } catch (gptError) {
+              console.error("GPT completion error:", gptError);
+              webhookService.addLiveEvent(callSid, "⚠️ GPT error, retrying", {
+                force: true,
+              });
+            }
+            setInteractionCount(currentCount + 1);
+          });
+          return;
         }
-      };
-      if (isDigitIntent) {
-        await enqueueGptTask(callSid, async () => {
-          const currentCount = interactionCount;
-          try {
-            await session.gptService.completion(
-              otpContext.maskedForGpt,
-              currentCount,
-            );
-          } catch (gptError) {
-            console.error("GPT completion error:", gptError);
-            webhookService.addLiveEvent(callSid, "⚠️ GPT error, retrying", {
-              force: true,
-            });
-          }
-          setInteractionCount(currentCount + 1);
-        });
-        return;
+        await processNormalFlowTranscript(
+          callSid,
+          otpContext.maskedForGpt,
+          session.gptService,
+          getInteractionCount,
+          setInteractionCount,
+        );
+      } catch (transcriptionError) {
+        console.error("AWS transcription handler error:", transcriptionError);
       }
-      await processNormalFlowTranscript(
-        callSid,
-        otpContext.maskedForGpt,
-        session.gptService,
-        getInteractionCount,
-        setInteractionCount,
-      );
     });
 
     ws.on("message", (data) => {
@@ -7512,20 +7570,25 @@ app.ws("/aws/stream", (ws, req) => {
 
     ws.on("close", async () => {
       transcriptionService.close();
-      const session = activeCalls.get(callSid);
-      if (session?.startTime) {
-        await handleCallEnd(callSid, session.startTime);
+      try {
+        const session = activeCalls.get(callSid);
+        if (session?.startTime) {
+          await handleCallEnd(callSid, session.startTime);
+        }
+      } catch (closeError) {
+        console.error("AWS websocket close handler error:", closeError);
+      } finally {
+        activeCalls.delete(callSid);
+        if (digitService) {
+          digitService.clearCallState(callSid);
+        }
+        clearGptQueue(callSid);
+        clearNormalFlowState(callSid);
+        clearCallEndLock(callSid);
+        clearSilenceTimer(callSid);
+        sttFallbackCalls.delete(callSid);
+        streamTimeoutCalls.delete(callSid);
       }
-      activeCalls.delete(callSid);
-      if (digitService) {
-        digitService.clearCallState(callSid);
-      }
-      clearGptQueue(callSid);
-      clearNormalFlowState(callSid);
-      clearCallEndLock(callSid);
-      clearSilenceTimer(callSid);
-      sttFallbackCalls.delete(callSid);
-      streamTimeoutCalls.delete(callSid);
     });
 
     recordCallStatus(callSid, "in-progress", "call_in_progress").catch(
@@ -8075,42 +8138,61 @@ app.post("/aws/transcripts", async (req, res) => {
       return;
     }
     const { callSid, transcript, isPartial } = req.body || {};
-    if (!callSid || !transcript) {
+    const normalizedCallSid = String(callSid || "").trim();
+    const normalizedTranscript = String(transcript || "").trim();
+    const partialFlag =
+      isPartial === true ||
+      isPartial === 1 ||
+      String(isPartial || "").toLowerCase() === "true";
+    if (
+      !normalizedCallSid ||
+      !normalizedTranscript ||
+      !isSafeId(normalizedCallSid, { max: 128 })
+    ) {
       return res
         .status(400)
         .json({ success: false, error: "callSid and transcript required" });
     }
-    if (isPartial) {
+    if (normalizedTranscript.length > 4000) {
+      return res.status(400).json({
+        success: false,
+        error: "transcript too long",
+      });
+    }
+    if (partialFlag) {
       return res.status(200).json({ success: true });
     }
-    const session = await ensureAwsSession(callSid);
-    clearSilenceTimer(callSid);
+    const session = await ensureAwsSession(normalizedCallSid);
+    clearSilenceTimer(normalizedCallSid);
     await db.addTranscript({
-      call_sid: callSid,
+      call_sid: normalizedCallSid,
       speaker: "user",
-      message: transcript,
+      message: normalizedTranscript,
       interaction_count: session.interactionCount,
     });
-    await db.updateCallState(callSid, "user_spoke", {
-      message: transcript,
+    await db.updateCallState(normalizedCallSid, "user_spoke", {
+      message: normalizedTranscript,
       interaction_count: session.interactionCount,
     });
-    if (shouldCloseConversation(transcript) && session.interactionCount >= 1) {
+    if (
+      shouldCloseConversation(normalizedTranscript) &&
+      session.interactionCount >= 1
+    ) {
       await speakAndEndCall(
-        callSid,
+        normalizedCallSid,
         CALL_END_MESSAGES.user_goodbye,
         "user_goodbye",
       );
       session.interactionCount += 1;
       return res.status(200).json({ success: true });
     }
-    enqueueGptTask(callSid, async () => {
+    enqueueGptTask(normalizedCallSid, async () => {
       const currentCount = session.interactionCount || 0;
       try {
-        await session.gptService.completion(transcript, currentCount);
+        await session.gptService.completion(normalizedTranscript, currentCount);
       } catch (gptError) {
         console.error("GPT completion error:", gptError);
-        webhookService.addLiveEvent(callSid, "⚠️ GPT error, retrying", {
+        webhookService.addLiveEvent(normalizedCallSid, "⚠️ GPT error, retrying", {
           force: true,
         });
       }
@@ -10198,6 +10280,9 @@ app.get("/email/templates", async (req, res) => {
 app.get("/email/templates/:id", async (req, res) => {
   try {
     const templateId = req.params.id;
+    if (!isSafeId(templateId, { max: 128 })) {
+      return res.status(400).json({ success: false, error: "Invalid template identifier" });
+    }
     const template = await db.getEmailTemplate(templateId);
     if (!template) {
       return res
@@ -10218,6 +10303,11 @@ app.post("/email/templates", async (req, res) => {
       return res
         .status(400)
         .json({ success: false, error: "template_id is required" });
+    }
+    if (!isSafeId(templateId, { max: 128 })) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Invalid template identifier" });
     }
     const subject = payload.subject || "";
     const html = payload.html || "";
@@ -10250,6 +10340,9 @@ app.post("/email/templates", async (req, res) => {
 app.put("/email/templates/:id", async (req, res) => {
   try {
     const templateId = req.params.id;
+    if (!isSafeId(templateId, { max: 128 })) {
+      return res.status(400).json({ success: false, error: "Invalid template identifier" });
+    }
     const existing = await db.getEmailTemplate(templateId);
     if (!existing) {
       return res
@@ -10282,6 +10375,9 @@ app.put("/email/templates/:id", async (req, res) => {
 app.delete("/email/templates/:id", async (req, res) => {
   try {
     const templateId = req.params.id;
+    if (!isSafeId(templateId, { max: 128 })) {
+      return res.status(400).json({ success: false, error: "Invalid template identifier" });
+    }
     await db.deleteEmailTemplate(templateId);
     res.json({ success: true });
   } catch (error) {
@@ -10312,6 +10408,9 @@ function normalizeEmailJobForApi(job) {
 app.get("/email/messages/:id", async (req, res) => {
   try {
     const messageId = req.params.id;
+    if (!isSafeId(messageId, { max: 128 })) {
+      return res.status(400).json({ success: false, error: "Invalid message identifier" });
+    }
     const message = await db.getEmailMessage(messageId);
     if (!message) {
       return res
@@ -10332,6 +10431,9 @@ app.get("/email/messages/:id", async (req, res) => {
 app.get("/email/bulk/:jobId", async (req, res) => {
   try {
     const jobId = req.params.jobId;
+    if (!isSafeId(jobId, { max: 128 })) {
+      return res.status(400).json({ success: false, error: "Invalid bulk job identifier" });
+    }
     const job = await db.getEmailBulkJob(jobId);
     if (!job) {
       return res
@@ -10908,12 +11010,12 @@ app.get("/api/sms/scripts", requireAdminToken, async (req, res) => {
 app.get("/api/sms/messages/conversation/:phone", async (req, res) => {
   try {
     const { phone } = req.params;
-    const limit = Math.min(parseInt(req.query.limit) || 50, 100);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
 
-    if (!phone) {
+    if (!phone || !/^\+?[1-9]\d{5,19}$/.test(String(phone).trim())) {
       return res.status(400).json({
         success: false,
-        error: "Phone number is required",
+        error: "Valid phone number is required",
       });
     }
 
@@ -10938,8 +11040,8 @@ app.get("/api/sms/messages/conversation/:phone", async (req, res) => {
 // Get recent SMS messages from database
 app.get("/api/sms/messages/recent", async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit) || 10, 50);
-    const offset = parseInt(req.query.offset) || 0;
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 10, 1), 50);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
 
     const messages = await db.getSMSMessages(limit, offset);
 

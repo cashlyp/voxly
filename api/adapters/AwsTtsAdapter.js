@@ -32,6 +32,28 @@ class AwsTtsAdapter {
     this.s3Prefix = config.polly?.outputPrefix || 'tts/';
     this.voiceId = config.polly?.voiceId || 'Joanna';
     this.s3 = this.s3Bucket ? new S3Client({ region: config.region }) : null;
+    const timeoutMs = Number(config?.polly?.requestTimeoutMs || config?.requestTimeoutMs);
+    this.requestTimeoutMs =
+      Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 15000;
+  }
+
+  withTimeout(promise, label = 'aws_tts_timeout') {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const timeoutError = new Error(label);
+        timeoutError.code = 'aws_tts_timeout';
+        reject(timeoutError);
+      }, this.requestTimeoutMs);
+      Promise.resolve(promise)
+        .then((result) => {
+          clearTimeout(timer);
+          resolve(result);
+        })
+        .catch((error) => {
+          clearTimeout(timer);
+          reject(error);
+        });
+    });
   }
 
   /**
@@ -56,7 +78,10 @@ class AwsTtsAdapter {
     };
 
     const command = new SynthesizeSpeechCommand(params);
-    const response = await this.polly.send(command);
+    const response = await this.withTimeout(
+      this.polly.send(command),
+      'aws_polly_synthesize_timeout',
+    );
     const audioArray = await streamCollector(response.AudioStream);
     this.logger.info?.('Polly synthesized speech', {
       voiceId: params.VoiceId,
@@ -96,7 +121,10 @@ class AwsTtsAdapter {
     };
 
     const command = new PutObjectCommand(params);
-    await this.s3.send(command);
+    await this.withTimeout(
+      this.s3.send(command),
+      'aws_s3_put_object_timeout',
+    );
     this.logger.info?.('Uploaded Polly audio to S3', { bucket: params.Bucket, key: params.Key });
 
     return { bucket: params.Bucket, key: params.Key };

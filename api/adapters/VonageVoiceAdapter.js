@@ -10,6 +10,13 @@ function isValidHttpsUrl(value) {
   }
 }
 
+function maskPhoneForLog(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (!digits) return null;
+  if (digits.length <= 4) return "*".repeat(digits.length);
+  return `${"*".repeat(Math.max(2, digits.length - 4))}${digits.slice(-4)}`;
+}
+
 class VonageVoiceAdapter {
   constructor(config = {}, logger = console) {
     const { apiKey, apiSecret, applicationId, privateKey, voice = {} } = config;
@@ -24,12 +31,34 @@ class VonageVoiceAdapter {
     this.fromNumber = voice.fromNumber;
     this.answerUrlOverride = voice.answerUrl;
     this.eventUrlOverride = voice.eventUrl;
+    const timeoutMs = Number(voice.requestTimeoutMs || config.requestTimeoutMs);
+    this.requestTimeoutMs =
+      Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 15000;
 
     this.client = new Vonage({
       apiKey,
       apiSecret,
       applicationId,
       privateKey,
+    });
+  }
+
+  withTimeout(promise, label = "vonage_request_timeout") {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const timeoutError = new Error(label);
+        timeoutError.code = "vonage_provider_timeout";
+        reject(timeoutError);
+      }, this.requestTimeoutMs);
+      Promise.resolve(promise)
+        .then((result) => {
+          clearTimeout(timer);
+          resolve(result);
+        })
+        .catch((error) => {
+          clearTimeout(timer);
+          reject(error);
+        });
     });
   }
 
@@ -100,15 +129,18 @@ class VonageVoiceAdapter {
     }
 
     this.logger.info?.("VonageVoiceAdapter: creating outbound call", {
-      to,
+      to: maskPhoneForLog(to),
       callSid,
-      from: this.fromNumber,
+      from: maskPhoneForLog(this.fromNumber),
       hasInlineNcco,
       answerUrl: payload.answer_url?.[0] || null,
       eventUrl: payload.event_url?.[0] || null,
     });
 
-    const response = await this.client.voice.createOutboundCall(payload);
+    const response = await this.withTimeout(
+      this.client.voice.createOutboundCall(payload),
+      "vonage_create_call_timeout",
+    );
     return response;
   }
 
@@ -116,7 +148,10 @@ class VonageVoiceAdapter {
     if (!callUuid) {
       throw new Error("VonageVoiceAdapter.hangupCall requires call UUID");
     }
-    await this.client.voice.updateCall(callUuid, { action: "hangup" });
+    await this.withTimeout(
+      this.client.voice.updateCall(callUuid, { action: "hangup" }),
+      "vonage_hangup_timeout",
+    );
   }
 
   async transferCallWithURL(callUuid, url) {
@@ -128,7 +163,10 @@ class VonageVoiceAdapter {
         "VonageVoiceAdapter.transferCallWithURL requires a valid HTTPS URL",
       );
     }
-    await this.client.voice.transferCallWithURL(callUuid, url);
+    await this.withTimeout(
+      this.client.voice.transferCallWithURL(callUuid, url),
+      "vonage_transfer_timeout",
+    );
   }
 }
 
