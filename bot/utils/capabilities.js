@@ -233,10 +233,11 @@ function getDeniedAuditSummary() {
 
 async function sendAccessDenied(ctx, capability, options = {}) {
   const actionLabel = options.actionLabel ? `\n\nAction: ${options.actionLabel}` : '';
-  const message =
-    `🔒 Access required to use this action.` +
-    `\n\nYou can explore menus, but execution is disabled without approval.` +
-    `${actionLabel}`;
+  const message = capability === 'provider_manage'
+    ? `❌ Admins only: provider controls are restricted to administrators.${actionLabel}`
+    : `🔒 Access required to use this action.` +
+      `\n\nYou can explore menus, but execution is disabled without approval.` +
+      `${actionLabel}`;
   await ctx.reply(message, { reply_markup: buildAccessKeyboard(ctx) });
 }
 

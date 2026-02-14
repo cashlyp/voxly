@@ -37,7 +37,7 @@ function formatProviderStatus(status) {
     const vonageReady = status.vonage_ready ? '✅ Ready' : '⚠️ Missing keys';
 
     const details = [
-        buildLine('•', `Current Provider`, `*${current.toUpperCase()}*`),
+        buildLine('•', `CALL_PROVIDER`, `*${current.toUpperCase()}*`),
         buildLine('•', `Stored Default`, stored.toUpperCase()),
         buildLine('•', `AWS Ready`, status.aws_ready ? '✅' : '⚠️'),
         buildLine('•', `Twilio Ready`, status.twilio_ready ? '✅' : '⚠️'),
@@ -72,6 +72,7 @@ async function fetchProviderStatus({ force = false } = {}) {
     }
     const response = await httpClient.get(null, `${config.apiUrl}/admin/provider`, {
         timeout: 10000,
+        params: { channel: 'call' },
         headers: {
             [ADMIN_HEADER_NAME]: config.admin.apiToken,
             'Content-Type': 'application/json',
@@ -101,7 +102,7 @@ async function updateProvider(provider) {
     const response = await httpClient.post(
         null,
         `${config.apiUrl}/admin/provider`,
-        { provider },
+        { provider, channel: 'call' },
         {
             timeout: 15000,
             headers: {
@@ -115,6 +116,10 @@ async function updateProvider(provider) {
 
 async function renderProviderMenu(ctx, { status, notice, forceRefresh = false } = {}) {
     try {
+        const { isAdminUser } = await ensureAuthorizedAdmin(ctx);
+        if (!isAdminUser) {
+            return;
+        }
         let resolvedStatus = status;
         let cachedNotice = null;
         if (!resolvedStatus) {
@@ -168,9 +173,19 @@ async function ensureAuthorizedAdmin(ctx) {
 
 async function handleProviderSwitch(ctx, requestedProvider) {
     try {
-        const status = await fetchProviderStatus();
-        const { supported } = normalizeProviders(status);
         const normalized = String(requestedProvider || '').toLowerCase();
+        if (!normalized) {
+            await renderProviderMenu(ctx, { forceRefresh: true });
+            return;
+        }
+
+        const { isAdminUser } = await ensureAuthorizedAdmin(ctx);
+        if (!isAdminUser) {
+            return;
+        }
+
+        const status = await fetchProviderStatus().catch(() => null);
+        const { supported, active } = normalizeProviders(status || {});
         if (!normalized || !supported.includes(normalized)) {
             const options = supported.map((item) => `• /provider ${item}`).join('\n');
             await ctx.reply(
@@ -179,9 +194,17 @@ async function handleProviderSwitch(ctx, requestedProvider) {
             return;
         }
 
+        if (active && active === normalized) {
+            await renderProviderMenu(ctx, {
+                status: status || null,
+                notice: `ℹ️ Provider already set to *${normalized.toUpperCase()}*.`,
+            });
+            return;
+        }
+
         const result = await updateProvider(normalized);
-        const refreshed = await fetchProviderStatus({ force: true });
-        const activeLabel = (refreshed.provider || normalized).toUpperCase();
+        const refreshed = await fetchProviderStatus({ force: true }).catch(() => result || status || null);
+        const activeLabel = (refreshed?.provider || result?.provider || normalized).toUpperCase();
         const notice = result.changed === false
             ? `ℹ️ Provider already set to *${activeLabel}*.`
             : `✅ Call provider set to *${activeLabel}*.`;
@@ -225,3 +248,5 @@ module.exports = initializeProviderCommand;
 module.exports.registerProviderCommand = registerProviderCommand;
 module.exports.fetchProviderStatus = fetchProviderStatus;
 module.exports.updateProvider = updateProvider;
+module.exports.renderProviderMenu = renderProviderMenu;
+module.exports.handleProviderSwitch = handleProviderSwitch;
