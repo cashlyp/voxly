@@ -188,8 +188,8 @@ function ensureFlow(ctx, name, options = {}) {
 
 async function safeReset(ctx, reason = 'reset', options = {}) {
   const {
-    message = 'â ï¸ Session expired. Restarting call setup...',
-    menuHint = 'ð Use /menu to start again.',
+    message = '⚠️ Session expired. Restarting call setup...',
+    menuHint = '📋 Use /menu to start again.',
     notify = true
   } = options;
 

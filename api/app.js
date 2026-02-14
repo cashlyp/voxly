@@ -5516,6 +5516,12 @@ async function startServer(options = {}) {
       smsService,
       healthProvider: getDigitSystemHealth,
     });
+    if (typeof webhookService.setDigitTokenResolver === "function") {
+      webhookService.setDigitTokenResolver((callSid, tokenRef) => {
+        if (!digitService?.resolveSensitiveTokenRef) return null;
+        return digitService.resolveSensitiveTokenRef(callSid, tokenRef);
+      });
+    }
 
     // Initialize function engine
     console.log("✅ Dynamic Function Engine ready");

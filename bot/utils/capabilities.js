@@ -154,9 +154,9 @@ function getCapabilityForAction(action = '') {
 function buildAccessKeyboard(ctx) {
   const adminUsername = (config.admin.username || '').replace(/^@/, '');
   const keyboard = new InlineKeyboard()
-    .text('â¬ï¸ Main Menu', buildCallbackData(ctx, 'MENU'));
+    .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
   if (adminUsername) {
-    keyboard.row().url('ð± Request Access', `https://t.me/${adminUsername}`);
+    keyboard.row().url('📱 Request Access', `https://t.me/${adminUsername}`);
   }
   return keyboard;
 }
@@ -234,7 +234,7 @@ function getDeniedAuditSummary() {
 async function sendAccessDenied(ctx, capability, options = {}) {
   const actionLabel = options.actionLabel ? `\n\nAction: ${options.actionLabel}` : '';
   const message =
-    `ð Access required to use this action.` +
+    `🔒 Access required to use this action.` +
     `\n\nYou can explore menus, but execution is disabled without approval.` +
     `${actionLabel}`;
   await ctx.reply(message, { reply_markup: buildAccessKeyboard(ctx) });
@@ -255,7 +255,7 @@ async function requireCapability(ctx, capability, options = {}) {
   });
   console.warn(`Access denied for user ${userId} (${profile.role}) on capability ${capability}${options.action ? ` via ${options.action}` : ''}`);
   if (isRateLimited(userId)) {
-    await ctx.reply('â³ Too many access attempts. Please wait a moment and try again.', {
+    await ctx.reply('⏳ Too many access attempts. Please wait a moment and try again.', {
       reply_markup: buildAccessKeyboard(ctx)
     });
     return false;
@@ -264,7 +264,7 @@ async function requireCapability(ctx, capability, options = {}) {
     const lastNotice = lastCooldownNotice.get(userId) || 0;
     if (Date.now() - lastNotice > COOLDOWN_MS) {
       lastCooldownNotice.set(userId, Date.now());
-      await ctx.reply('â³ Please wait 30 seconds before retrying locked actions.', {
+      await ctx.reply('⏳ Please wait 30 seconds before retrying locked actions.', {
         reply_markup: buildAccessKeyboard(ctx)
       });
       return false;

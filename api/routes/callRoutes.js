@@ -107,6 +107,114 @@ function createOutboundCallHandler(ctx = {}) {
   };
 }
 
+function getRequesterChatId(req) {
+  const raw =
+    req.headers?.["x-telegram-chat-id"] ||
+    req.query?.telegram_chat_id ||
+    req.query?.chat_id ||
+    "";
+  return String(raw || "").trim();
+}
+
+function isOwnedByDifferentChat(call, requesterChatId) {
+  if (!call?.user_chat_id || !requesterChatId) return false;
+  return String(call.user_chat_id) !== String(requesterChatId);
+}
+
+function pickTranscriptAudioUrl(call, states = []) {
+  const pickHttp = (value) => {
+    const candidate = String(value || "").trim();
+    if (!candidate) return null;
+    if (!/^https?:\/\//i.test(candidate)) return null;
+    return candidate;
+  };
+
+  const topLevelCandidates = [
+    call?.transcript_audio_url,
+    call?.transcriptAudioUrl,
+    call?.recording_url,
+    call?.recordingUrl,
+    call?.audio_url,
+    call?.audioUrl,
+  ];
+  for (const candidate of topLevelCandidates) {
+    const url = pickHttp(candidate);
+    if (url) return url;
+  }
+
+  for (const state of states) {
+    const data =
+      state?.data && typeof state.data === "object" && !Array.isArray(state.data)
+        ? state.data
+        : null;
+    if (!data) continue;
+    const stateCandidates = [
+      data.transcript_audio_url,
+      data.transcriptAudioUrl,
+      data.recording_url,
+      data.recordingUrl,
+      data.audio_url,
+      data.audioUrl,
+      data.media_url,
+      data.mediaUrl,
+      data.url,
+    ];
+    for (const candidate of stateCandidates) {
+      const url = pickHttp(candidate);
+      if (url) return url;
+    }
+  }
+
+  return null;
+}
+
+function maskNumericToken(value, keepTail = 2) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (!digits) return "";
+  if (digits.length <= keepTail) {
+    return "*".repeat(digits.length);
+  }
+  return `${"*".repeat(Math.max(2, digits.length - keepTail))}${digits.slice(-keepTail)}`;
+}
+
+function maskSensitiveExternalText(text, digitService = null) {
+  const raw = String(text || "");
+  if (!raw) return raw;
+  if (digitService && typeof digitService.maskOtpForExternal === "function") {
+    return digitService.maskOtpForExternal(raw);
+  }
+  return raw
+    .replace(/\b\d{4,}\b/g, (match) => maskNumericToken(match, 2) || "******")
+    .replace(
+      /\b(?:zero|oh|one|two|three|four|five|six|seven|eight|nine)(?:[\s-]+(?:zero|oh|one|two|three|four|five|six|seven|eight|nine)){3,}\b/gi,
+      "******",
+    );
+}
+
+const DIGIT_TOKEN_REF_REGEX = /(vault:\/\/digits\/[^\s/]+\/tok_[A-Za-z0-9_]+|tok_[A-Za-z0-9_]+)/g;
+
+function resolveDigitReference(value, callSid, digitService = null) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const isToken = raw.startsWith("vault://digits/") || raw.startsWith("tok_");
+  if (!isToken) return raw;
+  if (digitService && typeof digitService.resolveSensitiveTokenRef === "function") {
+    const result = digitService.resolveSensitiveTokenRef(callSid || null, raw);
+    if (result?.ok && result.value) {
+      return String(result.value);
+    }
+  }
+  return raw;
+}
+
+function resolveTokenizedExternalText(text, callSid, digitService = null) {
+  const raw = String(text || "");
+  if (!raw) return raw;
+  return raw.replace(DIGIT_TOKEN_REF_REGEX, (match) =>
+    resolveDigitReference(match, callSid, digitService),
+  );
+}
+
 function createGetCallDetailsHandler(ctx = {}) {
   const { isSafeId, normalizeCallRecordForApi, buildDigitSummary } = ctx;
 
@@ -125,6 +233,10 @@ function createGetCallDetailsHandler(ctx = {}) {
       const call = await db.getCall(callSid);
       if (!call) {
         return res.status(404).json({ error: "Call not found" });
+      }
+      const requesterChatId = getRequesterChatId(req);
+      if (isOwnedByDifferentChat(call, requesterChatId)) {
+        return res.status(403).json({ error: "Not authorized for this call" });
       }
       let callState = null;
       try {
@@ -149,6 +261,37 @@ function createGetCallDetailsHandler(ctx = {}) {
       }
 
       const transcripts = await db.getCallTranscripts(callSid);
+      const digitService =
+        typeof ctx.getDigitService === "function"
+          ? ctx.getDigitService()
+          : ctx.digitService;
+      const exposeRawDigits = Boolean(requesterChatId);
+      const responseTranscripts = (Array.isArray(transcripts) ? transcripts : []).map(
+        (entry) => ({
+          ...entry,
+          message: exposeRawDigits
+            ? resolveTokenizedExternalText(entry?.message || "", callSid, digitService)
+            : maskSensitiveExternalText(entry?.message || "", digitService),
+        }),
+      );
+      normalizedCall.call_summary = exposeRawDigits
+        ? resolveTokenizedExternalText(
+            normalizedCall.call_summary || "",
+            callSid,
+            digitService,
+          )
+        : maskSensitiveExternalText(normalizedCall.call_summary || "", digitService);
+      if (normalizedCall.last_otp && exposeRawDigits) {
+        normalizedCall.last_otp = resolveDigitReference(
+          normalizedCall.last_otp,
+          callSid,
+          digitService,
+        );
+      } else if (normalizedCall.last_otp) {
+        const otpMasked = String(normalizedCall.last_otp_masked || "").trim();
+        normalizedCall.last_otp =
+          otpMasked || maskNumericToken(normalizedCall.last_otp, 2) || "******";
+      }
 
       let adaptationData = {};
       try {
@@ -173,8 +316,8 @@ function createGetCallDetailsHandler(ctx = {}) {
 
       return res.json({
         call: normalizedCall,
-        transcripts,
-        transcript_count: transcripts.length,
+        transcripts: responseTranscripts,
+        transcript_count: responseTranscripts.length,
         adaptation_analytics: adaptationData,
         business_context: normalizedCall.business_context,
         webhook_notifications: webhookNotifications,
@@ -183,6 +326,79 @@ function createGetCallDetailsHandler(ctx = {}) {
     } catch (error) {
       console.error("Error fetching enhanced adaptive call details:", error);
       return res.status(500).json({ error: "Failed to fetch call details" });
+    }
+  };
+}
+
+function createGetTranscriptAudioHandler(ctx = {}) {
+  const { isSafeId } = ctx;
+
+  return async function handleGetTranscriptAudio(req, res) {
+    try {
+      const db = typeof ctx.getDb === "function" ? ctx.getDb() : ctx.db;
+      if (!db) {
+        return res.status(500).json({ error: "Database unavailable" });
+      }
+
+      const { callSid } = req.params;
+      if (!isSafeId(callSid, { max: 128 })) {
+        return res.status(400).json({ error: "Invalid call identifier" });
+      }
+
+      const call = await db.getCall(callSid);
+      if (!call) {
+        return res.status(404).json({
+          success: false,
+          error: "Call not found",
+        });
+      }
+
+      const requesterChatId = getRequesterChatId(req);
+      if (!requesterChatId && call?.user_chat_id) {
+        return res.status(403).json({
+          success: false,
+          error: "Not authorized for this call",
+        });
+      }
+      if (isOwnedByDifferentChat(call, requesterChatId)) {
+        return res.status(403).json({
+          success: false,
+          error: "Not authorized for this call",
+        });
+      }
+
+      const transcripts = await db.getCallTranscripts(callSid).catch(() => []);
+      if (!Array.isArray(transcripts) || transcripts.length === 0) {
+        return res.status(404).json({
+          success: false,
+          error: "Transcript not found",
+        });
+      }
+
+      const callStates = await db.getCallStates(callSid, { limit: 40 }).catch(() => []);
+      const audioUrl = pickTranscriptAudioUrl(call, callStates);
+      if (!audioUrl) {
+        return res.status(202).json({
+          success: false,
+          status: "pending",
+          message: "Transcript audio is not available yet.",
+          retry_after_seconds: 30,
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        status: "ready",
+        call_sid: callSid,
+        audio_url: audioUrl,
+        caption: "🎧 Transcript audio",
+      });
+    } catch (error) {
+      console.error("Error fetching transcript audio:", error);
+      return res.status(500).json({
+        success: false,
+        error: "Failed to fetch transcript audio",
+      });
     }
   };
 }
@@ -532,6 +748,7 @@ function createSearchCallsHandler(ctx = {}) {
 function registerCallRoutes(app, ctx = {}) {
   const handleOutboundCall = createOutboundCallHandler(ctx);
   const handleGetCallDetails = createGetCallDetailsHandler(ctx);
+  const handleGetTranscriptAudio = createGetTranscriptAudioHandler(ctx);
   const handleListCalls = createListCallsHandler(ctx);
   const handleListCallsFiltered = createListCallsFilteredHandler(ctx);
   const handleSearchCalls = createSearchCallsHandler(ctx);
@@ -542,6 +759,7 @@ function registerCallRoutes(app, ctx = {}) {
     handleOutboundCall,
   );
   app.get("/api/calls/:callSid", handleGetCallDetails);
+  app.get("/api/calls/:callSid/transcript/audio", handleGetTranscriptAudio);
   app.get("/api/calls", handleListCalls);
   app.get("/api/calls/list", handleListCallsFiltered);
   app.get("/api/calls/search", handleSearchCalls);

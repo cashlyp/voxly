@@ -62,7 +62,7 @@ function section(title, lines = []) {
 }
 
 async function styledAlert(ctx, message, options = {}) {
-    return ctx.reply(section('â ï¸ Notice', [message]), { parse_mode: 'Markdown', ...options });
+    return ctx.reply(section('⚠️ Notice', [message]), { parse_mode: 'Markdown', ...options });
 }
 
 function getMenuEntries(ctx) {

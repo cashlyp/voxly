@@ -224,7 +224,7 @@ function finishActionMetric(metric, status = 'ok', extra = {}) {
           .slice(0, 5)
           .map((row) => `${row.action}: ${row.errorRate}% (${row.total})`)
           .join(' | ');
-        console.log(`ð Menu action health: ${summary}`);
+        console.log(`📊 Menu action health: ${summary}`);
       }
     }
   }

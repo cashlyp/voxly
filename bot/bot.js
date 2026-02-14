@@ -309,6 +309,45 @@ bot.callbackQuery(/^lc:/, async (ctx) => {
   }
 });
 
+// Transcript actions from realtime status cards
+bot.callbackQuery(/^(tr|rca):/, async (ctx) => {
+  const data = String(ctx.callbackQuery?.data || "");
+  const [prefix, callSid] = data.split(":");
+  if (!callSid) {
+    await ctx.answerCallbackQuery({
+      text: "Missing call id",
+      show_alert: false,
+    });
+    return;
+  }
+  try {
+    const allowed = await requireCapability(ctx, "calllog_view", {
+      actionLabel: "Call transcript",
+    });
+    if (!allowed) {
+      await ctx.answerCallbackQuery({
+        text: "Access required.",
+        show_alert: false,
+      });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({
+      text: prefix === "tr" ? "Loading transcript..." : "Loading transcript audio...",
+      show_alert: false,
+    });
+
+    if (prefix === "tr") {
+      await sendFullTranscriptFromApi(ctx, callSid);
+      return;
+    }
+    await sendTranscriptAudioFromApi(ctx, callSid);
+  } catch (error) {
+    console.error("Transcript callback error:", error?.message || error);
+    await ctx.reply("⚠️ Failed to load transcript.");
+  }
+});
+
 // Initialize conversations middleware AFTER session
 bot.use(conversations());
 
@@ -485,6 +524,170 @@ registerApiCommands(bot);
 registerProviderCommand(bot);
 const API_BASE = config.apiUrl;
 
+function getRequesterChatId(ctx) {
+  const chatId =
+    ctx.callbackQuery?.message?.chat?.id || ctx.chat?.id || ctx.from?.id || "";
+  return String(chatId || "").trim();
+}
+
+function splitTelegramMessage(text, maxLength = 3900) {
+  const source = String(text || "");
+  if (source.length <= maxLength) return [source];
+  const chunks = [];
+  let remaining = source;
+  while (remaining.length > maxLength) {
+    let splitAt = remaining.lastIndexOf("\n", maxLength);
+    if (splitAt < maxLength * 0.6) {
+      splitAt = maxLength;
+    }
+    chunks.push(remaining.slice(0, splitAt).trim());
+    remaining = remaining.slice(splitAt).trim();
+  }
+  if (remaining) {
+    chunks.push(remaining);
+  }
+  return chunks;
+}
+
+function buildTranscriptText(call, transcripts) {
+  const lines = ["📄 Full Transcript", ""];
+  if (call?.phone_number) {
+    lines.push(`📞 Phone: ${call.phone_number}`);
+  }
+  const duration = Number(call?.duration);
+  if (Number.isFinite(duration) && duration > 0) {
+    const minutes = Math.floor(duration / 60);
+    const seconds = duration % 60;
+    lines.push(`⏱️ Duration: ${minutes}:${String(seconds).padStart(2, "0")}`);
+  }
+  if (call?.created_at) {
+    lines.push(`🕐 Started: ${new Date(call.created_at).toLocaleString()}`);
+  }
+  lines.push(`💬 Messages: ${transcripts.length}`);
+  lines.push("");
+  lines.push("Conversation:");
+  lines.push("─────────────────────────");
+
+  for (const entry of transcripts) {
+    const speaker = entry?.speaker === "user" ? "🧑 User" : "🤖 AI";
+    const message = String(entry?.message || "").trim();
+    if (!message) continue;
+    lines.push(`${speaker}: ${message}`);
+    lines.push("");
+  }
+
+  return lines.join("\n").trim();
+}
+
+async function sendFullTranscriptFromApi(ctx, callSid) {
+  const requesterChatId = getRequesterChatId(ctx);
+  const url = `${API_BASE}/api/calls/${encodeURIComponent(callSid)}`;
+  try {
+    const response = await httpClient.get(ctx, url, {
+      timeout: 15000,
+      headers: requesterChatId
+        ? { "x-telegram-chat-id": requesterChatId }
+        : undefined,
+    });
+    const payload = response?.data || {};
+    const call = payload?.call || payload;
+    const transcripts = Array.isArray(payload?.transcripts)
+      ? payload.transcripts
+      : [];
+
+    if (
+      call?.user_chat_id &&
+      requesterChatId &&
+      String(call.user_chat_id) !== requesterChatId
+    ) {
+      await ctx.reply("❌ Not authorized for this call.");
+      return;
+    }
+
+    if (!transcripts.length) {
+      await ctx.reply("📄 Transcript is not available yet.");
+      return;
+    }
+
+    const message = buildTranscriptText(call, transcripts);
+    const chunks = splitTelegramMessage(message, 3900);
+    const replyToMessageId = ctx.callbackQuery?.message?.message_id;
+
+    for (let index = 0; index < chunks.length; index += 1) {
+      const chunk = chunks[index];
+      if (!chunk) continue;
+      const options =
+        index === 0 && replyToMessageId
+          ? { reply_to_message_id: replyToMessageId }
+          : undefined;
+      await ctx.reply(chunk, options);
+    }
+  } catch (error) {
+    const status = Number(error?.response?.status || 0);
+    if (status === 403) {
+      await ctx.reply("❌ Not authorized for this call.");
+      return;
+    }
+    if (status === 404) {
+      await ctx.reply("📄 Transcript not found for this call.");
+      return;
+    }
+    if (status >= 500) {
+      await ctx.reply("⚠️ Transcript service is temporarily unavailable.");
+      return;
+    }
+    await ctx.reply(httpClient.getUserMessage(error, "Failed to fetch transcript."));
+  }
+}
+
+async function sendTranscriptAudioFromApi(ctx, callSid) {
+  const requesterChatId = getRequesterChatId(ctx);
+  const url = `${API_BASE}/api/calls/${encodeURIComponent(callSid)}/transcript/audio`;
+  try {
+    const response = await httpClient.get(ctx, url, {
+      timeout: 15000,
+      headers: requesterChatId
+        ? { "x-telegram-chat-id": requesterChatId }
+        : undefined,
+    });
+    const status = Number(response?.status || 0);
+    const payload = response?.data || {};
+
+    if (status === 202 || String(payload?.status || "").toLowerCase() === "pending") {
+      await ctx.reply(payload?.message || "🎧 Transcript audio is not available yet.");
+      return;
+    }
+
+    const audioUrl = String(payload?.audio_url || "").trim();
+    if (status !== 200 || !audioUrl) {
+      await ctx.reply("🎧 Transcript audio is not available yet.");
+      return;
+    }
+
+    await ctx.replyWithAudio(audioUrl, {
+      caption: payload?.caption || "🎧 Transcript audio",
+      reply_to_message_id: ctx.callbackQuery?.message?.message_id || undefined,
+    });
+  } catch (error) {
+    const status = Number(error?.response?.status || 0);
+    if (status === 403) {
+      await ctx.reply("❌ Not authorized for this call.");
+      return;
+    }
+    if (status === 404) {
+      await ctx.reply("🎧 Transcript audio not found for this call.");
+      return;
+    }
+    if (status >= 500) {
+      await ctx.reply("⚠️ Transcript audio service is temporarily unavailable.");
+      return;
+    }
+    await ctx.reply(
+      httpClient.getUserMessage(error, "Failed to fetch transcript audio."),
+    );
+  }
+}
+
 // Start command handler
 bot.command("start", async (ctx) => {
   try {
@@ -578,11 +781,16 @@ bot.on("callback_query:data", async (ctx) => {
     finishActionMetric(metric, status, extra);
   };
   try {
-    if (rawAction && rawAction.startsWith("lc:")) {
+    if (
+      rawAction &&
+      (rawAction.startsWith("lc:") ||
+        rawAction.startsWith("tr:") ||
+        rawAction.startsWith("rca:"))
+    ) {
       finishMetric("skipped");
       return;
     }
-    const menuExemptPrefixes = ["alert:", "lc:"];
+    const menuExemptPrefixes = ["alert:", "lc:", "tr:", "rca:"];
     const isMenuExempt = menuExemptPrefixes.some((prefix) =>
       rawAction.startsWith(prefix),
     );

