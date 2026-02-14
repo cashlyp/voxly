@@ -42,7 +42,7 @@ async function handleMenu(ctx) {
                 .text('🧰 Scripts', buildCallbackData(ctx, 'SCRIPTS'))
                 .row()
                 .text('📵 Caller Flags', buildCallbackData(ctx, 'CALLER_FLAGS'))
-                .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER:HOME'))
+                .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER_STATUS'))
                 .row()
                 .text('📤 SMS Sender', buildCallbackData(ctx, 'BULK_SMS'))
                 .text('📧 Mailer', buildCallbackData(ctx, 'BULK_EMAIL'));

@@ -411,9 +411,9 @@ async function buildCustomCallConfig(conversation, ctx, ensureActive, businessOp
     payloadUpdates,
     summary,
     meta: {
-      scriptName: personaOptions?.label || 'Custom',
+      scriptName: selectedBusiness?.label || selectedBusiness?.id || 'Custom',
       scriptDescription: 'Custom persona configuration',
-      personaLabel: personaOptions?.label || 'Custom',
+      personaLabel: selectedBusiness?.label || selectedBusiness?.id || 'Custom',
       scriptVoiceModel: null
     }
   };

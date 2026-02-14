@@ -370,6 +370,7 @@ async function askOptionWithButtons(
   const opId = getCurrentOpId(ctx);
   const basePrefix = prefix || 'option';
   const prefixKey = opId ? `${basePrefix}:${opId}` : basePrefix;
+  const optionLookupByToken = new Map();
   const labels = options.map((option) => (formatLabel ? formatLabel(option) : formatOptionLabel(option)));
   const hasLongLabel = labels.some((label) => String(label).length > 22);
   let resolvedColumns = Number.isFinite(columns) ? columns : (labels.length > 6 || hasLongLabel ? 1 : 2);
@@ -382,7 +383,9 @@ async function askOptionWithButtons(
 
   labels.forEach((label, index) => {
     const option = options[index];
-    const action = `${prefixKey}:${option.id}`;
+    const optionToken = String(index);
+    optionLookupByToken.set(optionToken, option);
+    const action = `${prefixKey}:${optionToken}`;
     keyboard.text(label, buildCallbackData(ctx, action));
     if ((index + 1) % resolvedColumns === 0) {
       keyboard.row();
@@ -390,15 +393,37 @@ async function askOptionWithButtons(
   });
 
   const message = await sendMenu(ctx, prompt, { parse_mode: 'Markdown', reply_markup: keyboard });
-  const selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {
-    return matchesCallbackPrefix(callbackCtx.callbackQuery.data, prefixKey);
-  });
   const activeChecker = typeof ensureActive === 'function'
     ? ensureActive
     : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
-  activeChecker();
+  let selected = null;
+  while (!selected) {
+    const selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {
+      return matchesCallbackPrefix(callbackCtx.callbackQuery.data, prefixKey);
+    });
+    activeChecker();
 
-  await selectionCtx.answerCallbackQuery();
+    const selectionAction = parseCallbackData(selectionCtx.callbackQuery.data).action || selectionCtx.callbackQuery.data;
+    const parts = selectionAction.split(':');
+    const selectedToken = opId ? parts.slice(2).join(':') : parts.slice(1).join(':');
+    selected = optionLookupByToken.get(selectedToken)
+      || options.find((option) => String(option.id) === selectedToken);
+
+    if (!selected) {
+      try {
+        await selectionCtx.answerCallbackQuery({
+          text: 'That option is no longer available. Please choose again.',
+          show_alert: false
+        });
+      } catch (_) {}
+      continue;
+    }
+
+    try {
+      await selectionCtx.answerCallbackQuery();
+    } catch (_) {}
+  }
+
   try {
     await ctx.api.deleteMessage(message.chat.id, message.message_id);
   } catch (_) {
@@ -406,10 +431,7 @@ async function askOptionWithButtons(
   }
   await clearMenuMessages(ctx);
 
-  const selectionAction = parseCallbackData(selectionCtx.callbackQuery.data).action || selectionCtx.callbackQuery.data;
-  const parts = selectionAction.split(':');
-  const selectedId = opId ? parts.slice(2).join(':') : parts.slice(1).join(':');
-  return options.find((option) => option.id === selectedId);
+  return selected;
 }
 
 function getOptionLabel(options, id) {

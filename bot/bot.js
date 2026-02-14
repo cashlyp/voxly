@@ -212,6 +212,14 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
   const data = ctx.callbackQuery.data || "";
   const parts = data.split(":");
   if (parts.length < 3) return;
+  const dedupeKey = `alert:${data}|${ctx.callbackQuery?.message?.message_id || ""}`;
+  if (isDuplicateAction(ctx, dedupeKey)) {
+    await safeAnswerCallbackQuery(ctx, {
+      text: "Already processed.",
+      show_alert: false,
+    });
+    return;
+  }
   const action = parts[1];
   const callSid = parts[2];
 
@@ -220,7 +228,7 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
       actionLabel: "Call controls",
     });
     if (!allowed) {
-      await ctx.answerCallbackQuery({
+      await safeAnswerCallbackQuery(ctx, {
         text: "Access required.",
         show_alert: false,
       });
@@ -234,7 +242,7 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
           { action: "mute_alerts" },
           { timeout: 8000 },
         );
-        await ctx.answerCallbackQuery({
+        await safeAnswerCallbackQuery(ctx, {
           text: "🔕 Alerts muted for this call",
           show_alert: false,
         });
@@ -246,7 +254,7 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
           { action: "clarify", text: "Let me retry that step." },
           { timeout: 8000 },
         );
-        await ctx.answerCallbackQuery({
+        await safeAnswerCallbackQuery(ctx, {
           text: "🔄 Retry requested",
           show_alert: false,
         });
@@ -258,13 +266,13 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
           { action: "transfer" },
           { timeout: 8000 },
         );
-        await ctx.answerCallbackQuery({
+        await safeAnswerCallbackQuery(ctx, {
           text: "📞 Transfer request noted",
           show_alert: false,
         });
         break;
       default:
-        await ctx.answerCallbackQuery({
+        await safeAnswerCallbackQuery(ctx, {
           text: "Action not supported yet",
           show_alert: false,
         });
@@ -272,7 +280,7 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
     }
   } catch (error) {
     console.error("Operator action error:", error?.message || error);
-    await ctx.answerCallbackQuery({
+    await safeAnswerCallbackQuery(ctx, {
       text: "⚠️ Failed to execute action",
       show_alert: false,
     });
@@ -281,18 +289,27 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
 
 // Live call console actions (proxy to API webhook handler)
 bot.callbackQuery(/^lc:/, async (ctx) => {
+  const data = String(ctx.callbackQuery?.data || "");
+  const dedupeKey = `lc:${data}|${ctx.callbackQuery?.message?.message_id || ""}`;
+  if (isDuplicateAction(ctx, dedupeKey)) {
+    await safeAnswerCallbackQuery(ctx, {
+      text: "Already processed.",
+      show_alert: false,
+    });
+    return;
+  }
   try {
     const allowed = await requireCapability(ctx, "calllog_view", {
       actionLabel: "Live call console",
     });
     if (!allowed) {
-      await ctx.answerCallbackQuery({
+      await safeAnswerCallbackQuery(ctx, {
         text: "Access required.",
         show_alert: false,
       });
       return;
     }
-    await ctx.answerCallbackQuery();
+    await safeAnswerCallbackQuery(ctx);
     await httpClient.post(
       ctx,
       `${config.apiUrl}/webhook/telegram`,
@@ -302,7 +319,7 @@ bot.callbackQuery(/^lc:/, async (ctx) => {
     return;
   } catch (error) {
     console.error("Live call action proxy error:", error?.message || error);
-    await ctx.answerCallbackQuery({
+    await safeAnswerCallbackQuery(ctx, {
       text: "⚠️ Failed to process action",
       show_alert: false,
     });
@@ -312,9 +329,17 @@ bot.callbackQuery(/^lc:/, async (ctx) => {
 // Transcript actions from realtime status cards
 bot.callbackQuery(/^(tr|rca):/, async (ctx) => {
   const data = String(ctx.callbackQuery?.data || "");
+  const dedupeKey = `transcript:${data}|${ctx.callbackQuery?.message?.message_id || ""}`;
+  if (isDuplicateAction(ctx, dedupeKey)) {
+    await safeAnswerCallbackQuery(ctx, {
+      text: "Already processed.",
+      show_alert: false,
+    });
+    return;
+  }
   const [prefix, callSid] = data.split(":");
   if (!callSid) {
-    await ctx.answerCallbackQuery({
+    await safeAnswerCallbackQuery(ctx, {
       text: "Missing call id",
       show_alert: false,
     });
@@ -325,14 +350,14 @@ bot.callbackQuery(/^(tr|rca):/, async (ctx) => {
       actionLabel: "Call transcript",
     });
     if (!allowed) {
-      await ctx.answerCallbackQuery({
+      await safeAnswerCallbackQuery(ctx, {
         text: "Access required.",
         show_alert: false,
       });
       return;
     }
 
-    await ctx.answerCallbackQuery({
+    await safeAnswerCallbackQuery(ctx, {
       text: prefix === "tr" ? "Loading transcript..." : "Loading transcript audio...",
       show_alert: false,
     });
@@ -344,6 +369,10 @@ bot.callbackQuery(/^(tr|rca):/, async (ctx) => {
     await sendTranscriptAudioFromApi(ctx, callSid);
   } catch (error) {
     console.error("Transcript callback error:", error?.message || error);
+    await safeAnswerCallbackQuery(ctx, {
+      text: "⚠️ Failed to load transcript",
+      show_alert: false,
+    });
     await ctx.reply("⚠️ Failed to load transcript.");
   }
 });
@@ -352,14 +381,14 @@ bot.callbackQuery(/^(tr|rca):/, async (ctx) => {
 bot.use(conversations());
 
 // Global error handler
-bot.catch((err) => {
+bot.catch(async (err) => {
   const errorMessage = `Error while handling update ${err.ctx.update.update_id}:
     ${err.error.message}
     Stack: ${err.error.stack}`;
   console.error(errorMessage);
 
   try {
-    err.ctx.reply("❌ An error occurred. Please try again or contact support.");
+    await err.ctx.reply("❌ An error occurred. Please try again or contact support.");
   } catch (replyError) {
     console.error("Failed to send error message:", replyError);
   }
@@ -523,6 +552,17 @@ registerGuideCommand(bot);
 registerApiCommands(bot);
 registerProviderCommand(bot);
 const API_BASE = config.apiUrl;
+
+async function safeAnswerCallbackQuery(ctx, options = {}) {
+  if (!ctx?.callbackQuery) {
+    return;
+  }
+  try {
+    await ctx.answerCallbackQuery(options);
+  } catch (_) {
+    // Ignore stale/already-answered callback query errors.
+  }
+}
 
 function getRequesterChatId(ctx) {
   const chatId =
@@ -1088,6 +1128,31 @@ bot.on("callback_query:data", async (ctx) => {
         finishMetric("ok");
         break;
 
+      case "PROVIDER:HOME":
+        await renderProviderMenu(ctx, { forceRefresh: true });
+        finishMetric("ok");
+        break;
+
+      case "REQUEST_ACCESS": {
+        const adminUsername = (config.admin.username || "").replace(/^@/, "");
+        if (!adminUsername) {
+          await ctx.reply(
+            "ℹ️ Access requests are enabled, but no admin username is configured.",
+          );
+          finishMetric("ok");
+          break;
+        }
+        const accessKb = new InlineKeyboard()
+          .url("📩 Request Access", `https://t.me/${adminUsername}`)
+          .row()
+          .text("⬅️ Main Menu", buildCallbackData(ctx, "MENU"));
+        await ctx.reply("📩 Contact the admin to request access:", {
+          reply_markup: accessKb,
+        });
+        finishMetric("ok");
+        break;
+      }
+
       case "CALLLOG":
         await renderCalllogMenu(ctx);
         finishMetric("ok");
@@ -1153,6 +1218,10 @@ bot.on("callback_query:data", async (ctx) => {
     }
   } catch (error) {
     console.error("Callback query error:", error);
+    await safeAnswerCallbackQuery(ctx, {
+      text: "⚠️ Failed to process action",
+      show_alert: false,
+    });
     const fallback =
       "❌ An error occurred processing your request. Please try again.";
     const message = error?.userMessage || fallback;
@@ -1227,12 +1296,9 @@ bot.on("message:text", async (ctx) => {
     return;
   }
 
-  // For non-command messages outside conversations
-  if (!ctx.conversation) {
-    await ctx.reply(
-      "👋 Use /help to see available commands or /menu for quick actions.",
-    );
-  }
+  await ctx.reply(
+    "👋 Use the current buttons or /cancel. You can also use /help or /menu.",
+  );
 });
 
 async function bootstrap() {

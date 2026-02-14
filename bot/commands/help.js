@@ -119,7 +119,7 @@ async function handleHelp(ctx) {
                         .text('👥 Users', buildCallbackData(ctx, 'USERS'))
                         .text('📵 Caller Flags', buildCallbackData(ctx, 'CALLER_FLAGS'))
                         .row()
-                        .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER:HOME'));
+                        .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER_STATUS'));
                 }
                 return keyboard;
             })()
