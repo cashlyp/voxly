@@ -204,6 +204,7 @@ function createDigitCollectionService(options = {}) {
     speakAndEndCall,
     clearSilenceTimer,
     queuePendingDigitAction,
+    getTwilioTtsAudioUrl,
     callEndMessages = {},
     closingMessage = 'Thank you for your time. Goodbye.',
     settings = {},
@@ -3481,15 +3482,15 @@ function createDigitCollectionService(options = {}) {
 
       if (!digitFallbackStates.get(callSid)?.active && typeof triggerTwilioGatherFallback === 'function') {
         try {
-          const fallbackPrompt = current?.reprompt_timeout || buildDigitPrompt(current);
+          const fallbackPrompt = buildTimeoutPrompt(
+            current,
+            (Number(current?.retries) || 0) + 1
+          ) || buildDigitPrompt(current);
           const usedFallback = await triggerTwilioGatherFallback(callSid, current, {
-            prompt: queuePendingDigitAction ? '' : fallbackPrompt
+            prompt: fallbackPrompt
           });
           if (usedFallback) {
             transitionCaptureState(callSid, CAPTURE_EVENTS.FALLBACK, { reason: 'twilio_gather_fallback' });
-            if (queuePendingDigitAction && fallbackPrompt) {
-              queuePendingDigitAction(callSid, { type: 'reprompt', text: fallbackPrompt, scheduleTimeout: true });
-            }
             return;
           }
         } catch (err) {
@@ -3638,10 +3639,27 @@ function createDigitCollectionService(options = {}) {
     if (!config?.server?.hostname) return false;
     if (!twilioClient || !config?.twilio?.accountSid || !config?.twilio?.authToken) return false;
     try {
+      const callConfig = callConfigurations.get(callSid) || {};
+      const resolvedOptions = { ...options };
+      if (typeof getTwilioTtsAudioUrl === 'function') {
+        try {
+          if (!resolvedOptions.promptUrl && resolvedOptions.prompt) {
+            resolvedOptions.promptUrl = await getTwilioTtsAudioUrl(resolvedOptions.prompt, callConfig);
+          }
+          if (!resolvedOptions.preambleUrl && resolvedOptions.preamble) {
+            resolvedOptions.preambleUrl = await getTwilioTtsAudioUrl(resolvedOptions.preamble, callConfig);
+          }
+          if (!resolvedOptions.followupUrl && resolvedOptions.followup) {
+            resolvedOptions.followupUrl = await getTwilioTtsAudioUrl(resolvedOptions.followup, callConfig);
+          }
+        } catch (ttsErr) {
+          logDigitMetric('twilio_gather_tts_fallback', { callSid, error: ttsErr?.message || 'tts_unavailable' });
+        }
+      }
       const client = twilioClient(config.twilio.accountSid, config.twilio.authToken);
-      const twiml = buildTwilioGatherTwiml(callSid, expectation, options, hostname);
+      const twiml = buildTwilioGatherTwiml(callSid, expectation, resolvedOptions, hostname);
       await client.calls(callSid).update({ twiml });
-      const promptText = [options?.preamble, options?.prompt].filter(Boolean).join(' ');
+      const promptText = [resolvedOptions?.preamble, resolvedOptions?.prompt].filter(Boolean).join(' ');
       markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: promptText });
       return true;
     } catch (err) {
@@ -3665,10 +3683,26 @@ function createDigitCollectionService(options = {}) {
       return false;
     }
 
+    const callConfig = callConfigurations.get(callSid) || {};
+    const fallbackPrompt = (typeof options.prompt === 'string' && options.prompt.trim())
+      ? options.prompt.trim()
+      : (buildTimeoutPrompt(expectation, (Number(expectation?.retries) || 0) + 1) || buildDigitPrompt(expectation));
+    let promptUrl = options.promptUrl || null;
+    if (!promptUrl && typeof getTwilioTtsAudioUrl === 'function') {
+      try {
+        promptUrl = await getTwilioTtsAudioUrl(fallbackPrompt, callConfig);
+      } catch (ttsErr) {
+        logDigitMetric('twilio_gather_fallback_tts_error', { callSid, error: ttsErr?.message || 'tts_unavailable' });
+      }
+    }
     const client = twilioClient(accountSid, authToken);
-    const twiml = buildTwilioGatherTwiml(callSid, expectation, options);
+    const twiml = buildTwilioGatherTwiml(callSid, expectation, {
+      ...options,
+      prompt: fallbackPrompt,
+      promptUrl
+    });
     await client.calls(callSid).update({ twiml });
-    markDigitPrompted(callSid, null, 0, 'dtmf', { prompt_text: options.prompt || '', reset_buffer: true });
+    markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: fallbackPrompt, reset_buffer: true });
 
     digitFallbackStates.set(callSid, {
       active: true,

@@ -1153,8 +1153,9 @@ async function synthesizeTwilioTtsAudio(text, voiceModel) {
 async function getTwilioTtsAudioUrl(text, callConfig, options = {}) {
   const cleaned = normalizeTwilioTtsText(text);
   if (!cleaned) return null;
-  if (!shouldUseTwilioPlay(callConfig)) return null;
   const cacheOnly = options?.cacheOnly === true;
+  const forceGenerate = options?.forceGenerate === true;
+  if (!forceGenerate && !shouldUseTwilioPlay(callConfig)) return null;
   const voiceModel = resolveDeepgramVoiceModel(callConfig);
   const key = buildTwilioTtsCacheKey(cleaned, voiceModel);
   const now = Date.now();
@@ -1221,18 +1222,23 @@ async function getTwilioTtsAudioUrl(text, callConfig, options = {}) {
   return null;
 }
 
-async function getTwilioTtsAudioUrlSafe(text, callConfig, timeoutMs = 1200) {
+async function getTwilioTtsAudioUrlSafe(
+  text,
+  callConfig,
+  timeoutMs = 1200,
+  options = {},
+) {
   const safeTimeoutMs =
     Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 0;
   if (!safeTimeoutMs) {
-    return getTwilioTtsAudioUrl(text, callConfig);
+    return getTwilioTtsAudioUrl(text, callConfig, options);
   }
   const timeoutPromise = new Promise((resolve) => {
     setTimeout(() => resolve(null), safeTimeoutMs);
   });
   try {
     return await Promise.race([
-      getTwilioTtsAudioUrl(text, callConfig),
+      getTwilioTtsAudioUrl(text, callConfig, options),
       timeoutPromise,
     ]);
   } catch (error) {
@@ -6075,6 +6081,7 @@ async function startServer(options = {}) {
       speakAndEndCall,
       clearSilenceTimer,
       queuePendingDigitAction,
+      getTwilioTtsAudioUrl: getTwilioTtsAudioUrlSafe,
       callEndMessages: CALL_END_MESSAGES,
       closingMessage: CLOSING_MESSAGE,
       settings: DIGIT_SETTINGS,
@@ -12601,6 +12608,19 @@ registerCallRoutes(app, {
   normalizeDateFilter,
   parseBoundedInteger,
   getDigitService: () => digitService,
+  getTranscriptAudioUrl: (text, callConfig, options = {}) => {
+    const timeoutMs = Number(options?.timeoutMs);
+    const effectiveTimeoutMs =
+      Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 12000;
+    return getTwilioTtsAudioUrlSafe(
+      text,
+      callConfig,
+      effectiveTimeoutMs,
+      { forceGenerate: true },
+    );
+  },
+  transcriptAudioTimeoutMs: Number(config.api?.transcriptAudioTimeoutMs) || 12000,
+  transcriptAudioMaxChars: Number(config.api?.transcriptAudioMaxChars) || 2600,
 });
 
 registerStatusRoutes(app, {

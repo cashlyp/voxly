@@ -168,6 +168,50 @@ function pickTranscriptAudioUrl(call, states = []) {
   return null;
 }
 
+function normalizeTranscriptMessage(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildTranscriptAudioNarration(transcripts = [], call = {}, options = {}) {
+  const maxChars = Math.max(
+    800,
+    Math.min(Number(options.maxChars) || 2600, 10000),
+  );
+  const contactLabel = normalizeTranscriptMessage(
+    call?.customer_name ||
+      call?.victim_name ||
+      call?.phone_number ||
+      "the contact",
+  );
+  const lines = [`Call transcript for ${contactLabel}.`];
+  let totalChars = lines[0].length;
+
+  for (const entry of Array.isArray(transcripts) ? transcripts : []) {
+    const message = normalizeTranscriptMessage(entry?.message);
+    if (!message) continue;
+    const speakerValue = String(entry?.speaker || "").toLowerCase();
+    const speaker =
+      speakerValue === "ai"
+        ? "Agent"
+        : speakerValue === "user"
+          ? "Customer"
+          : "Speaker";
+    const line = `${speaker}: ${message}.`;
+    if (totalChars + line.length + 1 > maxChars) {
+      break;
+    }
+    lines.push(line);
+    totalChars += line.length + 1;
+  }
+
+  if (lines.length === 1) {
+    return "";
+  }
+  return lines.join(" ");
+}
+
 function maskNumericToken(value, keepTail = 2) {
   const digits = String(value || "").replace(/\D/g, "");
   if (!digits) return "";
@@ -367,16 +411,53 @@ function createGetTranscriptAudioHandler(ctx = {}) {
         });
       }
 
-      const transcripts = await db.getCallTranscripts(callSid).catch(() => []);
-      if (!Array.isArray(transcripts) || transcripts.length === 0) {
+      const transcriptsRaw = await db.getCallTranscripts(callSid).catch(() => []);
+      if (!Array.isArray(transcriptsRaw) || transcriptsRaw.length === 0) {
         return res.status(404).json({
           success: false,
           error: "Transcript not found",
         });
       }
+      const digitService =
+        typeof ctx.getDigitService === "function"
+          ? ctx.getDigitService()
+          : ctx.digitService;
+      const exposeRawDigits = Boolean(requesterChatId);
+      const transcripts = transcriptsRaw.map((entry) => ({
+        ...entry,
+        message: exposeRawDigits
+          ? resolveTokenizedExternalText(entry?.message || "", callSid, digitService)
+          : maskSensitiveExternalText(entry?.message || "", digitService),
+      }));
 
       const callStates = await db.getCallStates(callSid, { limit: 40 }).catch(() => []);
-      const audioUrl = pickTranscriptAudioUrl(call, callStates);
+      let audioUrl = pickTranscriptAudioUrl(call, callStates);
+      if (!audioUrl && typeof ctx.getTranscriptAudioUrl === "function") {
+        try {
+          const narration = buildTranscriptAudioNarration(transcripts, call, {
+            maxChars: ctx.transcriptAudioMaxChars,
+          });
+          if (narration) {
+            audioUrl = await ctx.getTranscriptAudioUrl(narration, call, {
+              timeoutMs: ctx.transcriptAudioTimeoutMs,
+            });
+            if (audioUrl) {
+              await db
+                .updateCallState(callSid, "transcript_audio_ready", {
+                  audio_url: audioUrl,
+                  source: "transcript_tts",
+                  generated_at: new Date().toISOString(),
+                })
+                .catch(() => {});
+            }
+          }
+        } catch (audioError) {
+          console.error(
+            `Transcript audio generation failed for ${callSid}:`,
+            audioError?.message || audioError,
+          );
+        }
+      }
       if (!audioUrl) {
         return res.status(202).json({
           success: false,

@@ -683,25 +683,7 @@ async function callFlow(conversation, ctx) {
     }
     if (data?.success && data.call_sid) {
       flow.touch('completed');
-      await ctx.reply(
-        section('✅ Call Started', [
-          buildLine('🆔', 'Call SID', `\`${escapeMarkdown(data.call_sid)}\``),
-          buildLine('📞', 'Number', escapeMarkdown(number)),
-          tipLine('🔄', 'Use the buttons below for follow-up actions.')
-        ]),
-        {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: '📜 Call Log', callback_data: buildCallbackData(ctx, 'CALLLOG') }],
-              [
-                { text: '💬 SMS Follow-up', callback_data: buildCallbackData(ctx, 'SMS') },
-                { text: '⬅️ Main Menu', callback_data: buildCallbackData(ctx, 'MENU') }
-              ]
-            ]
-          }
-        }
-      );
+      await ctx.reply('✅ Call initiated.');
     } else {
       await ctx.reply('⚠️ Call was sent but response format unexpected. Check logs.', {
         reply_markup: buildMainMenuReplyMarkup(ctx)

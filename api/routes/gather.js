@@ -76,18 +76,14 @@ function createTwilioGatherHandler(deps = {}) {
       const callConfig = callConfigurations.get(callSid) || {};
       const sayVoice = resolveTwilioSayVoice ? resolveTwilioSayVoice(callConfig) : null;
       const sayOptions = sayVoice ? { voice: sayVoice } : null;
-      const playbackPlan = digitService?.getPlan ? digitService.getPlan(callSid) : null;
-      const isGroupedPlayback = typeof isGroupedGatherPlan === 'function'
-        ? isGroupedGatherPlan(playbackPlan, callConfig)
-        : Boolean(playbackPlan && ['banking', 'card'].includes(playbackPlan.group_id));
-      const usePlayForGrouped = Boolean(
-        isGroupedPlayback && typeof shouldUseTwilioPlay === 'function' && shouldUseTwilioPlay(callConfig)
+      const usePlayForGather = Boolean(
+        typeof shouldUseTwilioPlay === 'function' && shouldUseTwilioPlay(callConfig)
       );
       const safeTtsTimeoutMs = Number.isFinite(Number(ttsTimeoutMs)) && Number(ttsTimeoutMs) > 0
         ? Number(ttsTimeoutMs)
         : 1200;
       const resolveTtsUrl = async (text) => {
-        if (!usePlayForGrouped || !getTwilioTtsAudioUrl || !text) return null;
+        if (!usePlayForGather || !getTwilioTtsAudioUrl || !text) return null;
         if (!safeTtsTimeoutMs) {
           return getTwilioTtsAudioUrl(text, callConfig);
         }
@@ -209,7 +205,7 @@ function createTwilioGatherHandler(deps = {}) {
         callEndLocks?.set(callSid, true);
         const response = new VoiceResponse();
         if (message) {
-          if (usePlayForGrouped && getTwilioTtsAudioUrl) {
+          if (usePlayForGather && getTwilioTtsAudioUrl) {
             const url = await resolveTtsUrl(message);
             if (url) {
               response.play(url);
