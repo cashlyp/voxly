@@ -79,6 +79,15 @@ const twilioMachineDetectionTimeout = Number.isFinite(
   ? Number(twilioMachineDetectionTimeoutRaw)
   : undefined;
 const twilioTtsMaxWaitMs = Number(readEnv("TWILIO_TTS_MAX_WAIT_MS") || "1200");
+const twilioFinalPromptTtsTimeoutMs = Number(
+  readEnv("TWILIO_FINAL_PROMPT_TTS_TIMEOUT_MS") || "6000",
+);
+const twilioTtsStrictPlay =
+  String(readEnv("TWILIO_TTS_STRICT_PLAY") || "true").toLowerCase() ===
+  "true";
+const twilioTtsPrewarmEnabled =
+  String(readEnv("TWILIO_TTS_PREWARM_ENABLED") || "true").toLowerCase() ===
+  "true";
 const twilioWebhookValidationRaw = (
   readEnv("TWILIO_WEBHOOK_VALIDATION") || (isProduction ? "strict" : "warn")
 ).toLowerCase();
@@ -460,6 +469,11 @@ module.exports = {
     ttsMaxWaitMs: Number.isFinite(twilioTtsMaxWaitMs)
       ? twilioTtsMaxWaitMs
       : 1200,
+    finalPromptTtsTimeoutMs: Number.isFinite(twilioFinalPromptTtsTimeoutMs)
+      ? twilioFinalPromptTtsTimeoutMs
+      : 6000,
+    strictTtsPlay: twilioTtsStrictPlay,
+    ttsPrewarmEnabled: twilioTtsPrewarmEnabled,
     webhookValidation: twilioWebhookValidation,
   },
   aws: {

@@ -683,7 +683,6 @@ async function callFlow(conversation, ctx) {
     }
     if (data?.success && data.call_sid) {
       flow.touch('completed');
-      await ctx.reply('✅ Call initiated.');
     } else {
       await ctx.reply('⚠️ Call was sent but response format unexpected. Check logs.', {
         reply_markup: buildMainMenuReplyMarkup(ctx)

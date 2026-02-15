@@ -25,7 +25,33 @@ const SPOKEN_DIGIT_PATTERN = new RegExp(
 const SAFE_TIMEOUT_MIN_S = 3;
 const SAFE_TIMEOUT_MAX_S = 60;
 const SAFE_RETRY_MAX = 5;
+const DEFAULT_TIMEOUT_GRACE_MS = 1200;
 const MAX_DIGITS_BUFFER = 50;  // Prevent unbounded buffer growth
+const PROFILE_TIMEOUT_FLOORS_S = Object.freeze({
+  generic: 8,
+  verification: 12,
+  otp: 12,
+  pin: 10,
+  ssn: 12,
+  dob: 12,
+  routing_number: 12,
+  account_number: 14,
+  account: 12,
+  phone: 12,
+  tax_id: 12,
+  ein: 12,
+  claim_number: 10,
+  reservation_number: 10,
+  ticket_number: 10,
+  case_number: 10,
+  amount: 10,
+  callback_confirm: 12,
+  cvv: 10,
+  card_number: 18,
+  card_expiry: 12,
+  zip: 10,
+  extension: 8
+});
 const DEFAULT_RISK_THRESHOLDS = {
   confirm: 0.55,
   dtmf_only: 0.7,
@@ -237,6 +263,10 @@ function createDigitCollectionService(options = {}) {
     healthThresholds = DEFAULT_HEALTH_THRESHOLDS,
     circuitBreaker = DEFAULT_CIRCUIT_BREAKER
   } = settings;
+
+  const strictTimeoutGraceMs = Number.isFinite(Number(settings.strictTimeoutGraceMs))
+    ? Number(settings.strictTimeoutGraceMs)
+    : DEFAULT_TIMEOUT_GRACE_MS;
 
   const sanitizeMetricValue = (key, value) => {
     const keyName = String(key || '').toLowerCase();
@@ -602,8 +632,24 @@ function createDigitCollectionService(options = {}) {
 
   function buildSoftTimeoutPrompt(expectation = {}) {
     const label = buildExpectedLabel(expectation);
-    return expectation?.soft_timeout_prompt
-      || `Just a reminder—please enter the ${label} when you're ready.`;
+    const stage = Math.max(1, Number(expectation?.soft_timeout_stage) || 1);
+    if (Array.isArray(expectation?.soft_timeout_prompt) && expectation.soft_timeout_prompt.length) {
+      const idx = Math.max(
+        0,
+        Math.min(expectation.soft_timeout_prompt.length - 1, stage - 1),
+      );
+      return expectation.soft_timeout_prompt[idx];
+    }
+    if (typeof expectation?.soft_timeout_prompt === 'string' && expectation.soft_timeout_prompt.trim()) {
+      return expectation.soft_timeout_prompt.trim();
+    }
+    const defaults = [
+      `Just a reminder—please enter the ${label} when you're ready.`,
+      `Still waiting for the ${label}. Please enter it now.`,
+      `Final reminder: please enter the ${label} now.`
+    ];
+    const idx = Math.max(0, Math.min(defaults.length - 1, stage - 1));
+    return defaults[idx];
   }
 
   const OTP_REGEX = /\b\d{4,8}\b/g;
@@ -2586,6 +2632,13 @@ function createDigitCollectionService(options = {}) {
     return DIGIT_PROFILE_DEFAULTS[key] || {};
   }
 
+  function getProfileTimeoutFloor(profile = 'generic') {
+    const normalized = normalizeProfileId(profile) || 'generic';
+    return PROFILE_TIMEOUT_FLOORS_S[normalized]
+      || PROFILE_TIMEOUT_FLOORS_S.generic
+      || SAFE_TIMEOUT_MIN_S;
+  }
+
   function normalizeDigitExpectation(params = {}) {
     const promptHint = `${params.prompt || ''} ${params.prompt_hint || ''}`.toLowerCase();
     const hasExplicitProfile = params.profile !== undefined
@@ -2686,7 +2739,17 @@ function createDigitCollectionService(options = {}) {
 
     const estimatedPromptMs = estimateSpeechDurationMs(params.prompt || params.prompt_hint || '');
     const adjustedDelayMs = Math.max(minCollectDelayMs, estimatedPromptMs, 3000);
-    const safeTimeout = Math.min(SAFE_TIMEOUT_MAX_S, Math.max(SAFE_TIMEOUT_MIN_S, timeout));
+    const timeoutFloor = getProfileTimeoutFloor(profile);
+    const safeTimeout = Math.min(
+      SAFE_TIMEOUT_MAX_S,
+      Math.max(SAFE_TIMEOUT_MIN_S, timeoutFloor, timeout),
+    );
+    const timeoutGraceMs = Number.isFinite(Number(params.timeout_grace_ms))
+      ? Number(params.timeout_grace_ms)
+      : (Number.isFinite(Number(defaults.timeout_grace_ms))
+        ? Number(defaults.timeout_grace_ms)
+        : strictTimeoutGraceMs);
+    const safeTimeoutGraceMs = Math.max(250, Math.min(5000, timeoutGraceMs));
     const safeSoftTimeout = Number.isFinite(softTimeout)
       ? Math.max(1, Math.min(safeTimeout - 1, softTimeout))
       : Math.max(2, Math.round(safeTimeout * 0.6));
@@ -2705,6 +2768,8 @@ function createDigitCollectionService(options = {}) {
       min_digits: normalizedMin,
       max_digits: normalizedMax,
       timeout_s: safeTimeout,
+      timeout_floor_s: timeoutFloor,
+      timeout_grace_ms: safeTimeoutGraceMs,
       soft_timeout_s: safeSoftTimeout,
       soft_timeout_prompt,
       max_retries: safeMaxRetries,
@@ -2793,6 +2858,10 @@ function createDigitCollectionService(options = {}) {
     }
   }
 
+  function buildGatherNonce() {
+    return crypto.randomBytes(8).toString('hex');
+  }
+
   function markDigitPrompted(callSid, gptService = null, interactionCount = 0, source = 'dtmf', options = {}) {
     const expectation = digitCollectionManager.expectations.get(callSid);
     if (!expectation) return false;
@@ -2816,8 +2885,44 @@ function createDigitCollectionService(options = {}) {
       ? expectation.min_collect_delay_ms
       : 0;
     const promptDelayMs = Math.max(1000, baseDelayMs, estimatedPromptMs || 0);
+    const timeoutFloor = getProfileTimeoutFloor(expectation.profile);
+    const timeoutSeconds = Number.isFinite(Number(expectation.timeout_s))
+      ? Number(expectation.timeout_s)
+      : SAFE_TIMEOUT_MIN_S;
+    const effectiveTimeoutMs = Math.max(
+      5000,
+      Math.max(timeoutFloor, timeoutSeconds) * 1000,
+    );
+    const timeoutGraceMs = Number.isFinite(Number(expectation.timeout_grace_ms))
+      ? Number(expectation.timeout_grace_ms)
+      : strictTimeoutGraceMs;
+    const channelConditions = getChannelConditions(callSid, source);
     expectation.prompted_at = now;
     expectation.prompted_delay_ms = promptDelayMs;
+    expectation.timeout_deadline_at =
+      now + promptDelayMs + effectiveTimeoutMs + Math.max(250, timeoutGraceMs);
+    expectation.channel_conditions = {
+      poor: Boolean(channelConditions?.poor),
+      severe: Boolean(channelConditions?.severe),
+      qualityScore: Number.isFinite(channelConditions?.qualityScore)
+        ? channelConditions.qualityScore
+        : null,
+      jitterMs: Number.isFinite(channelConditions?.jitterMs)
+        ? channelConditions.jitterMs
+        : null,
+      rttMs: Number.isFinite(channelConditions?.rttMs)
+        ? channelConditions.rttMs
+        : null,
+      packetLossPct: Number.isFinite(channelConditions?.packetLossPct)
+        ? channelConditions.packetLossPct
+        : null,
+      updated_at: new Date(now).toISOString()
+    };
+    if (source === 'gather') {
+      expectation.gather_prompt_seq = Number(expectation.gather_prompt_seq || 0) + 1;
+      expectation.gather_nonce = buildGatherNonce();
+      expectation.gather_prompted_at = now;
+    }
     if (options.reset_buffer === true && (source === 'dtmf' || source === 'gather')) {
       expectation.buffer = '';
       expectation.collected = [];
@@ -2825,6 +2930,7 @@ function createDigitCollectionService(options = {}) {
       expectation.buffered_at = null;
       expectation.attempt_id = (expectation.attempt_id || 0) + 1;
       expectation.soft_timeout_fired = false;
+      expectation.soft_timeout_stage = 0;
       pendingDigits.delete(callSid);
       updateSessionState(callSid, { partialDigits: '' });
       transitionCaptureState(callSid, CAPTURE_EVENTS.RESUME_COLLECT, { reason: 'reprompt' });
@@ -3019,6 +3125,8 @@ function createDigitCollectionService(options = {}) {
         plan_total_steps: Number.isFinite(params.plan_total_steps) ? params.plan_total_steps : null,
         prompted_at: params.prompted_at || null,
         soft_timeout_fired: false,
+        soft_timeout_stage: 0,
+        timeout_streak: 0,
         retries: 0,
         attempt_count: 0,
         attempt_id: 1,
@@ -3138,6 +3246,36 @@ function createDigitCollectionService(options = {}) {
           source
         };
       }
+      const metaGatherNonce = meta.gather_nonce ? String(meta.gather_nonce) : null;
+      const expGatherNonce = exp.gather_nonce ? String(exp.gather_nonce) : null;
+      if (metaGatherNonce && expGatherNonce && metaGatherNonce !== expGatherNonce) {
+        return {
+          accepted: false,
+          reason: 'stale_nonce',
+          rejection_code: 'STALE_NONCE',
+          ignore: true,
+          profile: exp.profile,
+          mask_for_gpt: exp.mask_for_gpt,
+          source
+        };
+      }
+      const metaPromptSeq = Number.isFinite(Number(meta.gather_prompt_seq))
+        ? Number(meta.gather_prompt_seq)
+        : null;
+      const expPromptSeq = Number.isFinite(Number(exp.gather_prompt_seq))
+        ? Number(exp.gather_prompt_seq)
+        : null;
+      if (Number.isFinite(metaPromptSeq) && Number.isFinite(expPromptSeq) && metaPromptSeq !== expPromptSeq) {
+        return {
+          accepted: false,
+          reason: 'stale_prompt_seq',
+          rejection_code: 'STALE_PROMPT_SEQ',
+          ignore: true,
+          profile: exp.profile,
+          mask_for_gpt: exp.mask_for_gpt,
+          source
+        };
+      }
 
       // Validate input size to prevent buffer overflow
       const cleanDigitsTemp = String(digits || '').replace(/[^0-9]/g, '');
@@ -3154,7 +3292,21 @@ function createDigitCollectionService(options = {}) {
       const attemptId = Number.isFinite(Number(meta.attempt_id))
         ? Number(meta.attempt_id)
         : (Number.isFinite(Number(exp.attempt_id)) ? Number(exp.attempt_id) : 1);
-      const stepId = resolveCaptureStepId(exp, meta);
+      let stepId = resolveCaptureStepId(exp, meta);
+      if (source === 'gather') {
+        const promptSeqScope = Number.isFinite(Number(meta.gather_prompt_seq))
+          ? Number(meta.gather_prompt_seq)
+          : (Number.isFinite(Number(exp.gather_prompt_seq)) ? Number(exp.gather_prompt_seq) : null);
+        if (Number.isFinite(promptSeqScope)) {
+          stepId = `${stepId}:p${promptSeqScope}`;
+        }
+        const nonceScope = meta.gather_nonce
+          ? String(meta.gather_nonce)
+          : (exp.gather_nonce ? String(exp.gather_nonce) : '');
+        if (nonceScope) {
+          stepId = `${stepId}:n${nonceScope.slice(0, 8)}`;
+        }
+      }
       const inputHash = hashInput(cleanDigitsTemp || digits);
       const idempotencyKey = buildGlobalIdempotencyKey({
         scope: 'digit_capture',
@@ -3372,7 +3524,15 @@ function createDigitCollectionService(options = {}) {
       if (Number.isFinite(channelConditions?.packetLossPct) && channelConditions.packetLossPct > 2) multiplier += 0.05;
       return Math.min(1.45, multiplier);
     })();
-    const timeoutMs = Math.max(5000, (exp.timeout_s || 10) * 1000 * timeoutMultiplier);
+    const timeoutFloor = getProfileTimeoutFloor(exp.profile);
+    const baseTimeoutS = Number.isFinite(Number(exp.timeout_s))
+      ? Number(exp.timeout_s)
+      : 10;
+    const effectiveTimeoutS = Math.max(timeoutFloor, baseTimeoutS);
+    const timeoutMs = Math.max(5000, effectiveTimeoutS * 1000 * timeoutMultiplier);
+    const timeoutGraceMs = Number.isFinite(Number(exp.timeout_grace_ms))
+      ? Number(exp.timeout_grace_ms)
+      : strictTimeoutGraceMs;
     const softPromptMs = Number.isFinite(exp.soft_timeout_s)
       ? Math.max(1000, exp.soft_timeout_s * 1000)
       : Math.round(timeoutMs * 0.6);
@@ -3383,7 +3543,7 @@ function createDigitCollectionService(options = {}) {
     const normalizedPromptDelayMs = Math.max(1000, promptDelayMs);
     const elapsedSincePrompt = Date.now() - promptAt;
     const remainingPromptDelayMs = Math.max(0, normalizedPromptDelayMs - elapsedSincePrompt);
-    const waitMs = remainingPromptDelayMs + timeoutMs;
+    const waitMs = remainingPromptDelayMs + timeoutMs + Math.max(250, timeoutGraceMs);
     const softWaitMs = remainingPromptDelayMs + softPromptMs;
 
     if (!exp.soft_timeout_fired && softWaitMs + 200 < waitMs) {
@@ -3401,6 +3561,9 @@ function createDigitCollectionService(options = {}) {
       }, softWaitMs);
       digitTimeouts.set(`${callSid}:soft`, softTimer);
     }
+
+    exp.timeout_deadline_at = promptAt + normalizedPromptDelayMs + timeoutMs + Math.max(250, timeoutGraceMs);
+    digitCollectionManager.expectations.set(callSid, exp);
 
     const timer = setTimeout(async () => {
       const current = digitCollectionManager.expectations.get(callSid);
@@ -3460,27 +3623,8 @@ function createDigitCollectionService(options = {}) {
         && callConfig.digit_capture_active === true
         && current.plan_id === plan.id
       );
-      if (isGroupedPlan) {
-        const timeoutMessage = current.timeout_failure_message || callEndMessages.no_response;
-        updatePlanState(callSid, plan, PLAN_STATES.FAIL, {
-          step_index: current.plan_step_index,
-          reason: 'timeout'
-        });
-        transitionCaptureState(callSid, CAPTURE_EVENTS.ABORT, { reason: 'plan_timeout' });
-        digitCollectionManager.expectations.delete(callSid);
-        clearDigitTimeout(callSid);
-        clearDigitFallbackState(callSid);
-        clearDigitPlan(callSid);
-        setCaptureActive(callSid, false);
-        await completeCaptureSession(callSid, 'aborted', {
-          reason: 'group_plan_timeout',
-          channel: current.channel || 'dtmf'
-        });
-        await speakAndEndCall(callSid, timeoutMessage, 'digit_collection_timeout');
-        return;
-      }
 
-      if (!digitFallbackStates.get(callSid)?.active && typeof triggerTwilioGatherFallback === 'function') {
+      if (!isGroupedPlan && !digitFallbackStates.get(callSid)?.active && typeof triggerTwilioGatherFallback === 'function') {
         try {
           const fallbackPrompt = buildTimeoutPrompt(
             current,
@@ -3506,6 +3650,12 @@ function createDigitCollectionService(options = {}) {
       const qualityRetryBonus = channelConditions?.severe ? 1 : 0;
       const maxRetries = current.max_retries + qualityRetryBonus;
       if (current.retries > maxRetries) {
+        if (isGroupedPlan) {
+          updatePlanState(callSid, plan, PLAN_STATES.FAIL, {
+            step_index: current.plan_step_index,
+            reason: 'timeout'
+          });
+        }
         transitionCaptureState(callSid, CAPTURE_EVENTS.ABORT, { reason: 'max_retries_timeout' });
         digitCollectionManager.expectations.delete(callSid);
         clearDigitTimeout(callSid);
@@ -3579,6 +3729,15 @@ function createDigitCollectionService(options = {}) {
     if (expectation?.channel_session_id) {
       queryParams.set('channelSessionId', String(expectation.channel_session_id));
     }
+    if (Number.isFinite(Number(expectation?.attempt_id))) {
+      queryParams.set('attemptId', String(expectation.attempt_id));
+    }
+    if (expectation?.gather_nonce) {
+      queryParams.set('nonce', String(expectation.gather_nonce));
+    }
+    if (Number.isFinite(Number(expectation?.gather_prompt_seq))) {
+      queryParams.set('promptSeq', String(expectation.gather_prompt_seq));
+    }
     const actionUrl = `https://${host}/webhook/twilio-gather?${queryParams.toString()}`;
     const gatherOptions = {
       input: 'dtmf',
@@ -3641,6 +3800,9 @@ function createDigitCollectionService(options = {}) {
     try {
       const callConfig = callConfigurations.get(callSid) || {};
       const resolvedOptions = { ...options };
+      const promptText = [resolvedOptions?.preamble, resolvedOptions?.prompt].filter(Boolean).join(' ');
+      markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: promptText });
+      const currentExpectation = digitCollectionManager.expectations.get(callSid) || expectation;
       if (typeof getTwilioTtsAudioUrl === 'function') {
         try {
           if (!resolvedOptions.promptUrl && resolvedOptions.prompt) {
@@ -3657,10 +3819,8 @@ function createDigitCollectionService(options = {}) {
         }
       }
       const client = twilioClient(config.twilio.accountSid, config.twilio.authToken);
-      const twiml = buildTwilioGatherTwiml(callSid, expectation, resolvedOptions, hostname);
+      const twiml = buildTwilioGatherTwiml(callSid, currentExpectation, resolvedOptions, hostname);
       await client.calls(callSid).update({ twiml });
-      const promptText = [resolvedOptions?.preamble, resolvedOptions?.prompt].filter(Boolean).join(' ');
-      markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: promptText });
       return true;
     } catch (err) {
       logDigitMetric('twilio_gather_failed', { callSid, error: err.message });
@@ -3696,13 +3856,17 @@ function createDigitCollectionService(options = {}) {
       }
     }
     const client = twilioClient(accountSid, authToken);
-    const twiml = buildTwilioGatherTwiml(callSid, expectation, {
+    markDigitPrompted(callSid, null, 0, 'gather', {
+      prompt_text: fallbackPrompt,
+      reset_buffer: true
+    });
+    const currentExpectation = digitCollectionManager.expectations.get(callSid) || expectation;
+    const twiml = buildTwilioGatherTwiml(callSid, currentExpectation, {
       ...options,
       prompt: fallbackPrompt,
       promptUrl
     });
     await client.calls(callSid).update({ twiml });
-    markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: fallbackPrompt, reset_buffer: true });
 
     digitFallbackStates.set(callSid, {
       active: true,
@@ -5596,6 +5760,7 @@ function createDigitCollectionService(options = {}) {
     buildAdaptiveReprompt,
     buildDigitPrompt,
     buildTimeoutPrompt,
+    buildSoftTimeoutPrompt,
     buildTwilioGatherTwiml,
     buildPlanStepPrompt,
     sendTwilioGather,

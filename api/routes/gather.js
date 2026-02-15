@@ -79,26 +79,95 @@ function createTwilioGatherHandler(deps = {}) {
       const usePlayForGather = Boolean(
         typeof shouldUseTwilioPlay === 'function' && shouldUseTwilioPlay(callConfig)
       );
+      const strictTtsPlay = config?.twilio?.strictTtsPlay === true;
+      const ttsPrewarmEnabled = config?.twilio?.ttsPrewarmEnabled !== false;
       const safeTtsTimeoutMs = Number.isFinite(Number(ttsTimeoutMs)) && Number(ttsTimeoutMs) > 0
         ? Number(ttsTimeoutMs)
         : 1200;
-      const resolveTtsUrl = async (text) => {
+      const finalPromptTtsTimeoutMs = Number.isFinite(Number(config?.twilio?.finalPromptTtsTimeoutMs))
+        && Number(config.twilio.finalPromptTtsTimeoutMs) > 0
+        ? Number(config.twilio.finalPromptTtsTimeoutMs)
+        : Math.max(6000, safeTtsTimeoutMs);
+      const resolveTtsUrl = async (text, options = {}) => {
         if (!usePlayForGather || !getTwilioTtsAudioUrl || !text) return null;
-        if (!safeTtsTimeoutMs) {
-          return getTwilioTtsAudioUrl(text, callConfig);
+        const localTimeoutMs = Number.isFinite(Number(options.timeoutMs)) && Number(options.timeoutMs) > 0
+          ? Number(options.timeoutMs)
+          : safeTtsTimeoutMs;
+        const ttsOptions = options?.ttsOptions && typeof options.ttsOptions === 'object'
+          ? options.ttsOptions
+          : undefined;
+        if (!localTimeoutMs) {
+          return getTwilioTtsAudioUrl(text, callConfig, ttsOptions);
         }
         const timeoutPromise = new Promise((resolve) => {
-          setTimeout(() => resolve(null), safeTtsTimeoutMs);
+          setTimeout(() => resolve(null), localTimeoutMs);
         });
         try {
-          return await Promise.race([
-            getTwilioTtsAudioUrl(text, callConfig),
+          let url = await Promise.race([
+            getTwilioTtsAudioUrl(text, callConfig, ttsOptions),
             timeoutPromise
           ]);
+          if (!url && options.strictRequired === true) {
+            // Strict hosted-TTS mode retries once before giving up.
+            url = await Promise.race([
+              getTwilioTtsAudioUrl(text, callConfig, {
+                ...(ttsOptions || {}),
+                forceGenerate: true
+              }),
+              new Promise((resolve) => {
+                setTimeout(
+                  () => resolve(null),
+                  Math.max(localTimeoutMs + 1000, 2500),
+                );
+              })
+            ]);
+          }
+          return url;
         } catch (error) {
           console.error('Twilio TTS timeout fallback:', error);
           return null;
         }
+      };
+      const prewarmTtsMessages = (messages = []) => {
+        if (!ttsPrewarmEnabled || !usePlayForGather || !getTwilioTtsAudioUrl) return;
+        const uniqueMessages = [...new Set(
+          (Array.isArray(messages) ? messages : [])
+            .map((value) => String(value || '').trim())
+            .filter(Boolean)
+        )];
+        if (!uniqueMessages.length) return;
+        for (const text of uniqueMessages) {
+          Promise.resolve(
+            getTwilioTtsAudioUrl(text, callConfig, {
+              cacheOnly: true,
+              forceGenerate: true
+            })
+          ).catch(() => {});
+        }
+      };
+      const resolveTimeoutDeadlineAt = (exp) => {
+        const promptedAt = Number(exp?.prompted_at);
+        const promptDelayMs = Number.isFinite(Number(exp?.prompted_delay_ms))
+          ? Number(exp.prompted_delay_ms)
+          : 0;
+        const timeoutMs = Math.max(3000, Number(exp?.timeout_s || 10) * 1000);
+        const timeoutGraceMs = Number.isFinite(Number(exp?.timeout_grace_ms))
+          ? Number(exp.timeout_grace_ms)
+          : 1200;
+        const computed = (Number.isFinite(promptedAt) ? promptedAt : Date.now())
+          + promptDelayMs
+          + timeoutMs
+          + Math.max(250, timeoutGraceMs);
+        const explicit = Number(exp?.timeout_deadline_at);
+        if (Number.isFinite(explicit) && explicit > 0) {
+          return Math.max(explicit, computed);
+        }
+        return computed;
+      };
+      const isBeforeTimeoutBudget = (exp) => {
+        if (!exp) return false;
+        const deadlineAt = resolveTimeoutDeadlineAt(exp);
+        return Date.now() + 250 < deadlineAt;
       };
       const respondWithGather = async (exp, promptText = '', followupText = '', options = {}) => {
         try {
@@ -121,6 +190,16 @@ function createTwilioGatherHandler(deps = {}) {
           );
           res.type('text/xml');
           res.end(twiml);
+          if (exp) {
+            prewarmTtsMessages([
+              followupText,
+              digitService?.buildTimeoutPrompt
+                ? digitService.buildTimeoutPrompt(exp, (Number(exp?.retries) || 0) + 1)
+                : (exp.reprompt_timeout || ''),
+              exp.timeout_failure_message || callEndMessages.no_response || '',
+              exp.failure_message || callEndMessages.failure || ''
+            ]);
+          }
           return true;
         } catch (err) {
           console.error('Twilio gather build error:', err);
@@ -137,6 +216,36 @@ function createTwilioGatherHandler(deps = {}) {
         ].map((value) => Number(value)).filter((value) => Number.isFinite(value));
         if (!candidates.length) return 2;
         return Math.max(0, Math.min(6, candidates[0]));
+      };
+      const resolveAdaptiveRetryBudget = (exp = {}, callConfig = {}, reason = 'timeout') => {
+        const baseRetries = resolveMaxRetries(exp, callConfig);
+        const quality = exp?.channel_conditions || {};
+        let bonus = 0;
+        if (quality?.severe) {
+          bonus += 1;
+        }
+        if (reason === 'timeout' && Number(exp?.timeout_streak || 0) >= 2) {
+          bonus += 1;
+        }
+        return Math.max(0, Math.min(8, baseRetries + bonus));
+      };
+      const applyAdaptiveTimeoutForRetry = (exp = {}, reason = 'timeout') => {
+        if (!exp || reason !== 'timeout') return exp;
+        const quality = exp?.channel_conditions || {};
+        let boostSeconds = 0;
+        if (quality?.severe) {
+          boostSeconds += 4;
+        } else if (quality?.poor) {
+          boostSeconds += 2;
+        }
+        if (Number(exp?.timeout_streak || 0) >= 2) {
+          boostSeconds += 1;
+        }
+        if (boostSeconds <= 0) return exp;
+        const currentTimeout = Number(exp.timeout_s);
+        const safeCurrent = Number.isFinite(currentTimeout) ? currentTimeout : 10;
+        exp.timeout_s = Math.max(5, Math.min(45, safeCurrent + boostSeconds));
+        return exp;
       };
       const triggerPressOneFallback = async (exp, reason = 'retry') => {
         if (!exp || exp.fallback_prompted) return false;
@@ -159,6 +268,15 @@ function createTwilioGatherHandler(deps = {}) {
       const queryChannelSessionId = req.query?.channelSessionId
         ? String(req.query.channelSessionId)
         : null;
+      const queryAttemptId = req.query?.attemptId
+        ? String(req.query.attemptId)
+        : null;
+      const queryNonce = req.query?.nonce
+        ? String(req.query.nonce)
+        : null;
+      const queryPromptSeq = Number.isFinite(Number(req.query?.promptSeq))
+        ? Number(req.query.promptSeq)
+        : null;
       const shouldResetOnInterrupt = (exp, reason = '') => {
         if (!exp) return false;
         if (exp.reset_on_interrupt === true) return true;
@@ -172,19 +290,64 @@ function createTwilioGatherHandler(deps = {}) {
         ].includes(reasonCode);
       };
       const currentExpectation = digitService?.getExpectation?.(callSid);
-      if (currentExpectation && (queryPlanId || queryStepIndex || queryChannelSessionId)) {
+      if (
+        currentExpectation &&
+        (
+          queryPlanId ||
+          queryStepIndex ||
+          queryChannelSessionId ||
+          queryAttemptId ||
+          queryNonce ||
+          queryPromptSeq
+        )
+      ) {
+        const currentAttemptId = Number.isFinite(Number(currentExpectation.attempt_id))
+          ? String(currentExpectation.attempt_id)
+          : null;
+        const currentPromptSeq = Number.isFinite(Number(currentExpectation.gather_prompt_seq))
+          ? Number(currentExpectation.gather_prompt_seq)
+          : null;
+        const currentNonce = currentExpectation.gather_nonce
+          ? String(currentExpectation.gather_nonce)
+          : null;
         const missingPlan = queryPlanId && !currentExpectation.plan_id;
         const missingStep = Number.isFinite(queryStepIndex) && !Number.isFinite(currentExpectation.plan_step_index);
+        const missingAttempt = queryAttemptId && !currentAttemptId;
+        const missingNonce = queryNonce && !currentNonce;
+        const missingPromptSeq = Number.isFinite(queryPromptSeq) && !Number.isFinite(currentPromptSeq);
         const mismatchedPlan = queryPlanId && currentExpectation.plan_id && queryPlanId !== String(currentExpectation.plan_id);
         const mismatchedStep = Number.isFinite(queryStepIndex)
           && Number.isFinite(currentExpectation.plan_step_index)
           && queryStepIndex !== Number(currentExpectation.plan_step_index);
+        const mismatchedAttempt = queryAttemptId
+          && currentAttemptId
+          && queryAttemptId !== currentAttemptId;
+        const mismatchedPromptSeq = Number.isFinite(queryPromptSeq)
+          && Number.isFinite(currentPromptSeq)
+          && queryPromptSeq !== currentPromptSeq;
+        const mismatchedNonce = queryNonce
+          && currentNonce
+          && queryNonce !== currentNonce;
         const mismatchedChannelSession = queryChannelSessionId
           && currentExpectation.channel_session_id
           && queryChannelSessionId !== String(currentExpectation.channel_session_id);
-        if (missingPlan || missingStep || mismatchedPlan || mismatchedStep || mismatchedChannelSession) {
+        if (
+          missingPlan ||
+          missingStep ||
+          missingAttempt ||
+          missingNonce ||
+          missingPromptSeq ||
+          mismatchedPlan ||
+          mismatchedStep ||
+          mismatchedAttempt ||
+          mismatchedPromptSeq ||
+          mismatchedNonce ||
+          mismatchedChannelSession
+        ) {
           const prompt = currentExpectation.prompt || digitService.buildDigitPrompt(currentExpectation);
-          console.warn(`Stale gather ignored for ${callSid} (plan=${queryPlanId || 'n/a'} step=${queryStepIndex ?? 'n/a'})`);
+          console.warn(
+            `Stale gather ignored for ${callSid} (plan=${queryPlanId || 'n/a'} step=${queryStepIndex ?? 'n/a'} attempt=${queryAttemptId || 'n/a'} nonce=${queryNonce ? 'set' : 'n/a'})`,
+          );
           if (await respondWithGather(currentExpectation, prompt)) {
             return;
           }
@@ -206,13 +369,24 @@ function createTwilioGatherHandler(deps = {}) {
         const response = new VoiceResponse();
         if (message) {
           if (usePlayForGather && getTwilioTtsAudioUrl) {
-            const url = await resolveTtsUrl(message);
+            const url = await resolveTtsUrl(message, {
+              timeoutMs: finalPromptTtsTimeoutMs,
+              ttsOptions: { forceGenerate: true },
+              strictRequired: strictTtsPlay
+            });
             if (url) {
               response.play(url);
-            } else if (sayOptions) {
-              response.say(sayOptions, message);
             } else {
-              response.say(message);
+              if (strictTtsPlay) {
+                console.warn(
+                  `Strict hosted TTS mode active for ${callSid}; hanging up without Twilio say fallback.`,
+                );
+                response.pause({ length: 1 });
+              } else if (sayOptions) {
+                response.say(sayOptions, message);
+              } else {
+                response.say(message);
+              }
             }
           } else if (sayOptions) {
             response.say(sayOptions, message);
@@ -224,17 +398,87 @@ function createTwilioGatherHandler(deps = {}) {
         res.type('text/xml');
         res.end(response.toString());
       };
+      const setCaptureFlowNormal = (reason = 'timeout') => {
+        if (digitService?.setCaptureActive) {
+          digitService.setCaptureActive(callSid, false, { reason });
+          return;
+        }
+        if (typeof setCallFlowState === 'function') {
+          setCallFlowState(
+            callSid,
+            {
+              flow_state: 'normal',
+              reason,
+              call_mode: 'normal',
+              digit_capture_active: false,
+            },
+            { callConfig, source: 'twilio_gather' }
+          );
+          return;
+        }
+        callConfig.digit_capture_active = false;
+        if (callConfig.call_mode === 'dtmf_capture') {
+          callConfig.call_mode = 'normal';
+        }
+        callConfig.flow_state = 'normal';
+        callConfig.flow_state_reason = reason;
+        callConfig.flow_state_updated_at = new Date().toISOString();
+        callConfigurations.set(callSid, callConfig);
+      };
+      const finalizeTerminalCapture = async ({
+        expectation: exp,
+        planRef = null,
+        reason = 'timeout',
+        message = '',
+        updatePlanFail = false
+      } = {}) => {
+        clearPendingDigitReprompts?.(callSid);
+        digitService.clearDigitFallbackState(callSid);
+        digitService.clearDigitPlan(callSid);
+        if (updatePlanFail && planRef && digitService?.updatePlanState) {
+          digitService.updatePlanState(callSid, planRef, 'FAIL', {
+            step_index: exp?.plan_step_index,
+            reason
+          });
+        }
+        setCaptureFlowNormal(reason);
+        await respondWithHangup(message || callEndMessages.no_response);
+      };
+      const trySoftTimeoutLadder = async (exp = {}, reason = 'timeout') => {
+        if (!exp) return false;
+        if (exp.soft_timeout_fired) return false;
+        exp.soft_timeout_fired = true;
+        exp.soft_timeout_stage = Number(exp.soft_timeout_stage || 0) + 1;
+        if (digitService?.expectations?.set) {
+          digitService.expectations.set(callSid, exp);
+        }
+        const softPrompt = digitService?.buildSoftTimeoutPrompt
+          ? digitService.buildSoftTimeoutPrompt(exp)
+          : 'Just a reminder, please enter the digits when ready.';
+        clearPendingDigitReprompts?.(callSid);
+        digitService.clearDigitTimeout(callSid);
+        webhookService?.addLiveEvent?.(callSid, `🕒 Soft timeout prompt (${reason})`, { force: false });
+        return await respondWithGather(exp, softPrompt, '', {
+          resetBuffer: false
+        });
+      };
 
       digitService?.clearDigitTimeout?.(callSid);
 
       const digits = String(Digits || '').trim();
       const stepTag = expectation?.plan_id ? `${expectation.plan_id}:${expectation.plan_step_index || 'na'}` : 'no_plan';
-      const dedupeKey = digits
-        ? `${callSid}:${stepTag}:${queryChannelSessionId || expectation?.channel_session_id || 'no_channel'}:${digits}`
-        : null;
+      const dedupeAttempt = queryAttemptId
+        || (Number.isFinite(Number(expectation?.attempt_id)) ? String(expectation.attempt_id) : 'na');
+      const dedupePromptSeq = Number.isFinite(queryPromptSeq)
+        ? String(queryPromptSeq)
+        : (Number.isFinite(Number(expectation?.gather_prompt_seq)) ? String(expectation.gather_prompt_seq) : 'na');
+      const dedupeNonce = queryNonce || expectation?.gather_nonce || 'na';
+      const dedupeEvent = digits ? 'digits' : 'timeout';
+      const dedupeValue = digits || '_empty_';
+      const dedupeKey = `${callSid}:${stepTag}:${queryChannelSessionId || expectation?.channel_session_id || 'no_channel'}:${dedupeAttempt}:${dedupePromptSeq}:${dedupeNonce}:${dedupeEvent}:${dedupeValue}`;
       if (dedupeKey) {
         const lastSeen = gatherEventDedupe?.get(dedupeKey);
-        if (lastSeen && Date.now() - lastSeen < 2000) {
+        if (lastSeen && Date.now() - lastSeen < 4000) {
           console.warn(`Duplicate gather webhook ignored for ${callSid}`);
           const currentExpectation = digitService?.getExpectation?.(callSid);
           if (currentExpectation) {
@@ -250,6 +494,12 @@ function createTwilioGatherHandler(deps = {}) {
       }
       if (digits) {
         const expectation = digitService.getExpectation(callSid);
+        if (expectation && digitService?.expectations?.set) {
+          expectation.timeout_streak = 0;
+          expectation.soft_timeout_fired = false;
+          expectation.soft_timeout_stage = 0;
+          digitService.expectations.set(callSid, expectation);
+        }
         if (expectation?.fallback_mode === 'press1') {
           const accepted = digits === '1';
           webhookService?.addLiveEvent?.(callSid, accepted ? '✅ Fallback confirmed' : '❌ Fallback rejected', { force: true });
@@ -287,7 +537,11 @@ function createTwilioGatherHandler(deps = {}) {
             return;
           }
           const failureMessage = expectation?.timeout_failure_message || callEndMessages.no_response;
-          await respondWithHangup(failureMessage);
+          await finalizeTerminalCapture({
+            expectation,
+            reason: 'fallback_press1_rejected',
+            message: failureMessage
+          });
           return;
         }
         const plan = digitService?.getPlan ? digitService.getPlan(callSid) : null;
@@ -310,7 +564,13 @@ function createTwilioGatherHandler(deps = {}) {
           attempt_id: attemptId,
           plan_id: expectation?.plan_id || null,
           plan_step_index: expectation?.plan_step_index || null,
-          channel_session_id: queryChannelSessionId || expectation?.channel_session_id || null
+          channel_session_id: queryChannelSessionId || expectation?.channel_session_id || null,
+          gather_nonce: queryNonce || expectation?.gather_nonce || null,
+          gather_prompt_seq: Number.isFinite(queryPromptSeq)
+            ? queryPromptSeq
+            : (Number.isFinite(Number(expectation?.gather_prompt_seq))
+              ? Number(expectation.gather_prompt_seq)
+              : null)
         });
         await digitService.handleCollectionResult(callSid, collection, null, 0, 'gather', { allowCallEnd: true, deferCallEnd: true });
 
@@ -323,7 +583,6 @@ function createTwilioGatherHandler(deps = {}) {
             const nextPrompt = isGroupedPlan ? `Thanks. ${stepPrompt}` : stepPrompt;
             clearPendingDigitReprompts?.(callSid);
             digitService.clearDigitTimeout(callSid);
-            digitService.markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: nextPrompt });
             if (await respondWithGather(nextExpectation, nextPrompt)) {
               return;
             }
@@ -357,19 +616,30 @@ function createTwilioGatherHandler(deps = {}) {
 
         if (collection.fallback) {
           const failureMessage = expectation?.failure_message || callEndMessages.failure;
-          clearPendingDigitReprompts?.(callSid);
-          await respondWithHangup(failureMessage);
+          await finalizeTerminalCapture({
+            expectation,
+            planRef: plan,
+            reason: 'max_retries',
+            message: failureMessage,
+            updatePlanFail: Boolean(plan)
+          });
           return;
         }
 
         const attemptCount = collection.attempt_count || expectation?.attempt_count || collection.retries || 1;
-        const maxRetries = resolveMaxRetries(expectation, callConfig);
-        if (Number.isFinite(maxRetries) && attemptCount >= maxRetries) {
+        const maxRetries = resolveAdaptiveRetryBudget(expectation, callConfig, 'invalid');
+        if (Number.isFinite(maxRetries) && attemptCount > maxRetries) {
           if (await triggerPressOneFallback(expectation, 'max_retries')) {
             return;
           }
           const failureMessage = expectation?.failure_message || callEndMessages.failure || callEndMessages.no_response;
-          await respondWithHangup(failureMessage);
+          await finalizeTerminalCapture({
+            expectation,
+            planRef: plan,
+            reason: 'max_retries',
+            message: failureMessage,
+            updatePlanFail: Boolean(plan)
+          });
           return;
         }
         let reprompt = digitService?.buildAdaptiveReprompt
@@ -380,7 +650,6 @@ function createTwilioGatherHandler(deps = {}) {
         }
         clearPendingDigitReprompts?.(callSid);
         digitService.clearDigitTimeout(callSid);
-        digitService.markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: reprompt });
         if (await respondWithGather(expectation, reprompt, '', {
           resetBuffer: shouldResetOnInterrupt(expectation, collection.reason)
         })) {
@@ -395,72 +664,95 @@ function createTwilioGatherHandler(deps = {}) {
         ? isGroupedGatherPlan(plan, callConfig)
         : Boolean(plan && ['banking', 'card'].includes(plan.group_id));
       if (isGroupedPlan) {
-        const now = Date.now();
-        const timeoutMs = Math.max(3000, (expectation?.timeout_s || 10) * 1000);
-        const promptedAt = expectation?.prompted_at;
-        const promptDelayMs = Number.isFinite(expectation?.prompted_delay_ms)
-          ? expectation.prompted_delay_ms
-          : 0;
-        if (promptedAt) {
-          const expectedTimeoutAt = promptedAt + promptDelayMs + timeoutMs;
-          if (now + 250 < expectedTimeoutAt) {
-            const prompt = digitService.buildPlanStepPrompt
-              ? digitService.buildPlanStepPrompt(expectation)
-              : (expectation.prompt || digitService.buildDigitPrompt(expectation));
-            if (await respondWithGather(expectation, prompt, '', {
-              resetBuffer: shouldResetOnInterrupt(expectation, 'timeout')
-            })) {
-              return;
-            }
+        expectation.timeout_streak = Number(expectation.timeout_streak || 0) + 1;
+        expectation.soft_timeout_stage = Number(expectation.soft_timeout_stage || 0);
+        if (digitService?.expectations?.set) {
+          digitService.expectations.set(callSid, expectation);
+        }
+        if (await trySoftTimeoutLadder(expectation, 'grouped')) {
+          return;
+        }
+        if (isBeforeTimeoutBudget(expectation)) {
+          const prompt = digitService.buildPlanStepPrompt
+            ? digitService.buildPlanStepPrompt(expectation)
+            : (expectation.prompt || digitService.buildDigitPrompt(expectation));
+          if (await respondWithGather(expectation, prompt, '', {
+            resetBuffer: shouldResetOnInterrupt(expectation, 'timeout')
+          })) {
+            return;
           }
         }
-        const timeoutMessage = expectation.timeout_failure_message || callEndMessages.no_response;
+        expectation.retries = (expectation.retries || 0) + 1;
+        expectation.soft_timeout_fired = false;
+        expectation.soft_timeout_stage = 0;
+        applyAdaptiveTimeoutForRetry(expectation, 'timeout');
+        if (digitService?.expectations?.set) {
+          digitService.expectations.set(callSid, expectation);
+        }
+        const maxRetries = resolveAdaptiveRetryBudget(expectation, callConfig, 'timeout');
+        if (Number.isFinite(maxRetries) && expectation.retries > maxRetries) {
+          const timeoutMessage = expectation.timeout_failure_message || callEndMessages.no_response;
+          await finalizeTerminalCapture({
+            expectation,
+            planRef: plan,
+            reason: 'timeout',
+            message: timeoutMessage,
+            updatePlanFail: true
+          });
+          return;
+        }
+        const timeoutPrompt = digitService?.buildTimeoutPrompt
+          ? digitService.buildTimeoutPrompt(expectation, expectation.retries || 1)
+          : (expectation.reprompt_timeout
+            || expectation.reprompt_message
+            || 'I did not receive any input. Please enter the code using your keypad.');
         clearPendingDigitReprompts?.(callSid);
-        digitService.clearDigitFallbackState(callSid);
-        digitService.clearDigitPlan(callSid);
-        if (digitService?.updatePlanState) {
-          digitService.updatePlanState(callSid, plan, 'FAIL', { step_index: expectation?.plan_step_index, reason: 'timeout' });
+        digitService.clearDigitTimeout(callSid);
+        if (await respondWithGather(expectation, timeoutPrompt, '', {
+          resetBuffer: shouldResetOnInterrupt(expectation, 'timeout')
+        })) {
+          return;
         }
-        if (digitService?.setCaptureActive) {
-          digitService.setCaptureActive(callSid, false, { reason: 'timeout' });
-        } else if (typeof setCallFlowState === 'function') {
-          setCallFlowState(
-            callSid,
-            {
-              flow_state: 'normal',
-              reason: 'timeout',
-              call_mode: 'normal',
-              digit_capture_active: false,
-            },
-            { callConfig, source: 'twilio_gather' }
-          );
-        } else {
-          callConfig.digit_capture_active = false;
-          if (callConfig.call_mode === 'dtmf_capture') {
-            callConfig.call_mode = 'normal';
-          }
-          callConfig.flow_state = 'normal';
-          callConfig.flow_state_reason = 'timeout';
-          callConfig.flow_state_updated_at = new Date().toISOString();
-          callConfigurations.set(callSid, callConfig);
-        }
-        await respondWithHangup(timeoutMessage);
+        respondWithStream();
         return;
       }
 
+      expectation.timeout_streak = Number(expectation.timeout_streak || 0) + 1;
+      expectation.soft_timeout_stage = Number(expectation.soft_timeout_stage || 0);
+      if (digitService?.expectations?.set) {
+        digitService.expectations.set(callSid, expectation);
+      }
+      if (await trySoftTimeoutLadder(expectation, 'default')) {
+        return;
+      }
+      if (isBeforeTimeoutBudget(expectation)) {
+        const prompt = expectation.prompt || digitService.buildDigitPrompt(expectation);
+        if (await respondWithGather(expectation, prompt, '', {
+          resetBuffer: shouldResetOnInterrupt(expectation, 'timeout')
+        })) {
+          return;
+        }
+      }
+
       expectation.retries = (expectation.retries || 0) + 1;
+      expectation.soft_timeout_fired = false;
+      expectation.soft_timeout_stage = 0;
+      applyAdaptiveTimeoutForRetry(expectation, 'timeout');
       digitService.expectations.set(callSid, expectation);
 
-      const maxRetries = resolveMaxRetries(expectation, callConfig);
-      if (Number.isFinite(maxRetries) && expectation.retries >= maxRetries) {
+      const maxRetries = resolveAdaptiveRetryBudget(expectation, callConfig, 'timeout');
+      if (Number.isFinite(maxRetries) && expectation.retries > maxRetries) {
         if (await triggerPressOneFallback(expectation, 'timeout')) {
           return;
         }
         const timeoutMessage = expectation.timeout_failure_message || callEndMessages.no_response;
-        clearPendingDigitReprompts?.(callSid);
-        digitService.clearDigitFallbackState(callSid);
-        digitService.clearDigitPlan(callSid);
-        await respondWithHangup(timeoutMessage);
+        await finalizeTerminalCapture({
+          expectation,
+          planRef: plan,
+          reason: 'timeout',
+          message: timeoutMessage,
+          updatePlanFail: Boolean(plan)
+        });
         return;
       }
 
@@ -471,7 +763,6 @@ function createTwilioGatherHandler(deps = {}) {
           || 'I did not receive any input. Please enter the code using your keypad.');
       clearPendingDigitReprompts?.(callSid);
       digitService.clearDigitTimeout(callSid);
-      digitService.markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: timeoutPrompt });
       if (await respondWithGather(expectation, timeoutPrompt, '', {
         resetBuffer: shouldResetOnInterrupt(expectation, 'timeout')
       })) {

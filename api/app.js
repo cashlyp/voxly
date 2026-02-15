@@ -1062,17 +1062,29 @@ function resolveTwilioSayVoice(callConfig) {
 }
 
 function resolveDeepgramVoiceModel(callConfig) {
-  const model = callConfig?.voice_model;
-  if (model && typeof model === "string") {
-    const normalized = model.toLowerCase();
-    if (
-      !["alice", "man", "woman"].includes(normalized) &&
-      !model.startsWith("Polly.")
-    ) {
-      return model;
+  if (callConfig && typeof callConfig === "object") {
+    const lockedModel = String(callConfig.deepgram_voice_model_locked || "").trim();
+    if (lockedModel) {
+      return lockedModel;
     }
   }
-  return config.deepgram?.voiceModel || "aura-asteria-en";
+
+  const candidateModel = callConfig?.voice_model;
+  let resolvedModel = config.deepgram?.voiceModel || "aura-asteria-en";
+  if (candidateModel && typeof candidateModel === "string") {
+    const normalized = candidateModel.toLowerCase();
+    if (
+      !["alice", "man", "woman"].includes(normalized) &&
+      !candidateModel.startsWith("Polly.")
+    ) {
+      resolvedModel = candidateModel;
+    }
+  }
+
+  if (callConfig && typeof callConfig === "object") {
+    callConfig.deepgram_voice_model_locked = resolvedModel;
+  }
+  return resolvedModel;
 }
 
 function shouldUseTwilioPlay(callConfig) {
@@ -5743,11 +5755,49 @@ async function speakAndEndCall(callSid, message, reason = "completed") {
       const authToken = config.twilio.authToken;
       if (accountSid && authToken) {
         const response = new VoiceResponse();
-        const sayVoice = resolveTwilioSayVoice(callConfig);
-        if (sayVoice) {
-          response.say({ voice: sayVoice }, text);
-        } else {
-          response.say(text);
+        const shouldUseHostedTts = shouldUseTwilioPlay(callConfig);
+        const strictTtsPlay = config.twilio?.strictTtsPlay === true;
+        let playedHostedTts = false;
+        if (shouldUseHostedTts) {
+          const finalPromptTtsTimeoutMs = Number.isFinite(
+            Number(config.twilio?.finalPromptTtsTimeoutMs),
+          )
+            ? Number(config.twilio.finalPromptTtsTimeoutMs)
+            : 6000;
+          let ttsUrl = await getTwilioTtsAudioUrlSafe(
+            text,
+            callConfig,
+            Math.max(1500, finalPromptTtsTimeoutMs),
+            { forceGenerate: true },
+          );
+          if (!ttsUrl && strictTtsPlay) {
+            // Strict hosted-TTS mode: retry once before abandoning Twilio say().
+            ttsUrl = await getTwilioTtsAudioUrlSafe(
+              text,
+              callConfig,
+              Math.max(2500, finalPromptTtsTimeoutMs + 1500),
+              { forceGenerate: true },
+            );
+          }
+          if (ttsUrl) {
+            response.play(ttsUrl);
+            playedHostedTts = true;
+          }
+        }
+        if (!playedHostedTts) {
+          if (strictTtsPlay && shouldUseHostedTts) {
+            console.warn(
+              `Strict hosted TTS mode active for ${callSid}; ending call without Twilio say fallback.`,
+            );
+            response.pause({ length: 1 });
+          } else {
+            const sayVoice = resolveTwilioSayVoice(callConfig);
+            if (sayVoice) {
+              response.say({ voice: sayVoice }, text);
+            } else {
+              response.say(text);
+            }
+          }
         }
         response.hangup();
         const client = twilio(accountSid, authToken);
