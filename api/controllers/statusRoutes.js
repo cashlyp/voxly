@@ -276,12 +276,109 @@ function createHealthHandler(ctx = {}) {
   };
 }
 
+function parseWindowMinutes(rawValue, fallback = 60) {
+  const parsed = Number.parseInt(rawValue, 10);
+  if (!Number.isFinite(parsed)) return Math.max(1, Math.min(1440, Number(fallback) || 60));
+  return Math.max(1, Math.min(1440, parsed));
+}
+
+function createGptObservabilityHandler(ctx = {}) {
+  const { config, verifyHmacSignature, hasAdminToken } = ctx;
+
+  return async function handleGptObservability(req, res) {
+    try {
+      const db =
+        typeof ctx.getDb === "function"
+          ? ctx.getDb()
+          : ctx.db;
+      if (!db) {
+        return res.status(500).json({
+          success: false,
+          error: "Database unavailable",
+        });
+      }
+
+      const hmacSecret = config.apiAuth?.hmacSecret;
+      const hmacOk = hmacSecret ? verifyHmacSignature(req).ok : false;
+      const adminOk = hasAdminToken(req);
+      if (!hmacOk && !adminOk) {
+        return res.status(401).json({
+          success: false,
+          error: "Unauthorized",
+        });
+      }
+
+      const requestedWindow = parseWindowMinutes(
+        req.query?.window_minutes,
+        config.openRouter?.alerting?.windowMinutes || 60,
+      );
+      const summary = await db.getGptObservabilitySummary(requestedWindow);
+      const thresholds = {
+        tool_failure_rate:
+          Number(config.openRouter?.alerting?.toolFailureRate) ||
+          Number(config.openRouter?.slo?.toolFailureRate) ||
+          0.35,
+        circuit_open_count:
+          Number(config.openRouter?.alerting?.circuitOpenCount) || 2,
+        slo_degraded_count:
+          Number(config.openRouter?.alerting?.sloDegradedCount) || 1,
+      };
+      const alerts = [];
+      const failureRate = Number(summary?.tool_execution?.failure_rate) || 0;
+      const circuitOpenCount = Number(summary?.circuits?.open) || 0;
+      const sloDegradedCount = Number(summary?.slo?.degraded) || 0;
+
+      if (failureRate > thresholds.tool_failure_rate) {
+        alerts.push({
+          code: "tool_failure_rate_high",
+          severity: "high",
+          current: failureRate,
+          threshold: thresholds.tool_failure_rate,
+        });
+      }
+      if (circuitOpenCount >= thresholds.circuit_open_count) {
+        alerts.push({
+          code: "circuit_open_events_high",
+          severity: "high",
+          current: circuitOpenCount,
+          threshold: thresholds.circuit_open_count,
+        });
+      }
+      if (sloDegradedCount >= thresholds.slo_degraded_count) {
+        alerts.push({
+          code: "slo_degraded_events",
+          severity: "medium",
+          current: sloDegradedCount,
+          threshold: thresholds.slo_degraded_count,
+        });
+      }
+
+      return res.json({
+        success: true,
+        timestamp: new Date().toISOString(),
+        window_minutes: requestedWindow,
+        thresholds,
+        alerts,
+        summary,
+      });
+    } catch (error) {
+      console.error("Error fetching GPT observability summary:", error);
+      return res.status(500).json({
+        success: false,
+        error: "Failed to fetch GPT observability summary",
+      });
+    }
+  };
+}
+
 function registerStatusRoutes(app, ctx = {}) {
   const handleGetCallStatus = createGetCallStatusHandler(ctx);
   const handleSystemStatus = createSystemStatusHandler(ctx);
   const handleHealth = createHealthHandler(ctx);
+  const handleGptObservability = createGptObservabilityHandler(ctx);
 
   app.get("/api/calls/:callSid/status", handleGetCallStatus);
+  app.get("/api/observability/gpt", handleGptObservability);
   app.get("/status", handleSystemStatus);
   app.get("/health", handleHealth);
 }

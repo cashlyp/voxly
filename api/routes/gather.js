@@ -23,6 +23,7 @@ function createTwilioGatherHandler(deps = {}) {
     shouldUseTwilioPlay,
     resolveTwilioSayVoice,
     isGroupedGatherPlan,
+    setCallFlowState,
     ttsTimeoutMs
   } = deps;
 
@@ -264,6 +265,17 @@ function createTwilioGatherHandler(deps = {}) {
           }
           if (digitService?.setCaptureActive) {
             digitService.setCaptureActive(callSid, false, { reason: 'fallback_press1' });
+          } else if (typeof setCallFlowState === 'function') {
+            setCallFlowState(
+              callSid,
+              {
+                flow_state: 'normal',
+                reason: 'fallback_press1',
+                call_mode: 'normal',
+                digit_capture_active: false,
+              },
+              { callConfig, source: 'twilio_gather' }
+            );
           } else {
             callConfig.digit_capture_active = false;
             if (callConfig.call_mode === 'dtmf_capture') {
@@ -415,6 +427,17 @@ function createTwilioGatherHandler(deps = {}) {
         }
         if (digitService?.setCaptureActive) {
           digitService.setCaptureActive(callSid, false, { reason: 'timeout' });
+        } else if (typeof setCallFlowState === 'function') {
+          setCallFlowState(
+            callSid,
+            {
+              flow_state: 'normal',
+              reason: 'timeout',
+              call_mode: 'normal',
+              digit_capture_active: false,
+            },
+            { callConfig, source: 'twilio_gather' }
+          );
         } else {
           callConfig.digit_capture_active = false;
           if (callConfig.call_mode === 'dtmf_capture') {

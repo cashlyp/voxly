@@ -210,7 +210,8 @@ function createDigitCollectionService(options = {}) {
     logger = console,
     smsService = null,
     riskEvaluator = null,
-    healthProvider = null
+    healthProvider = null,
+    setCallFlowState = null
   } = options;
 
   const {
@@ -1386,12 +1387,26 @@ function createDigitCollectionService(options = {}) {
       if (getCaptureState(callSid) === CAPTURE_STATES.IDLE) {
         transitionCaptureState(callSid, CAPTURE_EVENTS.START_COLLECT, { reason: meta.reason || 'set_active' });
       }
-      callConfig.digit_capture_active = true;
-      callConfig.call_mode = 'dtmf_capture';
-      callConfig.flow_state = 'capture_active';
-      callConfig.flow_state_updated_at = updatedAt;
-      if (meta.reason) {
-        callConfig.flow_state_reason = meta.reason;
+      if (typeof setCallFlowState === 'function') {
+        setCallFlowState(
+          callSid,
+          {
+            flow_state: 'capture_active',
+            reason: meta.reason || 'set_active',
+            call_mode: 'dtmf_capture',
+            digit_capture_active: true,
+            flow_state_updated_at: updatedAt
+          },
+          { callConfig, source: 'digit.setCaptureActive' }
+        );
+      } else {
+        callConfig.digit_capture_active = true;
+        callConfig.call_mode = 'dtmf_capture';
+        callConfig.flow_state = 'capture_active';
+        callConfig.flow_state_updated_at = updatedAt;
+        if (meta.reason) {
+          callConfig.flow_state_reason = meta.reason;
+        }
       }
       if (meta.group_id) {
         callConfig.capture_group = meta.group_id;
@@ -1402,14 +1417,28 @@ function createDigitCollectionService(options = {}) {
       if (meta.complete === true) {
         void completeCaptureSession(callSid, 'completed', { reason: meta.reason || 'set_inactive', channel: meta.channel || null });
       }
-      callConfig.digit_capture_active = false;
-      if (callConfig.call_mode === 'dtmf_capture') {
-        callConfig.call_mode = 'normal';
-      }
-      callConfig.flow_state = meta.flow_state || 'normal';
-      callConfig.flow_state_updated_at = updatedAt;
-      if (meta.reason) {
-        callConfig.flow_state_reason = meta.reason;
+      if (typeof setCallFlowState === 'function') {
+        setCallFlowState(
+          callSid,
+          {
+            flow_state: meta.flow_state || 'normal',
+            reason: meta.reason || 'set_inactive',
+            call_mode: callConfig.call_mode === 'dtmf_capture' ? 'normal' : callConfig.call_mode,
+            digit_capture_active: false,
+            flow_state_updated_at: updatedAt
+          },
+          { callConfig, source: 'digit.setCaptureActive' }
+        );
+      } else {
+        callConfig.digit_capture_active = false;
+        if (callConfig.call_mode === 'dtmf_capture') {
+          callConfig.call_mode = 'normal';
+        }
+        callConfig.flow_state = meta.flow_state || 'normal';
+        callConfig.flow_state_updated_at = updatedAt;
+        if (meta.reason) {
+          callConfig.flow_state_reason = meta.reason;
+        }
       }
     }
     callConfigurations.set(callSid, callConfig);
@@ -2475,26 +2504,68 @@ function createDigitCollectionService(options = {}) {
     const updatedAt = new Date().toISOString();
     callConfig.digit_intent = intent;
     if (intent?.mode === 'dtmf') {
-      callConfig.digit_capture_active = true;
       const hasActiveCapture = digitCollectionManager.expectations.has(callSid)
         || digitCollectionPlans.has(callSid);
-      callConfig.flow_state = hasActiveCapture ? 'capture_active' : 'capture_pending';
-      callConfig.flow_state_reason = intent.reason || 'digit_intent';
-      callConfig.flow_state_updated_at = updatedAt;
+      if (typeof setCallFlowState === 'function') {
+        setCallFlowState(
+          callSid,
+          {
+            flow_state: hasActiveCapture ? 'capture_active' : 'capture_pending',
+            reason: intent.reason || 'digit_intent',
+            call_mode: 'dtmf_capture',
+            digit_capture_active: true,
+            flow_state_updated_at: updatedAt
+          },
+          { callConfig, source: 'digit.setCallDigitIntent' }
+        );
+      } else {
+        callConfig.digit_capture_active = true;
+        callConfig.flow_state = hasActiveCapture ? 'capture_active' : 'capture_pending';
+        callConfig.flow_state_reason = intent.reason || 'digit_intent';
+        callConfig.flow_state_updated_at = updatedAt;
+      }
     } else if (intent?.mode === 'normal') {
       if (digitCollectionManager.expectations.has(callSid) || digitCollectionPlans.has(callSid)) {
-        callConfig.digit_capture_active = true;
         callConfig.digit_intent = { mode: 'dtmf', reason: 'capture_active', confidence: 1 };
-        callConfig.flow_state = 'capture_active';
-        callConfig.flow_state_reason = 'capture_active';
-        callConfig.flow_state_updated_at = updatedAt;
+        if (typeof setCallFlowState === 'function') {
+          setCallFlowState(
+            callSid,
+            {
+              flow_state: 'capture_active',
+              reason: 'capture_active',
+              call_mode: 'dtmf_capture',
+              digit_capture_active: true,
+              flow_state_updated_at: updatedAt
+            },
+            { callConfig, source: 'digit.setCallDigitIntent' }
+          );
+        } else {
+          callConfig.digit_capture_active = true;
+          callConfig.flow_state = 'capture_active';
+          callConfig.flow_state_reason = 'capture_active';
+          callConfig.flow_state_updated_at = updatedAt;
+        }
         callConfigurations.set(callSid, callConfig);
         return;
       }
-      callConfig.digit_capture_active = false;
-      callConfig.flow_state = 'normal';
-      callConfig.flow_state_reason = intent.reason || 'normal';
-      callConfig.flow_state_updated_at = updatedAt;
+      if (typeof setCallFlowState === 'function') {
+        setCallFlowState(
+          callSid,
+          {
+            flow_state: 'normal',
+            reason: intent.reason || 'normal',
+            call_mode: 'normal',
+            digit_capture_active: false,
+            flow_state_updated_at: updatedAt
+          },
+          { callConfig, source: 'digit.setCallDigitIntent' }
+        );
+      } else {
+        callConfig.digit_capture_active = false;
+        callConfig.flow_state = 'normal';
+        callConfig.flow_state_reason = intent.reason || 'normal';
+        callConfig.flow_state_updated_at = updatedAt;
+      }
     }
     callConfigurations.set(callSid, callConfig);
   }
@@ -5313,16 +5384,30 @@ function createDigitCollectionService(options = {}) {
     clearSmsSession(callSid);
     const callConfig = callConfigurations.get(callSid);
     if (callConfig) {
-      callConfig.digit_capture_active = false;
       if (callConfig.digit_intent?.mode === 'dtmf') {
         callConfig.digit_intent = { mode: 'normal', reason: 'call_end', confidence: 1 };
       }
-      if (callConfig.call_mode === 'dtmf_capture') {
-        callConfig.call_mode = 'normal';
+      if (typeof setCallFlowState === 'function') {
+        setCallFlowState(
+          callSid,
+          {
+            flow_state: 'normal',
+            reason: 'call_end',
+            call_mode: callConfig.call_mode === 'dtmf_capture' ? 'normal' : callConfig.call_mode,
+            digit_capture_active: false,
+            flow_state_updated_at: new Date().toISOString()
+          },
+          { callConfig, source: 'digit.clearCallState' }
+        );
+      } else {
+        callConfig.digit_capture_active = false;
+        if (callConfig.call_mode === 'dtmf_capture') {
+          callConfig.call_mode = 'normal';
+        }
+        callConfig.flow_state = 'normal';
+        callConfig.flow_state_reason = 'call_end';
+        callConfig.flow_state_updated_at = new Date().toISOString();
       }
-      callConfig.flow_state = 'normal';
-      callConfig.flow_state_reason = 'call_end';
-      callConfig.flow_state_updated_at = new Date().toISOString();
       callConfigurations.set(callSid, callConfig);
     }
     logDigitMetric('call_state_cleared', { callSid, timestamp: Date.now() });

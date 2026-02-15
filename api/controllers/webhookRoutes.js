@@ -6,6 +6,25 @@ function getDigitService(ctx = {}) {
   return typeof ctx.getDigitService === "function" ? ctx.getDigitService() : ctx.digitService;
 }
 
+async function dedupeProviderEvent(asyncFn, syncFn, source, payload, options = {}) {
+  const fn = typeof asyncFn === "function"
+    ? asyncFn
+    : typeof syncFn === "function"
+      ? syncFn
+      : null;
+  if (!fn) return true;
+  try {
+    const result = await fn(source, payload, options);
+    return result !== false;
+  } catch (error) {
+    console.error("provider_event_dedupe_error", {
+      source: source || null,
+      error: error?.message || String(error || "unknown"),
+    });
+    return true;
+  }
+}
+
 function escapeHtml(value = "") {
   return String(value || "")
     .replace(/&/g, "&amp;")
@@ -821,6 +840,7 @@ function createSmsWebhookHandler(ctx = {}) {
   const {
     requireValidTwilioSignature,
     shouldProcessProviderEvent,
+    shouldProcessProviderEventAsync,
     smsWebhookDedupeTtlMs,
     maskPhoneForLog,
     maskSmsBodyForLog,
@@ -847,22 +867,27 @@ function createSmsWebhookHandler(ctx = {}) {
         return res.status(200).send("OK");
       }
 
-      if (
-        inboundSid &&
-        typeof shouldProcessProviderEvent === "function" &&
-        !shouldProcessProviderEvent("twilio_sms_inbound", {
-          messageSid: inboundSid,
-          from,
-          direction: req.body?.Direction || null,
-        }, {
-          ttlMs:
-            Number.isFinite(Number(smsWebhookDedupeTtlMs)) &&
-            Number(smsWebhookDedupeTtlMs) > 0
-              ? Number(smsWebhookDedupeTtlMs)
-              : undefined,
-        })
-      ) {
-        return res.status(200).send("OK");
+      if (inboundSid) {
+        const allow = await dedupeProviderEvent(
+          shouldProcessProviderEventAsync,
+          shouldProcessProviderEvent,
+          "twilio_sms_inbound",
+          {
+            messageSid: inboundSid,
+            from,
+            direction: req.body?.Direction || null,
+          },
+          {
+            ttlMs:
+              Number.isFinite(Number(smsWebhookDedupeTtlMs)) &&
+              Number(smsWebhookDedupeTtlMs) > 0
+                ? Number(smsWebhookDedupeTtlMs)
+                : undefined,
+          },
+        );
+        if (!allow) {
+          return res.status(200).send("OK");
+        }
       }
 
       console.log("sms_webhook_received", {
@@ -915,6 +940,7 @@ function createSmsStatusWebhookHandler(ctx = {}) {
   const {
     requireValidTwilioSignature,
     shouldProcessProviderEvent,
+    shouldProcessProviderEventAsync,
     smsWebhookDedupeTtlMs,
   } = ctx;
   return async function handleSmsStatusWebhook(req, res) {
@@ -933,20 +959,24 @@ function createSmsStatusWebhookHandler(ctx = {}) {
         });
         return res.status(200).send("OK");
       }
-      if (
-        typeof shouldProcessProviderEvent === "function" &&
-        !shouldProcessProviderEvent("twilio_sms_status", {
+      const allow = await dedupeProviderEvent(
+        shouldProcessProviderEventAsync,
+        shouldProcessProviderEvent,
+        "twilio_sms_status",
+        {
           messageSid,
           status: MessageStatus || null,
           errorCode: ErrorCode || null,
-        }, {
+        },
+        {
           ttlMs:
             Number.isFinite(Number(smsWebhookDedupeTtlMs)) &&
             Number(smsWebhookDedupeTtlMs) > 0
               ? Number(smsWebhookDedupeTtlMs)
               : undefined,
-        })
-      ) {
+        },
+      );
+      if (!allow) {
         return res.status(200).send("OK");
       }
 
@@ -1059,6 +1089,7 @@ function createSmsDeliveryWebhookHandler(ctx = {}) {
   const {
     requireValidTwilioSignature,
     shouldProcessProviderEvent,
+    shouldProcessProviderEventAsync,
     smsWebhookDedupeTtlMs,
   } = ctx;
   return async function handleSmsDeliveryWebhook(req, res) {
@@ -1077,20 +1108,24 @@ function createSmsDeliveryWebhookHandler(ctx = {}) {
         });
         return res.status(200).send("OK");
       }
-      if (
-        typeof shouldProcessProviderEvent === "function" &&
-        !shouldProcessProviderEvent("twilio_sms_delivery", {
+      const allow = await dedupeProviderEvent(
+        shouldProcessProviderEventAsync,
+        shouldProcessProviderEvent,
+        "twilio_sms_delivery",
+        {
           messageSid,
           status: MessageStatus || null,
           errorCode: ErrorCode || null,
-        }, {
+        },
+        {
           ttlMs:
             Number.isFinite(Number(smsWebhookDedupeTtlMs)) &&
             Number(smsWebhookDedupeTtlMs) > 0
               ? Number(smsWebhookDedupeTtlMs)
               : undefined,
-        })
-      ) {
+        },
+      );
+      if (!allow) {
         return res.status(200).send("OK");
       }
 
@@ -1151,8 +1186,12 @@ function createSmsDeliveryWebhookHandler(ctx = {}) {
 }
 
 function createAwsStatusWebhookHandler(ctx = {}) {
-  const { requireValidAwsWebhook, shouldProcessProviderEvent, recordCallStatus } =
-    ctx;
+  const {
+    requireValidAwsWebhook,
+    shouldProcessProviderEvent,
+    shouldProcessProviderEventAsync,
+    recordCallStatus,
+  } = ctx;
   return async function handleAwsStatusWebhook(req, res) {
     try {
       if (!requireValidAwsWebhook(req, res, "/webhook/aws/status")) {
@@ -1180,7 +1219,13 @@ function createAwsStatusWebhookHandler(ctx = {}) {
           req.body?.updatedAt ||
           null,
       };
-      if (!shouldProcessProviderEvent("aws_status", dedupePayload)) {
+      const allow = await dedupeProviderEvent(
+        shouldProcessProviderEventAsync,
+        shouldProcessProviderEvent,
+        "aws_status",
+        dedupePayload,
+      );
+      if (!allow) {
         return res.status(200).send("OK");
       }
 
@@ -1213,6 +1258,10 @@ function createAwsStatusWebhookHandler(ctx = {}) {
             await ctx.handleCallEnd(resolvedCallSid, session.startTime);
           }
           activeCalls?.delete(resolvedCallSid);
+          const dbRef = getDb(ctx);
+          if (dbRef?.deleteCallRuntimeState) {
+            await dbRef.deleteCallRuntimeState(resolvedCallSid).catch(() => {});
+          }
         }
       }
 
@@ -1230,6 +1279,7 @@ function createVonageEventWebhookHandler(ctx = {}) {
     getVonageCallPayload,
     getVonageDtmfDigits,
     shouldProcessProviderEvent,
+    shouldProcessProviderEventAsync,
     resolveVonageCallSid,
     isOutboundVonageDirection,
     buildVonageInboundCallSid,
@@ -1261,7 +1311,13 @@ function createVonageEventWebhookHandler(ctx = {}) {
         dtmf: dtmfDigits || null,
         direction: normalizedPayload?.direction || null,
       };
-      if (!shouldProcessProviderEvent("vonage_event", dedupePayload)) {
+      const allow = await dedupeProviderEvent(
+        shouldProcessProviderEventAsync,
+        shouldProcessProviderEvent,
+        "vonage_event",
+        dedupePayload,
+      );
+      if (!allow) {
         return res.status(200).send("OK");
       }
       const durationRaw =
@@ -1348,6 +1404,10 @@ function createVonageEventWebhookHandler(ctx = {}) {
             await handleCallEnd(callSid, session.startTime);
           }
           activeCalls.delete(callSid);
+          const dbRef = getDb(ctx);
+          if (dbRef?.deleteCallRuntimeState) {
+            await dbRef.deleteCallRuntimeState(callSid).catch(() => {});
+          }
           clearVonageCallMappings(callSid);
         }
       }

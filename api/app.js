@@ -1,5 +1,5 @@
+require("./config/bootstrapLogger");
 require("dotenv").config();
-require("colors");
 
 const express = require("express");
 const fetch = require("node-fetch");
@@ -19,9 +19,9 @@ const { recordingService } = require("./routes/recording");
 const { EnhancedSmsService } = require("./routes/sms.js");
 const { EmailService } = require("./routes/email");
 const { createTwilioGatherHandler } = require("./routes/gather");
-const { registerCallRoutes } = require("./routes/callRoutes");
-const { registerStatusRoutes } = require("./routes/statusRoutes");
-const { registerWebhookRoutes } = require("./routes/webhookRoutes");
+const { registerCallRoutes } = require("./controllers/callRoutes");
+const { registerStatusRoutes } = require("./controllers/statusRoutes");
+const { registerWebhookRoutes } = require("./controllers/webhookRoutes");
 const Database = require("./db/db");
 const { webhookService } = require("./routes/status");
 const twilioSignature = require("./middleware/twilioSignature");
@@ -47,7 +47,7 @@ const {
   setStoredSmsProvider,
   setStoredEmailProvider,
   normalizeProvider,
-} = require("./routes/providerState");
+} = require("./adapters/providerState");
 const {
   AwsConnectAdapter,
   AwsTtsAdapter,
@@ -99,17 +99,6 @@ const liveConsoleUserHoldMs = Number.isFinite(
   ? Number(config.liveConsole?.userHoldMs)
   : 450;
 
-// Console helpers with clean emoji prefixes (idempotent, minimal noise)
-if (!console.__emojiWrapped) {
-  const baseLog = console.log.bind(console);
-  const baseWarn = console.warn.bind(console);
-  const baseError = console.error.bind(console);
-  console.log = (...args) => baseLog("📘", ...args);
-  console.warn = (...args) => baseWarn("⚠️", ...args);
-  console.error = (...args) => baseError("❌", ...args);
-  console.__emojiWrapped = true;
-}
-
 const HMAC_HEADER_TIMESTAMP = "x-api-timestamp";
 const HMAC_HEADER_SIGNATURE = "x-api-signature";
 const HMAC_BYPASS_PATH_PREFIXES = [
@@ -152,6 +141,9 @@ const keypadProviderOverrides = new Map(); // scopeKey -> { provider, expiresAt,
 const keypadDtmfSeen = new Map(); // callSid -> { seenAt, source, digitsLength }
 const keypadDtmfWatchdogs = new Map(); // callSid -> timeoutId
 const vonageWebhookJtiCache = new Map(); // jti -> expiresAtMs
+const callRuntimePersistTimers = new Map(); // callSid -> timeoutId
+const callRuntimePendingWrites = new Map(); // callSid -> patch
+const callToolInFlight = new Map(); // callSid -> { tool, startedAt }
 let callJobProcessing = false;
 let backgroundWorkersStarted = false;
 const outboundRateBuckets = new Map(); // namespace:key -> { count, windowStart }
@@ -161,6 +153,9 @@ const CALL_STATUS_DEDUPE_MAX = 5000;
 const PROVIDER_EVENT_DEDUPE_MS = 5 * 60 * 1000;
 const PROVIDER_EVENT_DEDUPE_MAX = 10000;
 const VONAGE_WEBHOOK_JTI_CACHE_MAX = 5000;
+const CALL_RUNTIME_PERSIST_DEBOUNCE_MS = 150;
+const CALL_RUNTIME_STATE_STALE_MS = 6 * 60 * 60 * 1000;
+const TOOL_LOCK_TTL_MS = 20 * 1000;
 const KEYPAD_PROVIDER_OVERRIDE_SETTING_KEY = "keypad_provider_overrides_v1";
 const CALL_PROVIDER_SETTING_KEY = "call_provider_v1";
 const SMS_PROVIDER_SETTING_KEY = "sms_provider_v1";
@@ -183,6 +178,238 @@ function stableStringify(value) {
     (key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`,
   );
   return `{${entries.join(",")}}`;
+}
+
+const FLOW_STATE_DEFAULTS = Object.freeze({
+  normal: { call_mode: "normal", digit_capture_active: false },
+  capture_pending: { call_mode: "dtmf_capture", digit_capture_active: true },
+  capture_active: { call_mode: "dtmf_capture", digit_capture_active: true },
+  ending: { call_mode: "normal", digit_capture_active: false },
+});
+
+function normalizeFlowStateKey(value) {
+  const raw = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (!raw) return "normal";
+  return raw.replace(/\s+/g, "_");
+}
+
+function getFlowStateDefaults(flowState) {
+  const key = normalizeFlowStateKey(flowState);
+  return FLOW_STATE_DEFAULTS[key] || null;
+}
+
+function buildProviderEventFingerprint(source, dedupePayload = {}) {
+  const payload =
+    dedupePayload && typeof dedupePayload === "object"
+      ? dedupePayload
+      : { value: dedupePayload };
+  const sourceKey = String(source || "unknown");
+  const hash = crypto
+    .createHash("sha1")
+    .update(stableStringify(payload))
+    .digest("hex");
+  return {
+    source: sourceKey,
+    hash,
+    key: `${sourceKey}:${hash}`,
+  };
+}
+
+function buildRuntimeSnapshotPayload(callSid, patch = {}) {
+  if (!callSid) return null;
+  const callConfig = callConfigurations.get(callSid) || {};
+  const session = activeCalls.get(callSid);
+  const interactionCount = Number(
+    patch.interaction_count ??
+      patch.interactionCount ??
+      session?.interactionCount ??
+      0,
+  );
+  const payload = {
+    call_sid: callSid,
+    provider: patch.provider || callConfig.provider || currentProvider || null,
+    interaction_count: Number.isFinite(interactionCount)
+      ? Math.max(0, Math.floor(interactionCount))
+      : 0,
+    flow_state:
+      patch.flow_state ||
+      patch.flowState ||
+      callConfig.flow_state ||
+      "normal",
+    call_mode: patch.call_mode || patch.callMode || callConfig.call_mode || "normal",
+    digit_capture_active:
+      patch.digit_capture_active !== undefined
+        ? Boolean(patch.digit_capture_active)
+        : patch.digitCaptureActive !== undefined
+          ? Boolean(patch.digitCaptureActive)
+          : callConfig.digit_capture_active === true,
+  };
+  const baseSnapshot =
+    patch.snapshot && typeof patch.snapshot === "object"
+      ? patch.snapshot
+      : {};
+  payload.snapshot = {
+    flow_state_reason: callConfig.flow_state_reason || null,
+    digit_intent_mode: callConfig?.digit_intent?.mode || null,
+    tool_in_progress: callConfig?.tool_in_progress || null,
+    updated_at: new Date().toISOString(),
+    ...baseSnapshot,
+  };
+  return payload;
+}
+
+function queuePersistCallRuntimeState(callSid, patch = {}) {
+  if (!callSid || !db?.upsertCallRuntimeState) return;
+  const merged = {
+    ...(callRuntimePendingWrites.get(callSid) || {}),
+    ...(patch && typeof patch === "object" ? patch : {}),
+  };
+  callRuntimePendingWrites.set(callSid, merged);
+  if (callRuntimePersistTimers.has(callSid)) return;
+  const timer = setTimeout(async () => {
+    callRuntimePersistTimers.delete(callSid);
+    const pending = callRuntimePendingWrites.get(callSid) || {};
+    callRuntimePendingWrites.delete(callSid);
+    const payload = buildRuntimeSnapshotPayload(callSid, pending);
+    if (!payload) return;
+    try {
+      await db.upsertCallRuntimeState(payload);
+    } catch (error) {
+      console.error("Failed to persist call runtime state:", error);
+    }
+  }, CALL_RUNTIME_PERSIST_DEBOUNCE_MS);
+  callRuntimePersistTimers.set(callSid, timer);
+}
+
+async function clearCallRuntimeState(callSid) {
+  if (!callSid) return;
+  const timer = callRuntimePersistTimers.get(callSid);
+  if (timer) {
+    clearTimeout(timer);
+    callRuntimePersistTimers.delete(callSid);
+  }
+  callRuntimePendingWrites.delete(callSid);
+  if (!db?.deleteCallRuntimeState) return;
+  try {
+    await db.deleteCallRuntimeState(callSid);
+  } catch (_) {
+    // ignore cleanup failures
+  }
+}
+
+async function restoreCallRuntimeState(callSid, callConfig = null) {
+  if (!callSid || !db?.getCallRuntimeState) {
+    return { restored: false, interactionCount: 0 };
+  }
+  try {
+    const row = await db.getCallRuntimeState(callSid);
+    if (!row) return { restored: false, interactionCount: 0 };
+    const updatedAt = row.updated_at ? Date.parse(row.updated_at) : NaN;
+    if (
+      Number.isFinite(updatedAt) &&
+      Date.now() - updatedAt > CALL_RUNTIME_STATE_STALE_MS
+    ) {
+      db.deleteCallRuntimeState?.(callSid).catch(() => {});
+      return { restored: false, interactionCount: 0, stale: true };
+    }
+    const targetConfig = callConfig || callConfigurations.get(callSid);
+    if (targetConfig) {
+      const shouldRestoreCapture =
+        targetConfig.flow_state === "normal" &&
+        String(row.flow_state || "").startsWith("capture_");
+      const nextState = shouldRestoreCapture
+        ? row.flow_state
+        : targetConfig.flow_state || row.flow_state || "normal";
+      setCallFlowState(
+        callSid,
+        {
+          flow_state: nextState,
+          reason: "runtime_restore",
+          call_mode: row.call_mode || targetConfig.call_mode,
+          digit_capture_active: Number(row.digit_capture_active) === 1,
+        },
+        { callConfig: targetConfig, skipToolRefresh: true, skipPersist: true },
+      );
+    }
+    const restoredInteraction = Number(row.interaction_count);
+    const snapshot = safeJsonParse(row.snapshot, {}) || {};
+    return {
+      restored: true,
+      interactionCount: Number.isFinite(restoredInteraction)
+        ? Math.max(0, Math.floor(restoredInteraction))
+        : 0,
+      snapshot,
+      row,
+    };
+  } catch (error) {
+    console.error("Failed to restore call runtime state:", error);
+    return { restored: false, interactionCount: 0 };
+  }
+}
+
+function setCallFlowState(callSid, stateUpdate = {}, options = {}) {
+  if (!callSid) return null;
+  const callConfig = options.callConfig || callConfigurations.get(callSid);
+  if (!callConfig) return null;
+
+  const flowState = normalizeFlowStateKey(
+    stateUpdate.flowState || stateUpdate.flow_state || callConfig.flow_state,
+  );
+  const defaults = getFlowStateDefaults(flowState);
+  const explicitMode = stateUpdate.callMode ?? stateUpdate.call_mode;
+  const explicitCaptureActive =
+    stateUpdate.digitCaptureActive ?? stateUpdate.digit_capture_active;
+
+  const nextCallMode =
+    explicitMode ||
+    defaults?.call_mode ||
+    callConfig.call_mode ||
+    "normal";
+  const nextDigitCaptureActive =
+    explicitCaptureActive !== undefined
+      ? Boolean(explicitCaptureActive)
+      : defaults
+        ? defaults.digit_capture_active === true
+        : callConfig.digit_capture_active === true;
+  const nextReason =
+    stateUpdate.reason ??
+    stateUpdate.flow_state_reason ??
+    callConfig.flow_state_reason ??
+    null;
+  const nextUpdatedAt =
+    stateUpdate.updatedAt ||
+    stateUpdate.flow_state_updated_at ||
+    new Date().toISOString();
+  const changed =
+    callConfig.flow_state !== flowState ||
+    callConfig.call_mode !== nextCallMode ||
+    callConfig.digit_capture_active !== nextDigitCaptureActive ||
+    callConfig.flow_state_reason !== nextReason;
+
+  callConfig.flow_state = flowState;
+  callConfig.call_mode = nextCallMode;
+  callConfig.digit_capture_active = nextDigitCaptureActive;
+  callConfig.flow_state_reason = nextReason;
+  callConfig.flow_state_updated_at = nextUpdatedAt;
+  callConfigurations.set(callSid, callConfig);
+
+  if (changed && options.skipPersist !== true) {
+    queuePersistCallRuntimeState(callSid, {
+      flow_state: flowState,
+      flow_state_reason: nextReason,
+      call_mode: nextCallMode,
+      digit_capture_active: nextDigitCaptureActive,
+      snapshot: {
+        source: options.source || "setCallFlowState",
+      },
+    });
+  }
+  if (changed && options.skipToolRefresh !== true) {
+    refreshActiveCallTools(callSid);
+  }
+  return callConfig;
 }
 
 function purgeStreamStatusDedupe(callSid) {
@@ -250,15 +477,8 @@ function purgeCallStatusDedupe(callSid) {
 }
 
 function shouldProcessProviderEvent(source, dedupePayload = {}, options = {}) {
-  const payload =
-    dedupePayload && typeof dedupePayload === "object"
-      ? dedupePayload
-      : { value: dedupePayload };
-  const hash = crypto
-    .createHash("sha1")
-    .update(stableStringify(payload))
-    .digest("hex");
-  const key = `${String(source || "unknown")}:${hash}`;
+  const fingerprint = buildProviderEventFingerprint(source, dedupePayload);
+  const key = fingerprint.key;
   const now = Date.now();
   const ttlMs =
     Number.isFinite(Number(options.ttlMs)) && Number(options.ttlMs) > 0
@@ -271,6 +491,36 @@ function shouldProcessProviderEvent(source, dedupePayload = {}, options = {}) {
   providerEventDedupe.set(key, now);
   pruneDedupeMap(providerEventDedupe, PROVIDER_EVENT_DEDUPE_MAX);
   return true;
+}
+
+async function shouldProcessProviderEventAsync(
+  source,
+  dedupePayload = {},
+  options = {},
+) {
+  if (!shouldProcessProviderEvent(source, dedupePayload, options)) {
+    return false;
+  }
+  if (!db?.reserveProviderEventIdempotency) {
+    return true;
+  }
+  const ttlMs =
+    Number.isFinite(Number(options.ttlMs)) && Number(options.ttlMs) > 0
+      ? Number(options.ttlMs)
+      : PROVIDER_EVENT_DEDUPE_MS;
+  const fingerprint = buildProviderEventFingerprint(source, dedupePayload);
+  try {
+    const reserved = await db.reserveProviderEventIdempotency({
+      source: fingerprint.source,
+      payload_hash: fingerprint.hash,
+      event_key: fingerprint.key,
+      ttl_ms: ttlMs,
+    });
+    return reserved?.reserved !== false;
+  } catch (error) {
+    console.error("Provider event idempotency persistence failed:", error);
+    return true;
+  }
 }
 
 function recordCallLifecycle(callSid, status, meta = {}) {
@@ -538,6 +788,21 @@ function ensureCallSetup(callSid, payload = {}, options = {}) {
 
   callConfigurations.set(callSid, callConfig);
   callFunctionSystems.set(callSid, functionSystem);
+  setCallFlowState(
+    callSid,
+    {
+      flow_state: callConfig.flow_state || "normal",
+      reason: callConfig.flow_state_reason || "setup",
+      call_mode: callConfig.call_mode || "normal",
+      digit_capture_active: callConfig.digit_capture_active === true,
+      flow_state_updated_at:
+        callConfig.flow_state_updated_at || new Date().toISOString(),
+    },
+    { callConfig, skipToolRefresh: true, source: "ensureCallSetup" },
+  );
+  queuePersistCallRuntimeState(callSid, {
+    snapshot: { source: "ensureCallSetup" },
+  });
   return { callConfig, functionSystem, created: true };
 }
 
@@ -586,6 +851,12 @@ async function ensureCallRecord(
       route_label: callConfig.route_label || null,
       purpose: callConfig.purpose || null,
       voice_model: callConfig.voice_model || null,
+      flow_state: callConfig.flow_state || "normal",
+      flow_state_reason: callConfig.flow_state_reason || "call_created",
+      flow_state_updated_at:
+        callConfig.flow_state_updated_at || new Date().toISOString(),
+      call_mode: callConfig.call_mode || "normal",
+      digit_capture_active: callConfig.digit_capture_active === true,
     });
     return await db.getCall(callSid);
   } catch (error) {
@@ -648,12 +919,28 @@ async function hydrateCallConfigFromDb(callSid) {
     flow_state: state?.flow_state || "normal",
     flow_state_updated_at: state?.flow_state_updated_at || createdAt,
     call_mode: state?.call_mode || "normal",
-    digit_capture_active: false,
+    digit_capture_active:
+      state?.digit_capture_active === true ||
+      state?.digit_capture_active === 1 ||
+      state?.flow_state === "capture_active" ||
+      state?.flow_state === "capture_pending",
     inbound: false,
   };
 
   callConfigurations.set(callSid, callConfig);
   callFunctionSystems.set(callSid, functionSystem);
+  setCallFlowState(
+    callSid,
+    {
+      flow_state: callConfig.flow_state || "normal",
+      reason: callConfig.flow_state_reason || "hydrated",
+      call_mode: callConfig.call_mode || "normal",
+      digit_capture_active: callConfig.digit_capture_active === true,
+      flow_state_updated_at:
+        callConfig.flow_state_updated_at || new Date().toISOString(),
+    },
+    { callConfig, skipToolRefresh: true, skipPersist: true, source: "hydrate" },
+  );
   return { callConfig, functionSystem };
 }
 
@@ -1706,12 +1993,16 @@ async function activateDtmfFallback(
   if (!configToUse) return false;
 
   configToUse.digit_intent = { mode: "dtmf", reason, confidence: 1 };
-  configToUse.digit_capture_active = true;
-  configToUse.call_mode = "dtmf_capture";
-  configToUse.flow_state = "capture_pending";
-  configToUse.flow_state_reason = reason;
-  configToUse.flow_state_updated_at = new Date().toISOString();
-  callConfigurations.set(callSid, configToUse);
+  setCallFlowState(
+    callSid,
+    {
+      flow_state: "capture_pending",
+      reason,
+      call_mode: "dtmf_capture",
+      digit_capture_active: true,
+    },
+    { callConfig: configToUse, source: "activateDtmfFallback" },
+  );
 
   await db
     .updateCallState(callSid, "stt_fallback", {
@@ -2158,13 +2449,18 @@ async function applyInitialDigitIntent(
       existing.intent?.mode === "dtmf" &&
       callConfig.digit_capture_active !== true
     ) {
-      callConfig.digit_capture_active = true;
-      callConfig.flow_state = existing.expectation
-        ? "capture_active"
-        : "capture_pending";
-      callConfig.flow_state_reason = existing.intent?.reason || "digit_intent";
-      callConfig.flow_state_updated_at = new Date().toISOString();
-      callConfigurations.set(callSid, callConfig);
+      setCallFlowState(
+        callSid,
+        {
+          flow_state: existing.expectation
+            ? "capture_active"
+            : "capture_pending",
+          reason: existing.intent?.reason || "digit_intent",
+          call_mode: "dtmf_capture",
+          digit_capture_active: true,
+        },
+        { callConfig, source: "applyInitialDigitIntent_existing" },
+      );
     }
     if (existing.intent?.mode === "dtmf" && existing.expectation) {
       try {
@@ -2184,17 +2480,28 @@ async function applyInitialDigitIntent(
   const result = digitService.prepareInitialExpectation(callSid, callConfig);
   callConfig.digit_intent = result.intent;
   if (result.intent?.mode === "dtmf") {
-    callConfig.digit_capture_active = true;
-    callConfig.flow_state = result.expectation
-      ? "capture_active"
-      : "capture_pending";
-    callConfig.flow_state_reason = result.intent?.reason || "digit_intent";
+    setCallFlowState(
+      callSid,
+      {
+        flow_state: result.expectation ? "capture_active" : "capture_pending",
+        reason: result.intent?.reason || "digit_intent",
+        call_mode: "dtmf_capture",
+        digit_capture_active: true,
+      },
+      { callConfig, source: "applyInitialDigitIntent_prepare" },
+    );
   } else {
-    callConfig.digit_capture_active = false;
-    callConfig.flow_state = "normal";
-    callConfig.flow_state_reason = result.intent?.reason || "no_signal";
+    setCallFlowState(
+      callSid,
+      {
+        flow_state: "normal",
+        reason: result.intent?.reason || "no_signal",
+        call_mode: "normal",
+        digit_capture_active: false,
+      },
+      { callConfig, source: "applyInitialDigitIntent_prepare" },
+    );
   }
-  callConfig.flow_state_updated_at = new Date().toISOString();
   callConfigurations.set(callSid, callConfig);
   if (
     result.intent?.mode === "dtmf" &&
@@ -3636,7 +3943,94 @@ const telephonyTools = [
 ];
 
 function buildTelephonyImplementations(callSid, gptService = null) {
-  return {
+  const withToolExecution = (toolName, handler) => async (args = {}) => {
+    const now = Date.now();
+    const existingLock = callToolInFlight.get(callSid);
+    if (
+      existingLock &&
+      now - Number(existingLock.startedAt || 0) < TOOL_LOCK_TTL_MS
+    ) {
+      webhookService.addLiveEvent(
+        callSid,
+        `⏳ Tool in progress (${existingLock.tool || "action"})`,
+        { force: false },
+      );
+      return {
+        status: "in_progress",
+        tool: existingLock.tool || toolName,
+      };
+    }
+
+    const startedAtIso = new Date(now).toISOString();
+    callToolInFlight.set(callSid, {
+      tool: toolName,
+      startedAt: now,
+    });
+    const callConfig = callConfigurations.get(callSid);
+    if (callConfig) {
+      callConfig.tool_in_progress = toolName;
+      callConfig.tool_started_at = startedAtIso;
+      callConfigurations.set(callSid, callConfig);
+    }
+    webhookService.markToolInvocation(callSid, toolName, { force: true });
+    webhookService.addLiveEvent(callSid, `🛠️ Running ${toolName}`, {
+      force: false,
+    });
+    webhookService
+      .setLiveCallPhase(callSid, "agent_responding", { logEvent: false })
+      .catch(() => {});
+    queuePersistCallRuntimeState(callSid, {
+      snapshot: {
+        tool_in_progress: toolName,
+        tool_started_at: startedAtIso,
+      },
+    });
+    refreshActiveCallTools(callSid);
+
+    try {
+      const result = await handler(args);
+      webhookService.addLiveEvent(callSid, `✅ ${toolName} completed`, {
+        force: false,
+      });
+      return result;
+    } catch (error) {
+      webhookService.addLiveEvent(callSid, `⚠️ ${toolName} failed`, {
+        force: true,
+      });
+      console.error(`${toolName} handler error:`, error);
+      return {
+        error: "tool_failed",
+        tool: toolName,
+        message: error?.message || "Tool failed",
+      };
+    } finally {
+      const lock = callToolInFlight.get(callSid);
+      if (!lock || lock.tool === toolName) {
+        callToolInFlight.delete(callSid);
+      }
+      const finalConfig = callConfigurations.get(callSid);
+      if (finalConfig && finalConfig.tool_in_progress === toolName) {
+        delete finalConfig.tool_in_progress;
+        delete finalConfig.tool_started_at;
+        callConfigurations.set(callSid, finalConfig);
+      }
+      queuePersistCallRuntimeState(callSid, {
+        snapshot: {
+          tool_in_progress: null,
+          tool_started_at: null,
+        },
+      });
+      refreshActiveCallTools(callSid);
+      const latestConfig = callConfigurations.get(callSid);
+      if (normalizeFlowStateKey(latestConfig?.flow_state) !== "ending") {
+        webhookService
+          .setLiveCallPhase(callSid, "listening", { logEvent: false })
+          .catch(() => {});
+      }
+    }
+  };
+
+  const implementations = {
     confirm_identity: async (args = {}) => {
       const payload = {
         status: "acknowledged",
@@ -3702,6 +4096,12 @@ function buildTelephonyImplementations(callSid, gptService = null) {
       return payload;
     },
   };
+  return Object.fromEntries(
+    Object.entries(implementations).map(([toolName, handler]) => [
+      toolName,
+      withToolExecution(toolName, handler),
+    ]),
+  );
 }
 
 function applyTelephonyTools(
@@ -3764,22 +4164,47 @@ function applyTelephonyTools(
   gptService.setDynamicFunctions(combinedTools, combinedImpl);
 }
 
-function getCallToolOptions(callConfig = {}) {
-  const isDigitIntent = callConfig?.digit_intent?.mode === "dtmf";
+function getCallToolOptions(callSid, callConfig = {}) {
+  const isDigitIntent =
+    callConfig?.digit_intent?.mode === "dtmf" || isCaptureActiveConfig(callConfig);
+  const flowState = normalizeFlowStateKey(callConfig?.flow_state || "normal");
+  const hasToolLock = Boolean(
+    callConfig?.tool_in_progress || (callSid && callToolInFlight.has(callSid)),
+  );
+  const policyAllowsTransfer = isDigitIntent;
+  const policyAllowsDigitCollection = isDigitIntent;
+  const phaseAllowsTransfer = flowState !== "ending";
+  const phaseAllowsDigitCollection =
+    flowState !== "ending" && flowState !== "capture_active";
   return {
-    allowTransfer: isDigitIntent,
-    allowDigitCollection: isDigitIntent,
+    allowTransfer: policyAllowsTransfer && phaseAllowsTransfer && !hasToolLock,
+    allowDigitCollection:
+      policyAllowsDigitCollection && phaseAllowsDigitCollection && !hasToolLock,
+    policyAllowsTransfer,
+    policyAllowsDigitCollection,
+    flowState,
+    hasToolLock,
   };
+}
+
+function refreshActiveCallTools(callSid) {
+  if (!callSid) return;
+  const session = activeCalls.get(callSid);
+  if (!session?.gptService) return;
+  const callConfig = callConfigurations.get(callSid) || session.callConfig || {};
+  const functionSystem =
+    callFunctionSystems.get(callSid) || session.functionSystem || null;
+  configureCallTools(session.gptService, callSid, callConfig, functionSystem);
 }
 
 function configureCallTools(gptService, callSid, callConfig, functionSystem) {
   if (!gptService) return;
   const baseTools = functionSystem?.functions || [];
   const baseImpl = functionSystem?.implementations || {};
-  const options = getCallToolOptions(callConfig);
+  const options = getCallToolOptions(callSid, callConfig);
   applyTelephonyTools(gptService, callSid, baseTools, baseImpl, options);
   if (
-    !options.allowTransfer &&
+    !options.policyAllowsTransfer &&
     callConfig &&
     !callConfig.no_transfer_note_added
   ) {
@@ -5178,6 +5603,25 @@ function startBackgroundWorkers() {
   });
 
   setInterval(() => {
+    if (!db) return;
+    db.pruneProviderEventIdempotency?.().catch((error) => {
+      console.error("❌ Provider event dedupe prune error:", error);
+    });
+    db.cleanupCallRuntimeState?.(24).catch((error) => {
+      console.error("❌ Call runtime cleanup error:", error);
+    });
+  }, 5 * 60 * 1000);
+
+  if (db) {
+    db.pruneProviderEventIdempotency?.().catch((error) => {
+      console.error("❌ Initial provider event dedupe prune error:", error);
+    });
+    db.cleanupCallRuntimeState?.(24).catch((error) => {
+      console.error("❌ Initial call runtime cleanup error:", error);
+    });
+  }
+
+  setInterval(() => {
     runStreamWatchdog().catch((error) => {
       console.error("❌ Stream watchdog error:", error);
     });
@@ -5217,6 +5661,16 @@ async function speakAndEndCall(callSid, message, reason = "completed") {
   if (session) {
     session.ending = true;
   }
+  setCallFlowState(
+    callSid,
+    {
+      flow_state: "ending",
+      reason: reason || "call_ending",
+      call_mode: "normal",
+      digit_capture_active: false,
+    },
+    { callConfig, source: "speakAndEndCall" },
+  );
 
   webhookService.addLiveEvent(callSid, `👋 Ending call (${reason})`, {
     force: true,
@@ -5364,30 +5818,56 @@ async function ensureAwsSession(callSid) {
   if (!callConfig) {
     throw new Error(`Missing call configuration for ${callSid}`);
   }
+  const runtimeRestore = await restoreCallRuntimeState(callSid, callConfig);
 
   let gptService;
   if (functionSystem) {
     gptService = new EnhancedGptService(
       callConfig.prompt,
       callConfig.first_message,
+      {
+        db,
+        webhookService,
+        channel: "voice",
+        provider: callConfig?.provider || getCurrentProvider(),
+        traceId: `call:${callSid}`,
+      },
     );
   } else {
     gptService = new EnhancedGptService(
       callConfig.prompt,
       callConfig.first_message,
+      {
+        db,
+        webhookService,
+        channel: "voice",
+        provider: callConfig?.provider || getCurrentProvider(),
+        traceId: `call:${callSid}`,
+      },
     );
   }
 
   gptService.setCallSid(callSid);
+  gptService.setExecutionContext({
+    traceId: `call:${callSid}`,
+    channel: "voice",
+    provider: callConfig?.provider || getCurrentProvider(),
+  });
   gptService.setCustomerName(
     callConfig?.customer_name || callConfig?.victim_name,
   );
   gptService.setCallProfile(
     callConfig?.purpose || callConfig?.business_context?.purpose,
   );
+  gptService.setPersonaContext({
+    domain: callConfig?.purpose || callConfig?.business_context?.purpose || "general",
+    channel: "voice",
+    urgency: callConfig?.urgency || "normal",
+  });
   const intentLine = `Call intent: ${callConfig?.script || "general"} | purpose: ${callConfig?.purpose || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`;
   gptService.setCallIntent(intentLine);
-  await applyInitialDigitIntent(callSid, callConfig, gptService, 0);
+  const restoredCount = Number(runtimeRestore?.interactionCount || 0);
+  await applyInitialDigitIntent(callSid, callConfig, gptService, restoredCount);
   configureCallTools(gptService, callSid, callConfig, functionSystem);
 
   const session = {
@@ -5397,7 +5877,7 @@ async function ensureAwsSession(callSid) {
     callConfig,
     functionSystem,
     personalityChanges: [],
-    interactionCount: 0,
+    interactionCount: restoredCount,
   };
 
   gptService.on("gptreply", async (gptReply, icount) => {
@@ -5469,6 +5949,10 @@ async function ensureAwsSession(callSid) {
   });
 
   activeCalls.set(callSid, session);
+  queuePersistCallRuntimeState(callSid, {
+    interaction_count: session.interactionCount,
+    snapshot: { source: "ensureAwsSession" },
+  });
 
   try {
     const initialExpectation = digitService?.getExpectation(callSid);
@@ -5526,6 +6010,29 @@ async function startServer(options = {}) {
     console.log("Initializing enhanced database...");
     db = new Database();
     await db.initialize();
+    const schemaGuard = await db.ensureSchemaGuardrails({
+      expectedVersion: Number(config.database?.schemaVersion) || 2,
+      strict: config.database?.schemaStrict !== false,
+      requiredTables: [
+        "calls",
+        "call_states",
+        "gpt_call_memory",
+        "gpt_memory_facts",
+        "gpt_tool_audit",
+        "gpt_tool_idempotency",
+        "provider_event_idempotency",
+        "call_runtime_state",
+      ],
+      requiredIndexes: [
+        "idx_gpt_tool_audit_created",
+        "idx_gpt_tool_idem_status",
+        "idx_provider_event_idem_expires",
+        "idx_call_runtime_state_updated",
+      ],
+    });
+    if (!schemaGuard.ok) {
+      console.warn("Database schema guardrails detected missing artifacts:", schemaGuard);
+    }
     console.log("✅ Enhanced database initialized successfully");
     if (smsService?.setDb) {
       smsService.setDb(db);
@@ -5573,6 +6080,7 @@ async function startServer(options = {}) {
       settings: DIGIT_SETTINGS,
       smsService,
       healthProvider: getDigitSystemHealth,
+      setCallFlowState,
     });
     if (typeof webhookService.setDigitTokenResolver === "function") {
       webhookService.setDigitTokenResolver((callSid, tokenRef) => {
@@ -5887,6 +6395,16 @@ app.ws("/connection", (ws, req) => {
               inbound: isInbound,
             },
           );
+          const runtimeRestore = await restoreCallRuntimeState(
+            callSid,
+            callConfig,
+          );
+          if (runtimeRestore?.restored) {
+            interactionCount = Math.max(
+              interactionCount,
+              Number(runtimeRestore.interactionCount || 0),
+            );
+          }
           streamFirstMediaSeen.delete(callSid);
           scheduleFirstMediaWatchdog(callSid, host, callConfig);
 
@@ -5943,19 +6461,47 @@ app.ws("/connection", (ws, req) => {
             gptService = new EnhancedGptService(
               callConfig.prompt,
               callConfig.first_message,
+              {
+                db,
+                webhookService,
+                channel: "voice",
+                provider: callConfig?.provider || getCurrentProvider(),
+                traceId: `call:${callSid}`,
+              },
             );
           } else {
             console.log(`Standard call detected: ${callSid}`);
-            gptService = new EnhancedGptService();
+            gptService = new EnhancedGptService(
+              null,
+              null,
+              {
+                db,
+                webhookService,
+                channel: "voice",
+                provider: callConfig?.provider || getCurrentProvider(),
+                traceId: `call:${callSid}`,
+              },
+            );
           }
 
           gptService.setCallSid(callSid);
+          gptService.setExecutionContext({
+            traceId: `call:${callSid}`,
+            channel: "voice",
+            provider: callConfig?.provider || getCurrentProvider(),
+          });
           gptService.setCustomerName(
             callConfig?.customer_name || callConfig?.victim_name,
           );
           gptService.setCallProfile(
             callConfig?.purpose || callConfig?.business_context?.purpose,
           );
+          gptService.setPersonaContext({
+            domain:
+              callConfig?.purpose || callConfig?.business_context?.purpose || "general",
+            channel: "voice",
+            urgency: callConfig?.urgency || "normal",
+          });
           const intentLine = `Call intent: ${callConfig?.script || "general"} | purpose: ${callConfig?.purpose || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`;
           gptService.setCallIntent(intentLine);
           if (callConfig) {
@@ -6088,7 +6634,11 @@ app.ws("/connection", (ws, req) => {
             functionSystem,
             personalityChanges: [],
             ttsService,
-            interactionCount: 0,
+            interactionCount,
+          });
+          queuePersistCallRuntimeState(callSid, {
+            interaction_count: interactionCount,
+            snapshot: { source: "twilio_stream_start" },
           });
 
           const pendingDigitActions = popPendingDigitActions(callSid);
@@ -6587,7 +7137,18 @@ app.ws("/connection", (ws, req) => {
             console.log(
               `📟 Stream stopped during ${reason} for ${callSid}; preserving call state.`,
             );
+            const session = activeCalls.get(callSid);
+            if (session) {
+              queuePersistCallRuntimeState(callSid, {
+                interaction_count: session.interactionCount || interactionCount,
+                snapshot: {
+                  source: "twilio_stream_stop_preserve",
+                  reason,
+                },
+              });
+            }
             activeCalls.delete(callSid);
+            callToolInFlight.delete(callSid);
             clearCallEndLock(callSid);
             clearSilenceTimer(callSid);
             return;
@@ -6623,6 +7184,8 @@ app.ws("/connection", (ws, req) => {
 
           // Clean up
           activeCalls.delete(callSid);
+          callToolInFlight.delete(callSid);
+          await clearCallRuntimeState(callSid);
           if (callSid && callConfigurations.has(callSid)) {
             callConfigurations.delete(callSid);
             callFunctionSystems.delete(callSid);
@@ -6763,6 +7326,9 @@ app.ws("/connection", (ws, req) => {
           if (session) {
             session.interactionCount = interactionCount;
           }
+          queuePersistCallRuntimeState(callSid, {
+            interaction_count: interactionCount,
+          });
           return;
         }
 
@@ -6780,6 +7346,9 @@ app.ws("/connection", (ws, req) => {
           if (session) {
             session.interactionCount = interactionCount;
           }
+          queuePersistCallRuntimeState(callSid, {
+            interaction_count: interactionCount,
+          });
           return;
         }
 
@@ -6790,6 +7359,9 @@ app.ws("/connection", (ws, req) => {
           if (session) {
             session.interactionCount = nextCount;
           }
+          queuePersistCallRuntimeState(callSid, {
+            interaction_count: nextCount,
+          });
         };
         if (isDigitIntent) {
           await enqueueGptTask(callSid, async () => {
@@ -6977,6 +7549,13 @@ app.ws("/vonage/stream", async (ws, req) => {
     callConfig.inbound = isInboundCall;
     callConfigurations.set(callSid, callConfig);
     callDirections.set(callSid, isInboundCall ? "inbound" : "outbound");
+    const runtimeRestore = await restoreCallRuntimeState(callSid, callConfig);
+    if (runtimeRestore?.restored) {
+      interactionCount = Math.max(
+        interactionCount,
+        Number(runtimeRestore.interactionCount || 0),
+      );
+    }
 
     const vonageAudioSpec = getVonageWebsocketAudioSpec();
     const startedAt = new Date().toISOString();
@@ -7046,24 +7625,53 @@ app.ws("/vonage/stream", async (ws, req) => {
       gptService = new EnhancedGptService(
         callConfig?.prompt,
         callConfig?.first_message,
+        {
+          db,
+          webhookService,
+          channel: "voice",
+          provider: callConfig?.provider || getCurrentProvider(),
+          traceId: `call:${callSid}`,
+        },
       );
     } else {
       gptService = new EnhancedGptService(
         callConfig?.prompt,
         callConfig?.first_message,
+        {
+          db,
+          webhookService,
+          channel: "voice",
+          provider: callConfig?.provider || getCurrentProvider(),
+          traceId: `call:${callSid}`,
+        },
       );
     }
 
     gptService.setCallSid(callSid);
+    gptService.setExecutionContext({
+      traceId: `call:${callSid}`,
+      channel: "voice",
+      provider: callConfig?.provider || getCurrentProvider(),
+    });
     gptService.setCustomerName(
       callConfig?.customer_name || callConfig?.victim_name,
     );
     gptService.setCallProfile(
       callConfig?.purpose || callConfig?.business_context?.purpose,
     );
+    gptService.setPersonaContext({
+      domain: callConfig?.purpose || callConfig?.business_context?.purpose || "general",
+      channel: "voice",
+      urgency: callConfig?.urgency || "normal",
+    });
     const intentLine = `Call intent: ${callConfig?.script || "general"} | purpose: ${callConfig?.purpose || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`;
     gptService.setCallIntent(intentLine);
-    await applyInitialDigitIntent(callSid, callConfig, gptService, 0);
+    await applyInitialDigitIntent(
+      callSid,
+      callConfig,
+      gptService,
+      interactionCount,
+    );
     configureCallTools(gptService, callSid, callConfig, functionSystem);
 
     activeCalls.set(callSid, {
@@ -7075,7 +7683,11 @@ app.ws("/vonage/stream", async (ws, req) => {
       personalityChanges: [],
       ws,
       ttsService,
-      interactionCount: 0,
+      interactionCount,
+    });
+    queuePersistCallRuntimeState(callSid, {
+      interaction_count: interactionCount,
+      snapshot: { source: "vonage_stream_start" },
     });
     clearKeypadCallState(callSid);
     scheduleVonageKeypadDtmfWatchdog(callSid, callConfig);
@@ -7258,6 +7870,9 @@ app.ws("/vonage/stream", async (ws, req) => {
           if (session) {
             session.interactionCount = interactionCount;
           }
+          queuePersistCallRuntimeState(callSid, {
+            interaction_count: interactionCount,
+          });
           return;
         }
         if (
@@ -7274,6 +7889,9 @@ app.ws("/vonage/stream", async (ws, req) => {
           if (session) {
             session.interactionCount = interactionCount;
           }
+          queuePersistCallRuntimeState(callSid, {
+            interaction_count: interactionCount,
+          });
           return;
         }
         const getInteractionCount = () => interactionCount;
@@ -7283,6 +7901,9 @@ app.ws("/vonage/stream", async (ws, req) => {
           if (session) {
             session.interactionCount = nextCount;
           }
+          queuePersistCallRuntimeState(callSid, {
+            interaction_count: nextCount,
+          });
         };
         if (isDigitIntent) {
           await enqueueGptTask(callSid, async () => {
@@ -7351,6 +7972,8 @@ app.ws("/vonage/stream", async (ws, req) => {
         console.error("Vonage websocket close handler error:", closeError);
       } finally {
         activeCalls.delete(callSid);
+        callToolInFlight.delete(callSid);
+        await clearCallRuntimeState(callSid);
         if (digitService) {
           digitService.clearCallState(callSid);
         }
@@ -7495,6 +8118,10 @@ app.ws("/aws/stream", (ws, req) => {
         if (!session?.gptService) {
           return;
         }
+        interactionCount = Math.max(
+          interactionCount,
+          Number(session.interactionCount || 0),
+        );
         const isDigitIntent = session?.callConfig?.digit_intent?.mode === "dtmf";
         const captureActive = isCaptureActiveConfig(session?.callConfig);
         const otpContext = digitService.getOtpContext(text, callSid);
@@ -7567,6 +8194,9 @@ app.ws("/aws/stream", (ws, req) => {
           );
           interactionCount += 1;
           session.interactionCount = interactionCount;
+          queuePersistCallRuntimeState(callSid, {
+            interaction_count: interactionCount,
+          });
           return;
         }
 
@@ -7574,6 +8204,9 @@ app.ws("/aws/stream", (ws, req) => {
         const setInteractionCount = (nextCount) => {
           interactionCount = nextCount;
           session.interactionCount = nextCount;
+          queuePersistCallRuntimeState(callSid, {
+            interaction_count: nextCount,
+          });
         };
         if (isDigitIntent) {
           await enqueueGptTask(callSid, async () => {
@@ -7633,6 +8266,8 @@ app.ws("/aws/stream", (ws, req) => {
         console.error("AWS websocket close handler error:", closeError);
       } finally {
         activeCalls.delete(callSid);
+        callToolInFlight.delete(callSid);
+        await clearCallRuntimeState(callSid);
         if (digitService) {
           digitService.clearCallState(callSid);
         }
@@ -7871,6 +8506,9 @@ async function handleCallEnd(callSid, callStartTime) {
     } catch (logError) {
       console.error("Failed to log service health error:", logError);
     }
+  } finally {
+    callToolInFlight.delete(callSid);
+    await clearCallRuntimeState(callSid);
   }
 }
 
@@ -9579,6 +10217,20 @@ async function placeOutboundCall(payload, hostOverride = null) {
 
   callConfigurations.set(callId, callConfig);
   callFunctionSystems.set(callId, functionSystem);
+  setCallFlowState(
+    callId,
+    {
+      flow_state: callConfig.flow_state || "normal",
+      reason: callConfig.flow_state_reason || "outbound_created",
+      call_mode: callConfig.call_mode || "normal",
+      digit_capture_active: callConfig.digit_capture_active === true,
+      flow_state_updated_at: callConfig.flow_state_updated_at || createdAt,
+    },
+    { callConfig, skipToolRefresh: true, source: "placeOutboundCall" },
+  );
+  queuePersistCallRuntimeState(callId, {
+    snapshot: { source: "placeOutboundCall" },
+  });
 
   try {
     await db.createCall({
@@ -9617,6 +10269,12 @@ async function placeOutboundCall(payload, hostOverride = null) {
       collection_max_retries: collection_max_retries || null,
       collection_mask_for_gpt: collection_mask_for_gpt,
       collection_speak_confirmation: collection_speak_confirmation,
+      flow_state: callConfig.flow_state || "normal",
+      flow_state_reason: callConfig.flow_state_reason || "call_created",
+      flow_state_updated_at:
+        callConfig.flow_state_updated_at || new Date().toISOString(),
+      call_mode: callConfig.call_mode || "normal",
+      digit_capture_active: callConfig.digit_capture_active === true,
     });
 
     if (user_chat_id) {
@@ -10169,6 +10827,7 @@ const twilioGatherHandler = createTwilioGatherHandler({
   shouldUseTwilioPlay,
   resolveTwilioSayVoice,
   isGroupedGatherPlan,
+  setCallFlowState,
 });
 
 // Twilio Gather fallback handler (DTMF)
@@ -11982,6 +12641,7 @@ registerWebhookRoutes(app, {
   streamStatusDedupe,
   activeStreamConnections,
   shouldProcessProviderEvent,
+  shouldProcessProviderEventAsync,
   recordCallStatus,
   getVonageCallPayload,
   getVonageDtmfDigits,
@@ -12213,6 +12873,12 @@ process.on("SIGINT", async () => {
     keypadDtmfSeen.clear();
     keypadProviderOverrides.clear();
     keypadProviderGuardWarnings.clear();
+    for (const timer of callRuntimePersistTimers.values()) {
+      clearTimeout(timer);
+    }
+    callRuntimePersistTimers.clear();
+    callRuntimePendingWrites.clear();
+    callToolInFlight.clear();
     providerEventDedupe.clear();
     callStatusDedupe.clear();
 
@@ -12253,6 +12919,12 @@ process.on("SIGTERM", async () => {
     keypadDtmfSeen.clear();
     keypadProviderOverrides.clear();
     keypadProviderGuardWarnings.clear();
+    for (const timer of callRuntimePersistTimers.values()) {
+      clearTimeout(timer);
+    }
+    callRuntimePersistTimers.clear();
+    callRuntimePendingWrites.clear();
+    callToolInFlight.clear();
     providerEventDedupe.clear();
     callStatusDedupe.clear();
 

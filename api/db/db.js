@@ -262,6 +262,81 @@ class EnhancedDatabase {
                 last_activity DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
 
+            // Hierarchical GPT memory (session-level summary per call)
+            `CREATE TABLE IF NOT EXISTS gpt_call_memory (
+                call_sid TEXT PRIMARY KEY,
+                summary TEXT,
+                summary_turns INTEGER DEFAULT 0,
+                summary_updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                metadata TEXT
+            )`,
+
+            // Long-term facts extracted from conversation
+            `CREATE TABLE IF NOT EXISTS gpt_memory_facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_sid TEXT NOT NULL,
+                fact_key TEXT NOT NULL,
+                fact_text TEXT NOT NULL,
+                confidence REAL DEFAULT 0.5,
+                source TEXT DEFAULT 'derived',
+                last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(call_sid, fact_key)
+            )`,
+
+            // Tool audit + idempotency record
+            `CREATE TABLE IF NOT EXISTS gpt_tool_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_sid TEXT,
+                trace_id TEXT,
+                tool_name TEXT NOT NULL,
+                idempotency_key TEXT,
+                input_hash TEXT,
+                request_payload TEXT,
+                response_payload TEXT,
+                status TEXT NOT NULL,
+                error_message TEXT,
+                duration_ms INTEGER,
+                metadata TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            // Durable idempotency lock/result store for side-effect GPT tools
+            `CREATE TABLE IF NOT EXISTS gpt_tool_idempotency (
+                idempotency_key TEXT PRIMARY KEY,
+                call_sid TEXT,
+                trace_id TEXT,
+                tool_name TEXT NOT NULL,
+                input_hash TEXT,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'ok', 'failed')),
+                response_payload TEXT,
+                error_message TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            // Durable provider webhook idempotency guard
+            `CREATE TABLE IF NOT EXISTS provider_event_idempotency (
+                event_key TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                expires_at DATETIME NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            // Persisted runtime snapshot for active calls
+            `CREATE TABLE IF NOT EXISTS call_runtime_state (
+                call_sid TEXT PRIMARY KEY,
+                provider TEXT,
+                interaction_count INTEGER DEFAULT 0,
+                flow_state TEXT,
+                call_mode TEXT,
+                digit_capture_active INTEGER DEFAULT 0,
+                snapshot TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
         ];
 
         for (const table of tables) {
@@ -340,6 +415,17 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_sessions_chat_id ON user_sessions(telegram_chat_id)',
             'CREATE INDEX IF NOT EXISTS idx_sessions_start ON user_sessions(session_start)',
             'CREATE INDEX IF NOT EXISTS idx_sessions_activity ON user_sessions(last_activity)',
+            'CREATE INDEX IF NOT EXISTS idx_gpt_call_memory_updated ON gpt_call_memory(summary_updated_at)',
+            'CREATE INDEX IF NOT EXISTS idx_gpt_memory_facts_call_sid ON gpt_memory_facts(call_sid)',
+            'CREATE INDEX IF NOT EXISTS idx_gpt_memory_facts_last_seen ON gpt_memory_facts(last_seen_at)',
+            'CREATE INDEX IF NOT EXISTS idx_gpt_tool_audit_call_sid ON gpt_tool_audit(call_sid)',
+            'CREATE INDEX IF NOT EXISTS idx_gpt_tool_audit_idempotency ON gpt_tool_audit(idempotency_key)',
+            'CREATE INDEX IF NOT EXISTS idx_gpt_tool_audit_created ON gpt_tool_audit(created_at)',
+            'CREATE INDEX IF NOT EXISTS idx_gpt_tool_idem_status ON gpt_tool_idempotency(status)',
+            'CREATE INDEX IF NOT EXISTS idx_gpt_tool_idem_updated ON gpt_tool_idempotency(updated_at)',
+            'CREATE INDEX IF NOT EXISTS idx_provider_event_idem_source ON provider_event_idempotency(source)',
+            'CREATE INDEX IF NOT EXISTS idx_provider_event_idem_expires ON provider_event_idempotency(expires_at)',
+            'CREATE INDEX IF NOT EXISTS idx_call_runtime_state_updated ON call_runtime_state(updated_at)',
         ];
 
         for (const index of indexes) {
@@ -985,6 +1071,460 @@ class EnhancedDatabase {
         });
     }
 
+    async getCallMemory(call_sid) {
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT * FROM gpt_call_memory WHERE call_sid = ?`,
+                [call_sid],
+                (err, row) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(row || null);
+                    }
+                }
+            );
+        });
+    }
+
+    async upsertCallMemory(call_sid, payload = {}) {
+        const summary = typeof payload.summary === 'string' ? payload.summary : '';
+        const summaryTurns = Number.isFinite(Number(payload.summary_turns))
+            ? Number(payload.summary_turns)
+            : 0;
+        const metadata = payload.metadata && typeof payload.metadata === 'object'
+            ? JSON.stringify(payload.metadata)
+            : null;
+
+        return new Promise((resolve, reject) => {
+            const sql = `
+                INSERT INTO gpt_call_memory (call_sid, summary, summary_turns, metadata, summary_updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(call_sid) DO UPDATE SET
+                    summary = excluded.summary,
+                    summary_turns = excluded.summary_turns,
+                    metadata = excluded.metadata,
+                    summary_updated_at = CURRENT_TIMESTAMP
+            `;
+            this.db.run(sql, [call_sid, summary, summaryTurns, metadata], function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.changes || 0);
+                }
+            });
+        });
+    }
+
+    async listCallMemoryFacts(call_sid, limit = 20, maxAgeDays = 14) {
+        const safeLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
+        const safeMaxAgeDays = Math.min(Math.max(Number(maxAgeDays) || 14, 1), 90);
+        return new Promise((resolve, reject) => {
+            const sql = `
+                SELECT id, call_sid, fact_key, fact_text, confidence, source, last_seen_at, created_at
+                FROM gpt_memory_facts
+                WHERE call_sid = ?
+                  AND last_seen_at >= datetime('now', ?)
+                ORDER BY confidence DESC, last_seen_at DESC, id DESC
+                LIMIT ?
+            `;
+            this.db.all(sql, [call_sid, `-${safeMaxAgeDays} days`, safeLimit], (err, rows) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(rows || []);
+                }
+            });
+        });
+    }
+
+    async upsertCallMemoryFact(payload = {}) {
+        const {
+            call_sid,
+            fact_key,
+            fact_text,
+            confidence = 0.5,
+            source = 'derived'
+        } = payload;
+        if (!call_sid || !fact_key || !fact_text) {
+            return 0;
+        }
+        const safeConfidence = Math.max(0, Math.min(1, Number(confidence) || 0.5));
+
+        return new Promise((resolve, reject) => {
+            const sql = `
+                INSERT INTO gpt_memory_facts (
+                    call_sid, fact_key, fact_text, confidence, source, last_seen_at
+                )
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(call_sid, fact_key) DO UPDATE SET
+                    fact_text = excluded.fact_text,
+                    confidence = excluded.confidence,
+                    source = excluded.source,
+                    last_seen_at = CURRENT_TIMESTAMP
+            `;
+            this.db.run(
+                sql,
+                [call_sid, fact_key, fact_text, safeConfidence, String(source || 'derived')],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(this.changes || 0);
+                    }
+                }
+            );
+        });
+    }
+
+    async addGptToolAudit(payload = {}) {
+        const {
+            call_sid = null,
+            trace_id = null,
+            tool_name = null,
+            idempotency_key = null,
+            input_hash = null,
+            request_payload = null,
+            response_payload = null,
+            status = 'unknown',
+            error_message = null,
+            duration_ms = null,
+            metadata = null
+        } = payload;
+        if (!tool_name) {
+            return 0;
+        }
+
+        return new Promise((resolve, reject) => {
+            const sql = `
+                INSERT INTO gpt_tool_audit (
+                    call_sid, trace_id, tool_name, idempotency_key, input_hash,
+                    request_payload, response_payload, status, error_message, duration_ms, metadata
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `;
+            this.db.run(
+                sql,
+                [
+                    call_sid,
+                    trace_id,
+                    tool_name,
+                    idempotency_key,
+                    input_hash,
+                    request_payload ? JSON.stringify(request_payload) : null,
+                    response_payload ? JSON.stringify(response_payload) : null,
+                    String(status || 'unknown'),
+                    error_message,
+                    Number.isFinite(Number(duration_ms)) ? Number(duration_ms) : null,
+                    metadata ? JSON.stringify(metadata) : null
+                ],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(this.lastID || 0);
+                    }
+                }
+            );
+        });
+    }
+
+    async getGptToolAuditByIdempotency(idempotency_key) {
+        if (!idempotency_key) return null;
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT * FROM gpt_tool_audit
+                 WHERE idempotency_key = ? AND status IN ('ok', 'cached')
+                 ORDER BY id DESC LIMIT 1`,
+                [idempotency_key],
+                (err, row) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(row || null);
+                    }
+                }
+            );
+        });
+    }
+
+    async reserveGptToolIdempotency(payload = {}) {
+        const {
+            idempotency_key,
+            call_sid = null,
+            trace_id = null,
+            tool_name = null,
+            input_hash = null,
+        } = payload;
+        if (!idempotency_key || !tool_name) {
+            return { reserved: false };
+        }
+        return new Promise((resolve, reject) => {
+            const sql = `
+                INSERT INTO gpt_tool_idempotency (
+                    idempotency_key, call_sid, trace_id, tool_name, input_hash, status, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP)
+                ON CONFLICT(idempotency_key) DO NOTHING
+            `;
+            this.db.run(
+                sql,
+                [idempotency_key, call_sid, trace_id, tool_name, input_hash],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve({ reserved: (this.changes || 0) > 0 });
+                    }
+                }
+            );
+        });
+    }
+
+    async getGptToolIdempotency(idempotency_key) {
+        if (!idempotency_key) return null;
+        return new Promise((resolve, reject) => {
+            const sql = `
+                SELECT *
+                FROM gpt_tool_idempotency
+                WHERE idempotency_key = ?
+                LIMIT 1
+            `;
+            this.db.get(sql, [idempotency_key], (err, row) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(row || null);
+                }
+            });
+        });
+    }
+
+    async completeGptToolIdempotency(payload = {}) {
+        const {
+            idempotency_key,
+            call_sid = null,
+            trace_id = null,
+            tool_name = null,
+            input_hash = null,
+            status = 'failed',
+            response_payload = null,
+            error_message = null,
+        } = payload;
+        if (!idempotency_key || !tool_name) return 0;
+        const safeStatus = ['pending', 'ok', 'failed'].includes(String(status))
+            ? String(status)
+            : 'failed';
+        return new Promise((resolve, reject) => {
+            const sql = `
+                INSERT INTO gpt_tool_idempotency (
+                    idempotency_key, call_sid, trace_id, tool_name, input_hash,
+                    status, response_payload, error_message, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(idempotency_key) DO UPDATE SET
+                    call_sid = COALESCE(excluded.call_sid, gpt_tool_idempotency.call_sid),
+                    trace_id = COALESCE(excluded.trace_id, gpt_tool_idempotency.trace_id),
+                    tool_name = COALESCE(excluded.tool_name, gpt_tool_idempotency.tool_name),
+                    input_hash = COALESCE(excluded.input_hash, gpt_tool_idempotency.input_hash),
+                    status = excluded.status,
+                    response_payload = excluded.response_payload,
+                    error_message = excluded.error_message,
+                    updated_at = CURRENT_TIMESTAMP
+            `;
+            this.db.run(
+                sql,
+                [
+                    idempotency_key,
+                    call_sid,
+                    trace_id,
+                    tool_name,
+                    input_hash,
+                    safeStatus,
+                    response_payload != null ? JSON.stringify(response_payload) : null,
+                    error_message,
+                ],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(this.changes || 0);
+                    }
+                }
+            );
+        });
+    }
+
+    async reserveProviderEventIdempotency(payload = {}) {
+        const source = String(payload.source || '').trim();
+        const payloadHash = String(payload.payload_hash || '').trim();
+        const eventKey = String(payload.event_key || `${source}:${payloadHash}`).trim();
+        if (!source || !payloadHash || !eventKey) {
+            return { reserved: false };
+        }
+        const ttlMs = Number(payload.ttl_ms);
+        const ttlSecondsRaw = Number.isFinite(ttlMs) && ttlMs > 0
+            ? Math.ceil(ttlMs / 1000)
+            : 300;
+        const ttlSeconds = Math.max(1, Math.min(24 * 60 * 60, ttlSecondsRaw));
+
+        return new Promise((resolve, reject) => {
+            const cleanupSql = `
+                DELETE FROM provider_event_idempotency
+                WHERE expires_at <= CURRENT_TIMESTAMP
+            `;
+            const insertSql = `
+                INSERT OR IGNORE INTO provider_event_idempotency (
+                    event_key, source, payload_hash, expires_at
+                )
+                VALUES (?, ?, ?, datetime('now', '+' || ? || ' seconds'))
+            `;
+
+            this.db.run(cleanupSql, (cleanupErr) => {
+                if (cleanupErr) {
+                    reject(cleanupErr);
+                    return;
+                }
+                this.db.run(
+                    insertSql,
+                    [eventKey, source, payloadHash, ttlSeconds],
+                    function(err) {
+                        if (err) {
+                            reject(err);
+                        } else {
+                            resolve({ reserved: (this.changes || 0) > 0 });
+                        }
+                    }
+                );
+            });
+        });
+    }
+
+    async pruneProviderEventIdempotency() {
+        return new Promise((resolve, reject) => {
+            const sql = `
+                DELETE FROM provider_event_idempotency
+                WHERE expires_at <= CURRENT_TIMESTAMP
+            `;
+            this.db.run(sql, function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.changes || 0);
+                }
+            });
+        });
+    }
+
+    async getCallRuntimeState(call_sid) {
+        if (!call_sid) return null;
+        return new Promise((resolve, reject) => {
+            const sql = `
+                SELECT *
+                FROM call_runtime_state
+                WHERE call_sid = ?
+                LIMIT 1
+            `;
+            this.db.get(sql, [call_sid], (err, row) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(row || null);
+                }
+            });
+        });
+    }
+
+    async upsertCallRuntimeState(payload = {}) {
+        const callSid = String(payload.call_sid || '').trim();
+        if (!callSid) return 0;
+        const interactionCount = Number(payload.interaction_count);
+        const digitCaptureActive = payload.digit_capture_active ? 1 : 0;
+        const snapshot = payload.snapshot != null
+            ? JSON.stringify(payload.snapshot)
+            : null;
+
+        return new Promise((resolve, reject) => {
+            const sql = `
+                INSERT INTO call_runtime_state (
+                    call_sid,
+                    provider,
+                    interaction_count,
+                    flow_state,
+                    call_mode,
+                    digit_capture_active,
+                    snapshot,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(call_sid) DO UPDATE SET
+                    provider = COALESCE(excluded.provider, call_runtime_state.provider),
+                    interaction_count = COALESCE(excluded.interaction_count, call_runtime_state.interaction_count),
+                    flow_state = COALESCE(excluded.flow_state, call_runtime_state.flow_state),
+                    call_mode = COALESCE(excluded.call_mode, call_runtime_state.call_mode),
+                    digit_capture_active = excluded.digit_capture_active,
+                    snapshot = COALESCE(excluded.snapshot, call_runtime_state.snapshot),
+                    updated_at = CURRENT_TIMESTAMP
+            `;
+            this.db.run(
+                sql,
+                [
+                    callSid,
+                    payload.provider || null,
+                    Number.isFinite(interactionCount)
+                        ? Math.max(0, Math.floor(interactionCount))
+                        : 0,
+                    payload.flow_state || null,
+                    payload.call_mode || null,
+                    digitCaptureActive,
+                    snapshot,
+                ],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(this.changes || 0);
+                    }
+                }
+            );
+        });
+    }
+
+    async deleteCallRuntimeState(call_sid) {
+        const callSid = String(call_sid || '').trim();
+        if (!callSid) return 0;
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                'DELETE FROM call_runtime_state WHERE call_sid = ?',
+                [callSid],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(this.changes || 0);
+                    }
+                }
+            );
+        });
+    }
+
+    async cleanupCallRuntimeState(hoursToKeep = 24) {
+        const safeHours = Math.max(1, Number(hoursToKeep) || 24);
+        return new Promise((resolve, reject) => {
+            const sql = `
+                DELETE FROM call_runtime_state
+                WHERE updated_at < datetime('now', '-' || ? || ' hours')
+            `;
+            this.db.run(sql, [safeHours], function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.changes || 0);
+                }
+            });
+        });
+    }
+
     // NEW: Get recent calls with transcripts count (REQUIRED FOR API ENDPOINTS)
     async getRecentCalls(limitOrOptions = 10, offset = 0) {
         let limit = 10;
@@ -1144,6 +1684,90 @@ class EnhancedDatabase {
             });
             stmt.finalize();
         });
+    }
+
+    async tableExists(tableName) {
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`,
+                [tableName],
+                (err, row) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(Boolean(row?.name));
+                    }
+                }
+            );
+        });
+    }
+
+    async indexExists(indexName) {
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?`,
+                [indexName],
+                (err, row) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(Boolean(row?.name));
+                    }
+                }
+            );
+        });
+    }
+
+    async ensureSchemaGuardrails(options = {}) {
+        const expectedVersion = Math.max(1, Number(options.expectedVersion) || 1);
+        const strict = options.strict !== false;
+        const requiredTables = Array.isArray(options.requiredTables) ? options.requiredTables : [];
+        const requiredIndexes = Array.isArray(options.requiredIndexes) ? options.requiredIndexes : [];
+        const rawVersion = await this.getSetting('schema_version');
+        let currentVersion = Number.parseInt(rawVersion, 10);
+        if (!Number.isFinite(currentVersion)) {
+            currentVersion = 0;
+        }
+
+        if (currentVersion > expectedVersion) {
+            const error = new Error(`Database schema version ${currentVersion} is newer than supported ${expectedVersion}`);
+            if (strict) throw error;
+            console.warn(error.message);
+        } else if (currentVersion < expectedVersion) {
+            await this.setSetting('schema_version', String(expectedVersion));
+            currentVersion = expectedVersion;
+        }
+
+        const missingTables = [];
+        for (const tableName of requiredTables) {
+            if (!tableName) continue;
+            const exists = await this.tableExists(tableName);
+            if (!exists) missingTables.push(tableName);
+        }
+
+        const missingIndexes = [];
+        for (const indexName of requiredIndexes) {
+            if (!indexName) continue;
+            const exists = await this.indexExists(indexName);
+            if (!exists) missingIndexes.push(indexName);
+        }
+
+        if (missingTables.length || missingIndexes.length) {
+            const error = new Error(
+                `Database schema artifacts missing. tables=${missingTables.join(',') || 'none'} indexes=${missingIndexes.join(',') || 'none'}`
+            );
+            if (strict) throw error;
+            console.warn(error.message);
+        }
+
+        return {
+            schema_version: currentVersion,
+            expected_version: expectedVersion,
+            strict,
+            missing_tables: missingTables,
+            missing_indexes: missingIndexes,
+            ok: missingTables.length === 0 && missingIndexes.length === 0
+        };
     }
 
     // Enhanced webhook notification creation with priority
@@ -1891,6 +2515,123 @@ class EnhancedDatabase {
                }
            });
        });
+   }
+
+   async getGptObservabilitySummary(windowMinutes = 60) {
+       const safeWindow = Math.max(1, Math.min(1440, Number(windowMinutes) || 60));
+       const windowExpr = `-${safeWindow} minutes`;
+
+       const totals = await new Promise((resolve, reject) => {
+           const sql = `
+               SELECT
+                   COUNT(*) as total,
+                   SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) as ok_count,
+                   SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed_count,
+                   SUM(CASE WHEN status = 'cached' THEN 1 ELSE 0 END) as cached_count,
+                   AVG(CASE WHEN duration_ms IS NOT NULL THEN duration_ms END) as avg_duration_ms
+               FROM gpt_tool_audit
+               WHERE created_at >= datetime('now', ?)
+           `;
+           this.db.get(sql, [windowExpr], (err, row) => {
+               if (err) reject(err);
+               else resolve(row || {});
+           });
+       });
+
+       const byToolRows = await new Promise((resolve, reject) => {
+           const sql = `
+               SELECT tool_name, status, COUNT(*) as count
+               FROM gpt_tool_audit
+               WHERE created_at >= datetime('now', ?)
+               GROUP BY tool_name, status
+               ORDER BY tool_name ASC, status ASC
+           `;
+           this.db.all(sql, [windowExpr], (err, rows) => {
+               if (err) reject(err);
+               else resolve(rows || []);
+           });
+       });
+
+       const sloRows = await new Promise((resolve, reject) => {
+           const sql = `
+               SELECT status, COUNT(*) as count
+               FROM service_health_logs
+               WHERE service_name = 'gpt_slo'
+                 AND timestamp >= datetime('now', ?)
+               GROUP BY status
+           `;
+           this.db.all(sql, [windowExpr], (err, rows) => {
+               if (err) reject(err);
+               else resolve(rows || []);
+           });
+       });
+
+       const circuitRows = await new Promise((resolve, reject) => {
+           const sql = `
+               SELECT status, COUNT(*) as count
+               FROM service_health_logs
+               WHERE service_name = 'gpt_tool_circuit'
+                 AND timestamp >= datetime('now', ?)
+               GROUP BY status
+           `;
+           this.db.all(sql, [windowExpr], (err, rows) => {
+               if (err) reject(err);
+               else resolve(rows || []);
+           });
+       });
+
+       const idemRows = await new Promise((resolve, reject) => {
+           const sql = `
+               SELECT status, COUNT(*) as count
+               FROM gpt_tool_idempotency
+               WHERE updated_at >= datetime('now', ?)
+               GROUP BY status
+           `;
+           this.db.all(sql, [windowExpr], (err, rows) => {
+               if (err) reject(err);
+               else resolve(rows || []);
+           });
+       });
+
+       const total = Number(totals?.total) || 0;
+       const failed = Number(totals?.failed_count) || 0;
+       const failureRate = total > 0 ? failed / total : 0;
+       const byTool = {};
+       byToolRows.forEach((row) => {
+           const toolName = String(row.tool_name || 'unknown');
+           if (!byTool[toolName]) {
+               byTool[toolName] = { ok: 0, failed: 0, cached: 0, other: 0, total: 0 };
+           }
+           const status = String(row.status || 'other');
+           const count = Number(row.count) || 0;
+           if (status === 'ok') byTool[toolName].ok += count;
+           else if (status === 'failed') byTool[toolName].failed += count;
+           else if (status === 'cached') byTool[toolName].cached += count;
+           else byTool[toolName].other += count;
+           byTool[toolName].total += count;
+       });
+
+       const toMap = (rows = []) => rows.reduce((acc, row) => {
+           const key = String(row.status || 'unknown');
+           acc[key] = Number(row.count) || 0;
+           return acc;
+       }, {});
+
+       return {
+           window_minutes: safeWindow,
+           tool_execution: {
+               total,
+               ok: Number(totals?.ok_count) || 0,
+               failed,
+               cached: Number(totals?.cached_count) || 0,
+               failure_rate: Number(failureRate.toFixed(4)),
+               avg_duration_ms: Math.round(Number(totals?.avg_duration_ms) || 0),
+               by_tool: byTool
+           },
+           slo: toMap(sloRows),
+           circuits: toMap(circuitRows),
+           idempotency: toMap(idemRows)
+       };
    }
 
    // Create SMS messages table
@@ -3524,7 +4265,12 @@ class EnhancedDatabase {
            { name: 'call_metrics', dateField: 'timestamp' },
            { name: 'notification_metrics', dateField: 'created_at' },
            { name: 'email_provider_events', dateField: 'created_at' },
-           { name: 'email_idempotency', dateField: 'created_at' }
+           { name: 'email_idempotency', dateField: 'created_at' },
+           { name: 'gpt_tool_audit', dateField: 'created_at' },
+           { name: 'gpt_tool_idempotency', dateField: 'updated_at' },
+           { name: 'gpt_memory_facts', dateField: 'last_seen_at' },
+           { name: 'provider_event_idempotency', dateField: 'created_at' },
+           { name: 'call_runtime_state', dateField: 'updated_at' }
        ];
        
        let totalCleaned = 0;
@@ -3645,6 +4391,20 @@ class EnhancedDatabase {
        if (sessionsCleaned > 0) {
            console.log(`🧹 Cleaned ${sessionsCleaned} old user sessions`);
        }
+
+       const memoryCleaned = await new Promise((resolve, reject) => {
+           const sql = `DELETE FROM gpt_call_memory
+               WHERE summary_updated_at < datetime('now', '-${daysToKeep} days')`;
+           this.db.run(sql, function(err) {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(this.changes);
+               }
+           });
+       });
+       cleanupResults.gpt_call_memory = memoryCleaned;
+       totalCleaned += memoryCleaned;
        
        // Log cleanup operation
        await this.logServiceHealth('database', 'cleanup_completed', {

@@ -1,16 +1,6 @@
+require("../config/bootstrapLogger");
 const axios = require('axios');
 const config = require('../config');
-const { renderSignalBars } = require('./signalBars');
-// Keep status logs readable with emoji prefixes; avoid duplication
-if (!console.__emojiWrapped) {
-  const baseLog = console.log.bind(console);
-  const baseWarn = console.warn.bind(console);
-  const baseError = console.error.bind(console);
-  console.log = (...args) => baseLog('📘', ...args);
-  console.warn = (...args) => baseWarn('⚠️', ...args);
-  console.error = (...args) => baseError('❌', ...args);
-  console.__emojiWrapped = true;
-}
 
 function normalizePhoneDigits(value) {
   return String(value || '').replace(/\D/g, '');
@@ -55,6 +45,17 @@ function escapeMarkdownV2(value) {
 }
 
 const DIGIT_TOKEN_REF_REGEX = /(vault:\/\/digits\/[^\s/]+\/tok_[A-Za-z0-9_]+|tok_[A-Za-z0-9_]+)/g;
+const DEFAULT_SIGNAL_BAR_GLYPHS = ['▂', '▃', '▄', '▅', '▆'];
+
+function buildSignalBars(strength, max = 5, empty = '░') {
+  const maxBars = Number.isFinite(max) ? Math.max(1, Math.floor(max)) : 5;
+  const safeStrength = Number.isFinite(strength) ? strength : 0;
+  const filled = Math.max(0, Math.min(maxBars, Math.round(safeStrength)));
+  return DEFAULT_SIGNAL_BAR_GLYPHS
+    .slice(0, maxBars)
+    .map((glyph, index) => (index < filled ? glyph : empty))
+    .join('');
+}
 
 class EnhancedWebhookService {
   constructor() {
@@ -1756,7 +1757,7 @@ class EnhancedWebhookService {
   }
 
   renderSignalBars(strength, max = this.signalBarsMax) {
-    return renderSignalBars(strength, max, this.signalBarEmpty);
+    return buildSignalBars(strength, max, this.signalBarEmpty);
   }
 
   buildSignalLine(entry) {
