@@ -11,6 +11,7 @@ module.exports = {
       env: {
         NODE_ENV: 'production',
         PORT: 1337,
+        FORCE_COLOR: '1',
       },
       
       // Restart policy
@@ -22,7 +23,6 @@ module.exports = {
       log_file: '/home/ubuntu/voicednut/logs/api/combined.log',
       out_file: '/home/ubuntu/voicednut/logs/api/out.log',
       error_file: '/home/ubuntu/voicednut/logs/api/error.log',
-      log_type: 'json',
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
       
       // Advanced options
@@ -61,6 +61,7 @@ module.exports = {
       env_production: {
         NODE_ENV: 'production',
         PORT: 1337,
+        FORCE_COLOR: '1',
         // Add your production environment variables here
         // SERVER: process.env.SERVER,
         // TWILIO_ACCOUNT_SID: process.env.TWILIO_ACCOUNT_SID,

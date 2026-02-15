@@ -1,4 +1,16 @@
-require("colors");
+const colors = require("colors");
+
+if (String(process.env.NODE_DISABLE_COLORS || "").trim() !== "1") {
+  // PM2 and redirected streams are often non-TTY; force ANSI colors unless explicitly disabled.
+  if (!process.env.FORCE_COLOR) {
+    process.env.FORCE_COLOR = "1";
+  }
+  if (typeof colors.enable === "function") {
+    colors.enable();
+  } else {
+    colors.enabled = true;
+  }
+}
 
 if (!console.__apiColorWrapped) {
   const baseLog = console.log.bind(console);
