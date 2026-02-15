@@ -17,6 +17,12 @@ Features:
 - 🛠️ Allows the GPT to call external tools.
 - 🎭 Persona composer tailors tone, mood, and phrasing across business domains, channels, and urgency levels.
 
+## Digit Capture Roadmap
+
+For the phased enterprise hardening plan of digit-capture profiles (reprompts, retries, timeout/failure handling, state machine, observability, and security), see:
+
+- `api/docs/digit-capture-enterprise-roadmap.md`
+
 ## AWS Connect Mode
 
 Twilio Media Streams is still supported, but the API now ships with an AWS-native path that uses Amazon Connect, Kinesis/Transcribe, and Polly for end-to-end audio orchestration. Flip the provider by setting `CALL_PROVIDER=aws` and providing the following environment variables:

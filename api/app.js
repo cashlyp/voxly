@@ -2061,7 +2061,7 @@ async function activateDtmfFallback(
 
   const fallbackPrompt = expectation
     ? digitService.buildDigitPrompt(expectation)
-    : "Please enter the digits using your keypad.";
+    : "Enter the digits now.";
   if (gptService) {
     const personalityInfo =
       gptService?.personalityEngine?.getCurrentPersonality?.();
