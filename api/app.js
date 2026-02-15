@@ -5155,6 +5155,18 @@ function startBackgroundWorkers() {
     });
   }, 60000); // Check every minute
 
+  if (config.sms?.reconcile?.enabled !== false) {
+    setInterval(() => {
+      smsService.reconcileStaleOutboundStatuses().catch((error) => {
+        console.error("❌ SMS reconcile worker error:", error);
+      });
+    }, Number(config.sms?.reconcile?.intervalMs) || 120000);
+
+    smsService.reconcileStaleOutboundStatuses().catch((error) => {
+      console.error("❌ Initial SMS reconcile run failed:", error);
+    });
+  }
+
   setInterval(() => {
     processCallJobs().catch((error) => {
       console.error("❌ Call job processor error:", error);
@@ -9160,6 +9172,10 @@ async function processCallJobs() {
                 body: message,
                 status: smsResult.status || "queued",
                 direction: "outbound",
+                provider:
+                  smsResult.provider ||
+                  smsOptions.provider ||
+                  getActiveSmsProvider(),
                 user_chat_id: userChatId || null,
               });
             } catch (saveError) {
@@ -10602,9 +10618,146 @@ app.get("/email/bulk/stats", requireOutboundAuthorization, async (req, res) => {
   }
 });
 
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeSmsProviderInput(value) {
+  if (value === undefined || value === null || value === "") {
+    return { value: null };
+  }
+  const normalized = String(value).trim().toLowerCase();
+  if (!normalized) {
+    return { value: null };
+  }
+  if (!SUPPORTED_SMS_PROVIDERS.includes(normalized)) {
+    return {
+      error: `Provider must be one of: ${SUPPORTED_SMS_PROVIDERS.join(", ")}`,
+    };
+  }
+  return { value: normalized };
+}
+
+function normalizeSmsIdempotencyInput(value) {
+  if (value === undefined || value === null || value === "") {
+    return { value: null };
+  }
+  const normalized = String(value).trim();
+  if (!normalized || normalized.length > 128) {
+    return { error: "Idempotency key must be between 1 and 128 characters" };
+  }
+  return { value: normalized };
+}
+
+function normalizeSmsQuietHoursInput(value) {
+  if (value === undefined || value === null) {
+    return { value: null };
+  }
+  if (!isPlainObject(value)) {
+    return { error: "quiet_hours must be an object with start/end hours" };
+  }
+  const start = Number(value.start);
+  const end = Number(value.end);
+  const isValidHour = (hour) => Number.isInteger(hour) && hour >= 0 && hour <= 23;
+  if (!isValidHour(start) || !isValidHour(end) || start === end) {
+    return {
+      error: "quiet_hours start/end must be different integers between 0 and 23",
+    };
+  }
+  return { value: { start, end } };
+}
+
+function normalizeSmsMediaUrlInput(value) {
+  if (value === undefined || value === null || value === "") {
+    return { value: null };
+  }
+  const mediaList = Array.isArray(value) ? value : [value];
+  if (!mediaList.length || mediaList.length > 5) {
+    return { error: "media_url supports between 1 and 5 URLs" };
+  }
+  const normalized = [];
+  for (const item of mediaList) {
+    const mediaUrl = String(item || "").trim();
+    if (!mediaUrl) {
+      return { error: "media_url contains an empty value" };
+    }
+    try {
+      new URL(mediaUrl);
+    } catch (_) {
+      return { error: "media_url contains an invalid URL" };
+    }
+    normalized.push(mediaUrl);
+  }
+  return { value: normalized.length === 1 ? normalized[0] : normalized };
+}
+
+function normalizeSmsRecipientsInput(value) {
+  if (!Array.isArray(value) || value.length === 0) {
+    return {
+      error: "Recipients array is required and must not be empty",
+    };
+  }
+  const normalized = [];
+  for (const entry of value) {
+    const phone = String(entry || "").trim();
+    if (!phone) {
+      return { error: "Recipients must contain non-empty phone numbers" };
+    }
+    if (!phone.match(/^\+[1-9]\d{1,14}$/)) {
+      return { error: "Recipients must use E.164 phone format (e.g., +1234567890)" };
+    }
+    normalized.push(phone);
+  }
+  return { value: normalized };
+}
+
+function normalizeSmsChatIdInput(value) {
+  if (value === undefined || value === null || value === "") {
+    return { value: null };
+  }
+  const normalized = String(value).trim();
+  if (!normalized || normalized.length > 64) {
+    return { error: "user_chat_id must be a non-empty string up to 64 characters" };
+  }
+  return { value: normalized };
+}
+
+function normalizeSmsFromInput(value) {
+  if (value === undefined || value === null || value === "") {
+    return { value: null };
+  }
+  const normalized = String(value).trim();
+  if (!normalized) {
+    return { error: "from must be a non-empty string when provided" };
+  }
+  if (normalized.length > 64) {
+    return { error: "from must be 64 characters or fewer" };
+  }
+  return { value: normalized };
+}
+
+function normalizeSmsBooleanInput(value, fieldName) {
+  if (value === undefined || value === null) {
+    return { value: null };
+  }
+  if (typeof value !== "boolean") {
+    return { error: `${fieldName} must be true or false when provided` };
+  }
+  return { value };
+}
+
 // Send single SMS endpoint
 app.post("/api/sms/send", requireOutboundAuthorization, async (req, res) => {
   try {
+    if (!isPlainObject(req.body)) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        "Request body must be a JSON object",
+        req.requestId,
+      );
+    }
     const {
       to,
       message,
@@ -10617,10 +10770,103 @@ app.post("/api/sms/send", requireOutboundAuthorization, async (req, res) => {
       media_url,
       provider,
     } = req.body;
-    const idempotencyHeader =
-      req.headers["idempotency-key"] || req.headers["Idempotency-Key"];
+    const idempotencyHeader = req.headers["idempotency-key"];
+    const toNumber = String(to || "").trim();
+    const messageText = typeof message === "string" ? message : "";
 
-    if (!to || !message) {
+    if (!isPlainObject(options)) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        "options must be an object when provided",
+        req.requestId,
+      );
+    }
+
+    const parsedProvider = normalizeSmsProviderInput(provider);
+    if (parsedProvider.error) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        parsedProvider.error,
+        req.requestId,
+      );
+    }
+
+    const parsedIdempotency = normalizeSmsIdempotencyInput(
+      idempotency_key || idempotencyHeader,
+    );
+    if (parsedIdempotency.error) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        parsedIdempotency.error,
+        req.requestId,
+      );
+    }
+
+    const parsedQuietHours = normalizeSmsQuietHoursInput(quiet_hours);
+    if (parsedQuietHours.error) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        parsedQuietHours.error,
+        req.requestId,
+      );
+    }
+
+    const parsedMediaUrl = normalizeSmsMediaUrlInput(media_url);
+    if (parsedMediaUrl.error) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        parsedMediaUrl.error,
+        req.requestId,
+      );
+    }
+
+    const parsedUserChatId = normalizeSmsChatIdInput(user_chat_id);
+    if (parsedUserChatId.error) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        parsedUserChatId.error,
+        req.requestId,
+      );
+    }
+
+    const parsedFrom = normalizeSmsFromInput(from);
+    if (parsedFrom.error) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        parsedFrom.error,
+        req.requestId,
+      );
+    }
+
+    const parsedAllowQuietHours = normalizeSmsBooleanInput(
+      allow_quiet_hours,
+      "allow_quiet_hours",
+    );
+    if (parsedAllowQuietHours.error) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        parsedAllowQuietHours.error,
+        req.requestId,
+      );
+    }
+
+    if (!toNumber || !messageText.trim()) {
       return sendApiError(
         res,
         400,
@@ -10631,7 +10877,7 @@ app.post("/api/sms/send", requireOutboundAuthorization, async (req, res) => {
     }
 
     // Validate phone number format
-    if (!to.match(/^\+[1-9]\d{1,14}$/)) {
+    if (!toNumber.match(/^\+[1-9]\d{1,14}$/)) {
       return sendApiError(
         res,
         400,
@@ -10642,7 +10888,7 @@ app.post("/api/sms/send", requireOutboundAuthorization, async (req, res) => {
     }
 
     const maxSmsChars = Number(config.sms?.maxMessageChars) || 1600;
-    if (String(message).length > maxSmsChars) {
+    if (messageText.length > maxSmsChars) {
       return sendApiError(
         res,
         400,
@@ -10654,7 +10900,7 @@ app.post("/api/sms/send", requireOutboundAuthorization, async (req, res) => {
 
     const limitResponse = await enforceOutboundRateLimits(req, res, {
       namespace: "sms_send",
-      actorKey: getOutboundActorKey(req, user_chat_id),
+      actorKey: getOutboundActorKey(req, parsedUserChatId.value),
       perUserLimit: Number(config.outboundLimits?.sms?.perUser) || 15,
       globalLimit: Number(config.outboundLimits?.sms?.global) || 120,
       windowMs: Number(config.outboundLimits?.windowMs) || 60000,
@@ -10663,37 +10909,82 @@ app.post("/api/sms/send", requireOutboundAuthorization, async (req, res) => {
       return;
     }
 
-    const smsOptions = { ...(options || {}) };
-    if ((idempotency_key || idempotencyHeader) && !smsOptions.idempotencyKey) {
-      smsOptions.idempotencyKey = idempotency_key || idempotencyHeader;
+    const smsOptions = { ...options };
+    if (parsedIdempotency.value && !smsOptions.idempotencyKey) {
+      smsOptions.idempotencyKey = parsedIdempotency.value;
     }
-    if (allow_quiet_hours === false) {
-      smsOptions.allowQuietHours = false;
+    if (parsedAllowQuietHours.value !== null) {
+      smsOptions.allowQuietHours = parsedAllowQuietHours.value;
     }
-    if (quiet_hours && !smsOptions.quietHours) {
-      smsOptions.quietHours = quiet_hours;
+    if (parsedQuietHours.value && !smsOptions.quietHours) {
+      smsOptions.quietHours = parsedQuietHours.value;
     }
-    if (media_url && !smsOptions.mediaUrl) {
-      smsOptions.mediaUrl = media_url;
+    if (parsedMediaUrl.value && !smsOptions.mediaUrl) {
+      smsOptions.mediaUrl = parsedMediaUrl.value;
     }
-    if (user_chat_id && !smsOptions.userChatId) {
-      smsOptions.userChatId = String(user_chat_id);
+    if (parsedUserChatId.value && !smsOptions.userChatId) {
+      smsOptions.userChatId = parsedUserChatId.value;
     }
-    if (provider && !smsOptions.provider) {
-      smsOptions.provider = String(provider).trim().toLowerCase();
+    if (parsedProvider.value && !smsOptions.provider) {
+      smsOptions.provider = parsedProvider.value;
+    }
+    if (!Object.prototype.hasOwnProperty.call(smsOptions, "durable")) {
+      smsOptions.durable = false;
+    }
+    if (typeof smsOptions.durable !== "boolean") {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        "options.durable must be a boolean when provided",
+        req.requestId,
+      );
     }
 
     console.log("sms_send_request", {
       request_id: req.requestId || null,
-      actor: getOutboundActorKey(req, user_chat_id),
-      to: maskPhoneForLog(to),
-      body: maskSmsBodyForLog(message),
+      actor: getOutboundActorKey(req, parsedUserChatId.value),
+      to: maskPhoneForLog(toNumber),
+      body: maskSmsBodyForLog(messageText),
       provider: smsOptions.provider || getActiveSmsProvider(),
       idempotency_key: smsOptions.idempotencyKey ? "present" : "absent",
+      durable: smsOptions.durable === true,
     });
 
+    if (smsOptions.durable === true) {
+      if (!db?.createCallJob) {
+        return sendApiError(
+          res,
+          503,
+          "sms_queue_unavailable",
+          "Durable SMS queue is unavailable",
+          req.requestId,
+        );
+      }
+      const durableSmsOptions = { ...smsOptions };
+      delete durableSmsOptions.durable;
+      const queued = await runWithTimeout(
+        smsService.scheduleSMS(toNumber, messageText, new Date(), {
+          reason: "durable_send",
+          from: parsedFrom.value,
+          userChatId: parsedUserChatId.value,
+          idempotencyKey: smsOptions.idempotencyKey || null,
+          smsOptions: durableSmsOptions,
+        }),
+        Number(config.outboundLimits?.handlerTimeoutMs) || 30000,
+        "sms durable send handler",
+        "sms_handler_timeout",
+      );
+      return res.status(202).json({
+        success: true,
+        queued: true,
+        ...queued,
+        request_id: req.requestId || null,
+      });
+    }
+
     const result = await runWithTimeout(
-      smsService.sendSMS(to, message, from, smsOptions),
+      smsService.sendSMS(toNumber, messageText, parsedFrom.value, smsOptions),
       Number(config.outboundLimits?.handlerTimeoutMs) || 30000,
       "sms send handler",
       "sms_handler_timeout",
@@ -10704,12 +10995,13 @@ app.post("/api/sms/send", requireOutboundAuthorization, async (req, res) => {
       try {
         await db.saveSMSMessage({
           message_sid: result.message_sid,
-          to_number: to,
+          to_number: toNumber,
           from_number: result.from,
-          body: message,
+          body: messageText,
           status: result.status,
           direction: "outbound",
-          user_chat_id: user_chat_id,
+          provider: result.provider || smsOptions.provider || getActiveSmsProvider(),
+          user_chat_id: parsedUserChatId.value,
         });
       } catch (saveError) {
         const saveMsg = String(saveError?.message || "");
@@ -10722,11 +11014,11 @@ app.post("/api/sms/send", requireOutboundAuthorization, async (req, res) => {
       }
 
       // Create webhook notification
-      if (user_chat_id) {
+      if (parsedUserChatId.value) {
         await db.createEnhancedWebhookNotification(
           result.message_sid,
           "sms_sent",
-          user_chat_id,
+          parsedUserChatId.value,
         );
       }
     }
@@ -10778,6 +11070,15 @@ app.post("/api/sms/send", requireOutboundAuthorization, async (req, res) => {
 // Send bulk SMS endpoint
 app.post("/api/sms/bulk", requireOutboundAuthorization, async (req, res) => {
   try {
+    if (!isPlainObject(req.body)) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        "Request body must be a JSON object",
+        req.requestId,
+      );
+    }
     const {
       recipients,
       message,
@@ -10788,20 +11089,41 @@ app.post("/api/sms/bulk", requireOutboundAuthorization, async (req, res) => {
       idempotency_key,
       provider,
     } = req.body;
-    const idempotencyHeader =
-      req.headers["idempotency-key"] || req.headers["Idempotency-Key"];
+    const idempotencyHeader = req.headers["idempotency-key"];
+    const messageText = typeof message === "string" ? message : "";
 
-    if (!recipients || !Array.isArray(recipients) || recipients.length === 0) {
+    if (!isPlainObject(options)) {
       return sendApiError(
         res,
         400,
         "sms_validation_failed",
-        "Recipients array is required and must not be empty",
+        "options must be an object when provided",
         req.requestId,
       );
     }
 
-    if (!message) {
+    if (sms_options !== undefined && sms_options !== null && !isPlainObject(sms_options)) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        "sms_options must be an object when provided",
+        req.requestId,
+      );
+    }
+
+    const parsedRecipients = normalizeSmsRecipientsInput(recipients);
+    if (parsedRecipients.error) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        parsedRecipients.error,
+        req.requestId,
+      );
+    }
+
+    if (!messageText.trim()) {
       return sendApiError(
         res,
         400,
@@ -10811,11 +11133,57 @@ app.post("/api/sms/bulk", requireOutboundAuthorization, async (req, res) => {
       );
     }
 
+    const parsedProvider = normalizeSmsProviderInput(provider);
+    if (parsedProvider.error) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        parsedProvider.error,
+        req.requestId,
+      );
+    }
+
+    const parsedIdempotency = normalizeSmsIdempotencyInput(
+      idempotency_key || idempotencyHeader,
+    );
+    if (parsedIdempotency.error) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        parsedIdempotency.error,
+        req.requestId,
+      );
+    }
+
+    const parsedUserChatId = normalizeSmsChatIdInput(user_chat_id);
+    if (parsedUserChatId.error) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        parsedUserChatId.error,
+        req.requestId,
+      );
+    }
+
+    const parsedFrom = normalizeSmsFromInput(from);
+    if (parsedFrom.error) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        parsedFrom.error,
+        req.requestId,
+      );
+    }
+
     const maxBulkRecipients = Math.min(
       250,
-      Math.max(1, Number(config.email?.maxBulkRecipients) || 100),
+      Math.max(1, Number(config.sms?.maxBulkRecipients) || 100),
     );
-    if (recipients.length > maxBulkRecipients) {
+    if (parsedRecipients.value.length > maxBulkRecipients) {
       return sendApiError(
         res,
         400,
@@ -10826,7 +11194,7 @@ app.post("/api/sms/bulk", requireOutboundAuthorization, async (req, res) => {
     }
 
     const maxSmsChars = Number(config.sms?.maxMessageChars) || 1600;
-    if (String(message).length > maxSmsChars) {
+    if (messageText.length > maxSmsChars) {
       return sendApiError(
         res,
         400,
@@ -10838,7 +11206,7 @@ app.post("/api/sms/bulk", requireOutboundAuthorization, async (req, res) => {
 
     const limitResponse = await enforceOutboundRateLimits(req, res, {
       namespace: "sms_bulk",
-      actorKey: getOutboundActorKey(req, user_chat_id),
+      actorKey: getOutboundActorKey(req, parsedUserChatId.value),
       perUserLimit: Math.max(
         1,
         Math.floor((Number(config.outboundLimits?.sms?.perUser) || 15) / 3),
@@ -10850,34 +11218,51 @@ app.post("/api/sms/bulk", requireOutboundAuthorization, async (req, res) => {
       return;
     }
 
-    const bulkOptions = { ...(options || {}) };
-    if (from && !bulkOptions.from) {
-      bulkOptions.from = from;
+    const bulkOptions = { ...options };
+    if (parsedFrom.value && !bulkOptions.from) {
+      bulkOptions.from = parsedFrom.value;
     }
     if (sms_options && !bulkOptions.smsOptions) {
-      bulkOptions.smsOptions = sms_options;
+      bulkOptions.smsOptions = { ...sms_options };
     }
-    if (provider) {
+    if (parsedProvider.value) {
       bulkOptions.smsOptions = {
         ...(bulkOptions.smsOptions || {}),
-        provider:
-          bulkOptions.smsOptions?.provider || String(provider).trim().toLowerCase(),
+        provider: bulkOptions.smsOptions?.provider || parsedProvider.value,
       };
     }
-    if (user_chat_id && !bulkOptions.userChatId) {
-      bulkOptions.userChatId = String(user_chat_id);
+    if (parsedUserChatId.value && !bulkOptions.userChatId) {
+      bulkOptions.userChatId = parsedUserChatId.value;
     }
-    if ((idempotency_key || idempotencyHeader) && !bulkOptions.idempotencyKey) {
-      bulkOptions.idempotencyKey = idempotency_key || idempotencyHeader;
+    if (parsedIdempotency.value && !bulkOptions.idempotencyKey) {
+      bulkOptions.idempotencyKey = parsedIdempotency.value;
     }
     if (!Object.prototype.hasOwnProperty.call(bulkOptions, "durable")) {
       bulkOptions.durable = true;
     }
+    if (typeof bulkOptions.durable !== "boolean") {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        "options.durable must be a boolean when provided",
+        req.requestId,
+      );
+    }
+    if (bulkOptions.durable === true && !db?.createCallJob) {
+      return sendApiError(
+        res,
+        503,
+        "sms_queue_unavailable",
+        "Durable SMS queue is unavailable",
+        req.requestId,
+      );
+    }
 
     console.log("sms_bulk_request", {
       request_id: req.requestId || null,
-      actor: getOutboundActorKey(req, user_chat_id),
-      recipients: recipients.length,
+      actor: getOutboundActorKey(req, parsedUserChatId.value),
+      recipients: parsedRecipients.value.length,
       provider: bulkOptions.smsOptions?.provider || getActiveSmsProvider(),
       durable: bulkOptions.durable === true,
       idempotency_key: bulkOptions.idempotencyKey ? "present" : "absent",
@@ -10885,8 +11270,8 @@ app.post("/api/sms/bulk", requireOutboundAuthorization, async (req, res) => {
 
     const result = await runWithTimeout(
       smsService.sendBulkSMS(
-        recipients,
-        message,
+        parsedRecipients.value,
+        messageText,
         bulkOptions,
       ),
       Number(config.outboundLimits?.handlerTimeoutMs) || 30000,
@@ -10900,8 +11285,8 @@ app.post("/api/sms/bulk", requireOutboundAuthorization, async (req, res) => {
         total_recipients: result.total,
         successful: result.successful,
         failed: result.failed,
-        message: message,
-        user_chat_id: user_chat_id,
+        message: messageText,
+        user_chat_id: parsedUserChatId.value,
         timestamp: new Date(),
       });
     }
@@ -10953,6 +11338,15 @@ app.post("/api/sms/bulk", requireOutboundAuthorization, async (req, res) => {
 // Schedule SMS endpoint
 app.post("/api/sms/schedule", requireOutboundAuthorization, async (req, res) => {
   try {
+    if (!isPlainObject(req.body)) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        "Request body must be a JSON object",
+        req.requestId,
+      );
+    }
     const {
       to,
       message,
@@ -10963,15 +11357,82 @@ app.post("/api/sms/schedule", requireOutboundAuthorization, async (req, res) => 
       idempotency_key,
       provider,
     } = req.body;
-    const idempotencyHeader =
-      req.headers["idempotency-key"] || req.headers["Idempotency-Key"];
+    const idempotencyHeader = req.headers["idempotency-key"];
+    const toNumber = String(to || "").trim();
+    const messageText = typeof message === "string" ? message : "";
 
-    if (!to || !message || !scheduled_time) {
+    if (!isPlainObject(options)) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        "options must be an object when provided",
+        req.requestId,
+      );
+    }
+
+    const parsedProvider = normalizeSmsProviderInput(provider);
+    if (parsedProvider.error) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        parsedProvider.error,
+        req.requestId,
+      );
+    }
+
+    const parsedIdempotency = normalizeSmsIdempotencyInput(
+      idempotency_key || idempotencyHeader,
+    );
+    if (parsedIdempotency.error) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        parsedIdempotency.error,
+        req.requestId,
+      );
+    }
+
+    const parsedUserChatId = normalizeSmsChatIdInput(user_chat_id);
+    if (parsedUserChatId.error) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        parsedUserChatId.error,
+        req.requestId,
+      );
+    }
+
+    const parsedFrom = normalizeSmsFromInput(from);
+    if (parsedFrom.error) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        parsedFrom.error,
+        req.requestId,
+      );
+    }
+
+    if (!toNumber || !messageText.trim() || !scheduled_time) {
       return sendApiError(
         res,
         400,
         "sms_validation_failed",
         "Phone number, message, and scheduled_time are required",
+        req.requestId,
+      );
+    }
+
+    if (!toNumber.match(/^\+[1-9]\d{1,14}$/)) {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        "Invalid phone number format. Use E.164 format (e.g., +1234567890)",
         req.requestId,
       );
     }
@@ -10988,7 +11449,7 @@ app.post("/api/sms/schedule", requireOutboundAuthorization, async (req, res) => 
     }
 
     const maxSmsChars = Number(config.sms?.maxMessageChars) || 1600;
-    if (String(message).length > maxSmsChars) {
+    if (messageText.length > maxSmsChars) {
       return sendApiError(
         res,
         400,
@@ -11000,7 +11461,7 @@ app.post("/api/sms/schedule", requireOutboundAuthorization, async (req, res) => 
 
     const limitResponse = await enforceOutboundRateLimits(req, res, {
       namespace: "sms_schedule",
-      actorKey: getOutboundActorKey(req, user_chat_id),
+      actorKey: getOutboundActorKey(req, parsedUserChatId.value),
       perUserLimit: Number(config.outboundLimits?.sms?.perUser) || 15,
       globalLimit: Number(config.outboundLimits?.sms?.global) || 120,
       windowMs: Number(config.outboundLimits?.windowMs) || 60000,
@@ -11009,35 +11470,60 @@ app.post("/api/sms/schedule", requireOutboundAuthorization, async (req, res) => 
       return;
     }
 
-    const scheduleOptions = { ...(options || {}) };
-    if (from && !scheduleOptions.from) {
-      scheduleOptions.from = from;
+    const scheduleOptions = { ...options };
+    if (parsedFrom.value && !scheduleOptions.from) {
+      scheduleOptions.from = parsedFrom.value;
     }
-    if (user_chat_id && !scheduleOptions.userChatId) {
-      scheduleOptions.userChatId = String(user_chat_id);
+    if (parsedUserChatId.value && !scheduleOptions.userChatId) {
+      scheduleOptions.userChatId = parsedUserChatId.value;
     }
-    if ((idempotency_key || idempotencyHeader) && !scheduleOptions.idempotencyKey) {
-      scheduleOptions.idempotencyKey = idempotency_key || idempotencyHeader;
+    if (parsedIdempotency.value && !scheduleOptions.idempotencyKey) {
+      scheduleOptions.idempotencyKey = parsedIdempotency.value;
     }
-    if (provider && !scheduleOptions.provider) {
-      scheduleOptions.provider = String(provider).trim().toLowerCase();
+    if (parsedProvider.value && !scheduleOptions.provider) {
+      scheduleOptions.provider = parsedProvider.value;
+    }
+    if (!Object.prototype.hasOwnProperty.call(scheduleOptions, "durable")) {
+      scheduleOptions.durable = true;
+    }
+    if (typeof scheduleOptions.durable !== "boolean") {
+      return sendApiError(
+        res,
+        400,
+        "sms_validation_failed",
+        "options.durable must be a boolean when provided",
+        req.requestId,
+      );
+    }
+    if (scheduleOptions.durable === true && !db?.createCallJob) {
+      return sendApiError(
+        res,
+        503,
+        "sms_queue_unavailable",
+        "Durable SMS queue is unavailable",
+        req.requestId,
+      );
     }
 
     console.log("sms_schedule_request", {
       request_id: req.requestId || null,
-      actor: getOutboundActorKey(req, user_chat_id),
-      to: maskPhoneForLog(to),
+      actor: getOutboundActorKey(req, parsedUserChatId.value),
+      to: maskPhoneForLog(toNumber),
       provider: scheduleOptions.provider || getActiveSmsProvider(),
       scheduled_at: scheduledDate.toISOString(),
       idempotency_key: scheduleOptions.idempotencyKey ? "present" : "absent",
+      durable: scheduleOptions.durable === true,
     });
+
+    const serviceOptions = { ...scheduleOptions };
+    delete serviceOptions.durable;
 
     const result = await runWithTimeout(
       smsService.scheduleSMS(
-        to,
-        message,
-        scheduled_time,
-        scheduleOptions,
+        toNumber,
+        messageText,
+        scheduledDate.toISOString(),
+        serviceOptions,
       ),
       Number(config.outboundLimits?.handlerTimeoutMs) || 30000,
       "sms schedule handler",
@@ -11134,7 +11620,10 @@ app.get("/api/sms/scripts", requireAdminToken, async (req, res) => {
 });
 
 // Get SMS messages from database for conversation view
-app.get("/api/sms/messages/conversation/:phone", async (req, res) => {
+app.get(
+  "/api/sms/messages/conversation/:phone",
+  requireOutboundAuthorization,
+  async (req, res) => {
   try {
     const { phone } = req.params;
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
@@ -11162,10 +11651,11 @@ app.get("/api/sms/messages/conversation/:phone", async (req, res) => {
       details: error.message,
     });
   }
-});
+  },
+);
 
 // Get recent SMS messages from database
-app.get("/api/sms/messages/recent", async (req, res) => {
+app.get("/api/sms/messages/recent", requireOutboundAuthorization, async (req, res) => {
   try {
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 10, 1), 50);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
@@ -11190,7 +11680,7 @@ app.get("/api/sms/messages/recent", async (req, res) => {
 });
 
 // Get SMS database statistics
-app.get("/api/sms/database-stats", async (req, res) => {
+app.get("/api/sms/database-stats", requireOutboundAuthorization, async (req, res) => {
   try {
     const hours = parseInt(req.query.hours) || 24;
     const dateFrom = new Date(
@@ -11308,7 +11798,7 @@ app.get("/api/sms/database-stats", async (req, res) => {
 });
 
 // Get SMS status by message SID
-app.get("/api/sms/status/:messageSid", async (req, res) => {
+app.get("/api/sms/status/:messageSid", requireOutboundAuthorization, async (req, res) => {
   try {
     const { messageSid } = req.params;
     if (!isSafeId(messageSid, { max: 128 })) {
@@ -11533,20 +12023,29 @@ registerWebhookRoutes(app, {
   maskPhoneForLog,
   maskSmsBodyForLog,
   smsService,
+  smsWebhookDedupeTtlMs: Number(config.sms?.webhookDedupeTtlMs) || null,
   getDigitService: () => digitService,
   getEmailService: () => emailService,
 });
 
 // Get SMS statistics
-app.get("/api/sms/stats", async (req, res) => {
+app.get("/api/sms/stats", requireOutboundAuthorization, async (req, res) => {
   try {
     const stats = smsService.getStatistics();
     const activeConversations = smsService.getActiveConversations();
+    const providerCircuits = smsService.getProviderCircuitHealth
+      ? smsService.getProviderCircuitHealth()
+      : {};
+    const reconcileConfig = smsService.getReconcileConfig
+      ? smsService.getReconcileConfig()
+      : {};
 
     res.json({
       success: true,
       statistics: stats,
       active_conversations: activeConversations.slice(0, 20), // Last 20 conversations
+      provider_circuit_health: providerCircuits,
+      reconcile: reconcileConfig,
       sms_service_enabled: true,
     });
   } catch (error) {
@@ -11558,8 +12057,41 @@ app.get("/api/sms/stats", async (req, res) => {
   }
 });
 
+app.post("/api/sms/reconcile", requireAdminToken, async (req, res) => {
+  try {
+    const result = await runWithTimeout(
+      smsService.reconcileStaleOutboundStatuses({
+        staleMinutes: req.body?.stale_minutes,
+        limit: req.body?.limit,
+      }),
+      Number(config.outboundLimits?.handlerTimeoutMs) || 30000,
+      "sms reconcile handler",
+      "sms_handler_timeout",
+    );
+    return res.json({
+      success: true,
+      ...result,
+      request_id: req.requestId || null,
+    });
+  } catch (error) {
+    const status = error.code === "sms_handler_timeout" ? 504 : 500;
+    console.error("sms_reconcile_error", {
+      request_id: req.requestId || null,
+      error: redactSensitiveLogValue(error.message || "sms_reconcile_failed"),
+      code: error.code || null,
+    });
+    return sendApiError(
+      res,
+      status,
+      error.code || "sms_reconcile_failed",
+      error.message || "Failed to reconcile stale SMS statuses",
+      req.requestId,
+    );
+  }
+});
+
 // Bulk SMS status endpoint
-app.get("/api/sms/bulk/status", async (req, res) => {
+app.get("/api/sms/bulk/status", requireOutboundAuthorization, async (req, res) => {
   try {
     const limit = parseBoundedInteger(req.query.limit, {
       defaultValue: 10,

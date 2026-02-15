@@ -80,14 +80,39 @@ function logSmsError(label, error) {
     console.error(`${label}: ${summarizeErrorForLog(error)}`);
 }
 
-function buildIdempotencyKey(scope, actorId, payload = {}) {
+function normalizeIdempotencyPart(value, fallback) {
+    const clean = String(value || '')
+        .trim()
+        .replace(/[^a-zA-Z0-9_-]/g, '')
+        .slice(0, 32);
+    return clean || fallback;
+}
+
+function canonicalizeIdempotencyPayload(value) {
+    if (Array.isArray(value)) {
+        return value.map(canonicalizeIdempotencyPayload);
+    }
+    if (value && typeof value === 'object') {
+        return Object.keys(value)
+            .sort()
+            .reduce((acc, key) => {
+                acc[key] = canonicalizeIdempotencyPayload(value[key]);
+                return acc;
+            }, {});
+    }
+    return value;
+}
+
+function buildIdempotencyKey(scope, actorId, payload = {}, flowToken = null) {
     const digest = crypto
         .createHash('sha256')
-        .update(JSON.stringify(payload))
+        .update(JSON.stringify(canonicalizeIdempotencyPayload(payload)))
         .digest('hex')
-        .slice(0, 16);
-    const actor = String(actorId || 'anon');
-    return `${scope}:${actor}:${Date.now().toString(36)}:${digest}`;
+        .slice(0, 24);
+    const namespace = normalizeIdempotencyPart(scope, 'sms');
+    const actor = normalizeIdempotencyPart(actorId, 'anon');
+    const flow = normalizeIdempotencyPart(flowToken, 'global');
+    return `${namespace}:${actor}:${flow}:${digest}`;
 }
 
 function buildBackToMenuKeyboard(ctx, action = 'SMS', label = '⬅️ Back to SMS Menu') {
@@ -864,7 +889,7 @@ Tap an option below to continue.`;
             purpose: payload.purpose || null,
             script_name: payload.script_name || null,
             script_variables: payload.script_variables || null,
-        });
+        }, ctx.session?.currentOp?.token || opId);
 
         const response = await guardedPost(`${config.apiUrl}/api/sms/send`, {
             ...payload,
@@ -880,12 +905,37 @@ Tap an option below to continue.`;
 
         if (data.success) {
             const segmentInfo = data.segment_info || getSmsSegmentInfo(message);
-            const successMsg =
-                `✅ *SMS Sent Successfully!*\n\n` +
-                `📱 To: ${data.to}\n` +
-                `🆔 Message SID: \`${data.message_sid}\`\n` +
-                `📊 Status: ${data.status}\n` +
-                `📤 From: ${data.from}\n` +
+            const toDisplay = data.to || payload.to || 'unknown';
+            const fromDisplay = data.from || 'auto';
+            const statusDisplay = data.status || (data.queued ? 'queued' : 'sent');
+            const providerDisplay = data.provider ? String(data.provider).toUpperCase() : 'AUTO';
+            let successMsg =
+                `✅ *SMS Accepted*\n\n` +
+                `📱 To: ${escapeMarkdown(toDisplay)}\n` +
+                `📤 From: ${escapeMarkdown(fromDisplay)}\n` +
+                `📡 Provider: ${escapeMarkdown(providerDisplay)}\n` +
+                `📊 Status: ${escapeMarkdown(statusDisplay)}\n`;
+
+            if (data.message_sid) {
+                successMsg += `🆔 Message SID: \`${escapeMarkdown(data.message_sid)}\`\n`;
+            } else if (data.schedule_id) {
+                successMsg += `🆔 Queue ID: \`${escapeMarkdown(data.schedule_id)}\`\n`;
+            }
+
+            if (data.idempotent) {
+                successMsg += `♻️ Idempotent replay: no duplicate SMS sent.\n`;
+            }
+            if (data.failover_used) {
+                const attempted = Array.isArray(data.attempted_providers)
+                    ? data.attempted_providers.map((item) => String(item).toUpperCase()).join(' -> ')
+                    : 'primary -> fallback';
+                successMsg += `🔁 Provider failover used (${escapeMarkdown(attempted)}).\n`;
+            }
+            if (data.request_id) {
+                successMsg += `🧾 Request ID: \`${escapeMarkdown(data.request_id)}\`\n`;
+            }
+
+            successMsg +=
                 `📦 Segments: ${segmentInfo.segments} (${segmentInfo.encoding.toUpperCase()} ${segmentInfo.units}/${segmentInfo.per_segment})\n\n` +
                 `🔔 You'll receive delivery notifications`;
 
@@ -1037,7 +1087,7 @@ async function bulkSmsFlow(conversation, ctx) {
             recipients: numbers,
             message,
             options: payload.options,
-        });
+        }, ctx.session?.currentOp?.token || opId);
 
         const response = await guardedPost(`${config.apiUrl}/api/sms/bulk`, payload, {
             headers: {
@@ -1068,7 +1118,11 @@ async function bulkSmsFlow(conversation, ctx) {
                 `📦 Segments per SMS: ${segmentInfo.segments} (${segmentInfo.encoding.toUpperCase()} ${segmentInfo.units}/${segmentInfo.per_segment})\n\n` +
                 `🔔 Individual delivery reports will follow`;
 
-            await ctx.reply(successMsg, {
+            const requestLine = data.request_id
+                ? `\n🧾 Request ID: \`${escapeMarkdown(data.request_id)}\``
+                : '';
+
+            await ctx.reply(`${successMsg}${requestLine}`, {
                 parse_mode: 'Markdown',
                 reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_SMS', '⬅️ Back to SMS Sender')
             });
@@ -1197,7 +1251,12 @@ async function scheduleSmsFlow(conversation, ctx) {
             scheduled_time: scheduledTime.toISOString(),
             user_chat_id: ctx.from.id.toString()
         };
-        const idempotencyKey = buildIdempotencyKey('sms_schedule', ctx.from?.id, payload);
+        const idempotencyKey = buildIdempotencyKey(
+            'sms_schedule',
+            ctx.from?.id,
+            payload,
+            ctx.session?.currentOp?.token || opId,
+        );
 
         const response = await guardedPost(`${config.apiUrl}/api/sms/schedule`, payload, {
             headers: {
@@ -1209,12 +1268,15 @@ async function scheduleSmsFlow(conversation, ctx) {
         const data = response?.data || {};
 
         if (data.success) {
-            const successMsg =
+            let successMsg =
                 `✅ *SMS Scheduled Successfully!*\n\n` +
                 `🆔 Schedule ID: \`${data.schedule_id}\`\n` +
                 `📅 Will send: ${data.scheduled_time ? new Date(data.scheduled_time).toLocaleString() : 'unknown'}\n` +
                 `📱 To: ${maskPhoneForDisplay(number)}\n\n` +
                 `🔔 You'll receive confirmation when sent`;
+            if (data.request_id) {
+                successMsg += `\n🧾 Request ID: \`${escapeMarkdown(data.request_id)}\``;
+            }
 
             await ctx.reply(successMsg, {
                 parse_mode: 'Markdown',

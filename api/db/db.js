@@ -1904,6 +1904,7 @@ class EnhancedDatabase {
                body TEXT NOT NULL,
                status TEXT DEFAULT 'queued',
                direction TEXT NOT NULL CHECK(direction IN ('inbound', 'outbound')),
+               provider TEXT,
                error_code TEXT,
                error_message TEXT,
                ai_response TEXT,
@@ -1965,13 +1966,59 @@ class EnhancedDatabase {
                                reject(idemErr);
                                return;
                            }
-                           console.log('✅ SMS tables created successfully');
-                           resolve();
+                           this.ensureSmsColumns(['provider']).then(() => {
+                               const smsIndexes = [
+                                   'CREATE INDEX IF NOT EXISTS idx_sms_messages_status_updated_at ON sms_messages(status, updated_at)',
+                                   'CREATE INDEX IF NOT EXISTS idx_sms_messages_direction_updated_at ON sms_messages(direction, updated_at)',
+                                   'CREATE INDEX IF NOT EXISTS idx_sms_messages_provider ON sms_messages(provider)',
+                               ];
+                               Promise.all(
+                                   smsIndexes.map((sql) => new Promise((indexResolve, indexReject) => {
+                                       this.db.run(sql, (indexErr) => {
+                                           if (indexErr) indexReject(indexErr);
+                                           else indexResolve();
+                                       });
+                                   })),
+                               ).then(() => {
+                                   console.log('✅ SMS tables created successfully');
+                                   resolve();
+                               }).catch(reject);
+                           }).catch(reject);
                        });
                    });
                });
            });
        });
+   }
+
+   async ensureSmsColumns(columns = []) {
+       if (!columns.length) return;
+       const existing = await new Promise((resolve, reject) => {
+           this.db.all('PRAGMA table_info(sms_messages)', (err, rows) => {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(rows || []);
+               }
+           });
+       });
+       const existingNames = new Set(existing.map((row) => row.name));
+       const addColumn = (name, definition) => new Promise((resolve, reject) => {
+           this.db.run(`ALTER TABLE sms_messages ADD COLUMN ${name} ${definition}`, (err) => {
+               if (err) {
+                   if (String(err.message || '').includes('duplicate')) resolve();
+                   else reject(err);
+               } else {
+                   resolve();
+               }
+           });
+       });
+       for (const column of columns) {
+           if (existingNames.has(column)) continue;
+           if (column === 'provider') {
+               await addColumn('provider', 'TEXT');
+           }
+       }
    }
 
    // Create Email tables
@@ -2321,8 +2368,8 @@ class EnhancedDatabase {
        return new Promise((resolve, reject) => {
            const sql = `INSERT INTO sms_messages (
                message_sid, to_number, from_number, body, status, 
-               direction, ai_response, response_message_sid, user_chat_id
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+               direction, provider, ai_response, response_message_sid, user_chat_id
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
            this.db.run(sql, [
                messageData.message_sid,
@@ -2331,6 +2378,7 @@ class EnhancedDatabase {
                messageData.body,
                messageData.status || 'queued',
                messageData.direction,
+               messageData.provider || null,
                messageData.ai_response || null,
                messageData.response_message_sid || null,
                messageData.user_chat_id || null
@@ -2574,6 +2622,45 @@ class EnhancedDatabase {
                    resolve(rows || []);
                }
            });
+       });
+   }
+
+   async getSmsMessagesForReconcile({ statuses = [], olderThanMinutes = 15, limit = 50 } = {}) {
+       const normalizedStatuses = Array.isArray(statuses)
+           ? statuses
+               .map((item) => String(item || '').trim().toLowerCase())
+               .filter(Boolean)
+           : [];
+       if (!normalizedStatuses.length) {
+           return [];
+       }
+       const safeLimit = Math.max(1, Math.min(500, Number(limit) || 50));
+       const staleMinutes = Math.max(1, Number(olderThanMinutes) || 15);
+       const placeholders = normalizedStatuses.map(() => '?').join(', ');
+       const sql = `
+           SELECT message_sid, status, provider, error_code, error_message, updated_at
+           FROM sms_messages
+           WHERE direction = 'outbound'
+             AND message_sid IS NOT NULL
+             AND LOWER(COALESCE(status, '')) IN (${placeholders})
+             AND datetime(updated_at) <= datetime('now', ?)
+           ORDER BY datetime(updated_at) ASC
+           LIMIT ?
+       `;
+       const staleExpr = `-${staleMinutes} minutes`;
+       return new Promise((resolve, reject) => {
+           this.db.all(
+               sql,
+               [...normalizedStatuses, staleExpr, safeLimit],
+               (err, rows) => {
+                   if (err) {
+                       console.error('Error getting stale SMS messages for reconcile:', err);
+                       reject(err);
+                   } else {
+                       resolve(rows || []);
+                   }
+               },
+           );
        });
    }
 

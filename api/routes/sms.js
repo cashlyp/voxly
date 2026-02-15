@@ -13,6 +13,15 @@ const RETRYABLE_NETWORK_CODES = new Set([
     'EAI_AGAIN',
     'ENOTFOUND',
 ]);
+const SMS_PENDING_STATUSES = new Set(['queued', 'accepted', 'sending', 'sent']);
+const SMS_TERMINAL_STATUSES = new Set([
+    'delivered',
+    'failed',
+    'undelivered',
+    'canceled',
+    'cancelled',
+    'read',
+]);
 
 const GSM7_BASIC_CHARS = new Set([
     '@', '£', '$', '¥', 'è', 'é', 'ù', 'ì', 'ò', 'Ç', '\n', 'Ø', 'ø', '\r', 'Å', 'å',
@@ -119,6 +128,13 @@ function createSmsProviderError(provider, options = {}) {
     return err;
 }
 
+function createSmsValidationError(message) {
+    const err = new Error(sanitizeErrorMessage(message));
+    err.code = 'sms_validation_failed';
+    err.retryable = false;
+    return err;
+}
+
 class TwilioSmsAdapter {
     constructor(options = {}) {
         this.provider = 'twilio';
@@ -188,6 +204,38 @@ class TwilioSmsAdapter {
                 messageSid: result?.sid || null,
                 status: result?.status || 'queued',
                 from: requestPayload.from,
+                response: result || null,
+            };
+        } catch (error) {
+            throw this.mapError(error);
+        }
+    }
+
+    async fetchMessageStatus(messageSid, options = {}) {
+        const { withTimeout, providerTimeoutMs } = options;
+        const sid = String(messageSid || '').trim();
+        if (!sid) {
+            throw createSmsValidationError('SMS message sid is required');
+        }
+        if (!this.client) {
+            throw createSmsProviderError(this.provider, {
+                message: 'Twilio client is not configured',
+                code: 'sms_config_error',
+                retryable: false,
+            });
+        }
+        try {
+            const result = await withTimeout(
+                this.client.messages(sid).fetch(),
+                providerTimeoutMs,
+                'sms_provider_timeout',
+            );
+            return {
+                provider: this.provider,
+                messageSid: sid,
+                status: String(result?.status || '').toLowerCase() || null,
+                errorCode: result?.errorCode || null,
+                errorMessage: result?.errorMessage || null,
                 response: result || null,
             };
         } catch (error) {
@@ -439,6 +487,35 @@ class EnhancedSmsService extends EventEmitter {
         this.defaultProviderTimeoutMs = Number(config.sms?.providerTimeoutMs) || 15000;
         this.defaultAiTimeoutMs = Number(config.sms?.aiTimeoutMs) || 12000;
         this.maxMessageChars = Number(config.sms?.maxMessageChars) || 1600;
+        this.providerCircuitState = new Map();
+        this.circuitBreakerEnabled = config.sms?.circuitBreaker?.enabled !== false;
+        this.circuitBreakerFailureThreshold = Math.max(
+            1,
+            Number(config.sms?.circuitBreaker?.failureThreshold) || 3,
+        );
+        this.circuitBreakerWindowMs = Math.max(
+            1000,
+            Number(config.sms?.circuitBreaker?.windowMs) || 120000,
+        );
+        this.circuitBreakerCooldownMs = Math.max(
+            1000,
+            Number(config.sms?.circuitBreaker?.cooldownMs) || 120000,
+        );
+        this.providerFailoverEnabled = config.sms?.providerFailoverEnabled !== false;
+        this.reconcileEnabled = config.sms?.reconcile?.enabled !== false;
+        this.reconcileIntervalMs = Math.max(
+            10000,
+            Number(config.sms?.reconcile?.intervalMs) || 120000,
+        );
+        this.reconcileStaleMinutes = Math.max(
+            1,
+            Number(config.sms?.reconcile?.staleMinutes) || 15,
+        );
+        this.reconcileBatchSize = Math.max(
+            1,
+            Math.min(500, Number(config.sms?.reconcile?.batchSize) || 50),
+        );
+        this.reconcilePendingStatuses = Array.from(SMS_PENDING_STATUSES);
     }
 
     setDb(db) {
@@ -564,6 +641,116 @@ class EnhancedSmsService extends EventEmitter {
         return adapter;
     }
 
+    getProviderCircuitState(provider) {
+        const key = normalizeProviderName(provider);
+        if (!key) {
+            return {
+                failureTimestamps: [],
+                openUntil: 0,
+                lastErrorAt: null,
+                lastSuccessAt: null,
+            };
+        }
+        if (!this.providerCircuitState.has(key)) {
+            this.providerCircuitState.set(key, {
+                failureTimestamps: [],
+                openUntil: 0,
+                lastErrorAt: null,
+                lastSuccessAt: null,
+            });
+        }
+        return this.providerCircuitState.get(key);
+    }
+
+    isProviderCircuitOpen(provider) {
+        if (!this.circuitBreakerEnabled) return false;
+        const state = this.getProviderCircuitState(provider);
+        if (!state.openUntil) return false;
+        if (Date.now() >= state.openUntil) {
+            state.openUntil = 0;
+            this.providerCircuitState.set(normalizeProviderName(provider), state);
+            return false;
+        }
+        return true;
+    }
+
+    markProviderCircuitFailure(provider) {
+        if (!this.circuitBreakerEnabled) return;
+        const key = normalizeProviderName(provider);
+        const state = this.getProviderCircuitState(key);
+        const now = Date.now();
+        state.failureTimestamps = state.failureTimestamps.filter(
+            (ts) => now - ts <= this.circuitBreakerWindowMs,
+        );
+        state.failureTimestamps.push(now);
+        state.lastErrorAt = new Date(now).toISOString();
+        if (state.failureTimestamps.length >= this.circuitBreakerFailureThreshold) {
+            state.openUntil = now + this.circuitBreakerCooldownMs;
+            this.logger?.warn?.('sms_provider_circuit_open', {
+                provider: key,
+                failures: state.failureTimestamps.length,
+                cooldown_ms: this.circuitBreakerCooldownMs,
+            });
+        }
+        this.providerCircuitState.set(key, state);
+    }
+
+    markProviderCircuitSuccess(provider) {
+        if (!this.circuitBreakerEnabled) return;
+        const key = normalizeProviderName(provider);
+        const state = this.getProviderCircuitState(key);
+        state.failureTimestamps = [];
+        state.openUntil = 0;
+        state.lastSuccessAt = new Date().toISOString();
+        this.providerCircuitState.set(key, state);
+    }
+
+    shouldFailoverToNextProvider(error) {
+        if (!this.providerFailoverEnabled) return false;
+        if (!error) return false;
+        if (error.code === 'sms_config_error' || error.code === 'sms_provider_timeout') {
+            return true;
+        }
+        return this.isRetryableSmsError(error);
+    }
+
+    getCandidateProviders(preferredProvider, providerReadiness = {}) {
+        const preferred = this.resolveProvider(preferredProvider);
+        const order = this.providerFailoverEnabled
+            ? [preferred, ...SUPPORTED_SMS_PROVIDERS.filter((item) => item !== preferred)]
+            : [preferred];
+        const readyProviders = [];
+        const openCircuitProviders = [];
+
+        for (const candidate of order) {
+            if (!providerReadiness[candidate]) continue;
+            let adapter;
+            try {
+                adapter = this.getAdapter(candidate);
+            } catch {
+                continue;
+            }
+            if (!adapter?.isConfigured?.()) continue;
+            if (this.isProviderCircuitOpen(candidate)) {
+                openCircuitProviders.push(candidate);
+                continue;
+            }
+            readyProviders.push(candidate);
+        }
+
+        if (readyProviders.length > 0) {
+            return readyProviders;
+        }
+        return openCircuitProviders;
+    }
+
+    normalizeDeliveryStatus(status) {
+        const normalized = String(status || '').trim().toLowerCase();
+        if (!normalized) return null;
+        if (normalized === 'accepted') return 'queued';
+        return normalized;
+    }
+
     isRetryableSmsError(error) {
         if (typeof error?.retryable === 'boolean') {
             return error.retryable;
@@ -684,27 +871,22 @@ class EnhancedSmsService extends EventEmitter {
         }
 
         const segmentInfo = getSmsSegmentInfo(body);
-        const resolvedProvider = this.resolveProvider(provider);
+        const preferredProvider = this.resolveProvider(provider);
         const providerReadiness = this.getProviderReadiness();
-        if (!providerReadiness[resolvedProvider]) {
-            throw createSmsProviderError(resolvedProvider, {
-                message: `SMS provider ${resolvedProvider} is not configured`,
+        const candidateProviders = this.getCandidateProviders(preferredProvider, providerReadiness);
+        if (!candidateProviders.length) {
+            throw createSmsProviderError(preferredProvider, {
+                message: `No configured SMS providers are currently available`,
                 code: 'sms_config_error',
-                retryable: false,
+                retryable: true,
             });
         }
-        const adapter = this.getAdapter(resolvedProvider);
-        if (!adapter.isConfigured()) {
-            throw createSmsProviderError(resolvedProvider, {
-                message: `SMS provider ${resolvedProvider} is not ready`,
-                code: 'sms_config_error',
-                retryable: false,
-            });
-        }
-        const fromNumber = adapter.resolveFromNumber(from);
 
-        if (!fromNumber) {
-            throw createSmsProviderError(resolvedProvider, {
+        const defaultScheduleProvider = candidateProviders[0] || preferredProvider;
+        const defaultAdapter = this.getAdapter(defaultScheduleProvider);
+        const defaultFromNumber = String(from || defaultAdapter.resolveFromNumber(from) || '').trim();
+        if (!defaultFromNumber) {
+            throw createSmsProviderError(defaultScheduleProvider, {
                 message: 'No source number configured for selected SMS provider',
                 code: 'sms_config_error',
                 retryable: false,
@@ -719,7 +901,7 @@ class EnhancedSmsService extends EventEmitter {
             const scheduledTime = this.nextAllowedTime(new Date(), quietHours);
             await this.scheduleSMS(normalizedTo, body, scheduledTime, {
                 reason: 'quiet_hours',
-                from: fromNumber,
+                from: defaultFromNumber,
                 userChatId,
                 idempotencyKey: idempotencyKey ? `${idempotencyKey}:quiet_hours` : null,
                 smsOptions: {
@@ -728,7 +910,7 @@ class EnhancedSmsService extends EventEmitter {
                     retryDelayMs,
                     minIntervalMs,
                     mediaUrl,
-                    provider: resolvedProvider,
+                    provider: defaultScheduleProvider,
                 },
             });
             return { success: true, scheduled: true, scheduled_time: scheduledTime.toISOString(), segment_info: segmentInfo };
@@ -739,7 +921,7 @@ class EnhancedSmsService extends EventEmitter {
             const scheduledTime = new Date(Date.now() + Number(minIntervalMs));
             await this.scheduleSMS(normalizedTo, body, scheduledTime, {
                 reason: 'rate_limit',
-                from: fromNumber,
+                from: defaultFromNumber,
                 userChatId,
                 idempotencyKey: idempotencyKey ? `${idempotencyKey}:rate_limit` : null,
                 smsOptions: {
@@ -748,7 +930,7 @@ class EnhancedSmsService extends EventEmitter {
                     retryDelayMs,
                     minIntervalMs: 0,
                     mediaUrl,
-                    provider: resolvedProvider,
+                    provider: defaultScheduleProvider,
                 },
             });
             return { success: true, scheduled: true, scheduled_time: scheduledTime.toISOString(), segment_info: segmentInfo };
@@ -769,6 +951,7 @@ class EnhancedSmsService extends EventEmitter {
                     success: true,
                     idempotent: true,
                     message_sid: cached.messageSid,
+                    provider: cached.provider || preferredProvider,
                     segment_info: segmentInfo,
                 };
             }
@@ -787,112 +970,158 @@ class EnhancedSmsService extends EventEmitter {
                         messageSid: existing.message_sid,
                         toNumber: existing.to_number || normalizedTo,
                         bodyHash: existing.body_hash || bodyHash,
+                        provider: preferredProvider,
                     });
                     return {
                         success: true,
                         idempotent: true,
                         message_sid: existing.message_sid,
+                        provider: preferredProvider,
                         segment_info: segmentInfo,
                     };
                 }
             }
         }
 
-        const payload = {
-            body,
-            from: fromNumber,
-            to: normalizedTo,
-            statusCallback: config.server.hostname
-                ? `https://${config.server.hostname}/webhook/sms-status`
-                : undefined,
-            idempotencyKey: idempotencyKey || undefined,
-        };
-        if (mediaUrl) {
-            const mediaList = Array.isArray(mediaUrl) ? mediaUrl : [mediaUrl];
-            payload.mediaUrl = mediaList.filter(Boolean).slice(0, 5);
-        }
-
         const maxAttempts = Math.max(1, Number(maxRetries || 0) + 1);
-        let attempt = 0;
         let lastError = null;
-        while (attempt < maxAttempts) {
-            attempt += 1;
-            try {
-                console.log('sms_send_attempt', {
-                    provider: resolvedProvider,
-                    to: redactPhoneForLog(normalizedTo),
-                    from: redactPhoneForLog(fromNumber),
-                    idempotency_key: idempotencyKey ? 'present' : 'absent',
-                    attempt,
-                    max_attempts: maxAttempts,
-                    body_preview: redactBodyForLog(body),
+        const attemptedProviders = [];
+        for (let providerIndex = 0; providerIndex < candidateProviders.length; providerIndex += 1) {
+            const currentProvider = candidateProviders[providerIndex];
+            const adapter = this.getAdapter(currentProvider);
+            const fromNumber = adapter.resolveFromNumber(from);
+
+            if (!fromNumber) {
+                lastError = createSmsProviderError(currentProvider, {
+                    message: 'No source number configured for selected SMS provider',
+                    code: 'sms_config_error',
+                    retryable: false,
                 });
-                const smsMessage = await adapter.sendSms(
-                    payload,
-                    {
-                        withTimeout: this.withTimeout.bind(this),
-                        providerTimeoutMs,
-                    },
-                );
-                const messageSid = smsMessage?.messageSid || null;
-                if (!messageSid) {
-                    throw createSmsProviderError(resolvedProvider, {
-                        message: 'SMS provider did not return message id',
-                        code: 'sms_provider_error',
-                        retryable: false,
-                    });
-                }
-                this.lastSendAt.set(normalizedTo, Date.now());
-                if (idempotencyKey) {
-                    this.idempotencyCache.set(idempotencyKey, {
-                        messageSid,
-                        toNumber: normalizedTo,
-                        bodyHash,
-                        provider: resolvedProvider,
-                    });
-                    if (this.db?.saveSmsIdempotency) {
-                        await this.db.saveSmsIdempotency(
-                            idempotencyKey,
-                            messageSid,
-                            normalizedTo,
-                            bodyHash,
-                        );
-                    }
-                }
-                console.log('sms_send_success', {
-                    provider: resolvedProvider,
-                    to: redactPhoneForLog(normalizedTo),
-                    message_sid: messageSid,
-                    attempt,
-                    status: smsMessage?.status || 'queued',
-                });
-                return {
-                    success: true,
-                    message_sid: messageSid,
-                    provider: resolvedProvider,
-                    to: normalizedTo,
-                    from: smsMessage?.from || fromNumber,
-                    body,
-                    status: smsMessage?.status,
-                    segment_info: segmentInfo
-                };
-            } catch (error) {
-                lastError = error;
-                const retryable = this.isRetryableSmsError(error);
-                if (!retryable || attempt >= maxAttempts) {
+                this.markProviderCircuitFailure(currentProvider);
+                if (!this.shouldFailoverToNextProvider(lastError)) {
                     break;
                 }
-                const delay = this.computeRetryDelayMs(retryDelayMs, attempt);
-                console.warn('sms_send_retry_scheduled', {
-                    provider: resolvedProvider,
-                    to: redactPhoneForLog(normalizedTo),
-                    attempt,
-                    max_attempts: maxAttempts,
-                    retry_in_ms: delay,
-                    reason: sanitizeErrorMessage(error?.message || 'send_failed'),
-                });
-                await sleep(delay);
+                continue;
             }
+
+            const payload = {
+                body,
+                from: fromNumber,
+                to: normalizedTo,
+                statusCallback:
+                    currentProvider === 'twilio' && config.server.hostname
+                        ? `https://${config.server.hostname}/webhook/sms-status`
+                        : undefined,
+                idempotencyKey: idempotencyKey || undefined,
+            };
+            if (mediaUrl) {
+                const mediaList = Array.isArray(mediaUrl) ? mediaUrl : [mediaUrl];
+                payload.mediaUrl = mediaList.filter(Boolean).slice(0, 5);
+            }
+
+            attemptedProviders.push(currentProvider);
+            let attempt = 0;
+            let providerError = null;
+
+            while (attempt < maxAttempts) {
+                attempt += 1;
+                try {
+                    console.log('sms_send_attempt', {
+                        provider: currentProvider,
+                        to: redactPhoneForLog(normalizedTo),
+                        from: redactPhoneForLog(fromNumber),
+                        idempotency_key: idempotencyKey ? 'present' : 'absent',
+                        attempt,
+                        max_attempts: maxAttempts,
+                        body_preview: redactBodyForLog(body),
+                    });
+                    const smsMessage = await adapter.sendSms(
+                        payload,
+                        {
+                            withTimeout: this.withTimeout.bind(this),
+                            providerTimeoutMs,
+                        },
+                    );
+                    const messageSid = smsMessage?.messageSid || null;
+                    if (!messageSid) {
+                        throw createSmsProviderError(currentProvider, {
+                            message: 'SMS provider did not return message id',
+                            code: 'sms_provider_error',
+                            retryable: false,
+                        });
+                    }
+                    this.markProviderCircuitSuccess(currentProvider);
+                    this.lastSendAt.set(normalizedTo, Date.now());
+                    if (idempotencyKey) {
+                        this.idempotencyCache.set(idempotencyKey, {
+                            messageSid,
+                            toNumber: normalizedTo,
+                            bodyHash,
+                            provider: currentProvider,
+                        });
+                        if (this.db?.saveSmsIdempotency) {
+                            await this.db.saveSmsIdempotency(
+                                idempotencyKey,
+                                messageSid,
+                                normalizedTo,
+                                bodyHash,
+                            );
+                        }
+                    }
+                    console.log('sms_send_success', {
+                        provider: currentProvider,
+                        to: redactPhoneForLog(normalizedTo),
+                        message_sid: messageSid,
+                        attempt,
+                        status: smsMessage?.status || 'queued',
+                        failover_used: currentProvider !== preferredProvider,
+                    });
+                    return {
+                        success: true,
+                        message_sid: messageSid,
+                        provider: currentProvider,
+                        failover_used: currentProvider !== preferredProvider,
+                        attempted_providers: attemptedProviders,
+                        to: normalizedTo,
+                        from: smsMessage?.from || fromNumber,
+                        body,
+                        status: smsMessage?.status,
+                        segment_info: segmentInfo,
+                    };
+                } catch (error) {
+                    providerError = error;
+                    const retryable = this.isRetryableSmsError(error);
+                    if (!retryable || attempt >= maxAttempts) {
+                        break;
+                    }
+                    const delay = this.computeRetryDelayMs(retryDelayMs, attempt);
+                    console.warn('sms_send_retry_scheduled', {
+                        provider: currentProvider,
+                        to: redactPhoneForLog(normalizedTo),
+                        attempt,
+                        max_attempts: maxAttempts,
+                        retry_in_ms: delay,
+                        reason: sanitizeErrorMessage(error?.message || 'send_failed'),
+                    });
+                    await sleep(delay);
+                }
+            }
+
+            if (providerError) {
+                lastError = providerError;
+                this.markProviderCircuitFailure(currentProvider);
+            }
+
+            const hasNextProvider = providerIndex < candidateProviders.length - 1;
+            if (!hasNextProvider || !this.shouldFailoverToNextProvider(lastError)) {
+                break;
+            }
+            console.warn('sms_provider_failover', {
+                from_provider: currentProvider,
+                to_provider: candidateProviders[providerIndex + 1],
+                to: redactPhoneForLog(normalizedTo),
+                reason: sanitizeErrorMessage(lastError?.message || 'provider_unavailable'),
+            });
         }
         throw lastError || new Error('SMS send failed');
     }
@@ -911,19 +1140,27 @@ class EnhancedSmsService extends EventEmitter {
             userChatId = null,
         } = options;
 
+        if (!Array.isArray(recipients) || recipients.length === 0) {
+            throw createSmsValidationError('Recipients array is required');
+        }
+
         const body = this.normalizeBody(message);
         if (!body) {
-            throw new Error('No message body provided');
+            throw createSmsValidationError('No message body provided');
         }
         if (body.length > this.maxMessageChars) {
-            throw new Error(`Message body exceeds ${this.maxMessageChars} characters`);
+            throw createSmsValidationError(`Message body exceeds ${this.maxMessageChars} characters`);
         }
+        const safeBatchSize = Math.max(1, Number(batchSize) || 10);
+        const safeDelayMs = Math.max(0, Number(delay) || 0);
 
         const segmentInfo = getSmsSegmentInfo(body);
 
         console.log('sms_bulk_start', {
             recipients: recipients.length,
             durable: durable === true,
+            batch_size: safeBatchSize,
+            delay_ms: safeDelayMs,
             body_preview: redactBodyForLog(body),
         });
 
@@ -994,8 +1231,8 @@ class EnhancedSmsService extends EventEmitter {
         }
 
         // Process in batches to avoid rate limiting
-        for (let i = 0; i < recipients.length; i += batchSize) {
-            const batch = recipients.slice(i, i + batchSize);
+        for (let i = 0; i < recipients.length; i += safeBatchSize) {
+            const batch = recipients.slice(i, i + safeBatchSize);
             const batchPromises = batch.map(async (recipient) => {
                 const normalizedRecipient = this.normalizePhone(recipient);
                 if (validateNumbers && !isValidE164(normalizedRecipient)) {
@@ -1051,8 +1288,8 @@ class EnhancedSmsService extends EventEmitter {
             );
 
             // Add delay between batches
-            if (i + batchSize < recipients.length) {
-                await new Promise(resolve => setTimeout(resolve, delay));
+            if (i + safeBatchSize < recipients.length && safeDelayMs > 0) {
+                await sleep(safeDelayMs);
             }
         }
 
@@ -1248,17 +1485,17 @@ class EnhancedSmsService extends EventEmitter {
         const normalizedTo = this.normalizePhone(to);
         const body = this.normalizeBody(message);
         if (!isValidE164(normalizedTo)) {
-            throw new Error('Invalid phone number format');
+            throw createSmsValidationError('Invalid phone number format');
         }
         if (!body) {
-            throw new Error('No message body provided');
+            throw createSmsValidationError('No message body provided');
         }
         if (body.length > this.maxMessageChars) {
-            throw new Error(`Message body exceeds ${this.maxMessageChars} characters`);
+            throw createSmsValidationError(`Message body exceeds ${this.maxMessageChars} characters`);
         }
         const parsedSchedule = new Date(scheduledTime);
         if (Number.isNaN(parsedSchedule.getTime())) {
-            throw new Error('Invalid scheduled time');
+            throw createSmsValidationError('Invalid scheduled time');
         }
 
         const fromNumber = options.from || null;
@@ -1385,6 +1622,158 @@ class EnhancedSmsService extends EventEmitter {
         }
     }
 
+    getReconcileConfig() {
+        return {
+            enabled: this.reconcileEnabled,
+            intervalMs: this.reconcileIntervalMs,
+            staleMinutes: this.reconcileStaleMinutes,
+            batchSize: this.reconcileBatchSize,
+            statuses: [...this.reconcilePendingStatuses],
+        };
+    }
+
+    async reconcileStaleOutboundStatuses(options = {}) {
+        const enabled = options.enabled !== undefined
+            ? options.enabled === true
+            : this.reconcileEnabled;
+        if (!enabled) {
+            return {
+                enabled: false,
+                processed: 0,
+                updated: 0,
+                failed: 0,
+                unsupported_provider: 0,
+            };
+        }
+        if (!this.db?.getSmsMessagesForReconcile) {
+            return {
+                enabled: true,
+                processed: 0,
+                updated: 0,
+                failed: 0,
+                unsupported_provider: 0,
+                skipped: 'db_unavailable',
+            };
+        }
+
+        const staleMinutes = Math.max(
+            1,
+            Number(options.staleMinutes) || this.reconcileStaleMinutes,
+        );
+        const limit = Math.max(
+            1,
+            Math.min(500, Number(options.limit) || this.reconcileBatchSize),
+        );
+        const statuses = Array.isArray(options.statuses) && options.statuses.length
+            ? options.statuses.map((item) => String(item || '').toLowerCase()).filter(Boolean)
+            : [...this.reconcilePendingStatuses];
+
+        let rows = [];
+        try {
+            rows = await this.db.getSmsMessagesForReconcile({
+                statuses,
+                olderThanMinutes: staleMinutes,
+                limit,
+            });
+        } catch (error) {
+            this.logger?.error?.('sms_reconcile_query_failed', {
+                error: sanitizeErrorMessage(error?.message || 'query_failed'),
+            });
+            throw error;
+        }
+
+        let processed = 0;
+        let updated = 0;
+        let failed = 0;
+        let unsupportedProvider = 0;
+
+        for (const row of rows) {
+            const messageSid = String(row?.message_sid || '').trim();
+            if (!messageSid) continue;
+            let defaultProvider = 'twilio';
+            try {
+                defaultProvider = this.resolveProvider();
+            } catch (_) {
+                defaultProvider = 'twilio';
+            }
+            const preferredProvider = normalizeProviderName(row?.provider) || defaultProvider;
+            const provider = SUPPORTED_SMS_PROVIDERS.includes(preferredProvider)
+                ? preferredProvider
+                : defaultProvider;
+            let adapter;
+            try {
+                adapter = this.getAdapter(provider);
+            } catch {
+                unsupportedProvider += 1;
+                continue;
+            }
+            if (typeof adapter.fetchMessageStatus !== 'function') {
+                unsupportedProvider += 1;
+                continue;
+            }
+            try {
+                const statusResult = await adapter.fetchMessageStatus(
+                    messageSid,
+                    {
+                        withTimeout: this.withTimeout.bind(this),
+                        providerTimeoutMs: this.defaultProviderTimeoutMs,
+                    },
+                );
+                processed += 1;
+                const nextStatus = this.normalizeDeliveryStatus(statusResult?.status);
+                const currentStatus = this.normalizeDeliveryStatus(row?.status);
+                const nextErrorCode =
+                    statusResult?.errorCode !== undefined && statusResult?.errorCode !== null
+                        ? String(statusResult.errorCode)
+                        : null;
+                const nextErrorMessage = statusResult?.errorMessage
+                    ? sanitizeErrorMessage(statusResult.errorMessage)
+                    : null;
+
+                if (
+                    nextStatus &&
+                    (
+                        nextStatus !== currentStatus ||
+                        nextErrorCode !== (row?.error_code || null) ||
+                        nextErrorMessage !== (row?.error_message || null)
+                    )
+                ) {
+                    const changes = await this.db.updateSMSStatus(messageSid, {
+                        status: nextStatus,
+                        error_code: nextErrorCode,
+                        error_message: nextErrorMessage,
+                    });
+                    if (Number(changes) > 0) {
+                        updated += 1;
+                    }
+                }
+
+                if (nextStatus && SMS_TERMINAL_STATUSES.has(nextStatus)) {
+                    this.markProviderCircuitSuccess(provider);
+                }
+            } catch (error) {
+                failed += 1;
+                this.markProviderCircuitFailure(provider);
+                this.logger?.warn?.('sms_reconcile_fetch_failed', {
+                    provider,
+                    message_sid: messageSid,
+                    error: sanitizeErrorMessage(error?.message || 'fetch_failed'),
+                });
+            }
+        }
+
+        return {
+            enabled: true,
+            stale_minutes: staleMinutes,
+            requested_limit: limit,
+            candidate_count: rows.length,
+            processed,
+            updated,
+            failed,
+            unsupported_provider: unsupportedProvider,
+        };
+    }
+
     // SMS scripts system
     getScript(scriptName, variables = {}) {
         const scripts = {
@@ -1423,6 +1812,23 @@ class EnhancedSmsService extends EventEmitter {
             total_conversations_today: activeConversations, // Would be from DB in real implementation
             message_queue_size: this.messageQueue.size
         };
+    }
+
+    getProviderCircuitHealth() {
+        const snapshot = {};
+        for (const provider of SUPPORTED_SMS_PROVIDERS) {
+            const state = this.getProviderCircuitState(provider);
+            snapshot[provider] = {
+                open: this.isProviderCircuitOpen(provider),
+                open_until: state.openUntil ? new Date(state.openUntil).toISOString() : null,
+                recent_failures: Array.isArray(state.failureTimestamps)
+                    ? state.failureTimestamps.length
+                    : 0,
+                last_error_at: state.lastErrorAt || null,
+                last_success_at: state.lastSuccessAt || null,
+            };
+        }
+        return snapshot;
     }
 }
 

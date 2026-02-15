@@ -820,6 +820,8 @@ function createTwilioStreamWebhookHandler(ctx = {}) {
 function createSmsWebhookHandler(ctx = {}) {
   const {
     requireValidTwilioSignature,
+    shouldProcessProviderEvent,
+    smsWebhookDedupeTtlMs,
     maskPhoneForLog,
     maskSmsBodyForLog,
     smsService,
@@ -830,13 +832,44 @@ function createSmsWebhookHandler(ctx = {}) {
         return;
       }
       const db = getDb(ctx);
-      const { From, Body, MessageSid, SmsStatus } = req.body;
+      const { From, Body, MessageSid, SmsSid, SmsStatus } = req.body || {};
+      const inboundSid = String(MessageSid || SmsSid || "").trim() || null;
+      const from = String(From || "").trim();
+      const body = typeof Body === "string" ? Body : "";
+
+      if (!from || !body) {
+        console.warn("sms_webhook_invalid_payload", {
+          request_id: req.requestId || null,
+          message_sid: inboundSid,
+          has_from: Boolean(from),
+          has_body: Boolean(body),
+        });
+        return res.status(200).send("OK");
+      }
+
+      if (
+        inboundSid &&
+        typeof shouldProcessProviderEvent === "function" &&
+        !shouldProcessProviderEvent("twilio_sms_inbound", {
+          messageSid: inboundSid,
+          from,
+          direction: req.body?.Direction || null,
+        }, {
+          ttlMs:
+            Number.isFinite(Number(smsWebhookDedupeTtlMs)) &&
+            Number(smsWebhookDedupeTtlMs) > 0
+              ? Number(smsWebhookDedupeTtlMs)
+              : undefined,
+        })
+      ) {
+        return res.status(200).send("OK");
+      }
 
       console.log("sms_webhook_received", {
         request_id: req.requestId || null,
-        from: maskPhoneForLog(From),
-        body: maskSmsBodyForLog(Body),
-        message_sid: MessageSid || null,
+        from: maskPhoneForLog(from),
+        body: maskSmsBodyForLog(body),
+        message_sid: inboundSid,
       });
 
       const digitService =
@@ -844,22 +877,27 @@ function createSmsWebhookHandler(ctx = {}) {
           ? ctx.getDigitService()
           : ctx.digitService;
       if (digitService?.handleIncomingSms) {
-        const handled = await digitService.handleIncomingSms(From, Body);
+        const handled = await digitService.handleIncomingSms(from, body);
         if (handled?.handled) {
           res.status(200).send("OK");
           return;
         }
       }
 
-      const result = await smsService.handleIncomingSMS(From, Body, MessageSid);
+      if (!smsService?.handleIncomingSMS) {
+        return res.status(503).send("SMS service unavailable");
+      }
+
+      const result = await smsService.handleIncomingSMS(from, body, inboundSid);
 
       if (db) {
         await db.saveSMSMessage({
-          message_sid: MessageSid,
-          from_number: From,
-          body: Body,
+          message_sid: inboundSid,
+          from_number: from,
+          body,
           status: SmsStatus,
           direction: "inbound",
+          provider: "twilio",
           ai_response: result.ai_response,
           response_message_sid: result.message_sid,
         });
@@ -874,33 +912,60 @@ function createSmsWebhookHandler(ctx = {}) {
 }
 
 function createSmsStatusWebhookHandler(ctx = {}) {
-  const { requireValidTwilioSignature, shouldProcessProviderEvent } = ctx;
+  const {
+    requireValidTwilioSignature,
+    shouldProcessProviderEvent,
+    smsWebhookDedupeTtlMs,
+  } = ctx;
   return async function handleSmsStatusWebhook(req, res) {
     try {
       if (!requireValidTwilioSignature(req, res, "/webhook/sms-status")) {
         return;
       }
       const db = getDb(ctx);
-      const { MessageSid, MessageStatus, ErrorCode, ErrorMessage } = req.body;
+      const { MessageSid, SmsSid, MessageStatus, ErrorCode, ErrorMessage } =
+        req.body || {};
+      const messageSid = String(MessageSid || SmsSid || "").trim();
+      if (!messageSid) {
+        console.warn("sms_status_webhook_missing_sid", {
+          request_id: req.requestId || null,
+          status: MessageStatus || null,
+        });
+        return res.status(200).send("OK");
+      }
       if (
+        typeof shouldProcessProviderEvent === "function" &&
         !shouldProcessProviderEvent("twilio_sms_status", {
-          messageSid: MessageSid || null,
+          messageSid,
           status: MessageStatus || null,
           errorCode: ErrorCode || null,
+        }, {
+          ttlMs:
+            Number.isFinite(Number(smsWebhookDedupeTtlMs)) &&
+            Number(smsWebhookDedupeTtlMs) > 0
+              ? Number(smsWebhookDedupeTtlMs)
+              : undefined,
         })
       ) {
         return res.status(200).send("OK");
       }
 
-      console.log(`SMS status update: ${MessageSid} -> ${MessageStatus}`);
+      console.log(`SMS status update: ${messageSid} -> ${MessageStatus}`);
 
       if (db) {
-        await db.updateSMSStatus(MessageSid, {
+        const changes = await db.updateSMSStatus(messageSid, {
           status: MessageStatus,
           error_code: ErrorCode,
           error_message: ErrorMessage,
           updated_at: new Date(),
         });
+        if (!changes) {
+          console.warn("sms_status_webhook_unknown_sid", {
+            request_id: req.requestId || null,
+            message_sid: messageSid,
+            status: MessageStatus || null,
+          });
+        }
       }
 
       res.status(200).send("OK");
@@ -991,37 +1056,64 @@ function createEmailUnsubscribeWebhookHandler(ctx = {}) {
 }
 
 function createSmsDeliveryWebhookHandler(ctx = {}) {
-  const { requireValidTwilioSignature, shouldProcessProviderEvent } = ctx;
+  const {
+    requireValidTwilioSignature,
+    shouldProcessProviderEvent,
+    smsWebhookDedupeTtlMs,
+  } = ctx;
   return async function handleSmsDeliveryWebhook(req, res) {
     try {
       if (!requireValidTwilioSignature(req, res, "/webhook/sms-delivery")) {
         return;
       }
       const db = getDb(ctx);
-      const { MessageSid, MessageStatus, ErrorCode, ErrorMessage } = req.body;
+      const { MessageSid, SmsSid, MessageStatus, ErrorCode, ErrorMessage } =
+        req.body || {};
+      const messageSid = String(MessageSid || SmsSid || "").trim();
+      if (!messageSid) {
+        console.warn("sms_delivery_webhook_missing_sid", {
+          request_id: req.requestId || null,
+          status: MessageStatus || null,
+        });
+        return res.status(200).send("OK");
+      }
       if (
+        typeof shouldProcessProviderEvent === "function" &&
         !shouldProcessProviderEvent("twilio_sms_delivery", {
-          messageSid: MessageSid || null,
+          messageSid,
           status: MessageStatus || null,
           errorCode: ErrorCode || null,
+        }, {
+          ttlMs:
+            Number.isFinite(Number(smsWebhookDedupeTtlMs)) &&
+            Number(smsWebhookDedupeTtlMs) > 0
+              ? Number(smsWebhookDedupeTtlMs)
+              : undefined,
         })
       ) {
         return res.status(200).send("OK");
       }
 
-      console.log(`📱 SMS Delivery Status: ${MessageSid} -> ${MessageStatus}`);
+      console.log(`📱 SMS Delivery Status: ${messageSid} -> ${MessageStatus}`);
 
       if (db) {
-        await db.updateSMSStatus(MessageSid, {
+        const changes = await db.updateSMSStatus(messageSid, {
           status: MessageStatus,
           error_code: ErrorCode,
           error_message: ErrorMessage,
         });
+        if (!changes) {
+          console.warn("sms_delivery_webhook_unknown_sid", {
+            request_id: req.requestId || null,
+            message_sid: messageSid,
+            status: MessageStatus || null,
+          });
+        }
 
         const message = await new Promise((resolve, reject) => {
           db.db.get(
             `SELECT * FROM sms_messages WHERE message_sid = ?`,
-            [MessageSid],
+            [messageSid],
             (err, row) => {
               if (err) reject(err);
               else resolve(row);
@@ -1038,7 +1130,7 @@ function createSmsDeliveryWebhookHandler(ctx = {}) {
                 : `sms_${MessageStatus}`;
 
           await db.createEnhancedWebhookNotification(
-            MessageSid,
+            messageSid,
             notificationType,
             message.user_chat_id,
             MessageStatus === "failed" ? "high" : "normal",

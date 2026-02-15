@@ -370,6 +370,36 @@ const smsProviderTimeoutMs = Number(
 const smsProvider = (readEnv("SMS_PROVIDER") || callProvider).toLowerCase();
 const smsAiTimeoutMs = Number(readEnv("SMS_AI_TIMEOUT_MS") || "12000");
 const smsMaxMessageChars = Number(readEnv("SMS_MAX_MESSAGE_CHARS") || "1600");
+const smsMaxBulkRecipients = Number(readEnv("SMS_MAX_BULK_RECIPIENTS") || "100");
+const smsProviderFailoverEnabled =
+  String(readEnv("SMS_PROVIDER_FAILOVER_ENABLED") || "true").toLowerCase() ===
+  "true";
+const smsCircuitBreakerEnabled =
+  String(readEnv("SMS_CIRCUIT_BREAKER_ENABLED") || "true").toLowerCase() ===
+  "true";
+const smsCircuitBreakerFailureThreshold = Number(
+  readEnv("SMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD") || "3",
+);
+const smsCircuitBreakerWindowMs = Number(
+  readEnv("SMS_CIRCUIT_BREAKER_WINDOW_MS") || "120000",
+);
+const smsCircuitBreakerCooldownMs = Number(
+  readEnv("SMS_CIRCUIT_BREAKER_COOLDOWN_MS") || "120000",
+);
+const smsWebhookDedupeTtlMs = Number(
+  readEnv("SMS_WEBHOOK_DEDUPE_TTL_MS") || "300000",
+);
+const smsReconcileEnabled =
+  String(readEnv("SMS_RECONCILE_ENABLED") || "true").toLowerCase() === "true";
+const smsReconcileIntervalMs = Number(
+  readEnv("SMS_RECONCILE_INTERVAL_MS") || "120000",
+);
+const smsReconcileStaleMinutes = Number(
+  readEnv("SMS_RECONCILE_STALE_MINUTES") || "15",
+);
+const smsReconcileBatchSize = Number(
+  readEnv("SMS_RECONCILE_BATCH_SIZE") || "50",
+);
 const outboundRateWindowMs = Number(
   readEnv("OUTBOUND_RATE_LIMIT_WINDOW_MS") || "60000",
 );
@@ -644,6 +674,37 @@ module.exports = {
     maxMessageChars: Number.isFinite(smsMaxMessageChars)
       ? smsMaxMessageChars
       : 1600,
+    maxBulkRecipients: Number.isFinite(smsMaxBulkRecipients)
+      ? smsMaxBulkRecipients
+      : 100,
+    providerFailoverEnabled: smsProviderFailoverEnabled,
+    webhookDedupeTtlMs: Number.isFinite(smsWebhookDedupeTtlMs)
+      ? smsWebhookDedupeTtlMs
+      : 300000,
+    circuitBreaker: {
+      enabled: smsCircuitBreakerEnabled,
+      failureThreshold: Number.isFinite(smsCircuitBreakerFailureThreshold)
+        ? smsCircuitBreakerFailureThreshold
+        : 3,
+      windowMs: Number.isFinite(smsCircuitBreakerWindowMs)
+        ? smsCircuitBreakerWindowMs
+        : 120000,
+      cooldownMs: Number.isFinite(smsCircuitBreakerCooldownMs)
+        ? smsCircuitBreakerCooldownMs
+        : 120000,
+    },
+    reconcile: {
+      enabled: smsReconcileEnabled,
+      intervalMs: Number.isFinite(smsReconcileIntervalMs)
+        ? smsReconcileIntervalMs
+        : 120000,
+      staleMinutes: Number.isFinite(smsReconcileStaleMinutes)
+        ? smsReconcileStaleMinutes
+        : 15,
+      batchSize: Number.isFinite(smsReconcileBatchSize)
+        ? smsReconcileBatchSize
+        : 50,
+    },
   },
   outboundLimits: {
     windowMs: Number.isFinite(outboundRateWindowMs)
