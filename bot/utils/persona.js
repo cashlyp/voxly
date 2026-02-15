@@ -400,22 +400,39 @@ async function askOptionWithButtons(
     : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
   let selected = null;
   while (!selected) {
-    const selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {
-      const data = callbackCtx?.callbackQuery?.data;
-      if (!matchesCallbackPrefix(data, prefixKey)) {
-        return false;
-      }
-      const callbackMessageId = callbackCtx?.callbackQuery?.message?.message_id || null;
-      const callbackChatId = callbackCtx?.callbackQuery?.message?.chat?.id || null;
-      if (expectedMessageId && callbackMessageId && callbackMessageId !== expectedMessageId) {
-        return false;
-      }
-      if (expectedChatId && callbackChatId && callbackChatId !== expectedChatId) {
-        return false;
-      }
-      return true;
-    });
+    const selectionCtx = await conversation.waitFor('callback_query:data');
     activeChecker();
+    const rawData = selectionCtx?.callbackQuery?.data;
+    const callbackMessageId = selectionCtx?.callbackQuery?.message?.message_id || null;
+    const callbackChatId = selectionCtx?.callbackQuery?.message?.chat?.id || null;
+
+    if (!matchesCallbackPrefix(rawData, prefixKey)) {
+      try {
+        await selectionCtx.answerCallbackQuery({
+          text: 'Use the buttons in the active menu.',
+          show_alert: false
+        });
+      } catch (_) {}
+      continue;
+    }
+    if (expectedMessageId && callbackMessageId && callbackMessageId !== expectedMessageId) {
+      try {
+        await selectionCtx.answerCallbackQuery({
+          text: 'That menu is outdated. Please use the latest one.',
+          show_alert: false
+        });
+      } catch (_) {}
+      continue;
+    }
+    if (expectedChatId && callbackChatId && callbackChatId !== expectedChatId) {
+      try {
+        await selectionCtx.answerCallbackQuery({
+          text: 'That option is unavailable in this chat.',
+          show_alert: false
+        });
+      } catch (_) {}
+      continue;
+    }
 
     const selectionAction = parseCallbackData(selectionCtx.callbackQuery.data).action || selectionCtx.callbackQuery.data;
     const parts = selectionAction.split(':');

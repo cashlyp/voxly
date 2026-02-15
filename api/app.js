@@ -12601,52 +12601,561 @@ app.post("/api/sms/schedule", requireOutboundAuthorization, async (req, res) => 
   }
 });
 
-// SMS scripts endpoint
+const SMS_BUILTIN_SCRIPTS = Object.freeze({
+  welcome:
+    "Welcome to our service! We're excited to have you aboard. Reply HELP for assistance or STOP to unsubscribe.",
+  appointment_reminder:
+    "Reminder: You have an appointment on {date} at {time}. Reply CONFIRM to confirm or RESCHEDULE to change.",
+  verification:
+    "Your verification code is: {code}. This code will expire in 10 minutes. Do not share this code with anyone.",
+  order_update:
+    "Order #{order_id} update: {status}. Track your order at {tracking_url}",
+  payment_reminder:
+    "Payment reminder: Your payment of {amount} is due on {due_date}. Pay now: {payment_url}",
+  promotional:
+    "Special offer just for you! {offer_text} Use code {promo_code}. Valid until {expiry_date}. Reply STOP to opt out.",
+  customer_service:
+    "Thanks for contacting us! We've received your message and will respond within 24 hours. For urgent matters, call {phone}.",
+  survey:
+    "How was your experience with us? Rate us 1-5 stars by replying with a number. Your feedback helps us improve!",
+});
+
+function escapeSmsScriptToken(value = "") {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizeSmsScriptName(value = "") {
+  const name = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (!name) return null;
+  if (!/^[a-z0-9_-]{1,64}$/.test(name)) return null;
+  return name;
+}
+
+function parseSmsScriptBoolean(value, fallback = false) {
+  if (value === undefined || value === null || value === "") return fallback;
+  const normalized = String(value).trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes";
+}
+
+function parseSmsScriptVariables(value) {
+  if (value === undefined || value === null || value === "") {
+    return { value: {} };
+  }
+  if (isPlainObject(value)) {
+    return { value };
+  }
+  try {
+    const parsed = JSON.parse(String(value));
+    if (!isPlainObject(parsed)) {
+      return { error: "variables must be a JSON object" };
+    }
+    return { value: parsed };
+  } catch (_) {
+    return { error: "variables must be valid JSON" };
+  }
+}
+
+function applySmsScriptVariables(content, variables = {}) {
+  let rendered = String(content || "");
+  if (!isPlainObject(variables)) return rendered;
+  for (const [key, value] of Object.entries(variables)) {
+    if (!key) continue;
+    const token = escapeSmsScriptToken(key);
+    rendered = rendered.replace(new RegExp(`{${token}}`, "g"), String(value ?? ""));
+  }
+  return rendered;
+}
+
+function getBuiltinSmsScriptNames() {
+  return Object.keys(SMS_BUILTIN_SCRIPTS);
+}
+
+function getBuiltinSmsScriptByName(name) {
+  const normalized = normalizeSmsScriptName(name);
+  if (!normalized) return null;
+  const content = SMS_BUILTIN_SCRIPTS[normalized];
+  if (!content) return null;
+  return {
+    name: normalized,
+    description: null,
+    content,
+    metadata: {},
+    is_builtin: true,
+    created_by: null,
+    updated_by: null,
+    created_at: null,
+    updated_at: null,
+  };
+}
+
+async function suggestSmsScriptName(baseName) {
+  const normalizedBase = normalizeSmsScriptName(baseName) || "sms_script";
+  const existing = await db.listSmsScripts().catch(() => []);
+  const existingNames = new Set(
+    (existing || []).map((row) => String(row?.name || "").toLowerCase()),
+  );
+  for (const builtinName of getBuiltinSmsScriptNames()) {
+    existingNames.add(String(builtinName).toLowerCase());
+  }
+  if (!existingNames.has(normalizedBase)) {
+    return normalizedBase;
+  }
+  for (let index = 2; index < 1000; index += 1) {
+    const candidate = `${normalizedBase}_${index}`;
+    if (!existingNames.has(candidate)) {
+      return candidate;
+    }
+  }
+  return `${normalizedBase}_${Date.now().toString().slice(-4)}`;
+}
+
+// SMS script management endpoints
 app.get("/api/sms/scripts", requireAdminToken, async (req, res) => {
   try {
-    const { script_name, variables } = req.query;
-
-    if (script_name) {
-      try {
-        const parsedVariables = variables ? JSON.parse(variables) : {};
-        const script = smsService.getScript(script_name, parsedVariables);
-
-        res.json({
-          success: true,
-          script_name,
-          script,
-          variables: parsedVariables,
-        });
-      } catch (scriptError) {
-        res.status(400).json({
-          success: false,
-          error: scriptError.message,
-        });
-      }
-    } else {
-      // Return available scripts
-      res.json({
-        success: true,
-        available_scripts: [
-          "welcome",
-          "appointment_reminder",
-          "verification",
-          "order_update",
-          "payment_reminder",
-          "promotional",
-          "customer_service",
-          "survey",
-        ],
+    const scriptName = req.query?.script_name;
+    const parsedVariables = parseSmsScriptVariables(req.query?.variables);
+    if (parsedVariables.error) {
+      return res.status(400).json({
+        success: false,
+        error: parsedVariables.error,
       });
     }
+    const variables = parsedVariables.value;
+
+    if (scriptName) {
+      const normalizedName = normalizeSmsScriptName(scriptName);
+      if (!normalizedName) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "script_name must use lowercase letters, numbers, underscores, or dashes",
+        });
+      }
+      const customScript = await db.getSmsScript(normalizedName);
+      const builtinScript = getBuiltinSmsScriptByName(normalizedName);
+      const sourceScript = customScript || builtinScript;
+      if (!sourceScript) {
+        return res.status(404).json({
+          success: false,
+          error: `Script '${normalizedName}' not found`,
+        });
+      }
+      const rendered = applySmsScriptVariables(sourceScript.content, variables);
+      return res.json({
+        success: true,
+        script_name: normalizedName,
+        script: rendered,
+        original_script: sourceScript.content,
+        variables,
+      });
+    }
+
+    const includeBuiltins = parseSmsScriptBoolean(req.query?.include_builtins, true);
+    const detailed = parseSmsScriptBoolean(req.query?.detailed, false);
+    const customScripts = (await db.listSmsScripts()).map((script) => ({
+      ...script,
+      content: detailed ? script.content : "",
+      is_builtin: false,
+    }));
+    const builtinScripts = includeBuiltins
+      ? getBuiltinSmsScriptNames().map((name) => ({
+          ...getBuiltinSmsScriptByName(name),
+          content: detailed ? SMS_BUILTIN_SCRIPTS[name] : "",
+        }))
+      : [];
+
+    return res.json({
+      success: true,
+      scripts: customScripts,
+      builtin: builtinScripts,
+      available_scripts: includeBuiltins ? getBuiltinSmsScriptNames() : [],
+      script_count: customScripts.length + builtinScripts.length,
+    });
   } catch (error) {
-    console.error("❌ SMS scripts error:", error);
-    res.status(500).json({
+    console.error("sms_scripts_list_error", {
+      request_id: req.requestId || null,
+      error: redactSensitiveLogValue(error.message || "sms_scripts_list_failed"),
+    });
+    return res.status(500).json({
       success: false,
-      error: "Failed to get scripts",
+      error: "Failed to load SMS scripts",
     });
   }
 });
+
+app.get("/api/sms/scripts/:scriptName", requireAdminToken, async (req, res) => {
+  try {
+    const normalizedName = normalizeSmsScriptName(req.params.scriptName);
+    if (!normalizedName) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid script name",
+      });
+    }
+    const detailed = parseSmsScriptBoolean(req.query?.detailed, true);
+    const customScript = await db.getSmsScript(normalizedName);
+    const builtinScript = getBuiltinSmsScriptByName(normalizedName);
+    const script = customScript || builtinScript;
+    if (!script) {
+      return res.status(404).json({
+        success: false,
+        error: `Script '${normalizedName}' not found`,
+      });
+    }
+    const payload = {
+      ...script,
+      content: detailed ? script.content : "",
+    };
+    return res.json({
+      success: true,
+      script: payload,
+      script_name: payload.name,
+      original_script: script.content,
+    });
+  } catch (error) {
+    console.error("sms_script_get_error", {
+      request_id: req.requestId || null,
+      script_name: req.params?.scriptName || null,
+      error: redactSensitiveLogValue(error.message || "sms_script_get_failed"),
+    });
+    return res.status(500).json({
+      success: false,
+      error: "Failed to load SMS script",
+    });
+  }
+});
+
+app.post("/api/sms/scripts", requireAdminToken, async (req, res) => {
+  try {
+    const body = isPlainObject(req.body) ? req.body : {};
+    const normalizedName = normalizeSmsScriptName(body.name);
+    if (!normalizedName) {
+      return res.status(400).json({
+        success: false,
+        error:
+          "name is required and must use lowercase letters, numbers, underscores, or dashes",
+      });
+    }
+    const content = String(body.content || "").trim();
+    if (!content) {
+      return res.status(400).json({
+        success: false,
+        error: "content is required",
+      });
+    }
+    if (getBuiltinSmsScriptByName(normalizedName)) {
+      return res.status(409).json({
+        success: false,
+        error: `Script name '${normalizedName}' is reserved for a built-in script`,
+        code: "SCRIPT_NAME_DUPLICATE",
+        suggested_name: await suggestSmsScriptName(`${normalizedName}_custom`),
+      });
+    }
+    const existing = await db.getSmsScript(normalizedName);
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        error: `Script '${normalizedName}' already exists`,
+        code: "SCRIPT_NAME_DUPLICATE",
+        suggested_name: await suggestSmsScriptName(`${normalizedName}_copy`),
+      });
+    }
+
+    const metadata = body.metadata;
+    if (metadata !== undefined && metadata !== null && !isPlainObject(metadata)) {
+      return res.status(400).json({
+        success: false,
+        error: "metadata must be an object when provided",
+      });
+    }
+    await db.createSmsScript({
+      name: normalizedName,
+      description: body.description || null,
+      content,
+      metadata: metadata === undefined ? null : metadata,
+      created_by: body.created_by || req.headers?.["x-admin-user"] || null,
+      updated_by: body.updated_by || req.headers?.["x-admin-user"] || null,
+    });
+    const script = await db.getSmsScript(normalizedName);
+    return res.status(201).json({
+      success: true,
+      script: {
+        ...script,
+        is_builtin: false,
+      },
+    });
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (
+      message.includes("UNIQUE constraint failed") ||
+      message.includes("SQLITE_CONSTRAINT")
+    ) {
+      return res.status(409).json({
+        success: false,
+        error: "Script name already exists",
+        code: "SCRIPT_NAME_DUPLICATE",
+        suggested_name: await suggestSmsScriptName(
+          `${normalizeSmsScriptName(req.body?.name) || "sms_script"}_copy`,
+        ),
+      });
+    }
+    console.error("sms_script_create_error", {
+      request_id: req.requestId || null,
+      error: redactSensitiveLogValue(error.message || "sms_script_create_failed"),
+    });
+    return res.status(500).json({
+      success: false,
+      error: "Failed to create SMS script",
+    });
+  }
+});
+
+app.put("/api/sms/scripts/:scriptName", requireAdminToken, async (req, res) => {
+  try {
+    const normalizedName = normalizeSmsScriptName(req.params.scriptName);
+    if (!normalizedName) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid script name",
+      });
+    }
+    const existing = await db.getSmsScript(normalizedName);
+    if (!existing) {
+      if (getBuiltinSmsScriptByName(normalizedName)) {
+        return res.status(400).json({
+          success: false,
+          error: "Built-in scripts are read-only and cannot be edited",
+        });
+      }
+      return res.status(404).json({
+        success: false,
+        error: `Script '${normalizedName}' not found`,
+      });
+    }
+
+    const body = isPlainObject(req.body) ? req.body : {};
+    const updates = {};
+    if (body.description !== undefined) {
+      updates.description = body.description;
+    }
+    if (body.content !== undefined) {
+      const content = String(body.content || "").trim();
+      if (!content) {
+        return res.status(400).json({
+          success: false,
+          error: "content cannot be empty",
+        });
+      }
+      updates.content = content;
+    }
+    if (body.metadata !== undefined) {
+      if (body.metadata !== null && !isPlainObject(body.metadata)) {
+        return res.status(400).json({
+          success: false,
+          error: "metadata must be an object when provided",
+        });
+      }
+      updates.metadata = body.metadata;
+    }
+    updates.updated_by = body.updated_by || req.headers?.["x-admin-user"] || null;
+
+    await db.updateSmsScript(normalizedName, updates);
+    const script = await db.getSmsScript(normalizedName);
+    return res.json({
+      success: true,
+      script: {
+        ...script,
+        is_builtin: false,
+      },
+    });
+  } catch (error) {
+    console.error("sms_script_update_error", {
+      request_id: req.requestId || null,
+      script_name: req.params?.scriptName || null,
+      error: redactSensitiveLogValue(error.message || "sms_script_update_failed"),
+    });
+    return res.status(500).json({
+      success: false,
+      error: "Failed to update SMS script",
+    });
+  }
+});
+
+app.delete("/api/sms/scripts/:scriptName", requireAdminToken, async (req, res) => {
+  try {
+    const normalizedName = normalizeSmsScriptName(req.params.scriptName);
+    if (!normalizedName) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid script name",
+      });
+    }
+    if (getBuiltinSmsScriptByName(normalizedName)) {
+      return res.status(400).json({
+        success: false,
+        error: "Built-in scripts cannot be deleted",
+      });
+    }
+    const changes = await db.deleteSmsScript(normalizedName);
+    if (!changes) {
+      return res.status(404).json({
+        success: false,
+        error: `Script '${normalizedName}' not found`,
+      });
+    }
+    return res.json({ success: true });
+  } catch (error) {
+    console.error("sms_script_delete_error", {
+      request_id: req.requestId || null,
+      script_name: req.params?.scriptName || null,
+      error: redactSensitiveLogValue(error.message || "sms_script_delete_failed"),
+    });
+    return res.status(500).json({
+      success: false,
+      error: "Failed to delete SMS script",
+    });
+  }
+});
+
+app.post(
+  "/api/sms/scripts/:scriptName/preview",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const normalizedName = normalizeSmsScriptName(req.params.scriptName);
+      if (!normalizedName) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid script name",
+        });
+      }
+      const body = isPlainObject(req.body) ? req.body : {};
+      const to = String(body.to || "").trim();
+      if (!to.match(/^\+[1-9]\d{1,14}$/)) {
+        return res.status(400).json({
+          success: false,
+          error: "to must be a valid E.164 phone number",
+        });
+      }
+
+      const parsedVariables = parseSmsScriptVariables(body.variables);
+      if (parsedVariables.error) {
+        return res.status(400).json({
+          success: false,
+          error: parsedVariables.error,
+        });
+      }
+      const variables = parsedVariables.value;
+      const customScript = await db.getSmsScript(normalizedName);
+      const builtinScript = getBuiltinSmsScriptByName(normalizedName);
+      const script = customScript || builtinScript;
+      if (!script) {
+        return res.status(404).json({
+          success: false,
+          error: `Script '${normalizedName}' not found`,
+        });
+      }
+      const content = applySmsScriptVariables(script.content, variables);
+      if (!content.trim()) {
+        return res.status(400).json({
+          success: false,
+          error: "Resolved preview message is empty",
+        });
+      }
+
+      const options = isPlainObject(body.options) ? { ...body.options } : {};
+      const parsedIdempotency = normalizeSmsIdempotencyInput(
+        body.idempotency_key || req.headers["idempotency-key"],
+      );
+      if (parsedIdempotency.error) {
+        return res.status(400).json({
+          success: false,
+          error: parsedIdempotency.error,
+        });
+      }
+      if (parsedIdempotency.value && !options.idempotencyKey) {
+        options.idempotencyKey = parsedIdempotency.value;
+      }
+      if (!Object.prototype.hasOwnProperty.call(options, "durable")) {
+        options.durable = false;
+      }
+
+      const previewResult = await runWithTimeout(
+        smsService.sendSMS(to, content, null, options),
+        Number(config.outboundLimits?.handlerTimeoutMs) || 30000,
+        "sms script preview handler",
+        "sms_handler_timeout",
+      );
+      if (db && previewResult.message_sid && previewResult.idempotent !== true) {
+        try {
+          await db.saveSMSMessage({
+            message_sid: previewResult.message_sid,
+            to_number: to,
+            from_number: previewResult.from || null,
+            body: content,
+            status: previewResult.status || "queued",
+            direction: "outbound",
+            provider: previewResult.provider || getActiveSmsProvider(),
+            user_chat_id: body.user_chat_id || null,
+          });
+        } catch (saveError) {
+          const saveMsg = String(saveError?.message || "");
+          if (
+            !saveMsg.includes("UNIQUE constraint failed") &&
+            !saveMsg.includes("SQLITE_CONSTRAINT")
+          ) {
+            throw saveError;
+          }
+        }
+      }
+      return res.json({
+        success: true,
+        preview: {
+          to,
+          message_sid: previewResult.message_sid || null,
+          status: previewResult.status || null,
+          provider: previewResult.provider || null,
+          content,
+          script_name: normalizedName,
+        },
+      });
+    } catch (error) {
+      const providerStatus = Number(
+        error?.status || error?.statusCode || error?.response?.status,
+      );
+      const status =
+        error.code === "sms_validation_failed"
+          ? 400
+          : error.code === "sms_handler_timeout" ||
+              error.code === "sms_provider_timeout" ||
+              error.code === "sms_timeout"
+            ? 504
+            : providerStatus === 429
+              ? 429
+              : providerStatus >= 400 && providerStatus < 500
+                ? 400
+                : providerStatus >= 500
+                  ? 502
+                  : 500;
+      console.error("sms_script_preview_error", {
+        request_id: req.requestId || null,
+        script_name: req.params?.scriptName || null,
+        to: maskPhoneForLog(req.body?.to || ""),
+        error: redactSensitiveLogValue(
+          error.message || "sms_script_preview_failed",
+        ),
+        code: error.code || null,
+      });
+      return res.status(status).json({
+        success: false,
+        error: error.message || "Failed to send SMS script preview",
+        code: error.code || "sms_script_preview_failed",
+      });
+    }
+  },
+);
 
 // Get SMS messages from database for conversation view
 app.get(
@@ -12871,88 +13380,6 @@ app.get("/api/sms/status/:messageSid", requireOutboundAuthorization, async (req,
     });
   }
 });
-
-// Enhanced SMS scripts endpoint with better error handling
-app.get(
-  "/api/sms/scripts/:scriptName?",
-  requireAdminToken,
-  async (req, res) => {
-    try {
-      const { scriptName } = req.params;
-      const { variables } = req.query;
-
-      // Built-in scripts (fallback)
-      const builtInScripts = {
-        welcome:
-          "Welcome to our service! We're excited to have you aboard. Reply HELP for assistance or STOP to unsubscribe.",
-        appointment_reminder:
-          "Reminder: You have an appointment on {date} at {time}. Reply CONFIRM to confirm or RESCHEDULE to change.",
-        verification:
-          "Your verification code is: {code}. This code will expire in 10 minutes. Do not share this code with anyone.",
-        order_update:
-          "Order #{order_id} update: {status}. Track your order at {tracking_url}",
-        payment_reminder:
-          "Payment reminder: Your payment of {amount} is due on {due_date}. Pay now: {payment_url}",
-        promotional:
-          "🎉 Special offer just for you! {offer_text} Use code {promo_code}. Valid until {expiry_date}. Reply STOP to opt out.",
-        customer_service:
-          "Thanks for contacting us! We've received your message and will respond within 24 hours. For urgent matters, call {phone}.",
-        survey:
-          "How was your experience with us? Rate us 1-5 stars by replying with a number. Your feedback helps us improve!",
-      };
-
-      if (scriptName) {
-        // Get specific script
-        if (!builtInScripts[scriptName]) {
-          return res.status(404).json({
-            success: false,
-            error: `Script '${scriptName}' not found`,
-          });
-        }
-
-        let script = builtInScripts[scriptName];
-        let parsedVariables = {};
-
-        // Parse and apply variables if provided
-        if (variables) {
-          try {
-            parsedVariables = JSON.parse(variables);
-
-            // Replace variables in script
-            for (const [key, value] of Object.entries(parsedVariables)) {
-              script = script.replace(new RegExp(`{${key}}`, "g"), value);
-            }
-          } catch (parseError) {
-            console.error("Error parsing script variables:", parseError);
-            // Continue with script without variable substitution
-          }
-        }
-
-        res.json({
-          success: true,
-          script_name: scriptName,
-          script: script,
-          original_script: builtInScripts[scriptName],
-          variables: parsedVariables,
-        });
-      } else {
-        // Get list of available scripts
-        res.json({
-          success: true,
-          available_scripts: Object.keys(builtInScripts),
-          script_count: Object.keys(builtInScripts).length,
-        });
-      }
-    } catch (error) {
-      console.error("❌ Error handling SMS scripts:", error);
-      res.status(500).json({
-        success: false,
-        error: "Failed to process script request",
-        details: error.message,
-      });
-    }
-  },
-);
 
 registerCallRoutes(app, {
   requireOutboundAuthorization,

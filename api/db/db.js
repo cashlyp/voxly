@@ -2680,6 +2680,17 @@ class EnhancedDatabase {
                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
            )`;
 
+           const createSmsScriptsTable = `CREATE TABLE IF NOT EXISTS sms_scripts (
+               name TEXT PRIMARY KEY,
+               description TEXT,
+               content TEXT NOT NULL,
+               metadata TEXT,
+               created_by TEXT,
+               updated_by TEXT,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+           )`;
+
            this.db.serialize(() => {
                this.db.run(createSMSTable, (err) => {
                    if (err) {
@@ -2707,24 +2718,32 @@ class EnhancedDatabase {
                                reject(idemErr);
                                return;
                            }
-                           this.ensureSmsColumns(['provider']).then(() => {
-                               const smsIndexes = [
-                                   'CREATE INDEX IF NOT EXISTS idx_sms_messages_status_updated_at ON sms_messages(status, updated_at)',
-                                   'CREATE INDEX IF NOT EXISTS idx_sms_messages_direction_updated_at ON sms_messages(direction, updated_at)',
-                                   'CREATE INDEX IF NOT EXISTS idx_sms_messages_provider ON sms_messages(provider)',
-                               ];
-                               Promise.all(
-                                   smsIndexes.map((sql) => new Promise((indexResolve, indexReject) => {
-                                       this.db.run(sql, (indexErr) => {
-                                           if (indexErr) indexReject(indexErr);
-                                           else indexResolve();
-                                       });
-                                   })),
-                               ).then(() => {
-                                   console.log('✅ SMS tables created successfully');
-                                   resolve();
+                           this.db.run(createSmsScriptsTable, (scriptErr) => {
+                               if (scriptErr) {
+                                   console.error('Error creating sms_scripts table:', scriptErr);
+                                   reject(scriptErr);
+                                   return;
+                               }
+                               this.ensureSmsColumns(['provider']).then(() => {
+                                   const smsIndexes = [
+                                       'CREATE INDEX IF NOT EXISTS idx_sms_messages_status_updated_at ON sms_messages(status, updated_at)',
+                                       'CREATE INDEX IF NOT EXISTS idx_sms_messages_direction_updated_at ON sms_messages(direction, updated_at)',
+                                       'CREATE INDEX IF NOT EXISTS idx_sms_messages_provider ON sms_messages(provider)',
+                                       'CREATE INDEX IF NOT EXISTS idx_sms_scripts_updated_at ON sms_scripts(updated_at)',
+                                   ];
+                                   Promise.all(
+                                       smsIndexes.map((sql) => new Promise((indexResolve, indexReject) => {
+                                           this.db.run(sql, (indexErr) => {
+                                               if (indexErr) indexReject(indexErr);
+                                               else indexResolve();
+                                           });
+                                       })),
+                                   ).then(() => {
+                                       console.log('✅ SMS tables created successfully');
+                                       resolve();
+                                   }).catch(reject);
                                }).catch(reject);
-                           }).catch(reject);
+                           });
                        });
                    });
                });
@@ -3424,6 +3443,147 @@ class EnhancedDatabase {
        });
    }
 
+   normalizeSmsScriptRow(row = {}) {
+       if (!row || typeof row !== 'object') return null;
+       let metadata = {};
+       if (row.metadata) {
+           try {
+               const parsed = JSON.parse(row.metadata);
+               if (parsed && typeof parsed === 'object') {
+                   metadata = parsed;
+               }
+           } catch (_) {
+               metadata = {};
+           }
+       }
+       return {
+           name: row.name,
+           description: row.description || null,
+           content: row.content || '',
+           metadata,
+           created_by: row.created_by || null,
+           updated_by: row.updated_by || null,
+           created_at: row.created_at || null,
+           updated_at: row.updated_at || null,
+       };
+   }
+
+   async listSmsScripts() {
+       return new Promise((resolve, reject) => {
+           const sql = `
+               SELECT name, description, content, metadata, created_by, updated_by, created_at, updated_at
+               FROM sms_scripts
+               ORDER BY datetime(updated_at) DESC, name COLLATE NOCASE ASC
+           `;
+           this.db.all(sql, [], (err, rows) => {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve((rows || []).map((row) => this.normalizeSmsScriptRow(row)).filter(Boolean));
+               }
+           });
+       });
+   }
+
+   async getSmsScript(name) {
+       return new Promise((resolve, reject) => {
+           const sql = `
+               SELECT name, description, content, metadata, created_by, updated_by, created_at, updated_at
+               FROM sms_scripts
+               WHERE name = ?
+           `;
+           this.db.get(sql, [name], (err, row) => {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(row ? this.normalizeSmsScriptRow(row) : null);
+               }
+           });
+       });
+   }
+
+   async createSmsScript(payload = {}) {
+       const metadata = payload.metadata && typeof payload.metadata === 'object'
+           ? JSON.stringify(payload.metadata)
+           : null;
+       return new Promise((resolve, reject) => {
+           const sql = `
+               INSERT INTO sms_scripts (
+                   name, description, content, metadata, created_by, updated_by, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+           `;
+           this.db.run(
+               sql,
+               [
+                   payload.name,
+                   payload.description || null,
+                   payload.content || '',
+                   metadata,
+                   payload.created_by || null,
+                   payload.created_by || payload.updated_by || null,
+               ],
+               function (err) {
+                   if (err) {
+                       reject(err);
+                   } else {
+                       resolve(this.changes || 0);
+                   }
+               },
+           );
+       });
+   }
+
+   async updateSmsScript(name, payload = {}) {
+       const fields = [];
+       const values = [];
+       if (payload.description !== undefined) {
+           fields.push('description = ?');
+           values.push(payload.description || null);
+       }
+       if (payload.content !== undefined) {
+           fields.push('content = ?');
+           values.push(payload.content || '');
+       }
+       if (payload.metadata !== undefined) {
+           const metadata = payload.metadata && typeof payload.metadata === 'object'
+               ? JSON.stringify(payload.metadata)
+               : null;
+           fields.push('metadata = ?');
+           values.push(metadata);
+       }
+       if (payload.updated_by !== undefined) {
+           fields.push('updated_by = ?');
+           values.push(payload.updated_by || null);
+       }
+       if (!fields.length) {
+           return 0;
+       }
+       fields.push('updated_at = CURRENT_TIMESTAMP');
+       values.push(name);
+       return new Promise((resolve, reject) => {
+           const sql = `UPDATE sms_scripts SET ${fields.join(', ')} WHERE name = ?`;
+           this.db.run(sql, values, function (err) {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(this.changes || 0);
+               }
+           });
+       });
+   }
+
+   async deleteSmsScript(name) {
+       return new Promise((resolve, reject) => {
+           this.db.run('DELETE FROM sms_scripts WHERE name = ?', [name], function (err) {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(this.changes || 0);
+               }
+           });
+       });
+   }
+
    // Save Email message
    async saveEmailMessage(messageData) {
        return new Promise((resolve, reject) => {
@@ -3466,20 +3626,6 @@ class EnhancedDatabase {
            this.db.get(sql, [messageId], (err, row) => {
                if (err) {
                    console.error('Error fetching email message:', err);
-                   reject(err);
-               } else {
-                   resolve(row || null);
-               }
-           });
-       });
-   }
-
-   async getEmailMessageByProviderId(providerMessageId) {
-       return new Promise((resolve, reject) => {
-           const sql = `SELECT * FROM email_messages WHERE provider_message_id = ?`;
-           this.db.get(sql, [providerMessageId], (err, row) => {
-               if (err) {
-                   console.error('Error fetching email message by provider id:', err);
                    reject(err);
                } else {
                    resolve(row || null);

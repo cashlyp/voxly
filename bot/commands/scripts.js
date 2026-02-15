@@ -1131,7 +1131,41 @@ async function collectDigitCaptureConfig(conversation, ctx, defaults = {}, ensur
 
 async function fetchCallScripts() {
   const data = await scriptsApiRequest({ method: 'get', url: '/api/call-scripts' });
-  return data.scripts || [];
+  const payload = Array.isArray(data)
+    ? { scripts: data }
+    : (data?.data && typeof data.data === 'object' ? data.data : data) || {};
+  const sourceList = Array.isArray(payload?.scripts)
+    ? payload.scripts
+    : Array.isArray(payload?.templates)
+      ? payload.templates
+      : Array.isArray(payload?.call_scripts)
+        ? payload.call_scripts
+        : Array.isArray(payload?.callTemplates)
+          ? payload.callTemplates
+          : Array.isArray(payload?.items)
+            ? payload.items
+            : [];
+
+  return sourceList
+    .map((item, index) => {
+      if (!item || typeof item !== 'object') return null;
+      const idCandidate = item.id ?? item.script_id ?? item.template_id ?? item.call_template_id ?? null;
+      const parsedId = Number(idCandidate);
+      const normalizedId = Number.isFinite(parsedId) ? parsedId : null;
+      const normalizedName = String(
+        item.name ?? item.script_name ?? item.template_name ?? `Script ${index + 1}`
+      ).trim();
+      if (!normalizedName) return null;
+      return {
+        ...item,
+        id: normalizedId,
+        name: normalizedName,
+        description: item.description ?? item.summary ?? item.notes ?? null,
+        prompt: item.prompt ?? item.script_prompt ?? null,
+        first_message: item.first_message ?? item.firstMessage ?? null
+      };
+    })
+    .filter(Boolean);
 }
 
 async function fetchCallScriptById(id) {
@@ -1871,17 +1905,29 @@ async function listCallScriptsFlow(conversation, ctx, ensureActive) {
     const scripts = await fetchCallScripts();
     safeEnsureActive();
     const list = Array.isArray(scripts) ? scripts : [];
-    const validScripts = list.filter((script) => script && typeof script.id !== 'undefined' && script.id !== null);
+    const manageableScripts = list.filter((script) => script && Number.isFinite(Number(script.id)));
+    const readOnlyScripts = list.filter((script) => script && !Number.isFinite(Number(script.id)));
 
-    if (!validScripts.length) {
-      if (scripts && scripts.length && scripts.some((t) => !t || typeof t.id === 'undefined')) {
-        console.warn('Script list contained invalid entries, ignoring malformed records.');
-      }
+    if (!manageableScripts.length && !readOnlyScripts.length) {
       await ctx.reply('ℹ️ No call scripts found. Use the create action to add one.');
       return;
     }
 
-    const summaryLines = validScripts.slice(0, 15).map((script, index) => {
+    if (!manageableScripts.length && readOnlyScripts.length) {
+      const previewNames = readOnlyScripts.slice(0, 10).map((script, index) => `${index + 1}. ${script.name}`);
+      await ctx.reply(
+        `⚠️ Call scripts were returned by the API, but they are missing numeric IDs, so they cannot be managed from this menu.\n\n${previewNames.join('\n')}`
+      );
+      return;
+    }
+
+    if (readOnlyScripts.length) {
+      console.warn('[scripts] call script entries missing numeric id; ignoring unmanageable records', {
+        count: readOnlyScripts.length
+      });
+    }
+
+    const summaryLines = manageableScripts.slice(0, 15).map((script, index) => {
       const parts = [`${index + 1}. ${script.name}`];
       if (script.description) {
         parts.push(`– ${script.description}`);
@@ -1891,14 +1937,17 @@ async function listCallScriptsFlow(conversation, ctx, ensureActive) {
 
     let message = '☎️ Call Scripts\n\n';
     message += summaryLines.join('\n');
-    if (validScripts.length > 15) {
-      message += `\n… and ${validScripts.length - 15} more.`;
+    if (manageableScripts.length > 15) {
+      message += `\n… and ${manageableScripts.length - 15} more.`;
+    }
+    if (readOnlyScripts.length > 0) {
+      message += `\n\n⚠️ ${readOnlyScripts.length} script record(s) were skipped because they are missing IDs.`;
     }
     message += '\n\nSelect a script below to view details.';
 
     await ctx.reply(message);
 
-    const options = validScripts.map((script) => ({
+    const options = manageableScripts.map((script) => ({
       id: script.id.toString(),
       label: `📄 ${script.name}`
     }));
@@ -1993,13 +2042,18 @@ async function inboundDefaultScriptMenu(conversation, ctx, ensureActive) {
           break;
         }
 
-        if (!scripts.length) {
+        const manageableScripts = scripts.filter((script) => script && Number.isFinite(Number(script.id)));
+        if (!manageableScripts.length) {
+          if (scripts.length) {
+            await ctx.reply('⚠️ No selectable call scripts were returned (missing numeric IDs).');
+            break;
+          }
           await ctx.reply('ℹ️ No call scripts available. Create one first.');
           break;
         }
 
-        const options = scripts.map((script) => ({
-          id: script.id.toString(),
+        const options = manageableScripts.map((script) => ({
+          id: String(Number(script.id)),
           label: `📄 ${script.name}`
         }));
         options.push({ id: 'back', label: '⬅️ Back' });
@@ -2067,34 +2121,42 @@ async function callScriptsMenu(conversation, ctx, ensureActive) {
     : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
   let open = true;
   while (open) {
-    const action = await askOptionWithButtons(
-      conversation,
-      ctx,
-      '☎️ *Call Script Designer*\nChoose an action.',
-      [
-        { id: 'list', label: '📄 List scripts' },
-        { id: 'create', label: '➕ Create script' },
-        { id: 'incoming', label: '📥 Incoming default' },
-        { id: 'back', label: '⬅️ Back' }
-      ],
-      { prefix: 'call-script-main', columns: 1, ensureActive: safeEnsureActive }
-    );
+    try {
+      const action = await askOptionWithButtons(
+        conversation,
+        ctx,
+        '☎️ *Call Script Designer*\nChoose an action.',
+        [
+          { id: 'list', label: '📄 List scripts' },
+          { id: 'create', label: '➕ Create script' },
+          { id: 'incoming', label: '📥 Incoming default' },
+          { id: 'back', label: '⬅️ Back' }
+        ],
+        { prefix: 'call-script-main', columns: 1, ensureActive: safeEnsureActive }
+      );
 
-    switch (action.id) {
-      case 'list':
-        await listCallScriptsFlow(conversation, ctx, safeEnsureActive);
-        break;
-      case 'create':
-        await createCallScriptFlow(conversation, ctx, safeEnsureActive);
-        break;
-      case 'incoming':
-        await inboundDefaultScriptMenu(conversation, ctx, safeEnsureActive);
-        break;
-      case 'back':
-        open = false;
-        break;
-      default:
-        break;
+      switch (action.id) {
+        case 'list':
+          await listCallScriptsFlow(conversation, ctx, safeEnsureActive);
+          break;
+        case 'create':
+          await createCallScriptFlow(conversation, ctx, safeEnsureActive);
+          break;
+        case 'incoming':
+          await inboundDefaultScriptMenu(conversation, ctx, safeEnsureActive);
+          break;
+        case 'back':
+          open = false;
+          break;
+        default:
+          break;
+      }
+    } catch (error) {
+      if (error instanceof OperationCancelledError) {
+        throw error;
+      }
+      logScriptsError('Call scripts menu step failed', error);
+      await ctx.reply(formatScriptsApiError(error, 'Call script menu failed'));
     }
   }
 }
@@ -2108,10 +2170,21 @@ async function fetchSmsScripts({ includeContent = false } = {}) {
       detailed: includeContent
     }
   });
+  const payload = Array.isArray(data)
+    ? { scripts: data }
+    : (data?.data && typeof data.data === 'object' ? data.data : data) || {};
 
   const scriptsMap = new Map();
-  const customSource = Array.isArray(data.scripts) ? data.scripts : [];
-  const builtinSource = Array.isArray(data.builtin) ? data.builtin : [];
+  const customSource = Array.isArray(payload.scripts)
+    ? payload.scripts
+    : Array.isArray(payload.custom)
+      ? payload.custom
+      : [];
+  const builtinSource = Array.isArray(payload.builtin)
+    ? payload.builtin
+    : Array.isArray(payload.builtin_scripts)
+      ? payload.builtin_scripts
+      : [];
 
   customSource.forEach((script) => {
     const scriptName = script?.name || script?.script_name;
@@ -2135,8 +2208,8 @@ async function fetchSmsScripts({ includeContent = false } = {}) {
     });
   });
 
-  if (!scriptsMap.size && Array.isArray(data.available_scripts)) {
-    data.available_scripts.forEach((scriptName) => {
+  if (!scriptsMap.size && Array.isArray(payload.available_scripts)) {
+    payload.available_scripts.forEach((scriptName) => {
       if (!scriptName || scriptsMap.has(scriptName)) return;
       scriptsMap.set(scriptName, {
         name: scriptName,
@@ -2793,7 +2866,7 @@ async function listSmsScriptsFlow(conversation, ctx) {
       { prefix: 'sms-script-select', columns: 1, formatLabel: (option) => option.label }
     );
 
-    if (selection.id === 'back') {
+    if (!selection?.id || selection.id === 'back') {
       return;
     }
 
@@ -2818,30 +2891,38 @@ async function listSmsScriptsFlow(conversation, ctx) {
 async function smsScriptsMenu(conversation, ctx) {
   let open = true;
   while (open) {
-    const action = await askOptionWithButtons(
-      conversation,
-      ctx,
-      '💬 *SMS Script Designer*\nChoose an action.',
-      [
-        { id: 'list', label: '📄 List scripts' },
-        { id: 'create', label: '➕ Create script' },
-        { id: 'back', label: '⬅️ Back' }
-      ],
-      { prefix: 'sms-script-main', columns: 1 }
-    );
+    try {
+      const action = await askOptionWithButtons(
+        conversation,
+        ctx,
+        '💬 *SMS Script Designer*\nChoose an action.',
+        [
+          { id: 'list', label: '📄 List scripts' },
+          { id: 'create', label: '➕ Create script' },
+          { id: 'back', label: '⬅️ Back' }
+        ],
+        { prefix: 'sms-script-main', columns: 1 }
+      );
 
-    switch (action.id) {
-      case 'list':
-        await listSmsScriptsFlow(conversation, ctx);
-        break;
-      case 'create':
-        await createSmsScriptFlow(conversation, ctx);
-        break;
-      case 'back':
-        open = false;
-        break;
-      default:
-        break;
+      switch (action.id) {
+        case 'list':
+          await listSmsScriptsFlow(conversation, ctx);
+          break;
+        case 'create':
+          await createSmsScriptFlow(conversation, ctx);
+          break;
+        case 'back':
+          open = false;
+          break;
+        default:
+          break;
+      }
+    } catch (error) {
+      if (error instanceof OperationCancelledError) {
+        throw error;
+      }
+      logScriptsError('SMS scripts menu step failed', error);
+      await ctx.reply(formatScriptsApiError(error, 'SMS script menu failed'));
     }
   }
 }
@@ -2911,7 +2992,8 @@ async function scriptsFlow(conversation, ctx) {
     await ctx.reply('✅ Script designer closed.');
   } catch (error) {
     if (error instanceof OperationCancelledError) {
-      console.log('Scripts flow cancelled:', error.message);
+      console.warn('Scripts flow cancelled:', error.message);
+      await ctx.reply('⚠️ Script designer session was interrupted. Run /scripts to continue.');
       return;
     }
     console.error('Scripts flow unexpected error:', error?.message || error);
