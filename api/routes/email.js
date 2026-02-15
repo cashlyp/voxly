@@ -144,6 +144,47 @@ function mapProviderError(provider, err) {
   return wrapped;
 }
 
+function createProviderTimeoutError(provider, timeoutMs, action = 'request') {
+  const normalizedProvider = normalizeProviderName(provider) || 'unknown';
+  const safeTimeoutMs = Math.max(1000, Number(timeoutMs) || 15000);
+  const error = new Error(
+    `${normalizedProvider} ${action} timed out after ${safeTimeoutMs}ms`,
+  );
+  error.code = 'email_provider_timeout';
+  error.provider = normalizedProvider;
+  error.retryable = true;
+  error.statusCode = 504;
+  error.status = 504;
+  return error;
+}
+
+async function runProviderRequestWithTimeout({
+  timeoutMs = 15000,
+  provider = 'unknown',
+  action = 'request',
+  request,
+}) {
+  const safeTimeoutMs = Math.max(1000, Number(timeoutMs) || 15000);
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, safeTimeoutMs);
+  try {
+    return await request({ signal: controller.signal, timeoutMs: safeTimeoutMs });
+  } catch (err) {
+    if (
+      controller.signal.aborted ||
+      err?.code === 'ERR_CANCELED' ||
+      err?.name === 'CanceledError'
+    ) {
+      throw createProviderTimeoutError(provider, safeTimeoutMs, action);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 class ProviderAdapter {
   constructor(providerName = 'unknown') {
     this.providerName = providerName;
@@ -192,12 +233,18 @@ class SendGridAdapter extends ProviderAdapter {
       payload.content.push({ type: 'text/html', value: message.html });
     }
     try {
-      const response = await axios.post(url, payload, {
-        timeout: this.requestTimeoutMs,
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          'Content-Type': 'application/json'
-        }
+      const response = await runProviderRequestWithTimeout({
+        timeoutMs: this.requestTimeoutMs,
+        provider: this.providerName,
+        action: 'send_email',
+        request: ({ signal, timeoutMs }) => axios.post(url, payload, {
+          timeout: timeoutMs,
+          signal,
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json'
+          }
+        }),
       });
       const providerMessageId = response.headers?.['x-message-id'] || null;
       return { providerMessageId, response: response.data };
@@ -245,15 +292,21 @@ class MailgunAdapter extends ProviderAdapter {
       });
     }
     try {
-      const response = await axios.post(url, params, {
-        timeout: this.requestTimeoutMs,
-        auth: {
-          username: 'api',
-          password: this.apiKey
-        },
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded'
-        }
+      const response = await runProviderRequestWithTimeout({
+        timeoutMs: this.requestTimeoutMs,
+        provider: this.providerName,
+        action: 'send_email',
+        request: ({ signal, timeoutMs }) => axios.post(url, params, {
+          timeout: timeoutMs,
+          signal,
+          auth: {
+            username: 'api',
+            password: this.apiKey
+          },
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded'
+          }
+        }),
       });
       const providerMessageId = response.data?.id || null;
       return { providerMessageId, response: response.data };
@@ -329,9 +382,15 @@ class SesAdapter extends ProviderAdapter {
 
     const signed = await signer.sign(request);
     try {
-      const response = await axios.post(url, body, {
-        timeout: this.requestTimeoutMs,
-        headers: signed.headers,
+      const response = await runProviderRequestWithTimeout({
+        timeoutMs: this.requestTimeoutMs,
+        provider: this.providerName,
+        action: 'send_email',
+        request: ({ signal, timeoutMs }) => axios.post(url, body, {
+          timeout: timeoutMs,
+          signal,
+          headers: signed.headers,
+        }),
       });
       const providerMessageId = response.data?.MessageId || null;
       return { providerMessageId, response: response.data };
@@ -351,6 +410,7 @@ class EmailService {
   }) {
     this.db = db;
     this.logger = logger;
+    this.rootConfig = cfg || {};
     this.config = cfg?.email || {};
     this.getActiveProvider =
       typeof getActiveProvider === 'function'
@@ -366,6 +426,35 @@ class EmailService {
     this.maxSubjectChars = Number(this.config.maxSubjectChars) || 200;
     this.maxBodyChars = Number(this.config.maxBodyChars) || 200000;
     this.maxBulkRecipients = Number(this.config.maxBulkRecipients) || 500;
+    this.providerEventDedupe = new Map();
+    this.providerEventDedupeTtlMs = 30 * 60 * 1000;
+    this.queueClaimLeaseMs = Math.max(
+      10000,
+      Number(this.config.queueClaimLeaseMs) || 60000,
+    );
+    this.queueStaleSendingMs = Math.max(
+      this.queueClaimLeaseMs * 2,
+      Number(this.config.queueStaleSendingMs) || 180000,
+    );
+    this.providerEventsTtlDays = Math.max(
+      1,
+      Number(this.config.providerEventsTtlDays) || 14,
+    );
+    this.circuitBreakerEnabled = this.config.circuitBreaker?.enabled !== false;
+    this.circuitFailureThreshold = Math.max(
+      2,
+      Number(this.config.circuitBreaker?.failureThreshold) || 5,
+    );
+    this.circuitFailureWindowMs = Math.max(
+      10000,
+      Number(this.config.circuitBreaker?.windowMs) || 120000,
+    );
+    this.circuitCooldownMs = Math.max(
+      10000,
+      Number(this.config.circuitBreaker?.cooldownMs) || 120000,
+    );
+    this.providerCircuits = new Map();
+    this.providerEventsLastCleanupMs = 0;
   }
 
   resolveProvider(providerOverride = null) {
@@ -435,6 +524,44 @@ class EmailService {
     return this.config.defaultFrom || '';
   }
 
+  getUnsubscribeSecret() {
+    const configured = String(this.config.unsubscribeSecret || '').trim();
+    if (configured) {
+      return configured;
+    }
+    const fallback = String(this.rootConfig?.apiAuth?.hmacSecret || '').trim();
+    return fallback || '';
+  }
+
+  hasUnsubscribeSignature() {
+    return Boolean(this.getUnsubscribeSecret());
+  }
+
+  buildUnsubscribeSignature(email, messageId = '') {
+    const secret = this.getUnsubscribeSecret();
+    if (!secret) return '';
+    const normalizedEmail = normalizeEmail(email);
+    const normalizedMessageId = String(messageId || '').trim();
+    return crypto
+      .createHmac('sha256', secret)
+      .update(`${normalizedEmail}|${normalizedMessageId}`)
+      .digest('hex');
+  }
+
+  verifyUnsubscribeSignature(email, messageId = '', signature = '') {
+    const expected = this.buildUnsubscribeSignature(email, messageId);
+    const provided = String(signature || '').trim();
+    if (!expected || !provided) return false;
+    try {
+      const expectedBuf = Buffer.from(expected, 'hex');
+      const providedBuf = Buffer.from(provided, 'hex');
+      if (expectedBuf.length !== providedBuf.length) return false;
+      return crypto.timingSafeEqual(expectedBuf, providedBuf);
+    } catch (_) {
+      return false;
+    }
+  }
+
   buildHeaders(payload) {
     const headers = { ...(payload.headers || {}) };
     if (payload.is_marketing && this.config.unsubscribeUrl) {
@@ -446,6 +573,13 @@ class EmailService {
         }
         if (payload.message_id) {
           built.searchParams.set('message_id', payload.message_id);
+        }
+        const signature = this.buildUnsubscribeSignature(
+          payload.to_email || payload.to || '',
+          payload.message_id || '',
+        );
+        if (signature) {
+          built.searchParams.set('sig', signature);
         }
         url = built.toString();
       } catch {
@@ -575,9 +709,15 @@ class EmailService {
       send_at: scheduledAt
     });
     const resolvedProvider = this.resolveProvider(payload.provider);
+    let idempotencyReservationInserted = false;
 
     if (idempotencyKey) {
-      const existing = await this.db.getEmailIdempotency(idempotencyKey);
+      const reservation = await this.db.reserveEmailIdempotency(
+        idempotencyKey,
+        requestHash,
+        payload.bulk_job_id || null,
+      );
+      const existing = reservation.record;
       if (existing?.message_id) {
         if (existing.request_hash && existing.request_hash !== requestHash) {
           const error = new Error('Idempotency key reuse with different payload');
@@ -586,6 +726,17 @@ class EmailService {
         }
         return { message_id: existing.message_id, deduped: true };
       }
+      if (existing?.request_hash && existing.request_hash !== requestHash) {
+        const error = new Error('Idempotency key reuse with different payload');
+        error.code = 'idempotency_conflict';
+        throw error;
+      }
+      if (!reservation.inserted) {
+        const error = new Error('Idempotency key is currently processing');
+        error.code = 'idempotency_in_progress';
+        throw error;
+      }
+      idempotencyReservationInserted = true;
     }
 
     const suppressed = await this.db.isEmailSuppressed(to);
@@ -593,27 +744,39 @@ class EmailService {
     const messageId = `email_${crypto.randomUUID()}`;
     const metadata = { ...(payload.metadata || {}), is_marketing: !!payload.is_marketing };
 
-    await this.db.saveEmailMessage({
-      message_id: messageId,
-      to_email: to,
-      from_email: from,
-      subject: rendered.subject,
-      html: rendered.html,
-      text: rendered.text,
-      template_id: script.script_id,
-      variables_json: JSON.stringify(variables),
-      variables_hash: hashPayload(variables),
-      metadata_json: JSON.stringify(metadata),
-      status,
-      provider: resolvedProvider,
-      tenant_id: payload.tenant_id || null,
-      bulk_job_id: payload.bulk_job_id || null,
-      scheduled_at: scheduledAt,
-      max_retries: payload.max_retries || this.config.maxRetries || 5
-    });
+    try {
+      await this.db.saveEmailMessage({
+        message_id: messageId,
+        to_email: to,
+        from_email: from,
+        subject: rendered.subject,
+        html: rendered.html,
+        text: rendered.text,
+        template_id: script.script_id,
+        variables_json: JSON.stringify(variables),
+        variables_hash: hashPayload(variables),
+        metadata_json: JSON.stringify(metadata),
+        status,
+        provider: resolvedProvider,
+        tenant_id: payload.tenant_id || null,
+        bulk_job_id: payload.bulk_job_id || null,
+        scheduled_at: scheduledAt,
+        max_retries: payload.max_retries || this.config.maxRetries || 5
+      });
+    } catch (err) {
+      if (idempotencyReservationInserted && idempotencyKey) {
+        await this.db.clearPendingEmailIdempotency(idempotencyKey).catch(() => {});
+      }
+      throw err;
+    }
 
     if (idempotencyKey) {
-      await this.db.saveEmailIdempotency(idempotencyKey, messageId, payload.bulk_job_id || null, requestHash);
+      await this.db.finalizeEmailIdempotency(
+        idempotencyKey,
+        messageId,
+        payload.bulk_job_id || null,
+        requestHash,
+      );
     }
 
     if (suppressed) {
@@ -654,9 +817,15 @@ class EmailService {
       variables: payload.variables || {},
       send_at: payload.send_at || null
     });
+    let idempotencyReservationInserted = false;
 
     if (idempotencyKey) {
-      const existing = await this.db.getEmailIdempotency(idempotencyKey);
+      const reservation = await this.db.reserveEmailIdempotency(
+        idempotencyKey,
+        requestHash,
+        null,
+      );
+      const existing = reservation.record;
       if (existing?.bulk_job_id) {
         if (existing.request_hash && existing.request_hash !== requestHash) {
           const error = new Error('Idempotency key reuse with different payload');
@@ -665,20 +834,43 @@ class EmailService {
         }
         return { bulk_job_id: existing.bulk_job_id, deduped: true };
       }
+      if (existing?.request_hash && existing.request_hash !== requestHash) {
+        const error = new Error('Idempotency key reuse with different payload');
+        error.code = 'idempotency_conflict';
+        throw error;
+      }
+      if (!reservation.inserted) {
+        const error = new Error('Idempotency key is currently processing');
+        error.code = 'idempotency_in_progress';
+        throw error;
+      }
+      idempotencyReservationInserted = true;
     }
 
     const jobId = `bulk_${crypto.randomUUID()}`;
-    await this.db.createEmailBulkJob({
-      job_id: jobId,
-      status: 'queued',
-      total: recipients.length,
-      queued: 0,
-      tenant_id: payload.tenant_id || null,
-      template_id: payload.script_id || null
-    });
+    try {
+      await this.db.createEmailBulkJob({
+        job_id: jobId,
+        status: 'queued',
+        total: recipients.length,
+        queued: 0,
+        tenant_id: payload.tenant_id || null,
+        template_id: payload.script_id || null
+      });
+    } catch (err) {
+      if (idempotencyReservationInserted && idempotencyKey) {
+        await this.db.clearPendingEmailIdempotency(idempotencyKey).catch(() => {});
+      }
+      throw err;
+    }
 
     if (idempotencyKey) {
-      await this.db.saveEmailIdempotency(idempotencyKey, null, jobId, requestHash);
+      await this.db.finalizeEmailIdempotency(
+        idempotencyKey,
+        null,
+        jobId,
+        requestHash,
+      );
     }
 
     let queued = 0;
@@ -736,9 +928,39 @@ class EmailService {
     if (this.processing) return;
     this.processing = true;
     try {
-      const messages = await this.db.getPendingEmailMessages(limit);
+      const nowMs = Date.now();
+      if (
+        nowMs - this.providerEventsLastCleanupMs >
+        60 * 60 * 1000
+      ) {
+        this.providerEventsLastCleanupMs = nowMs;
+        await this.db
+          .cleanupExpiredEmailProviderEvents(this.providerEventsTtlDays)
+          .catch(() => {});
+      }
+      const messages = await this.db.claimPendingEmailMessages(limit, {
+        leaseMs: this.queueClaimLeaseMs,
+        staleSendingMs: this.queueStaleSendingMs,
+      });
       for (const message of messages) {
-        await this.processMessage(message);
+        try {
+          await this.processMessage(message);
+        } catch (err) {
+          this.logger.error('Email queue message processing failed:', {
+            message_id: message?.message_id || null,
+            error: previewForLog(err.message),
+          });
+          await this.handleSendFailure(message, err).catch((failureErr) => {
+            this.logger.error('Email queue failure handling failed:', {
+              message_id: message?.message_id || null,
+              error: previewForLog(failureErr.message),
+            });
+          });
+        } finally {
+          await this.db
+            .releaseEmailMessageClaim(message?.message_id, message?.queue_lock_token || null)
+            .catch(() => {});
+        }
       }
     } catch (err) {
       this.logger.error('Email queue processing error:', err.message);
@@ -783,7 +1005,17 @@ class EmailService {
     const nowIso = now.toISOString();
 
     if (message.status === 'sending') {
-      return;
+      const lastAttemptMs = Date.parse(message.last_attempt_at || '');
+      const staleForMs = Number.isFinite(lastAttemptMs)
+        ? Date.now() - lastAttemptMs
+        : Number.POSITIVE_INFINITY;
+      if (staleForMs < this.queueStaleSendingMs) {
+        return;
+      }
+      await this.db.addEmailEvent(messageId, 'retry_scheduled', {
+        reason: 'stale_sending_recovered',
+        stale_for_ms: staleForMs,
+      });
     }
 
     const suppressed = await this.db.isEmailSuppressed(message.to_email);
@@ -797,6 +1029,22 @@ class EmailService {
       await this.db.addEmailEvent(messageId, 'suppressed', { reason: suppressed.reason, source: suppressed.source });
       await this.db.incrementEmailMetric('suppressed');
       await this.updateBulkCounters(message.bulk_job_id, message.status, 'suppressed');
+      return;
+    }
+
+    const circuitStatus = this.getProviderCircuitStatus(provider);
+    if (circuitStatus.open) {
+      const retryAt = new Date(Date.now() + circuitStatus.retryAfterMs).toISOString();
+      await this.db.updateEmailMessageStatus(messageId, {
+        status: 'retry',
+        next_attempt_at: retryAt,
+        failure_reason: 'provider_circuit_open',
+      });
+      await this.db.addEmailEvent(messageId, 'retry_scheduled', {
+        provider,
+        reason: 'provider_circuit_open',
+        retry_at: retryAt,
+      });
       return;
     }
 
@@ -834,7 +1082,8 @@ class EmailService {
 
     await this.db.updateEmailMessageStatus(messageId, {
       status: 'sending',
-      last_attempt_at: nowIso
+      last_attempt_at: nowIso,
+      queue_lock_expires_at_ms: Date.now() + this.queueClaimLeaseMs,
     });
     await this.db.addEmailEvent(messageId, 'sending', { provider });
 
@@ -862,14 +1111,157 @@ class EmailService {
         status: 'sent',
         provider_message_id: result.providerMessageId,
         provider_response: result.response ? JSON.stringify(result.response) : null,
-        sent_at: nowIso
+        sent_at: nowIso,
       });
       await this.db.addEmailEvent(messageId, 'sent', { provider_message_id: result.providerMessageId }, provider);
       await this.db.incrementEmailMetric('sent');
       await this.updateBulkCounters(message.bulk_job_id, message.status, 'sent');
+      this.recordProviderSuccess(provider);
     } catch (err) {
-      await this.handleSendFailure(message, err);
+      await this.handleSendFailure(message, err, provider);
     }
+  }
+
+  shouldCountCircuitFailure(classification = {}) {
+    if (!this.circuitBreakerEnabled) return false;
+    if (classification.permanent) return false;
+    if (classification.reason === 'rate_limited') return false;
+    return ['provider_error', 'provider_timeout', 'network_error'].includes(
+      classification.reason,
+    );
+  }
+
+  getProviderCircuitState(provider) {
+    const key = normalizeProviderName(provider) || 'unknown';
+    if (!this.providerCircuits.has(key)) {
+      this.providerCircuits.set(key, {
+        failures: [],
+        openUntilMs: 0,
+      });
+    }
+    return this.providerCircuits.get(key);
+  }
+
+  pruneCircuitFailures(state, nowMs = Date.now()) {
+    state.failures = (state.failures || []).filter(
+      (timestamp) => nowMs - timestamp <= this.circuitFailureWindowMs,
+    );
+  }
+
+  getProviderCircuitStatus(provider) {
+    if (!this.circuitBreakerEnabled) {
+      return { open: false, retryAfterMs: 0 };
+    }
+    const nowMs = Date.now();
+    const state = this.getProviderCircuitState(provider);
+    this.pruneCircuitFailures(state, nowMs);
+    if (state.openUntilMs && state.openUntilMs > nowMs) {
+      return { open: true, retryAfterMs: state.openUntilMs - nowMs };
+    }
+    if (state.openUntilMs && state.openUntilMs <= nowMs) {
+      state.openUntilMs = 0;
+      state.failures = [];
+    }
+    return { open: false, retryAfterMs: 0 };
+  }
+
+  recordProviderFailure(provider, classification = {}) {
+    if (!this.circuitBreakerEnabled) return;
+    const key = normalizeProviderName(provider) || 'unknown';
+    const nowMs = Date.now();
+    const state = this.getProviderCircuitState(key);
+    state.failures.push(nowMs);
+    this.pruneCircuitFailures(state, nowMs);
+    if (state.failures.length < this.circuitFailureThreshold) {
+      return;
+    }
+    const currentlyOpen = state.openUntilMs && state.openUntilMs > nowMs;
+    state.openUntilMs = nowMs + this.circuitCooldownMs;
+    if (currentlyOpen) {
+      return;
+    }
+    const details = {
+      provider: key,
+      failure_reason: classification.reason || 'provider_error',
+      failure_count: state.failures.length,
+      threshold: this.circuitFailureThreshold,
+      window_ms: this.circuitFailureWindowMs,
+      cooldown_ms: this.circuitCooldownMs,
+      opened_at: new Date(nowMs).toISOString(),
+    };
+    this.logger.warn('⚠️ Email provider circuit opened', details);
+    this.db?.logServiceHealth?.('email_provider_circuit', 'open', details).catch(() => {});
+  }
+
+  recordProviderSuccess(provider) {
+    if (!this.circuitBreakerEnabled) return;
+    const key = normalizeProviderName(provider) || 'unknown';
+    const state = this.getProviderCircuitState(key);
+    if (!state.failures.length && !state.openUntilMs) {
+      return;
+    }
+    const wasOpen = state.openUntilMs > Date.now();
+    state.failures = [];
+    state.openUntilMs = 0;
+    if (wasOpen) {
+      this.db
+        ?.logServiceHealth?.('email_provider_circuit', 'closed', {
+          provider: key,
+          closed_at: new Date().toISOString(),
+          reason: 'provider_request_succeeded',
+        })
+        .catch(() => {});
+    }
+  }
+
+  shouldSuppressFromFailure(classification = {}, err) {
+    if (!classification.permanent) return false;
+    const text = `${classification.reason || ''} ${classification.message || ''} ${
+      err?.providerCode || ''
+    }`.toLowerCase();
+    return (
+      /invalid.+(recipient|address|mailbox)/.test(text) ||
+      /recipient.+(rejected|invalid|unknown)/.test(text) ||
+      /mailbox.+(invalid|unavailable|not found)/.test(text) ||
+      /user unknown/.test(text) ||
+      /hard bounce/.test(text) ||
+      /5\.1\.1/.test(text)
+    );
+  }
+
+  buildProviderEventKey(event = {}, resolvedMessageId = '') {
+    const provider = normalizeProviderName(event.provider) || 'unknown';
+    const eventId = String(event.event_id || event.eventId || '').trim();
+    if (eventId) {
+      return `${provider}:${eventId}`;
+    }
+    return hashPayload({
+      provider,
+      message_id: resolvedMessageId || event.message_id || null,
+      provider_message_id: event.provider_message_id || null,
+      type: event.type || null,
+      reason: event.reason || null,
+      occurred_at: event.occurred_at || null,
+    });
+  }
+
+  getSuppressionReasonFromProviderEvent(event = {}) {
+    const type = this.normalizeStatus(event.type);
+    if (type === 'bounced') return 'bounce';
+    if (type === 'complained') return 'complaint';
+    if (type !== 'failed') return null;
+    const reason = String(event.reason || '').toLowerCase();
+    if (
+      /bounce|user unknown|mailbox|invalid|recipient|5\.1\.1|hard bounce/.test(
+        reason,
+      )
+    ) {
+      return 'hard_bounce';
+    }
+    if (/complaint|spam/.test(reason)) {
+      return 'complaint';
+    }
+    return null;
   }
 
   classifyError(err) {
@@ -877,25 +1269,35 @@ class EmailService {
     const code = String(err?.code || err?.providerCode || '').toUpperCase();
     const message = err?.response?.data?.error || err?.message || 'send_failed';
     if (err?.retryable === true) {
-      return { permanent: false, reason: 'provider_error', statusCode: status || null };
+      return { permanent: false, reason: 'provider_error', statusCode: status || null, message };
     }
     if (err?.code === 'email_provider_timeout') {
-      return { permanent: false, reason: 'provider_timeout', statusCode: status || null };
+      return { permanent: false, reason: 'provider_timeout', statusCode: status || null, message };
     }
-    if (status === 429) return { permanent: false, reason: 'rate_limited', statusCode: status };
-    if (status && status >= 500) return { permanent: false, reason: 'provider_error', statusCode: status };
-    if (status && status >= 400) return { permanent: true, reason: 'invalid_request', statusCode: status };
+    if (status === 429) return { permanent: false, reason: 'rate_limited', statusCode: status, message };
+    if (status && status >= 500) return { permanent: false, reason: 'provider_error', statusCode: status, message };
+    if (status && status >= 400) return { permanent: true, reason: 'invalid_request', statusCode: status, message };
     if (code && RETRYABLE_NETWORK_CODES.has(code)) {
-      return { permanent: false, reason: 'network_error', statusCode: status };
+      return { permanent: false, reason: 'network_error', statusCode: status, message };
     }
-    return { permanent: true, reason: message, statusCode: status };
+    return { permanent: true, reason: message, statusCode: status, message };
   }
 
-  async handleSendFailure(message, err) {
+  async handleSendFailure(message, err, providerOverride = null) {
     const messageId = message.message_id;
     const classification = this.classifyError(err);
     const retryCount = Number(message.retry_count || 0) + 1;
     const maxRetries = Number(message.max_retries || this.config.maxRetries || 5);
+    let provider = normalizeProviderName(providerOverride || message.provider) || 'unknown';
+    try {
+      provider = this.resolveProvider(provider);
+    } catch (_) {
+      // keep normalized fallback for logging/suppression when provider config drifts
+    }
+
+    if (this.shouldCountCircuitFailure(classification)) {
+      this.recordProviderFailure(provider, classification);
+    }
 
     if (!classification.permanent && retryCount <= maxRetries) {
       const baseDelay = 30000;
@@ -906,16 +1308,30 @@ class EmailService {
         status: 'retry',
         retry_count: retryCount,
         next_attempt_at: nextAttempt,
-        failure_reason: classification.reason
+        failure_reason: classification.reason,
       });
       await this.db.addEmailEvent(messageId, 'retry_scheduled', { retry_at: nextAttempt, reason: classification.reason });
       return;
     }
 
+    if (this.shouldSuppressFromFailure(classification, err)) {
+      await this.db
+        .setEmailSuppression(message.to_email, 'provider_permanent_failure', provider)
+        .catch(() => {});
+      await this.db
+        .addEmailEvent(
+          messageId,
+          'suppression_added',
+          { reason: 'provider_permanent_failure', provider },
+          provider,
+        )
+        .catch(() => {});
+    }
+
     await this.db.updateEmailMessageStatus(messageId, {
       status: 'failed',
       failure_reason: classification.reason,
-      failed_at: new Date().toISOString()
+      failed_at: new Date().toISOString(),
     });
     await this.db.addEmailEvent(messageId, 'failed', { reason: classification.reason, status: classification.statusCode });
     await this.db.incrementEmailMetric('failed');
@@ -986,9 +1402,76 @@ class EmailService {
     await this.db.updateEmailBulkJob(jobId, updates);
   }
 
+  pruneProviderEventDedupe(nowMs = Date.now()) {
+    for (const [key, expiresAt] of this.providerEventDedupe.entries()) {
+      if (!Number.isFinite(expiresAt) || expiresAt <= nowMs) {
+        this.providerEventDedupe.delete(key);
+      }
+    }
+  }
+
+  markProviderEventSeen(event = {}) {
+    const nowMs = Date.now();
+    this.pruneProviderEventDedupe(nowMs);
+    const key = [
+      event.event_id || '',
+      event.message_id || '',
+      event.provider_message_id || '',
+      event.provider || '',
+      event.type || '',
+      event.reason || ''
+    ].join('|');
+    if (!key.replace(/\|/g, '').trim()) {
+      return false;
+    }
+    if (this.providerEventDedupe.has(key)) {
+      return true;
+    }
+    this.providerEventDedupe.set(key, nowMs + this.providerEventDedupeTtlMs);
+    return false;
+  }
+
+  normalizeStatus(status = '') {
+    return String(status || '').trim().toLowerCase();
+  }
+
+  isTerminalStatus(status = '') {
+    return ['delivered', 'bounced', 'complained', 'failed', 'suppressed'].includes(
+      this.normalizeStatus(status),
+    );
+  }
+
+  canTransitionStatus(currentStatus = '', targetStatus = '') {
+    const current = this.normalizeStatus(currentStatus);
+    const target = this.normalizeStatus(targetStatus);
+    if (!target) return false;
+    if (!current) return true;
+    if (current === target) return false;
+    const allowed = {
+      queued: new Set(['sending', 'sent', 'failed', 'delivered', 'bounced', 'complained']),
+      retry: new Set(['sending', 'sent', 'failed', 'delivered', 'bounced', 'complained']),
+      sending: new Set(['sent', 'failed', 'delivered', 'bounced', 'complained']),
+      sent: new Set(['delivered', 'bounced', 'complained', 'failed']),
+      delivered: new Set(['complained']),
+      failed: new Set([]),
+      bounced: new Set([]),
+      complained: new Set([]),
+      suppressed: new Set([])
+    };
+    const allowedTargets = allowed[current];
+    if (!allowedTargets) return false;
+    return allowedTargets.has(target);
+  }
+
   async handleProviderEvent(payload) {
     const events = this.normalizeProviderEvents(payload);
+    let processed = 0;
+    let deduped = 0;
     for (const event of events) {
+      if (this.markProviderEventSeen(event)) {
+        deduped += 1;
+        continue;
+      }
       let messageId = event.message_id;
       let message = null;
       if (messageId) {
@@ -1000,6 +1483,30 @@ class EmailService {
       }
       if (!messageId || !message) continue;
 
+      const eventKey = this.buildProviderEventKey(event, messageId);
+      if (eventKey) {
+        const accepted = await this.db.saveEmailProviderEvent({
+          event_key: eventKey,
+          message_id: messageId,
+          provider: event.provider,
+          event_type: event.type,
+          reason: event.reason || null,
+          payload_json: JSON.stringify({
+            message_id: messageId,
+            provider_message_id: event.provider_message_id || null,
+            event_id: event.event_id || null,
+            type: event.type || null,
+            provider: event.provider || null,
+            reason: event.reason || null,
+            occurred_at: event.occurred_at || null,
+          }),
+        });
+        if (!accepted) {
+          deduped += 1;
+          continue;
+        }
+      }
+
       const statusMap = {
         delivered: { status: 'delivered', metric: 'delivered' },
         bounced: { status: 'bounced', metric: 'bounced', suppress: 'bounce' },
@@ -1008,6 +1515,9 @@ class EmailService {
       };
       const statusInfo = statusMap[event.type];
       if (!statusInfo) continue;
+      if (!this.canTransitionStatus(message.status, statusInfo.status)) {
+        continue;
+      }
 
       await this.db.updateEmailMessageStatus(messageId, {
         status: statusInfo.status,
@@ -1019,11 +1529,14 @@ class EmailService {
       await this.db.incrementEmailMetric(statusInfo.metric);
       await this.updateBulkCounters(message.bulk_job_id, message.status, statusInfo.status);
 
-      if (statusInfo.suppress) {
-        await this.db.setEmailSuppression(message.to_email, statusInfo.suppress, event.provider);
+      const suppressionReason =
+        statusInfo.suppress || this.getSuppressionReasonFromProviderEvent(event);
+      if (suppressionReason) {
+        await this.db.setEmailSuppression(message.to_email, suppressionReason, event.provider);
       }
+      processed += 1;
     }
-    return { processed: events.length };
+    return { processed, deduped, received: events.length };
   }
 
   normalizeProviderEvents(payload) {
@@ -1045,12 +1558,17 @@ class EmailService {
         const mapped = typeMap[eventType];
         if (!mapped) return;
         const customArgs = event.custom_args || event.unique_args || {};
+        const timestampMs = Number(event.timestamp) * 1000;
         events.push({
           message_id: event.message_id || customArgs.message_id || null,
           provider_message_id: event.sg_message_id || event.message_id,
+          event_id: event.sg_event_id || event.event_id || null,
           type: mapped,
           provider: 'sendgrid',
-          reason: event.reason || event.response
+          reason: event.reason || event.response,
+          occurred_at: Number.isFinite(timestampMs)
+            ? new Date(timestampMs).toISOString()
+            : null,
         });
       });
       return events;
@@ -1069,12 +1587,17 @@ class EmailService {
       const mapped = typeMap[eventType];
       if (mapped) {
         const userVars = eventData['user-variables'] || {};
+        const timestampMs = Number(eventData.timestamp || payload.timestamp) * 1000;
         events.push({
           message_id: payload.message_id || userVars.message_id || null,
           provider_message_id: eventData.message?.headers?.['message-id'],
+          event_id: eventData.id || payload.id || null,
           type: mapped,
           provider: 'mailgun',
-          reason: eventData.reason || eventData['delivery-status']?.message
+          reason: eventData.reason || eventData['delivery-status']?.message,
+          occurred_at: Number.isFinite(timestampMs)
+            ? new Date(timestampMs).toISOString()
+            : null,
         });
       }
       return events;
@@ -1084,9 +1607,11 @@ class EmailService {
       events.push({
         message_id: payload.message_id,
         provider_message_id: payload.provider_message_id,
+        event_id: payload.event_id || null,
         type: payload.event_type,
         provider: payload.provider || 'custom',
-        reason: payload.reason
+        reason: payload.reason,
+        occurred_at: payload.timestamp || payload.occurred_at || null,
       });
     }
     return events;

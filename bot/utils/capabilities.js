@@ -91,6 +91,8 @@ const ACTION_CAPABILITIES = [
   { match: (action) => action === 'PERSONA', cap: 'persona_manage' },
   { match: (action) => action === 'PROVIDER:HOME', cap: 'provider_manage' },
   { match: (action) => action === 'PROVIDER_STATUS', cap: 'provider_manage' },
+  { match: (action) => action.startsWith('PROVIDER_STATUS:'), cap: 'provider_manage' },
+  { match: (action) => action.startsWith('PROVIDER_CHANNEL:'), cap: 'provider_manage' },
   { match: (action) => action.startsWith('PROVIDER_SET:'), cap: 'provider_manage' },
   { match: (action) => ['USERS', 'USERS_LIST', 'ADDUSER', 'PROMOTE', 'REMOVE'].includes(action), cap: 'users_manage' },
   { match: (action) => ['CALLER_FLAGS', 'CALLER_FLAGS_LIST', 'CALLER_FLAGS_ALLOW', 'CALLER_FLAGS_BLOCK', 'CALLER_FLAGS_SPAM'].includes(action), cap: 'caller_flags_manage' },

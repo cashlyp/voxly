@@ -842,14 +842,22 @@ bot.on("callback_query:data", async (ctx) => {
         validation.status === "expired"
           ? "⌛ This menu expired. Opening the latest view…"
           : "⚠️ This menu is no longer active.";
+      const staleTarget = getConversationRecoveryTarget(validation.action);
+      const hasActiveConversationOp = Boolean(
+        staleTarget && ctx.session?.currentOp?.id,
+      );
       await ctx.answerCallbackQuery({ text: message, show_alert: false });
-      await clearMenuMessages(ctx);
-      await handleMenu(ctx);
+      if (!hasActiveConversationOp) {
+        await clearMenuMessages(ctx);
+        await handleMenu(ctx);
+      }
       finishMetric(validation.status, { reason: validation.reason });
       return;
     }
 
     const action = validation.action;
+    const recoveryTarget = getConversationRecoveryTarget(action);
+    const isConversationAction = Boolean(recoveryTarget);
     const actionKey = `${action}|${ctx.callbackQuery?.message?.message_id || ""}`;
     if (isDuplicateAction(ctx, actionKey)) {
       await ctx.answerCallbackQuery({
@@ -883,8 +891,10 @@ bot.on("callback_query:data", async (ctx) => {
     const menuChatId = ctx.callbackQuery?.message?.chat?.id;
     const latestMenuId = getLatestMenuMessageId(ctx, menuChatId);
     if (!isMenuExemptAction && isLatestMenuExpired(ctx, menuChatId)) {
-      await clearMenuMessages(ctx);
-      await handleMenu(ctx);
+      if (!isConversationAction || !ctx.session?.currentOp?.id) {
+        await clearMenuMessages(ctx);
+        await handleMenu(ctx);
+      }
       finishMetric("expired");
       return;
     }
@@ -894,8 +904,10 @@ bot.on("callback_query:data", async (ctx) => {
       latestMenuId &&
       menuMessageId !== latestMenuId
     ) {
-      await clearMenuMessages(ctx);
-      await handleMenu(ctx);
+      if (!isConversationAction || !ctx.session?.currentOp?.id) {
+        await clearMenuMessages(ctx);
+        await handleMenu(ctx);
+      }
       finishMetric("stale");
       return;
     }
@@ -914,10 +926,41 @@ bot.on("callback_query:data", async (ctx) => {
     }
 
     if (action.startsWith("PROVIDER_SET:")) {
-      const [, provider] = action.split(":");
+      const parts = action.split(":");
+      const hasChannel = parts.length >= 3;
+      const channel = hasChannel ? parts[1] : "call";
+      const provider = hasChannel ? parts.slice(2).join(":") : parts[1];
       await cancelActiveFlow(ctx, `callback:${action}`);
       resetSession(ctx);
-      await handleProviderSwitch(ctx, provider?.toLowerCase());
+      await handleProviderSwitch(
+        ctx,
+        provider?.toLowerCase(),
+        channel?.toLowerCase(),
+      );
+      finishMetric("ok");
+      return;
+    }
+
+    if (action.startsWith("PROVIDER_CHANNEL:")) {
+      const [, channel] = action.split(":");
+      await cancelActiveFlow(ctx, `callback:${action}`);
+      resetSession(ctx);
+      await renderProviderMenu(ctx, {
+        forceRefresh: true,
+        channel: channel?.toLowerCase(),
+      });
+      finishMetric("ok");
+      return;
+    }
+
+    if (action.startsWith("PROVIDER_STATUS:")) {
+      const [, channel] = action.split(":");
+      await cancelActiveFlow(ctx, `callback:${action}`);
+      resetSession(ctx);
+      await renderProviderMenu(ctx, {
+        forceRefresh: true,
+        channel: channel?.toLowerCase(),
+      });
       finishMetric("ok");
       return;
     }
@@ -964,7 +1007,6 @@ bot.on("callback_query:data", async (ctx) => {
       return;
     }
 
-    const recoveryTarget = getConversationRecoveryTarget(action);
     if (recoveryTarget) {
       // If a conversation callback reaches this global handler, the flow is out of sync.
       // Recover by restarting the expected conversation instead of silently swallowing input.

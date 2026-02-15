@@ -3,7 +3,7 @@ const config = require('../config');
 const httpClient = require('../utils/httpClient');
 const { getUser, isAdmin } = require('../db/db');
 const { buildCallbackData } = require('../utils/actions');
-const { guardAgainstCommandInterrupt, OperationCancelledError, startOperation } = require('../utils/sessionState');
+const { OperationCancelledError, startOperation, waitForConversationText } = require('../utils/sessionState');
 const { escapeMarkdown, renderMenu } = require('../utils/ui');
 
 const ADMIN_HEADER_NAME = 'x-admin-token';
@@ -225,11 +225,9 @@ function createCallerFlagFlow(status) {
       if (!isAdminUser) return;
 
       await ctx.reply('📞 Enter the caller phone number:');
-      const phoneMsg = await conversation.wait();
-      const phoneText = phoneMsg?.message?.text?.trim();
-      if (phoneText) {
-        await guardAgainstCommandInterrupt(ctx, phoneText);
-      }
+      const { text: phoneText } = await waitForConversationText(conversation, ctx, {
+        invalidMessage: '⚠️ Please send the phone number as text.'
+      });
       const normalizedPhone = normalizePhoneInput(phoneText);
       if (!normalizedPhone) {
         await ctx.reply('❌ Please provide a valid phone number.');
@@ -237,11 +235,9 @@ function createCallerFlagFlow(status) {
       }
 
       await ctx.reply('📝 Optional note (or type skip):');
-      const noteMsg = await conversation.wait();
-      const noteText = noteMsg?.message?.text?.trim();
-      if (noteText) {
-        await guardAgainstCommandInterrupt(ctx, noteText);
-      }
+      const { text: noteText } = await waitForConversationText(conversation, ctx, {
+        invalidMessage: '⚠️ Please send the note as text (or type skip).'
+      });
       const note = noteText && noteText.toLowerCase() !== 'skip'
         ? noteText
         : null;

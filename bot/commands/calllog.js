@@ -2,7 +2,7 @@ const config = require('../config');
 const httpClient = require('../utils/httpClient');
 const { InlineKeyboard } = require('grammy');
 const { getUser } = require('../db/db');
-const { startOperation, ensureOperationActive, OperationCancelledError, guardAgainstCommandInterrupt } = require('../utils/sessionState');
+const { startOperation, ensureOperationActive, OperationCancelledError, waitForConversationText } = require('../utils/sessionState');
 const { renderMenu, escapeMarkdown, buildLine, section } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 const { getAccessProfile } = require('../utils/capabilities');
@@ -117,12 +117,12 @@ async function calllogRecentFlow(conversation, ctx) {
         await ctx.reply('🕒 Enter limit (max 30) and optional filter (status or phone).\nExample: `15 completed` or `20 +1234567890`', {
             parse_mode: 'Markdown'
         });
-        const update = await conversation.wait();
-        ensureActive();
-        const raw = update?.message?.text?.trim() || '';
-        if (raw) {
-            await guardAgainstCommandInterrupt(ctx, raw);
-        }
+        const { text: rawText } = await waitForConversationText(conversation, ctx, {
+            ensureActive,
+            allowEmpty: true,
+            invalidMessage: '⚠️ Please send the limit/filter as text.'
+        });
+        const raw = rawText || '';
         const parts = raw.split(/\s+/).filter(Boolean);
         const limit = Math.min(parseInt(parts[0], 10) || 10, 30);
         const filter = parts.slice(1).join(' ');
@@ -174,12 +174,10 @@ async function calllogSearchFlow(conversation, ctx) {
             return;
         }
         await ctx.reply('🔍 Enter a search term (phone, call ID, or status).');
-        const update = await conversation.wait();
-        ensureActive();
-        const query = update?.message?.text?.trim();
-        if (query) {
-            await guardAgainstCommandInterrupt(ctx, query);
-        }
+        const { text: query } = await waitForConversationText(conversation, ctx, {
+            ensureActive,
+            invalidMessage: '⚠️ Please send the search term as text.'
+        });
         if (!query || query.length < 2) {
             await ctx.reply('❌ Please provide at least 2 characters.');
             return;
@@ -229,12 +227,10 @@ async function calllogDetailsFlow(conversation, ctx) {
             return;
         }
         await ctx.reply('📄 Enter the call SID to view details.');
-        const update = await conversation.wait();
-        ensureActive();
-        const callSid = update?.message?.text?.trim();
-        if (callSid) {
-            await guardAgainstCommandInterrupt(ctx, callSid);
-        }
+        const { text: callSid } = await waitForConversationText(conversation, ctx, {
+            ensureActive,
+            invalidMessage: '⚠️ Please send the call SID as text.'
+        });
         if (!callSid) {
             await ctx.reply('❌ Call SID is required.');
             return;
@@ -287,12 +283,10 @@ async function calllogEventsFlow(conversation, ctx) {
             return;
         }
         await ctx.reply('🧾 Enter the call SID to view recent events.');
-        const update = await conversation.wait();
-        ensureActive();
-        const callSid = update?.message?.text?.trim();
-        if (callSid) {
-            await guardAgainstCommandInterrupt(ctx, callSid);
-        }
+        const { text: callSid } = await waitForConversationText(conversation, ctx, {
+            ensureActive,
+            invalidMessage: '⚠️ Please send the call SID as text.'
+        });
         if (!callSid) {
             await ctx.reply('❌ Call SID is required.');
             return;

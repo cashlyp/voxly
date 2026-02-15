@@ -2766,6 +2766,48 @@ function requireValidAwsWebhook(req, res, label = "", options = {}) {
   return true;
 }
 
+function verifyEmailWebhookAuth(req) {
+  const expectedSecret = String(config.email?.webhookSecret || "").trim();
+  const providedHeaderSecret = req?.headers?.["x-email-webhook-secret"];
+  const providedQuerySecret = req?.query?.secret || req?.query?.token;
+  const providedSecret = providedHeaderSecret || providedQuerySecret;
+
+  if (expectedSecret) {
+    if (!providedSecret) {
+      return { ok: false, reason: "missing_email_secret" };
+    }
+    if (!safeCompareSecret(providedSecret, expectedSecret)) {
+      return { ok: false, reason: "invalid_email_secret" };
+    }
+    return { ok: true, method: "email_secret" };
+  }
+
+  const hmac = verifyHmacSignature(req);
+  if (hmac.ok && !hmac.skipped) {
+    return { ok: true, method: "hmac" };
+  }
+  if (hmac.skipped) {
+    return { ok: false, reason: "missing_auth_config" };
+  }
+  return { ok: false, reason: hmac.reason || "invalid_hmac" };
+}
+
+function requireValidEmailWebhook(req, res, label = "") {
+  const mode = String(config.email?.webhookValidation || "warn").toLowerCase();
+  if (mode === "off") return true;
+  const verification = verifyEmailWebhookAuth(req);
+  if (verification.ok) return true;
+  const path = label || req.originalUrl || req.path || "unknown";
+  console.warn(
+    `⚠️ Email webhook auth failed for ${path}: ${verification.reason || "unknown"}`,
+  );
+  if (mode === "strict") {
+    res.status(401).send("Unauthorized");
+    return false;
+  }
+  return true;
+}
+
 function verifyAwsStreamAuth(callSid, req) {
   const streamAuth = verifyStreamAuth(callSid, req);
   if (streamAuth.ok || streamAuth.skipped) {
@@ -8676,6 +8718,17 @@ app.get("/api/personas", async (req, res) => {
   });
 });
 
+const callScriptCloneIdempotency = new Map();
+const CALL_SCRIPT_CLONE_IDEMPOTENCY_TTL_MS = 10 * 60 * 1000;
+
+function pruneCallScriptCloneIdempotency(now = Date.now()) {
+  for (const [key, value] of callScriptCloneIdempotency.entries()) {
+    if (!value?.at || now - value.at > CALL_SCRIPT_CLONE_IDEMPOTENCY_TTL_MS) {
+      callScriptCloneIdempotency.delete(key);
+    }
+  }
+}
+
 // Call script endpoints for bot script management
 app.get("/api/call-scripts", requireAdminToken, async (req, res) => {
   try {
@@ -8797,12 +8850,36 @@ app.post("/api/call-scripts/:id/clone", requireAdminToken, async (req, res) => {
         .status(404)
         .json({ success: false, error: "Script not found" });
     }
+    const idempotencyKey = String(
+      req.headers["idempotency-key"] || req.headers["Idempotency-Key"] || "",
+    ).trim();
+    const now = Date.now();
+    pruneCallScriptCloneIdempotency(now);
+    const useIdempotencyKey = isSafeId(idempotencyKey, { max: 128 });
+    if (useIdempotencyKey) {
+      const prior = callScriptCloneIdempotency.get(idempotencyKey);
+      if (prior?.scriptId) {
+        const clonedScript = await db
+          .getCallTemplateById(prior.scriptId)
+          .catch(() => null);
+        if (clonedScript) {
+          return res.status(201).json({ success: true, script: clonedScript });
+        }
+        callScriptCloneIdempotency.delete(idempotencyKey);
+      }
+    }
     const payload = {
       ...existing,
       name: req.body?.name || `${existing.name} Copy`,
     };
     delete payload.id;
     const newId = await db.createCallTemplate(payload);
+    if (useIdempotencyKey) {
+      callScriptCloneIdempotency.set(idempotencyKey, {
+        scriptId: newId,
+        at: now,
+      });
+    }
     const script = await db.getCallTemplateById(newId);
     res.status(201).json({ success: true, script });
   } catch (error) {
@@ -10136,6 +10213,8 @@ app.post("/email/send", requireOutboundAuthorization, async (req, res) => {
     const status =
       error.code === "idempotency_conflict"
         ? 409
+        : error.code === "idempotency_in_progress"
+        ? 409
         : error.code === "email_handler_timeout"
           ? 504
           : error.code === "missing_variables" || error.code === "validation_error"
@@ -10213,6 +10292,8 @@ app.post("/email/bulk", requireOutboundAuthorization, async (req, res) => {
     const status =
       error.code === "idempotency_conflict"
         ? 409
+        : error.code === "idempotency_in_progress"
+        ? 409
         : error.code === "email_handler_timeout"
           ? 504
           : error.code === "validation_error"
@@ -10234,7 +10315,7 @@ app.post("/email/bulk", requireOutboundAuthorization, async (req, res) => {
   }
 });
 
-app.post("/email/preview", async (req, res) => {
+app.post("/email/preview", requireOutboundAuthorization, async (req, res) => {
   try {
     if (!emailService) {
       return res
@@ -10267,9 +10348,9 @@ function buildRequiredVars(subject, html, text) {
   return Array.from(required);
 }
 
-app.get("/email/templates", async (req, res) => {
+app.get("/email/templates", requireOutboundAuthorization, async (req, res) => {
   try {
-    const limit = Number(req.query?.limit) || 50;
+    const limit = Math.min(Math.max(parseInt(req.query?.limit, 10) || 50, 1), 200);
     const templates = await db.listEmailTemplates(limit);
     res.json({ success: true, templates });
   } catch (error) {
@@ -10277,7 +10358,7 @@ app.get("/email/templates", async (req, res) => {
   }
 });
 
-app.get("/email/templates/:id", async (req, res) => {
+app.get("/email/templates/:id", requireOutboundAuthorization, async (req, res) => {
   try {
     const templateId = req.params.id;
     if (!isSafeId(templateId, { max: 128 })) {
@@ -10295,7 +10376,7 @@ app.get("/email/templates/:id", async (req, res) => {
   }
 });
 
-app.post("/email/templates", async (req, res) => {
+app.post("/email/templates", requireOutboundAuthorization, async (req, res) => {
   try {
     const payload = req.body || {};
     const templateId = String(payload.template_id || "").trim();
@@ -10312,15 +10393,35 @@ app.post("/email/templates", async (req, res) => {
     const subject = payload.subject || "";
     const html = payload.html || "";
     const text = payload.text || "";
+    const maxSubjectChars = Number(config.email?.maxSubjectChars) || 200;
+    const maxBodyChars = Number(config.email?.maxBodyChars) || 200000;
     if (!subject) {
       return res
         .status(400)
         .json({ success: false, error: "subject is required" });
     }
+    if (String(subject).length > maxSubjectChars) {
+      return res.status(400).json({
+        success: false,
+        error: `subject exceeds ${maxSubjectChars} characters`,
+      });
+    }
     if (!html && !text) {
       return res
         .status(400)
         .json({ success: false, error: "html or text is required" });
+    }
+    if (String(text || "").length > maxBodyChars) {
+      return res.status(400).json({
+        success: false,
+        error: `text exceeds ${maxBodyChars} characters`,
+      });
+    }
+    if (String(html || "").length > maxBodyChars) {
+      return res.status(400).json({
+        success: false,
+        error: `html exceeds ${maxBodyChars} characters`,
+      });
     }
     const requiredVars = buildRequiredVars(subject, html, text);
     await db.createEmailTemplate({
@@ -10337,7 +10438,7 @@ app.post("/email/templates", async (req, res) => {
   }
 });
 
-app.put("/email/templates/:id", async (req, res) => {
+app.put("/email/templates/:id", requireOutboundAuthorization, async (req, res) => {
   try {
     const templateId = req.params.id;
     if (!isSafeId(templateId, { max: 128 })) {
@@ -10354,6 +10455,32 @@ app.put("/email/templates/:id", async (req, res) => {
       payload.subject !== undefined ? payload.subject : existing.subject;
     const html = payload.html !== undefined ? payload.html : existing.html;
     const text = payload.text !== undefined ? payload.text : existing.text;
+    const maxSubjectChars = Number(config.email?.maxSubjectChars) || 200;
+    const maxBodyChars = Number(config.email?.maxBodyChars) || 200000;
+    if (!subject) {
+      return res.status(400).json({ success: false, error: "subject is required" });
+    }
+    if (String(subject).length > maxSubjectChars) {
+      return res.status(400).json({
+        success: false,
+        error: `subject exceeds ${maxSubjectChars} characters`,
+      });
+    }
+    if (!html && !text) {
+      return res.status(400).json({ success: false, error: "html or text is required" });
+    }
+    if (String(text || "").length > maxBodyChars) {
+      return res.status(400).json({
+        success: false,
+        error: `text exceeds ${maxBodyChars} characters`,
+      });
+    }
+    if (String(html || "").length > maxBodyChars) {
+      return res.status(400).json({
+        success: false,
+        error: `html exceeds ${maxBodyChars} characters`,
+      });
+    }
     const requiredVars = buildRequiredVars(
       subject || "",
       html || "",
@@ -10372,7 +10499,7 @@ app.put("/email/templates/:id", async (req, res) => {
   }
 });
 
-app.delete("/email/templates/:id", async (req, res) => {
+app.delete("/email/templates/:id", requireOutboundAuthorization, async (req, res) => {
   try {
     const templateId = req.params.id;
     if (!isSafeId(templateId, { max: 128 })) {
@@ -10405,7 +10532,7 @@ function normalizeEmailJobForApi(job) {
   return normalized;
 }
 
-app.get("/email/messages/:id", async (req, res) => {
+app.get("/email/messages/:id", requireOutboundAuthorization, async (req, res) => {
   try {
     const messageId = req.params.id;
     if (!isSafeId(messageId, { max: 128 })) {
@@ -10428,7 +10555,7 @@ app.get("/email/messages/:id", async (req, res) => {
   }
 });
 
-app.get("/email/bulk/:jobId", async (req, res) => {
+app.get("/email/bulk/:jobId", requireOutboundAuthorization, async (req, res) => {
   try {
     const jobId = req.params.jobId;
     if (!isSafeId(jobId, { max: 128 })) {
@@ -10446,7 +10573,7 @@ app.get("/email/bulk/:jobId", async (req, res) => {
   }
 });
 
-app.get("/email/bulk/history", async (req, res) => {
+app.get("/email/bulk/history", requireOutboundAuthorization, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 10, 50);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
@@ -10462,7 +10589,7 @@ app.get("/email/bulk/history", async (req, res) => {
   }
 });
 
-app.get("/email/bulk/stats", async (req, res) => {
+app.get("/email/bulk/stats", requireOutboundAuthorization, async (req, res) => {
   try {
     const hours = Math.min(
       Math.max(parseInt(req.query.hours, 10) || 24, 1),
@@ -11357,6 +11484,7 @@ registerWebhookRoutes(app, {
   handleTwilioGatherWebhook,
   requireValidTwilioSignature,
   requireValidAwsWebhook,
+  requireValidEmailWebhook,
   requireValidVonageWebhook,
   requireValidTelegramWebhook,
   processCallStatusWebhookPayload,

@@ -343,6 +343,27 @@ const emailDlqAlertThreshold = Number(
   readEnv("EMAIL_DLQ_ALERT_THRESHOLD") || "25",
 );
 const emailDlqMaxReplays = Number(readEnv("EMAIL_DLQ_MAX_REPLAYS") || "2");
+const emailQueueClaimLeaseMs = Number(
+  readEnv("EMAIL_QUEUE_CLAIM_LEASE_MS") || "60000",
+);
+const emailQueueStaleSendingMs = Number(
+  readEnv("EMAIL_QUEUE_STALE_SENDING_MS") || "180000",
+);
+const emailProviderEventsTtlDays = Number(
+  readEnv("EMAIL_PROVIDER_EVENTS_TTL_DAYS") || "14",
+);
+const emailCircuitBreakerEnabled =
+  String(readEnv("EMAIL_CIRCUIT_BREAKER_ENABLED") || "true").toLowerCase() ===
+  "true";
+const emailCircuitBreakerFailureThreshold = Number(
+  readEnv("EMAIL_CIRCUIT_BREAKER_FAILURE_THRESHOLD") || "5",
+);
+const emailCircuitBreakerWindowMs = Number(
+  readEnv("EMAIL_CIRCUIT_BREAKER_WINDOW_MS") || "120000",
+);
+const emailCircuitBreakerCooldownMs = Number(
+  readEnv("EMAIL_CIRCUIT_BREAKER_COOLDOWN_MS") || "120000",
+);
 const smsProviderTimeoutMs = Number(
   readEnv("SMS_PROVIDER_TIMEOUT_MS") || "15000",
 );
@@ -376,6 +397,11 @@ const emailDkimEnabled =
 const emailSpfEnabled =
   String(readEnv("EMAIL_SPF_ENABLED") || "true").toLowerCase() === "true";
 const emailDmarcPolicy = readEnv("EMAIL_DMARC_POLICY") || "none";
+const emailWebhookSecret = readEnv("EMAIL_WEBHOOK_SECRET") || "";
+const emailWebhookValidation = (
+  readEnv("EMAIL_WEBHOOK_VALIDATION") || "warn"
+).toLowerCase();
+const emailUnsubscribeSecret = readEnv("EMAIL_UNSUBSCRIBE_SECRET") || "";
 const sendgridApiKey = readEnv("SENDGRID_API_KEY");
 const sendgridBaseUrl = readEnv("SENDGRID_BASE_URL");
 const mailgunApiKey = readEnv("MAILGUN_API_KEY");
@@ -545,7 +571,28 @@ module.exports = {
     dlqMaxReplays: Number.isFinite(emailDlqMaxReplays)
       ? emailDlqMaxReplays
       : 2,
+    queueClaimLeaseMs: Number.isFinite(emailQueueClaimLeaseMs)
+      ? emailQueueClaimLeaseMs
+      : 60000,
+    queueStaleSendingMs: Number.isFinite(emailQueueStaleSendingMs)
+      ? emailQueueStaleSendingMs
+      : 180000,
+    providerEventsTtlDays: Number.isFinite(emailProviderEventsTtlDays)
+      ? emailProviderEventsTtlDays
+      : 14,
     unsubscribeUrl: emailUnsubscribeUrl,
+    circuitBreaker: {
+      enabled: emailCircuitBreakerEnabled,
+      failureThreshold: Number.isFinite(emailCircuitBreakerFailureThreshold)
+        ? emailCircuitBreakerFailureThreshold
+        : 5,
+      windowMs: Number.isFinite(emailCircuitBreakerWindowMs)
+        ? emailCircuitBreakerWindowMs
+        : 120000,
+      cooldownMs: Number.isFinite(emailCircuitBreakerCooldownMs)
+        ? emailCircuitBreakerCooldownMs
+        : 120000,
+    },
     rateLimits: {
       perProviderPerMinute: Number.isFinite(emailRateLimitProvider)
         ? emailRateLimitProvider
@@ -566,6 +613,9 @@ module.exports = {
       spfEnabled: emailSpfEnabled,
       dmarcPolicy: emailDmarcPolicy,
     },
+    webhookSecret: emailWebhookSecret,
+    webhookValidation: emailWebhookValidation,
+    unsubscribeSecret: emailUnsubscribeSecret,
     sendgrid: {
       apiKey: sendgridApiKey,
       baseUrl: sendgridBaseUrl,

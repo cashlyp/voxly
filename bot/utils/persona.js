@@ -393,13 +393,27 @@ async function askOptionWithButtons(
   });
 
   const message = await sendMenu(ctx, prompt, { parse_mode: 'Markdown', reply_markup: keyboard });
+  const expectedMessageId = message?.message_id || null;
+  const expectedChatId = message?.chat?.id || ctx.chat?.id || null;
   const activeChecker = typeof ensureActive === 'function'
     ? ensureActive
     : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
   let selected = null;
   while (!selected) {
     const selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {
-      return matchesCallbackPrefix(callbackCtx.callbackQuery.data, prefixKey);
+      const data = callbackCtx?.callbackQuery?.data;
+      if (!matchesCallbackPrefix(data, prefixKey)) {
+        return false;
+      }
+      const callbackMessageId = callbackCtx?.callbackQuery?.message?.message_id || null;
+      const callbackChatId = callbackCtx?.callbackQuery?.message?.chat?.id || null;
+      if (expectedMessageId && callbackMessageId && callbackMessageId !== expectedMessageId) {
+        return false;
+      }
+      if (expectedChatId && callbackChatId && callbackChatId !== expectedChatId) {
+        return false;
+      }
+      return true;
     });
     activeChecker();
 

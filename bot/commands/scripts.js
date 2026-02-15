@@ -25,7 +25,7 @@ const {
   ensureOperationActive,
   OperationCancelledError,
   getCurrentOpId,
-  guardAgainstCommandInterrupt
+  waitForConversationText
 } = require('../utils/sessionState');
 const { emailTemplatesFlow } = require('./email');
 const { section, buildLine, tipLine } = require('../utils/ui');
@@ -69,12 +69,29 @@ function nonJsonResponseError(endpoint, response) {
 }
 
 async function scriptsApiRequest(options) {
-  const endpoint = `${(options.method || 'GET').toUpperCase()} ${options.url}`;
+  const method = `${(options.method || 'GET').toUpperCase()}`;
+  const endpoint = `${method} ${options.url}`;
+  const { retry, ...requestOptions } = options || {};
+  const retryOptions = retry !== undefined ? retry : (method === 'GET' ? {} : { retries: 0 });
   try {
-    const response = await withRetry(() => scriptsApi.request(options), options.retry || {});
+    const response = await withRetry(() => scriptsApi.request(requestOptions), retryOptions || {});
+    const status = Number(response?.status || 0);
+    if (status === 204 || status === 205) {
+      return { success: true };
+    }
     const contentType = response.headers?.['content-type'] || '';
+    const isEmptyBody =
+      response.data === undefined ||
+      response.data === null ||
+      response.data === '';
+    if (!contentType.includes('application/json') && isEmptyBody) {
+      return { success: true };
+    }
     if (!contentType.includes('application/json')) {
       throw nonJsonResponseError(endpoint, response);
+    }
+    if (!response.data || typeof response.data !== 'object') {
+      return { success: true };
     }
     if (response.data && response.data.success === false) {
       const apiError = new Error(response.data.error || 'Scripts API reported failure');
@@ -98,6 +115,9 @@ async function scriptsApiRequest(options) {
 
 function formatScriptsApiError(error, action) {
   const baseHelp = `Ensure the scripts service is reachable at ${config.scriptsApiUrl} or update SCRIPTS_API_URL.`;
+  if (error?.code === 'ECONNABORTED' || /timeout/i.test(String(error?.message || ''))) {
+    return `❌ ${action}: Scripts API timed out. ${baseHelp}`;
+  }
 
   const apiCode = error.response?.data?.code || error.code;
   if (apiCode === 'SCRIPT_NAME_DUPLICATE') {
@@ -283,34 +303,34 @@ async function promptText(
 
   const promptMessage = hints.length > 0 ? `${message}\n_${hints.join(' | ')}_` : message;
   await ctx.reply(promptMessage, { parse_mode: 'Markdown' });
+  while (true) {
+    const { text } = await waitForConversationText(conversation, ctx, {
+      ensureActive: safeEnsureActive,
+      allowEmpty,
+      invalidMessage: '⚠️ Please send a text response to continue.'
+    });
 
-  const response = await conversation.wait();
-  safeEnsureActive();
-  const text = response?.message?.text?.trim();
-  if (text) {
-    await guardAgainstCommandInterrupt(ctx, text);
-  }
-
-  if (!text) {
-    if (allowEmpty) {
-      return '';
+    if (!text) {
+      if (allowEmpty) {
+        return '';
+      }
+      await ctx.reply('⚠️ Please enter a value or type cancel.');
+      continue;
     }
-    return null;
-  }
 
-  if (isCancelInput(text)) {
-    return null;
-  }
+    if (isCancelInput(text)) {
+      return null;
+    }
 
-  if (allowSkip && text.toLowerCase() === 'skip') {
-    return undefined;
-  }
+    if (allowSkip && text.toLowerCase() === 'skip') {
+      return undefined;
+    }
 
-  try {
-    return parse(text);
-  } catch (error) {
-    await ctx.reply(`❌ ${error.message || 'Invalid value supplied.'}`);
-    return null;
+    try {
+      return parse(text);
+    } catch (error) {
+      await ctx.reply(`❌ ${error.message || 'Invalid value supplied.'}`);
+    }
   }
 }
 
@@ -341,12 +361,10 @@ async function collectPlaceholderValues(conversation, ctx, placeholders, ensureA
       `✏️ Enter value for *${escapeMarkdown(placeholder)}* (type skip to leave unchanged, cancel to abort).`,
       { parse_mode: 'Markdown' }
     );
-    const response = await conversation.wait();
-    safeEnsureActive();
-    const text = response?.message?.text?.trim();
-    if (text) {
-      await guardAgainstCommandInterrupt(ctx, text);
-    }
+    const { text } = await waitForConversationText(conversation, ctx, {
+      ensureActive: safeEnsureActive,
+      invalidMessage: '⚠️ Please send a text response for this placeholder.'
+    });
     if (!text) {
       continue;
     }
@@ -684,9 +702,19 @@ async function collectDigitCaptureConfig(conversation, ctx, defaults = {}, ensur
       conversation,
       ctx,
       '🔢 OTP length (4-8 digits).',
-      { allowEmpty: false, parse: (value) => Number(value), ensureActive: safeEnsureActive }
+      {
+        allowEmpty: false,
+        parse: (value) => {
+          const parsed = Number(value);
+          if (!Number.isInteger(parsed) || parsed < 4 || parsed > 8) {
+            throw new Error('OTP length must be an integer between 4 and 8.');
+          }
+          return parsed;
+        },
+        ensureActive: safeEnsureActive
+      }
     );
-    if (!length || Number.isNaN(length)) return null;
+    if (length === null) return null;
     capture.expected_length = length;
     return capture;
   }
@@ -722,10 +750,21 @@ async function collectDigitCaptureConfig(conversation, ctx, defaults = {}, ensur
     conversation,
     ctx,
     'Optional expected length (or type skip).',
-    { allowEmpty: true, allowSkip: true, parse: (value) => Number(value), ensureActive: safeEnsureActive }
+    {
+      allowEmpty: true,
+      allowSkip: true,
+      parse: (value) => {
+        const parsed = Number(value);
+        if (!Number.isInteger(parsed) || parsed < 1 || parsed > 64) {
+          throw new Error('Expected length must be an integer between 1 and 64.');
+        }
+        return parsed;
+      },
+      ensureActive: safeEnsureActive
+    }
   );
   if (expectedLength === null) return null;
-  if (expectedLength !== undefined && !Number.isNaN(expectedLength)) {
+  if (expectedLength !== undefined && expectedLength !== '') {
     capture.expected_length = expectedLength;
   }
 
@@ -789,7 +828,16 @@ async function deleteCallScript(id) {
 }
 
 async function cloneCallScript(id, payload) {
-  const data = await scriptsApiRequest({ method: 'post', url: `/api/call-scripts/${id}/clone`, data: payload });
+  const idempotencyKey = `clone_call_script_${id}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  const data = await scriptsApiRequest({
+    method: 'post',
+    url: `/api/call-scripts/${id}/clone`,
+    data: payload,
+    retry: { retries: 0 },
+    headers: {
+      'Idempotency-Key': idempotencyKey
+    }
+  });
   return data.script;
 }
 
@@ -1582,19 +1630,46 @@ async function fetchSmsScripts({ includeContent = false } = {}) {
     }
   });
 
-  const custom = (data.scripts || []).map((script) => ({
-    ...script,
-    is_builtin: !!script.is_builtin,
-    metadata: script.metadata || {}
-  }));
+  const scriptsMap = new Map();
+  const customSource = Array.isArray(data.scripts) ? data.scripts : [];
+  const builtinSource = Array.isArray(data.builtin) ? data.builtin : [];
 
-  const builtin = (data.builtin || []).map((script) => ({
-    ...script,
-    is_builtin: true,
-    metadata: script.metadata || {}
-  }));
+  customSource.forEach((script) => {
+    const scriptName = script?.name || script?.script_name;
+    if (!scriptName) return;
+    scriptsMap.set(scriptName, {
+      ...script,
+      name: scriptName,
+      is_builtin: !!script.is_builtin,
+      metadata: script.metadata || {}
+    });
+  });
 
-  return [...custom, ...builtin];
+  builtinSource.forEach((script) => {
+    const scriptName = script?.name || script?.script_name;
+    if (!scriptName || scriptsMap.has(scriptName)) return;
+    scriptsMap.set(scriptName, {
+      ...script,
+      name: scriptName,
+      is_builtin: true,
+      metadata: script.metadata || {}
+    });
+  });
+
+  if (!scriptsMap.size && Array.isArray(data.available_scripts)) {
+    data.available_scripts.forEach((scriptName) => {
+      if (!scriptName || scriptsMap.has(scriptName)) return;
+      scriptsMap.set(scriptName, {
+        name: scriptName,
+        description: null,
+        content: '',
+        metadata: {},
+        is_builtin: true
+      });
+    });
+  }
+
+  return Array.from(scriptsMap.values());
 }
 
 async function fetchSmsScriptByName(name, { detailed = true } = {}) {
@@ -1604,8 +1679,19 @@ async function fetchSmsScriptByName(name, { detailed = true } = {}) {
     params: { detailed }
   });
 
-  const script = data.script;
+  const script = data.script && typeof data.script === 'object'
+    ? data.script
+    : (data.script_name
+      ? {
+        name: data.script_name,
+        content: data.script || data.original_script || '',
+        description: null,
+        metadata: {},
+        is_builtin: true
+      }
+      : null);
   if (script) {
+    script.name = script.name || script.script_name || name;
     script.is_builtin = !!script.is_builtin;
     script.metadata = script.metadata || {};
   }
@@ -1632,7 +1718,20 @@ async function requestSmsScriptPreview(name, payload) {
     url: `/api/sms/scripts/${encodeURIComponent(name)}/preview`,
     data: payload
   });
-  return data.preview;
+  if (data?.preview && typeof data.preview === 'object') {
+    return data.preview;
+  }
+  if (typeof data?.content === 'string' || typeof data?.script === 'string') {
+    return {
+      to: data.to || payload.to,
+      message_sid: data.message_sid || data.messageSid || 'preview',
+      content: data.content || data.script || ''
+    };
+  }
+  const error = new Error('Scripts API returned an invalid preview response.');
+  error.isScriptsApiError = true;
+  error.reason = 'api_failure';
+  throw error;
 }
 
 function formatSmsScriptSummary(script) {
@@ -1984,9 +2083,12 @@ async function previewSmsScript(conversation, ctx, script) {
 
   try {
     const preview = await requestSmsScriptPreview(script.name, payload);
-    const snippet = preview.content.substring(0, 200);
+    const previewContent = String(preview?.content || '');
+    const snippet = previewContent.substring(0, 200);
+    const messageSid = preview?.message_sid || preview?.messageSid || 'n/a';
+    const toValue = preview?.to || to;
     await ctx.reply(
-      `✅ Preview SMS sent!\n\n📱 To: ${preview.to}\n🆔 Message SID: \`${preview.message_sid}\`\n💬 Content: ${escapeMarkdown(snippet)}${preview.content.length > 200 ? '…' : ''}`,
+      `✅ Preview SMS sent!\n\n📱 To: ${toValue}\n🆔 Message SID: \`${messageSid}\`\n💬 Content: ${escapeMarkdown(snippet)}${previewContent.length > 200 ? '…' : ''}`,
       { parse_mode: 'Markdown' }
     );
   } catch (error) {

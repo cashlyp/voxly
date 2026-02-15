@@ -7,6 +7,7 @@ class EnhancedDatabase {
         this.isInitialized = false;
         this.dbPath = path.join(__dirname, 'data.db');
         this.emailDlqColumnsEnsured = false;
+        this.emailQueueColumnsEnsured = false;
         this.outboundRateLastCleanupMs = 0;
     }
 
@@ -23,9 +24,11 @@ class EnhancedDatabase {
                     this.initializeSMSTables().then(() => {
                         this.initializeEmailTables().then(() => {
                             this.ensureEmailDlqColumns().then(() => {
-                                this.isInitialized = true;
-                                console.log('✅ Enhanced database initialization complete');
-                                resolve();
+                                this.ensureEmailQueueColumns().then(() => {
+                                    this.isInitialized = true;
+                                    console.log('✅ Enhanced database initialization complete');
+                                    resolve();
+                                }).catch(reject);
                             }).catch(reject);
                         }).catch(reject);
                     }).catch(reject);
@@ -1998,6 +2001,8 @@ class EnhancedDatabase {
                next_attempt_at DATETIME,
                retry_count INTEGER DEFAULT 0,
                max_retries INTEGER DEFAULT 5,
+               queue_lock_token TEXT,
+               queue_lock_expires_at_ms INTEGER,
                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                sent_at DATETIME,
@@ -2050,6 +2055,17 @@ class EnhancedDatabase {
                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
            )`;
 
+           const createEmailProviderEventsTable = `CREATE TABLE IF NOT EXISTS email_provider_events (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               event_key TEXT UNIQUE NOT NULL,
+               message_id TEXT,
+               provider TEXT,
+               event_type TEXT,
+               reason TEXT,
+               payload_json TEXT,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+           )`;
+
            const createEmailDlqTable = `CREATE TABLE IF NOT EXISTS email_dlq (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
                message_id TEXT NOT NULL,
@@ -2094,7 +2110,10 @@ class EnhancedDatabase {
                'CREATE INDEX IF NOT EXISTS idx_email_events_timestamp ON email_events(timestamp)',
                'CREATE INDEX IF NOT EXISTS idx_email_bulk_status ON email_bulk_jobs(status)',
                'CREATE INDEX IF NOT EXISTS idx_email_bulk_tenant ON email_bulk_jobs(tenant_id)',
-               'CREATE INDEX IF NOT EXISTS idx_email_suppression_email ON email_suppression(email)'
+               'CREATE INDEX IF NOT EXISTS idx_email_suppression_email ON email_suppression(email)',
+               'CREATE INDEX IF NOT EXISTS idx_email_provider_events_key ON email_provider_events(event_key)',
+               'CREATE INDEX IF NOT EXISTS idx_email_provider_events_message_id ON email_provider_events(message_id)',
+               'CREATE INDEX IF NOT EXISTS idx_email_provider_events_created_at ON email_provider_events(created_at)'
            ];
 
            this.db.serialize(() => {
@@ -2129,6 +2148,13 @@ class EnhancedDatabase {
                this.db.run(createEmailIdempotencyTable, (err) => {
                    if (err) {
                        console.error('Error creating email_idempotency table:', err);
+                       reject(err);
+                       return;
+                   }
+               });
+               this.db.run(createEmailProviderEventsTable, (err) => {
+                   if (err) {
+                       console.error('Error creating email_provider_events table:', err);
                        reject(err);
                        return;
                    }
@@ -2239,6 +2265,55 @@ class EnhancedDatabase {
            );
        });
        this.emailDlqColumnsEnsured = true;
+   }
+
+   async ensureEmailQueueColumns() {
+       if (this.emailQueueColumnsEnsured) {
+           return;
+       }
+       const existing = await new Promise((resolve, reject) => {
+           this.db.all('PRAGMA table_info(email_messages)', (err, rows) => {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(rows || []);
+               }
+           });
+       });
+       const names = new Set(existing.map((row) => row.name));
+       const alterStatements = [];
+       if (!names.has('queue_lock_token')) {
+           alterStatements.push('ALTER TABLE email_messages ADD COLUMN queue_lock_token TEXT');
+       }
+       if (!names.has('queue_lock_expires_at_ms')) {
+           alterStatements.push('ALTER TABLE email_messages ADD COLUMN queue_lock_expires_at_ms INTEGER');
+       }
+       for (const stmt of alterStatements) {
+           await new Promise((resolve, reject) => {
+               this.db.run(stmt, (err) => {
+                   if (err) {
+                       const message = String(err.message || '').toLowerCase();
+                       if (message.includes('duplicate column name')) {
+                           resolve();
+                           return;
+                       }
+                       reject(err);
+                   } else {
+                       resolve();
+                   }
+               });
+           });
+       }
+       await new Promise((resolve, reject) => {
+           this.db.run(
+               'CREATE INDEX IF NOT EXISTS idx_email_messages_queue_lock ON email_messages(queue_lock_expires_at_ms)',
+               (err) => {
+                   if (err) reject(err);
+                   else resolve();
+               },
+           );
+       });
+       this.emailQueueColumnsEnsured = true;
    }
 
    // Save SMS message
@@ -2633,6 +2708,52 @@ class EnhancedDatabase {
        });
    }
 
+   async saveEmailProviderEvent(event = {}) {
+       const eventKey = String(event.event_key || event.eventKey || '').trim();
+       if (!eventKey) {
+           return false;
+       }
+       return new Promise((resolve, reject) => {
+           const sql = `INSERT OR IGNORE INTO email_provider_events (
+               event_key, message_id, provider, event_type, reason, payload_json
+           ) VALUES (?, ?, ?, ?, ?, ?)`;
+           this.db.run(
+               sql,
+               [
+                   eventKey,
+                   event.message_id || null,
+                   event.provider || null,
+                   event.event_type || null,
+                   event.reason || null,
+                   event.payload_json || null,
+               ],
+               function (err) {
+                   if (err) {
+                       console.error('Error saving email provider event:', err);
+                       reject(err);
+                   } else {
+                       resolve((this.changes || 0) > 0);
+                   }
+               },
+           );
+       });
+   }
+
+   async cleanupExpiredEmailProviderEvents(daysToKeep = 14) {
+       const safeDays = Math.max(1, Number(daysToKeep) || 14);
+       return new Promise((resolve, reject) => {
+           const sql = `DELETE FROM email_provider_events WHERE created_at < datetime('now', ?)`;
+           this.db.run(sql, [`-${safeDays} days`], function (err) {
+               if (err) {
+                   console.error('Error cleaning email provider events:', err);
+                   reject(err);
+               } else {
+                   resolve(this.changes || 0);
+               }
+           });
+       });
+   }
+
    async updateEmailMessageStatus(messageId, updates = {}) {
        return new Promise((resolve, reject) => {
            const fields = [];
@@ -2652,6 +2773,8 @@ class EnhancedDatabase {
            if (Object.prototype.hasOwnProperty.call(updates, 'delivered_at')) setField('delivered_at', updates.delivered_at);
            if (Object.prototype.hasOwnProperty.call(updates, 'failed_at')) setField('failed_at', updates.failed_at);
            if (Object.prototype.hasOwnProperty.call(updates, 'suppressed_reason')) setField('suppressed_reason', updates.suppressed_reason);
+           if (Object.prototype.hasOwnProperty.call(updates, 'queue_lock_token')) setField('queue_lock_token', updates.queue_lock_token);
+           if (Object.prototype.hasOwnProperty.call(updates, 'queue_lock_expires_at_ms')) setField('queue_lock_expires_at_ms', updates.queue_lock_expires_at_ms);
            fields.push('updated_at = CURRENT_TIMESTAMP');
            params.push(messageId);
            const sql = `UPDATE email_messages SET ${fields.join(', ')} WHERE message_id = ?`;
@@ -2680,6 +2803,89 @@ class EnhancedDatabase {
                    reject(err);
                } else {
                    resolve(rows || []);
+               }
+           });
+       });
+   }
+
+   async claimPendingEmailMessages(limit = 10, options = {}) {
+       await this.ensureEmailQueueColumns();
+       const safeLimit = Math.max(1, Math.min(100, Number(limit) || 10));
+       const leaseMs = Math.max(1000, Number(options.leaseMs) || 60000);
+       const staleSendingMs = Math.max(15000, Number(options.staleSendingMs) || leaseMs * 2);
+       const nowMs = Date.now();
+       const expiresAtMs = nowMs + leaseMs;
+       const token = `emailq_${nowMs}_${Math.random().toString(36).slice(2, 10)}`;
+
+       const sqlClaim = `
+           UPDATE email_messages
+           SET queue_lock_token = ?, queue_lock_expires_at_ms = ?, updated_at = CURRENT_TIMESTAMP
+           WHERE id IN (
+               SELECT id
+               FROM email_messages
+               WHERE (
+                   (
+                       status IN ('queued', 'retry')
+                       AND (scheduled_at IS NULL OR scheduled_at <= CURRENT_TIMESTAMP)
+                       AND (next_attempt_at IS NULL OR next_attempt_at <= CURRENT_TIMESTAMP)
+                   )
+                   OR (
+                       status = 'sending'
+                       AND last_attempt_at IS NOT NULL
+                       AND (strftime('%s', 'now') - strftime('%s', last_attempt_at)) * 1000 >= ?
+                   )
+               )
+               AND (queue_lock_expires_at_ms IS NULL OR queue_lock_expires_at_ms <= ?)
+               ORDER BY created_at ASC
+               LIMIT ?
+           )
+       `;
+
+       await new Promise((resolve, reject) => {
+           this.db.run(sqlClaim, [token, expiresAtMs, staleSendingMs, nowMs, safeLimit], (err) => {
+               if (err) {
+                   console.error('Error claiming pending email messages:', err);
+                   reject(err);
+               } else {
+                   resolve();
+               }
+           });
+       });
+
+       return new Promise((resolve, reject) => {
+           const sql = `SELECT * FROM email_messages WHERE queue_lock_token = ? ORDER BY created_at ASC`;
+           this.db.all(sql, [token], (err, rows) => {
+               if (err) {
+                   console.error('Error fetching claimed email messages:', err);
+                   reject(err);
+               } else {
+                   resolve(rows || []);
+               }
+           });
+       });
+   }
+
+   async releaseEmailMessageClaim(messageId, lockToken = null) {
+       await this.ensureEmailQueueColumns();
+       if (!messageId) {
+           return 0;
+       }
+       return new Promise((resolve, reject) => {
+           const hasToken = typeof lockToken === 'string' && lockToken.length > 0;
+           const sql = hasToken
+               ? `UPDATE email_messages
+                   SET queue_lock_token = NULL, queue_lock_expires_at_ms = NULL, updated_at = CURRENT_TIMESTAMP
+                   WHERE message_id = ? AND queue_lock_token = ?`
+               : `UPDATE email_messages
+                   SET queue_lock_token = NULL, queue_lock_expires_at_ms = NULL, updated_at = CURRENT_TIMESTAMP
+                   WHERE message_id = ?`;
+           const params = hasToken ? [messageId, lockToken] : [messageId];
+           this.db.run(sql, params, function (err) {
+               if (err) {
+                   console.error('Error releasing email message claim:', err);
+                   reject(err);
+               } else {
+                   resolve(this.changes || 0);
                }
            });
        });
@@ -2905,19 +3111,91 @@ class EnhancedDatabase {
        });
    }
 
-   async saveEmailIdempotency(idempotencyKey, messageId, bulkJobId, requestHash) {
+   async reserveEmailIdempotency(idempotencyKey, requestHash, bulkJobId = null) {
+       const key = String(idempotencyKey || '').trim();
+       if (!key) {
+           throw new Error('Idempotency key is required');
+       }
+       const hash = requestHash || null;
+       const dbInstance = this;
        return new Promise((resolve, reject) => {
-           const sql = `INSERT OR IGNORE INTO email_idempotency (idempotency_key, message_id, bulk_job_id, request_hash)
-               VALUES (?, ?, ?, ?)`;
-           this.db.run(sql, [idempotencyKey, messageId || null, bulkJobId || null, requestHash || null], function (err) {
+           const sql = `INSERT OR IGNORE INTO email_idempotency (
+               idempotency_key, message_id, bulk_job_id, request_hash
+           ) VALUES (?, NULL, ?, ?)`;
+           this.db.run(sql, [key, bulkJobId || null, hash], function (insertErr) {
+               if (insertErr) {
+                   console.error('Error reserving email idempotency key:', insertErr);
+                   reject(insertErr);
+                   return;
+               }
+               const inserted = (this.changes || 0) > 0;
+               dbInstance.getEmailIdempotency(key)
+                   .then((record) => {
+                       resolve({ inserted, record });
+                   })
+                   .catch(reject);
+           });
+       });
+   }
+
+   async finalizeEmailIdempotency(idempotencyKey, messageId = null, bulkJobId = null, requestHash = null) {
+       const key = String(idempotencyKey || '').trim();
+       if (!key) {
+           throw new Error('Idempotency key is required');
+       }
+       return new Promise((resolve, reject) => {
+           const sql = `
+               INSERT INTO email_idempotency (idempotency_key, message_id, bulk_job_id, request_hash)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(idempotency_key) DO UPDATE SET
+                   message_id = COALESCE(email_idempotency.message_id, excluded.message_id),
+                   bulk_job_id = COALESCE(email_idempotency.bulk_job_id, excluded.bulk_job_id),
+                   request_hash = COALESCE(email_idempotency.request_hash, excluded.request_hash)
+           `;
+           this.db.run(
+               sql,
+               [key, messageId || null, bulkJobId || null, requestHash || null],
+               function (err) {
+                   if (err) {
+                       console.error('Error finalizing email idempotency key:', err);
+                       reject(err);
+                   } else {
+                       resolve((this.changes || 0) > 0);
+                   }
+               },
+           );
+       });
+   }
+
+   async clearPendingEmailIdempotency(idempotencyKey) {
+       const key = String(idempotencyKey || '').trim();
+       if (!key) {
+           return 0;
+       }
+       return new Promise((resolve, reject) => {
+           const sql = `
+               DELETE FROM email_idempotency
+               WHERE idempotency_key = ?
+                 AND message_id IS NULL
+           `;
+           this.db.run(sql, [key], function (err) {
                if (err) {
-                   console.error('Error saving email idempotency:', err);
+                   console.error('Error clearing pending email idempotency:', err);
                    reject(err);
                } else {
-                   resolve(true);
+                   resolve(this.changes || 0);
                }
            });
        });
+   }
+
+   async saveEmailIdempotency(idempotencyKey, messageId, bulkJobId, requestHash) {
+       return this.finalizeEmailIdempotency(
+           idempotencyKey,
+           messageId || null,
+           bulkJobId || null,
+           requestHash || null,
+       );
    }
 
    async getEmailIdempotency(idempotencyKey) {
@@ -3157,7 +3435,9 @@ class EnhancedDatabase {
            { name: 'call_states', dateField: 'timestamp' },
            { name: 'service_health_logs', dateField: 'timestamp' },
            { name: 'call_metrics', dateField: 'timestamp' },
-           { name: 'notification_metrics', dateField: 'created_at' }
+           { name: 'notification_metrics', dateField: 'created_at' },
+           { name: 'email_provider_events', dateField: 'created_at' },
+           { name: 'email_idempotency', dateField: 'created_at' }
        ];
        
        let totalCleaned = 0;

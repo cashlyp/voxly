@@ -9,7 +9,7 @@ const {
   registerAbortController,
   OperationCancelledError,
   getCurrentOpId,
-  guardAgainstCommandInterrupt
+  waitForConversationText
 } = require('../utils/sessionState');
 const {
   askOptionWithButtons,
@@ -155,13 +155,11 @@ async function promptForText(conversation, ctx, message, options = {}) {
   while (true) {
     await styledSection(ctx, '📝 Provide Input', [promptText]);
 
-    const update = await conversation.wait();
-    safeEnsureActive();
-
-    const text = update?.message?.text?.trim();
-    if (text) {
-      await guardAgainstCommandInterrupt(ctx, text);
-    }
+    const { text } = await waitForConversationText(conversation, ctx, {
+      ensureActive: safeEnsureActive,
+      allowEmpty: !required,
+      invalidMessage: '⚠️ Please send a text response to continue.'
+    });
     if (!text) {
       if (required) {
         await styledAlert(ctx, 'Please provide a response or type cancel.');

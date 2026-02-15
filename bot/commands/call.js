@@ -18,7 +18,7 @@ const {
   OperationCancelledError,
   ensureFlow,
   safeReset,
-  guardAgainstCommandInterrupt
+  waitForConversationText
 } = require('../utils/sessionState');
 function buildMainMenuReplyMarkup(ctx) {
   return {
@@ -89,12 +89,10 @@ async function collectPlaceholderValues(conversation, ctx, placeholders, ensureA
   const values = {};
   for (const placeholder of placeholders) {
     await ctx.reply(`✏️ Enter value for *${placeholder}* (type skip to leave unchanged):`, { parse_mode: 'Markdown' });
-    const update = await conversation.wait();
-    ensureActive();
-    const text = update?.message?.text?.trim();
-    if (text) {
-      await guardAgainstCommandInterrupt(ctx, text);
-    }
+    const { text } = await waitForConversationText(conversation, ctx, {
+      ensureActive,
+      invalidMessage: '⚠️ Please type a value or "skip" to continue.'
+    });
     if (!text || text.toLowerCase() === 'skip') {
       continue;
     }
@@ -296,24 +294,20 @@ async function buildCustomCallConfig(conversation, ctx, ensureActive, businessOp
 
   if (selectedBusiness.custom) {
     await ctx.reply('✍️ Enter the agent prompt (describe how the AI should behave):');
-    const promptMsg = await conversation.wait();
-    ensureActive();
-    const prompt = promptMsg?.message?.text?.trim();
-    if (prompt) {
-      await guardAgainstCommandInterrupt(ctx, prompt);
-    }
+    const { text: prompt } = await waitForConversationText(conversation, ctx, {
+      ensureActive,
+      invalidMessage: '⚠️ Please send the prompt as text.'
+    });
     if (!prompt) {
       await ctx.reply('❌ Please provide a valid prompt.');
       return null;
     }
 
     await ctx.reply('💬 Enter the first message the agent will say:');
-    const firstMsg = await conversation.wait();
-    ensureActive();
-    const firstMessage = firstMsg?.message?.text?.trim();
-    if (firstMessage) {
-      await guardAgainstCommandInterrupt(ctx, firstMessage);
-    }
+    const { text: firstMessage } = await waitForConversationText(conversation, ctx, {
+      ensureActive,
+      invalidMessage: '⚠️ Please send the first message as text.'
+    });
     if (!firstMessage) {
       await ctx.reply('❌ Please provide a valid first message.');
       return null;
@@ -425,12 +419,10 @@ async function callFlow(conversation, ctx) {
   const ensureActive = () => ensureOperationActive(ctx, opId);
 
   const waitForMessage = async () => {
-    const update = await conversation.wait();
-    ensureActive();
-    const text = update?.message?.text?.trim();
-    if (text) {
-      await guardAgainstCommandInterrupt(ctx, text);
-    }
+    const { update } = await waitForConversationText(conversation, ctx, {
+      ensureActive,
+      invalidMessage: '⚠️ Please send a text response to continue call setup.'
+    });
     return update;
   };
 
@@ -691,6 +683,25 @@ async function callFlow(conversation, ctx) {
     }
     if (data?.success && data.call_sid) {
       flow.touch('completed');
+      await ctx.reply(
+        section('✅ Call Started', [
+          buildLine('🆔', 'Call SID', `\`${escapeMarkdown(data.call_sid)}\``),
+          buildLine('📞', 'Number', escapeMarkdown(number)),
+          tipLine('🔄', 'Use the buttons below for follow-up actions.')
+        ]),
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '📜 Call Log', callback_data: buildCallbackData(ctx, 'CALLLOG') }],
+              [
+                { text: '💬 SMS Follow-up', callback_data: buildCallbackData(ctx, 'SMS') },
+                { text: '⬅️ Main Menu', callback_data: buildCallbackData(ctx, 'MENU') }
+              ]
+            ]
+          }
+        }
+      );
     } else {
       await ctx.reply('⚠️ Call was sent but response format unexpected. Check logs.', {
         reply_markup: buildMainMenuReplyMarkup(ctx)

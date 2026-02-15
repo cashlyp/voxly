@@ -234,6 +234,55 @@ async function guardAgainstCommandInterrupt(ctx, text, reason = 'command_interru
   throw new OperationCancelledError('Conversation interrupted by slash command');
 }
 
+async function waitForConversationText(conversation, ctx, options = {}) {
+  const {
+    ensureActive,
+    allowEmpty = false,
+    guardCommands = true,
+    invalidMessage = '⚠️ Please send a text response to continue.',
+    emptyMessage = '⚠️ Please send a non-empty response to continue.'
+  } = options;
+
+  while (true) {
+    const update = await conversation.wait();
+    if (typeof ensureActive === 'function') {
+      ensureActive();
+    }
+
+    const rawText = update?.message?.text;
+    if (typeof rawText !== 'string') {
+      if (update?.callbackQuery?.id && typeof update.answerCallbackQuery === 'function') {
+        try {
+          await update.answerCallbackQuery({
+            text: 'Please reply in chat with text.',
+            show_alert: false
+          });
+        } catch (_) {
+          // ignore callback answer failures
+        }
+      }
+      if (invalidMessage) {
+        await ctx.reply(invalidMessage);
+      }
+      continue;
+    }
+
+    const text = rawText.trim();
+    if (!text && !allowEmpty) {
+      if (emptyMessage) {
+        await ctx.reply(emptyMessage);
+      }
+      continue;
+    }
+
+    if (guardCommands && text) {
+      await guardAgainstCommandInterrupt(ctx, text);
+    }
+
+    return { update, text };
+  }
+}
+
 module.exports = {
   initialSessionState,
   startOperation,
@@ -247,6 +296,7 @@ module.exports = {
   ensureFlow,
   safeReset,
   guardAgainstCommandInterrupt,
+  waitForConversationText,
   isSlashCommandInput,
   FlowContext,
   OperationCancelledError

@@ -914,6 +914,12 @@ function createSmsStatusWebhookHandler(ctx = {}) {
 function createEmailWebhookHandler(ctx = {}) {
   return async function handleEmailWebhook(req, res) {
     try {
+      if (
+        typeof ctx.requireValidEmailWebhook === "function" &&
+        !ctx.requireValidEmailWebhook(req, res, "/webhook/email")
+      ) {
+        return;
+      }
       const emailService =
         typeof ctx.getEmailService === "function"
           ? ctx.getEmailService()
@@ -940,12 +946,30 @@ function createEmailUnsubscribeWebhookHandler(ctx = {}) {
   return async function handleEmailUnsubscribeWebhook(req, res) {
     try {
       const db = getDb(ctx);
+      if (!db) {
+        return res.status(500).send("Database not initialized");
+      }
+      const emailService =
+        typeof ctx.getEmailService === "function"
+          ? ctx.getEmailService()
+          : ctx.emailService;
       const email = String(req.query?.email || "")
         .trim()
         .toLowerCase();
       const messageId = String(req.query?.message_id || "").trim();
+      const signature = String(req.query?.sig || "").trim();
       if (!email) {
         return res.status(400).send("Missing email");
+      }
+      if (emailService?.hasUnsubscribeSignature?.()) {
+        const validSig = emailService.verifyUnsubscribeSignature(
+          email,
+          messageId,
+          signature,
+        );
+        if (!validSig) {
+          return res.status(403).send("Invalid signature");
+        }
       }
       await db.setEmailSuppression(email, "unsubscribe", "link");
       if (messageId) {

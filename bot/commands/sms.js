@@ -8,7 +8,7 @@ const {
     ensureOperationActive,
     registerAbortController,
     OperationCancelledError,
-    guardAgainstCommandInterrupt
+    waitForConversationText
 } = require('../utils/sessionState');
 const {
     getBusinessOptions,
@@ -185,9 +185,10 @@ async function smsStatusFlow(conversation, ctx) {
             return;
         }
         await ctx.reply('📬 Enter the SMS message SID:');
-        const update = await conversation.wait();
-        ensureActive();
-        const messageSid = update?.message?.text?.trim();
+        const { text: messageSid } = await waitForConversationText(conversation, ctx, {
+            ensureActive,
+            invalidMessage: '⚠️ Please send the SMS SID as text.'
+        });
         if (!messageSid) {
             await ctx.reply('❌ Message SID is required.');
             return;
@@ -211,9 +212,10 @@ async function smsConversationFlow(conversation, ctx) {
             return;
         }
         await ctx.reply('📱 Enter the phone number (E.164 format):');
-        const update = await conversation.wait();
-        ensureActive();
-        const phoneNumber = update?.message?.text?.trim();
+        const { text: phoneNumber } = await waitForConversationText(conversation, ctx, {
+            ensureActive,
+            invalidMessage: '⚠️ Please send the phone number as text.'
+        });
         if (!phoneNumber || !isValidPhoneNumber(phoneNumber)) {
             await ctx.reply('❌ Invalid phone number format. Use E.164 format: +1234567890');
             return;
@@ -267,9 +269,11 @@ async function recentSmsFlow(conversation, ctx) {
             return;
         }
         await ctx.reply('🕒 Enter number of messages to fetch (max 20).');
-        const update = await conversation.wait();
-        ensureActive();
-        const raw = update?.message?.text?.trim();
+        const { text: raw } = await waitForConversationText(conversation, ctx, {
+            ensureActive,
+            allowEmpty: true,
+            invalidMessage: '⚠️ Please send the limit as text.'
+        });
         const limit = Math.min(Number(raw) || 10, 20);
         await ctx.reply(`📱 Fetching last ${limit} SMS messages...`);
         await sendRecentSms(ctx, limit);
@@ -370,9 +374,10 @@ async function bulkSmsStatusFlow(conversation, ctx) {
             return;
         }
         await ctx.reply('🆔 Enter the bulk SMS job ID:');
-        const update = await conversation.wait();
-        ensureActive();
-        const rawId = update?.message?.text?.trim();
+        const { text: rawId } = await waitForConversationText(conversation, ctx, {
+            ensureActive,
+            invalidMessage: '⚠️ Please send the bulk SMS job ID as text.'
+        });
         if (!rawId) {
             await ctx.reply('❌ Job ID is required.');
             return;
@@ -472,12 +477,10 @@ async function smsFlow(conversation, ctx) {
     const opId = startOperation(ctx, 'sms');
     const ensureActive = () => ensureOperationActive(ctx, opId);
     const waitForMessage = async () => {
-        const update = await conversation.wait();
-        ensureActive();
-        const text = update?.message?.text?.trim();
-        if (text) {
-            await guardAgainstCommandInterrupt(ctx, text);
-        }
+        const { update } = await waitForConversationText(conversation, ctx, {
+            ensureActive,
+            invalidMessage: '⚠️ Please send a text response to continue SMS setup.'
+        });
         return update;
     };
     const askWithGuard = async (...params) => {
@@ -908,12 +911,10 @@ async function bulkSmsFlow(conversation, ctx) {
     const opId = startOperation(ctx, 'bulk-sms');
     const ensureActive = () => ensureOperationActive(ctx, opId);
     const waitForMessage = async () => {
-        const update = await conversation.wait();
-        ensureActive();
-        const text = update?.message?.text?.trim();
-        if (text) {
-            await guardAgainstCommandInterrupt(ctx, text);
-        }
+        const { update } = await waitForConversationText(conversation, ctx, {
+            ensureActive,
+            invalidMessage: '⚠️ Please send a text response to continue bulk SMS.'
+        });
         return update;
     };
     const askWithGuard = async (...params) => {
@@ -1102,12 +1103,10 @@ async function scheduleSmsFlow(conversation, ctx) {
     const opId = startOperation(ctx, 'schedule-sms');
     const ensureActive = () => ensureOperationActive(ctx, opId);
     const waitForMessage = async () => {
-        const update = await conversation.wait();
-        ensureActive();
-        const text = update?.message?.text?.trim();
-        if (text) {
-            await guardAgainstCommandInterrupt(ctx, text);
-        }
+        const { update } = await waitForConversationText(conversation, ctx, {
+            ensureActive,
+            invalidMessage: '⚠️ Please send a text response to continue scheduling.'
+        });
         return update;
     };
     const guardedPost = async (url, data, options = {}) => {

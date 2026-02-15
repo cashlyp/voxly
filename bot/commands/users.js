@@ -1,7 +1,7 @@
 const { InlineKeyboard } = require('grammy');
 const { getUser, getUserList, addUser, promoteUser, removeUser, isAdmin } = require('../db/db');
 const { buildCallbackData } = require('../utils/actions');
-const { guardAgainstCommandInterrupt, OperationCancelledError } = require('../utils/sessionState');
+const { OperationCancelledError, waitForConversationText } = require('../utils/sessionState');
 const { renderMenu } = require('../utils/ui');
 
 async function ensureAdminAccess(ctx) {
@@ -78,11 +78,9 @@ async function sendUsersList(ctx) {
 async function addUserFlow(conversation, ctx) {
   try {
     await ctx.reply('🆔 Enter Telegram ID:');
-    const idMsg = await conversation.wait();
-    const idText = idMsg?.message?.text?.trim();
-    if (idText) {
-      await guardAgainstCommandInterrupt(ctx, idText);
-    }
+    const { text: idText } = await waitForConversationText(conversation, ctx, {
+      invalidMessage: '⚠️ Please send the Telegram ID as text.'
+    });
     if (!idText) {
       await ctx.reply('❌ Please send a valid text message.');
       return;
@@ -95,11 +93,9 @@ async function addUserFlow(conversation, ctx) {
     }
 
     await ctx.reply('🔠 Enter username:');
-    const usernameMsg = await conversation.wait();
-    const usernameText = usernameMsg?.message?.text?.trim();
-    if (usernameText) {
-      await guardAgainstCommandInterrupt(ctx, usernameText);
-    }
+    const { text: usernameText } = await waitForConversationText(conversation, ctx, {
+      invalidMessage: '⚠️ Please send the username as text.'
+    });
     if (!usernameText) {
       await ctx.reply('❌ Please send a valid username.');
       return;
@@ -138,11 +134,9 @@ async function addUserFlow(conversation, ctx) {
 async function promoteFlow(conversation, ctx) {
   try {
     await ctx.reply('🆔 Enter Telegram ID to promote:');
-    const idMsg = await conversation.wait();
-    const idText = idMsg?.message?.text?.trim();
-    if (idText) {
-      await guardAgainstCommandInterrupt(ctx, idText);
-    }
+    const { text: idText } = await waitForConversationText(conversation, ctx, {
+      invalidMessage: '⚠️ Please send the Telegram ID as text.'
+    });
     if (!idText) {
       await ctx.reply('❌ Please send a valid Telegram ID.');
       return;
@@ -181,11 +175,9 @@ async function promoteFlow(conversation, ctx) {
 async function removeUserFlow(conversation, ctx) {
   try {
     await ctx.reply('🆔 Enter Telegram ID to remove:');
-    const idMsg = await conversation.wait();
-    const idText = idMsg?.message?.text?.trim();
-    if (idText) {
-      await guardAgainstCommandInterrupt(ctx, idText);
-    }
+    const { text: idText } = await waitForConversationText(conversation, ctx, {
+      invalidMessage: '⚠️ Please send the Telegram ID as text.'
+    });
     if (!idText) {
       await ctx.reply('❌ Please send a valid Telegram ID.');
       return;
