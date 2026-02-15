@@ -815,12 +815,20 @@ bot.command("start", async (ctx) => {
 
 // Enhanced callback query handler
 bot.on("callback_query:data", async (ctx) => {
-  const rawAction = ctx.callbackQuery.data;
+  const rawAction = String(ctx.callbackQuery?.data || "");
   const metric = startActionMetric(ctx, "callback", { raw_action: rawAction });
   const finishMetric = (status, extra = {}) => {
     finishActionMetric(metric, status, extra);
   };
   try {
+    if (!rawAction) {
+      await safeAnswerCallbackQuery(ctx, {
+        text: "⚠️ That option is unavailable.",
+        show_alert: false,
+      });
+      finishMetric("invalid");
+      return;
+    }
     if (
       rawAction &&
       (rawAction.startsWith("lc:") ||
@@ -846,7 +854,7 @@ bot.on("callback_query:data", async (ctx) => {
       const hasActiveConversationOp = Boolean(
         staleTarget && ctx.session?.currentOp?.id,
       );
-      await ctx.answerCallbackQuery({ text: message, show_alert: false });
+      await safeAnswerCallbackQuery(ctx, { text: message, show_alert: false });
       if (!hasActiveConversationOp) {
         await clearMenuMessages(ctx);
         await handleMenu(ctx);
@@ -860,7 +868,7 @@ bot.on("callback_query:data", async (ctx) => {
     const isConversationAction = Boolean(recoveryTarget);
     const actionKey = `${action}|${ctx.callbackQuery?.message?.message_id || ""}`;
     if (isDuplicateAction(ctx, actionKey)) {
-      await ctx.answerCallbackQuery({
+      await safeAnswerCallbackQuery(ctx, {
         text: "Already processed.",
         show_alert: false,
       });
@@ -869,7 +877,7 @@ bot.on("callback_query:data", async (ctx) => {
     }
 
     // Answer callback query immediately to prevent timeout
-    await ctx.answerCallbackQuery();
+    await safeAnswerCallbackQuery(ctx);
     console.log(`Callback query received: ${action} from user ${ctx.from.id}`);
 
     await getAccessProfile(ctx);
@@ -1270,9 +1278,20 @@ bot.on("callback_query:data", async (ctx) => {
       text: "⚠️ Failed to process action",
       show_alert: false,
     });
-    const fallback =
-      "❌ An error occurred processing your request. Please try again.";
-    const message = error?.userMessage || fallback;
+    let isGuest = false;
+    try {
+      const access = await getAccessProfile(ctx);
+      isGuest = !access?.user;
+    } catch (_) {
+      isGuest = false;
+    }
+    const fallback = isGuest
+      ? "🔒 This option is not available in guest mode. Use Request Access to unlock actions."
+      : "❌ An error occurred processing your request. Please try again.";
+    const message =
+      isGuest
+        ? fallback
+        : error?.userMessage || fallback;
     await ctx.reply(message);
     finishMetric("error", { error: error?.message || String(error) });
   }
