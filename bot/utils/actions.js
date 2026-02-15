@@ -2,7 +2,7 @@ const crypto = require('crypto');
 const config = require('../config');
 const { ensureSession } = require('./sessionState');
 
-const DEFAULT_CALLBACK_TTL_MS = 15 * 60 * 1000;
+const DEFAULT_CALLBACK_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_DEDUPE_TTL_MS = 8000;
 const SIGN_PREFIX = 'cb';
 const MENU_ACTION_LOG_INTERVAL = 25;
@@ -124,11 +124,13 @@ function validateCallback(ctx, rawAction, options = {}) {
     if (!parsed.valid) {
       return { status: 'invalid', reason: parsed.reason, action: parsed.action };
     }
-    if (parsed.timestamp && now - parsed.timestamp > ttlMs) {
+    const action = String(parsed.action || '');
+    const sessionBound = action.includes(':');
+    if (sessionBound && parsed.timestamp && now - parsed.timestamp > ttlMs) {
       return { status: 'expired', reason: 'ttl', action: parsed.action };
     }
     const currentToken = ctx.session?.currentOp?.token;
-    if (parsed.token && currentToken && parsed.token !== currentToken) {
+    if (sessionBound && parsed.token && currentToken && parsed.token !== currentToken) {
       return { status: 'stale', reason: 'token_mismatch', action: parsed.action };
     }
     return { status: 'ok', action: parsed.action };

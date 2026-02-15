@@ -887,10 +887,15 @@ bot.on("callback_query:data", async (ctx) => {
     const isMenuExemptAction = menuExemptPrefixes.some((prefix) =>
       action.startsWith(prefix),
     );
+    const isSessionBoundAction = action.includes(":");
     const menuMessageId = ctx.callbackQuery?.message?.message_id;
     const menuChatId = ctx.callbackQuery?.message?.chat?.id;
     const latestMenuId = getLatestMenuMessageId(ctx, menuChatId);
-    if (!isMenuExemptAction && isLatestMenuExpired(ctx, menuChatId)) {
+    if (
+      !isMenuExemptAction &&
+      isSessionBoundAction &&
+      isLatestMenuExpired(ctx, menuChatId)
+    ) {
       if (!isConversationAction || !ctx.session?.currentOp?.id) {
         await clearMenuMessages(ctx);
         await handleMenu(ctx);
@@ -900,6 +905,7 @@ bot.on("callback_query:data", async (ctx) => {
     }
     if (
       !isMenuExemptAction &&
+      isSessionBoundAction &&
       menuMessageId &&
       latestMenuId &&
       menuMessageId !== latestMenuId

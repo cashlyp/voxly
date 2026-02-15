@@ -1,6 +1,6 @@
 const { ensureSession } = require('./sessionState');
 
-const DEFAULT_MENU_TTL_MS = 15 * 60 * 1000;
+const DEFAULT_MENU_TTL_MS = 24 * 60 * 60 * 1000;
 
 function normalizeReply(text, options = {}) {
     const normalizedText = text === undefined || text === null ? '' : String(text);
