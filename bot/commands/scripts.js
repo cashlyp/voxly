@@ -31,6 +31,9 @@ const { emailTemplatesFlow } = require('./email');
 const { section, buildLine, tipLine } = require('../utils/ui');
 const { attachHmacAuth } = require('../utils/apiAuth');
 
+const CLONE_REQUEST_TTL_MS = 30000;
+const cloneRequestState = new Map();
+
 const scriptsApi = axios.create({
   baseURL: config.scriptsApiUrl.replace(/\/+$/, ''),
   timeout: 15000,
@@ -275,6 +278,43 @@ async function storeScriptVersionSnapshot(script, type, ctx) {
 
 function stripUndefined(payload = {}) {
   return Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined));
+}
+
+function pruneCloneRequestState() {
+  const now = Date.now();
+  for (const [key, entry] of cloneRequestState.entries()) {
+    const age = now - Number(entry?.timestamp || 0);
+    if (!entry || age > CLONE_REQUEST_TTL_MS) {
+      cloneRequestState.delete(key);
+    }
+  }
+}
+
+function buildCloneRequestKey(ctx, scriptId, name) {
+  const userId = String(ctx?.from?.id || 'unknown');
+  const safeScriptId = String(scriptId || 'unknown');
+  const safeName = String(name || '').trim().toLowerCase();
+  return `clone:${userId}:${safeScriptId}:${safeName}`;
+}
+
+function beginCloneRequest(ctx, scriptId, name) {
+  pruneCloneRequestState();
+  const key = buildCloneRequestKey(ctx, scriptId, name);
+  const now = Date.now();
+  const existing = cloneRequestState.get(key);
+  if (existing && existing.status === 'pending') {
+    return { allowed: false, key, reason: 'pending' };
+  }
+  if (existing && existing.status === 'done' && now - existing.timestamp < CLONE_REQUEST_TTL_MS) {
+    return { allowed: false, key, reason: 'recent' };
+  }
+  cloneRequestState.set(key, { status: 'pending', timestamp: now });
+  return { allowed: true, key };
+}
+
+function finishCloneRequest(key, status = 'done') {
+  if (!key) return;
+  cloneRequestState.set(key, { status, timestamp: Date.now() });
 }
 
 async function promptText(
@@ -827,8 +867,10 @@ async function deleteCallScript(id) {
   await scriptsApiRequest({ method: 'delete', url: `/api/call-scripts/${id}` });
 }
 
-async function cloneCallScript(id, payload) {
-  const idempotencyKey = `clone_call_script_${id}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+async function cloneCallScript(id, payload, options = {}) {
+  const explicitKey = String(options.idempotencyKey || '').trim();
+  const fallbackKey = `clone_call_script_${id}`;
+  const idempotencyKey = explicitKey || fallbackKey;
   const data = await scriptsApiRequest({
     method: 'post',
     url: `/api/call-scripts/${id}/clone`,
@@ -1245,14 +1287,27 @@ async function cloneCallScriptFlow(conversation, ctx, script, ensureActive) {
     return;
   }
 
+  const cloneGate = beginCloneRequest(ctx, script.id, name);
+  if (!cloneGate.allowed) {
+    await ctx.reply('⚠️ Clone already in progress or just completed. Please wait a moment before trying again.');
+    return;
+  }
+
   try {
+    const opId = getCurrentOpId(ctx) || `user_${ctx?.from?.id || 'unknown'}`;
+    const normalizedName = name.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48) || 'script';
+    const idempotencyKey = `clone_call_script_${script.id}_${opId}_${normalizedName}`;
     const cloned = await cloneCallScript(script.id, {
       name,
       description: description === undefined ? script.description : (description.length ? description : null)
+    }, {
+      idempotencyKey
     });
+    finishCloneRequest(cloneGate.key, 'done');
     await ctx.reply(`✅ Script cloned as *${escapeMarkdown(cloned.name)}*.`, { parse_mode: 'Markdown' });
   } catch (error) {
-    console.error('Failed to clone script:', error);
+    finishCloneRequest(cloneGate.key, 'failed');
+    console.error('Failed to clone script:', error?.message || error);
     await ctx.reply(formatScriptsApiError(error, 'Failed to clone script'));
   }
 }
@@ -2278,9 +2333,15 @@ async function scriptsFlow(conversation, ctx) {
       return;
     }
 
-    // Warm persona cache so downstream selections have up-to-date personas.
-    await getBusinessOptions();
-    ensureActive();
+    try {
+      // Warm persona cache so downstream selections have up-to-date personas.
+      await getBusinessOptions();
+      ensureActive();
+    } catch (error) {
+      console.error('Failed to load persona options for scripts command:', error?.message || error);
+      await ctx.reply(formatScriptsApiError(error, 'Failed to initialize script designer'));
+      return;
+    }
 
     let active = true;
     while (active) {
@@ -2321,7 +2382,9 @@ async function scriptsFlow(conversation, ctx) {
       console.log('Scripts flow cancelled:', error.message);
       return;
     }
-    throw error;
+    console.error('Scripts flow unexpected error:', error?.message || error);
+    await ctx.reply(formatScriptsApiError(error, 'Script command failed'));
+    return;
   } finally {
     if (ctx.session?.currentOp?.id === opId) {
       ctx.session.currentOp = null;
@@ -2341,7 +2404,12 @@ function registerScriptsCommand(bot) {
       return ctx.reply('❌ This command is for administrators only.');
     }
 
-    await ctx.conversation.enter('scripts-conversation');
+    try {
+      await ctx.conversation.enter('scripts-conversation');
+    } catch (error) {
+      console.error('Failed to enter scripts conversation:', error?.message || error);
+      await ctx.reply(formatScriptsApiError(error, 'Unable to open script designer'));
+    }
   });
 }
 

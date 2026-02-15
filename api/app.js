@@ -3501,6 +3501,9 @@ const gptQueues = new Map();
 const normalFlowBuffers = new Map();
 const normalFlowProcessing = new Set();
 const normalFlowLastInput = new Map();
+const normalFlowFailureCounts = new Map();
+const gptStallState = new Map();
+const gptStallTimers = new Map();
 const speechTickTimers = new Map();
 const userAudioStates = new Map();
 
@@ -3534,6 +3537,80 @@ function clearNormalFlowState(callSid) {
   normalFlowBuffers.delete(callSid);
   normalFlowProcessing.delete(callSid);
   normalFlowLastInput.delete(callSid);
+  normalFlowFailureCounts.delete(callSid);
+  gptStallState.delete(callSid);
+  const stallTimer = gptStallTimers.get(callSid);
+  if (stallTimer) {
+    clearTimeout(stallTimer);
+    gptStallTimers.delete(callSid);
+  }
+}
+
+function markGptReplyProgress(callSid) {
+  if (!callSid) return;
+  const state = gptStallState.get(callSid) || {};
+  state.lastReplyAt = Date.now();
+  state.consecutiveStalls = 0;
+  gptStallState.set(callSid, state);
+  normalFlowFailureCounts.delete(callSid);
+  const stallTimer = gptStallTimers.get(callSid);
+  if (stallTimer) {
+    clearTimeout(stallTimer);
+    gptStallTimers.delete(callSid);
+  }
+}
+
+function getLastGptReplyAt(callSid) {
+  return Number(gptStallState.get(callSid)?.lastReplyAt || 0);
+}
+
+function scheduleGptStallGuard(callSid, stallAt) {
+  if (!callSid) return;
+  const existing = gptStallTimers.get(callSid);
+  if (existing) {
+    clearTimeout(existing);
+  }
+  const stallCloseMs =
+    Number(config.openRouter?.stallCloseMs) > 0
+      ? Number(config.openRouter.stallCloseMs)
+      : 12000;
+  const timer = setTimeout(() => {
+    const state = gptStallState.get(callSid);
+    const lastReplyAt = Number(state?.lastReplyAt || 0);
+    if (lastReplyAt > stallAt) return;
+    if (callEndLocks.has(callSid)) return;
+    const session = activeCalls.get(callSid);
+    if (session?.ending) return;
+    webhookService.addLiveEvent(
+      callSid,
+      "⚠️ Unable to complete response. Ending call safely.",
+      { force: true },
+    );
+    speakAndEndCall(callSid, CALL_END_MESSAGES.error, "gpt_stall_timeout").catch(
+      () => {},
+    );
+  }, stallCloseMs);
+  gptStallTimers.set(callSid, timer);
+}
+
+function handleGptStall(callSid, fillerText, emitFiller) {
+  if (!callSid) return;
+  const state = gptStallState.get(callSid) || {};
+  state.lastStallAt = Date.now();
+  state.consecutiveStalls = Number(state.consecutiveStalls || 0) + 1;
+  gptStallState.set(callSid, state);
+
+  if (state.consecutiveStalls <= 1) {
+    webhookService.addLiveEvent(callSid, "⏳ One moment…", { force: true });
+    if (typeof emitFiller === "function") {
+      emitFiller(fillerText);
+    }
+  } else {
+    webhookService.addLiveEvent(callSid, "⏳ Still working on that request…", {
+      force: true,
+    });
+  }
+  scheduleGptStallGuard(callSid, state.lastStallAt);
 }
 
 function shouldSkipNormalInput(callSid, text, windowMs = 2000) {
@@ -3575,13 +3652,35 @@ async function processNormalFlowTranscript(
         if (session?.ending) return;
         const currentCount =
           typeof getInteractionCount === "function" ? getInteractionCount() : 0;
+        const beforeReplyAt = getLastGptReplyAt(callSid);
         try {
           await gptService.completion(next.text, currentCount);
+          const afterReplyAt = getLastGptReplyAt(callSid);
+          if (afterReplyAt <= beforeReplyAt) {
+            const failures = Number(normalFlowFailureCounts.get(callSid) || 0) + 1;
+            normalFlowFailureCounts.set(callSid, failures);
+            if (failures >= 2) {
+              await speakAndEndCall(
+                callSid,
+                CALL_END_MESSAGES.error,
+                "gpt_no_reply",
+              );
+              return;
+            }
+          } else {
+            normalFlowFailureCounts.delete(callSid);
+          }
         } catch (gptError) {
           console.error("GPT completion error:", gptError);
+          const failures = Number(normalFlowFailureCounts.get(callSid) || 0) + 1;
+          normalFlowFailureCounts.set(callSid, failures);
           webhookService.addLiveEvent(callSid, "⚠️ GPT error, retrying", {
             force: true,
           });
+          if (failures >= 2) {
+            await speakAndEndCall(callSid, CALL_END_MESSAGES.error, "gpt_error");
+            return;
+          }
         }
         const nextCount = currentCount + 1;
         if (typeof setInteractionCount === "function") {
@@ -5949,6 +6048,7 @@ async function ensureAwsSession(callSid) {
 
   gptService.on("gptreply", async (gptReply, icount) => {
     try {
+      markGptReplyProgress(callSid);
       if (session?.ending) {
         return;
       }
@@ -6013,6 +6113,32 @@ async function ensureAwsSession(callSid) {
     } catch (gptReplyError) {
       console.error("AWS session GPT reply handler error:", gptReplyError);
     }
+  });
+
+  gptService.on("stall", async (fillerText) => {
+    handleGptStall(callSid, fillerText, async (speechText) => {
+      try {
+        const ttsAdapter = getAwsTtsAdapter();
+        const voiceId = resolveVoiceModel(callConfig);
+        const { key } = await ttsAdapter.synthesizeToS3(
+          speechText,
+          voiceId ? { voiceId } : {},
+        );
+        const contactId = callConfig?.provider_metadata?.contact_id;
+        if (contactId) {
+          const awsAdapter = getAwsConnectAdapter();
+          await awsAdapter.enqueueAudioPlayback({
+            contactId,
+            audioKey: key,
+          });
+          webhookService
+            .setLiveCallPhase(callSid, "agent_speaking")
+            .catch(() => {});
+        }
+      } catch (err) {
+        console.error("AWS filler TTS error:", err);
+      }
+    });
   });
 
   activeCalls.set(callSid, session);
@@ -6588,6 +6714,7 @@ app.ws("/connection", (ws, req) => {
           gptService.on("gptreply", async (gptReply, icount) => {
             try {
               gptErrorCount = 0;
+              markGptReplyProgress(callSid);
               const activeSession = activeCalls.get(callSid);
               if (activeSession?.ending) {
                 return;
@@ -6635,21 +6762,20 @@ app.ws("/connection", (ws, req) => {
           });
 
           gptService.on("stall", (fillerText) => {
-            webhookService.addLiveEvent(callSid, "⏳ One moment…", {
-              force: true,
+            handleGptStall(callSid, fillerText, (speechText) => {
+              try {
+                ttsService.generate(
+                  {
+                    partialResponse: speechText,
+                    personalityInfo: { name: "filler" },
+                    adaptationHistory: [],
+                  },
+                  interactionCount,
+                );
+              } catch (err) {
+                console.error("Filler TTS error:", err);
+              }
             });
-            try {
-              ttsService.generate(
-                {
-                  partialResponse: fillerText,
-                  personalityInfo: { name: "filler" },
-                  adaptationHistory: [],
-                },
-                interactionCount,
-              );
-            } catch (err) {
-              console.error("Filler TTS error:", err);
-            }
           });
 
           gptService.on("gpterror", async (err) => {
@@ -7764,6 +7890,7 @@ app.ws("/vonage/stream", async (ws, req) => {
     gptService.on("gptreply", async (gptReply, icount) => {
       try {
         gptErrorCount = 0;
+        markGptReplyProgress(callSid);
         const activeSession = activeCalls.get(callSid);
         if (activeSession?.ending) {
           return;
@@ -7801,19 +7928,20 @@ app.ws("/vonage/stream", async (ws, req) => {
     });
 
     gptService.on("stall", (fillerText) => {
-      webhookService.addLiveEvent(callSid, "⏳ One moment…", { force: true });
-      try {
-        ttsService.generate(
-          {
-            partialResponse: fillerText,
-            personalityInfo: { name: "filler" },
-            adaptationHistory: [],
-          },
-          interactionCount,
-        );
-      } catch (err) {
-        console.error("Filler TTS error:", err);
-      }
+      handleGptStall(callSid, fillerText, (speechText) => {
+        try {
+          ttsService.generate(
+            {
+              partialResponse: speechText,
+              personalityInfo: { name: "filler" },
+              adaptationHistory: [],
+            },
+            interactionCount,
+          );
+        } catch (err) {
+          console.error("Filler TTS error:", err);
+        }
+      });
     });
 
     gptService.on("gpterror", async (err) => {
@@ -8507,8 +8635,39 @@ async function handleCallEnd(callSid, callStartTime) {
         callDetails.user_chat_id,
       );
 
-      // Schedule transcript notification with delay
-      if (finalStatus === "completed") {
+      const hasTranscriptText = transcripts.some(
+        (entry) => String(entry?.message || "").trim().length > 0,
+      );
+      let hasTranscriptAudio = Boolean(
+        String(
+          callDetails?.transcript_audio_url ||
+            callDetails?.recording_url ||
+            callDetails?.audio_url ||
+            "",
+        ).trim(),
+      );
+      if (!hasTranscriptAudio) {
+        const recentStates = await db.getCallStates(callSid, { limit: 40 }).catch(() => []);
+        hasTranscriptAudio = recentStates.some((state) => {
+          const data =
+            state?.data && typeof state.data === "object" && !Array.isArray(state.data)
+              ? state.data
+              : {};
+          return Boolean(
+            String(
+              data.transcript_audio_url ||
+                data.recording_url ||
+                data.audio_url ||
+                data.media_url ||
+                data.url ||
+                "",
+            ).trim(),
+          );
+        });
+      }
+
+      // Schedule transcript notification whenever transcript text/audio is available.
+      if (hasTranscriptText || hasTranscriptAudio) {
         setTimeout(async () => {
           try {
             await db.createEnhancedWebhookNotification(
