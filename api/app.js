@@ -9595,15 +9595,128 @@ app.get("/api/personas", async (req, res) => {
   });
 });
 
-const callScriptCloneIdempotency = new Map();
-const CALL_SCRIPT_CLONE_IDEMPOTENCY_TTL_MS = 10 * 60 * 1000;
+const callScriptMutationIdempotency = new Map();
+const CALL_SCRIPT_MUTATION_IDEMPOTENCY_TTL_MS = 10 * 60 * 1000;
 
-function pruneCallScriptCloneIdempotency(now = Date.now()) {
-  for (const [key, value] of callScriptCloneIdempotency.entries()) {
-    if (!value?.at || now - value.at > CALL_SCRIPT_CLONE_IDEMPOTENCY_TTL_MS) {
-      callScriptCloneIdempotency.delete(key);
+function sortObjectKeys(value) {
+  if (Array.isArray(value)) {
+    return value.map(sortObjectKeys);
+  }
+  if (value && typeof value === "object") {
+    return Object.keys(value)
+      .sort()
+      .reduce((acc, key) => {
+        acc[key] = sortObjectKeys(value[key]);
+        return acc;
+      }, {});
+  }
+  return value;
+}
+
+function buildCallScriptMutationFingerprint(action, target, payload) {
+  const normalizedAction = String(action || "").trim().toLowerCase();
+  const normalizedTarget = String(target || "").trim().toLowerCase();
+  const normalizedPayload = sortObjectKeys(payload || {});
+  return `${normalizedAction}:${normalizedTarget}:${JSON.stringify(normalizedPayload)}`;
+}
+
+function pruneCallScriptMutationIdempotency(now = Date.now()) {
+  for (const [key, value] of callScriptMutationIdempotency.entries()) {
+    if (!value?.at || now - value.at > CALL_SCRIPT_MUTATION_IDEMPOTENCY_TTL_MS) {
+      callScriptMutationIdempotency.delete(key);
     }
   }
+}
+
+function resetCallScriptMutationIdempotencyForTests() {
+  callScriptMutationIdempotency.clear();
+}
+
+function beginCallScriptMutationIdempotency(req, action, target, payload) {
+  const key = String(
+    req.headers["idempotency-key"] || req.headers["Idempotency-Key"] || "",
+  ).trim();
+  if (!isSafeId(key, { max: 128 })) {
+    return { enabled: false };
+  }
+
+  const fingerprint = buildCallScriptMutationFingerprint(action, target, payload);
+  const now = Date.now();
+  pruneCallScriptMutationIdempotency(now);
+  const existing = callScriptMutationIdempotency.get(key);
+  if (existing) {
+    if (existing.fingerprint !== fingerprint) {
+      return {
+        enabled: true,
+        key,
+        error: {
+          status: 409,
+          code: "idempotency_conflict",
+          message: "Idempotency key reuse with different payload",
+        },
+      };
+    }
+    if (existing.status === "pending") {
+      return {
+        enabled: true,
+        key,
+        error: {
+          status: 409,
+          code: "idempotency_in_progress",
+          message: "Idempotency key is currently processing",
+        },
+      };
+    }
+    if (existing.status === "done" && existing.response) {
+      return {
+        enabled: true,
+        key,
+        replay: existing.response,
+      };
+    }
+  }
+
+  callScriptMutationIdempotency.set(key, {
+    at: now,
+    status: "pending",
+    fingerprint,
+    response: null,
+  });
+  return { enabled: true, key };
+}
+
+function completeCallScriptMutationIdempotency(idem, status, body) {
+  if (!idem?.enabled || !idem?.key) return;
+  callScriptMutationIdempotency.set(idem.key, {
+    at: Date.now(),
+    status: "done",
+    fingerprint:
+      callScriptMutationIdempotency.get(idem.key)?.fingerprint || null,
+    response: {
+      status: Number(status) || 200,
+      body,
+    },
+  });
+}
+
+function failCallScriptMutationIdempotency(idem) {
+  if (!idem?.enabled || !idem?.key) return;
+  callScriptMutationIdempotency.delete(idem.key);
+}
+
+function applyIdempotencyResponse(res, idem) {
+  if (!idem) return false;
+  if (idem.error) {
+    return res.status(idem.error.status).json({
+      success: false,
+      error: idem.error.message,
+      code: idem.error.code,
+    });
+  }
+  if (idem.replay) {
+    return res.status(idem.replay.status).json(idem.replay.body);
+  }
+  return false;
 }
 
 // Call script endpoints for bot script management
@@ -9641,17 +9754,29 @@ app.get("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
 });
 
 app.post("/api/call-scripts", requireAdminToken, async (req, res) => {
+  const idempotency = beginCallScriptMutationIdempotency(
+    req,
+    "create",
+    "new",
+    req.body || {},
+  );
+  const prior = applyIdempotencyResponse(res, idempotency);
+  if (prior) return prior;
   try {
     const { name, first_message } = req.body || {};
     if (!name || !first_message) {
+      failCallScriptMutationIdempotency(idempotency);
       return res
         .status(400)
         .json({ success: false, error: "name and first_message are required" });
     }
     const id = await db.createCallTemplate(req.body);
     const script = await db.getCallTemplateById(id);
-    res.status(201).json({ success: true, script });
+    const body = { success: true, script };
+    completeCallScriptMutationIdempotency(idempotency, 201, body);
+    res.status(201).json(body);
   } catch (error) {
+    failCallScriptMutationIdempotency(idempotency);
     res
       .status(500)
       .json({ success: false, error: "Failed to create call script" });
@@ -9659,15 +9784,26 @@ app.post("/api/call-scripts", requireAdminToken, async (req, res) => {
 });
 
 app.put("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
+  const scriptIdForIdem = Number(req.params.id);
+  const idempotency = beginCallScriptMutationIdempotency(
+    req,
+    "update",
+    Number.isFinite(scriptIdForIdem) ? scriptIdForIdem : req.params.id,
+    req.body || {},
+  );
+  const prior = applyIdempotencyResponse(res, idempotency);
+  if (prior) return prior;
   try {
     const scriptId = Number(req.params.id);
     if (Number.isNaN(scriptId)) {
+      failCallScriptMutationIdempotency(idempotency);
       return res
         .status(400)
         .json({ success: false, error: "Invalid script id" });
     }
     const updated = await db.updateCallTemplate(scriptId, req.body || {});
     if (!updated) {
+      failCallScriptMutationIdempotency(idempotency);
       return res
         .status(404)
         .json({ success: false, error: "Script not found" });
@@ -9677,8 +9813,11 @@ app.put("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
       inboundDefaultScript = script || null;
       inboundDefaultLoadedAt = Date.now();
     }
-    res.json({ success: true, script });
+    const body = { success: true, script };
+    completeCallScriptMutationIdempotency(idempotency, 200, body);
+    res.json(body);
   } catch (error) {
+    failCallScriptMutationIdempotency(idempotency);
     res
       .status(500)
       .json({ success: false, error: "Failed to update call script" });
@@ -9686,15 +9825,26 @@ app.put("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
 });
 
 app.delete("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
+  const scriptIdForIdem = Number(req.params.id);
+  const idempotency = beginCallScriptMutationIdempotency(
+    req,
+    "delete",
+    Number.isFinite(scriptIdForIdem) ? scriptIdForIdem : req.params.id,
+    {},
+  );
+  const prior = applyIdempotencyResponse(res, idempotency);
+  if (prior) return prior;
   try {
     const scriptId = Number(req.params.id);
     if (Number.isNaN(scriptId)) {
+      failCallScriptMutationIdempotency(idempotency);
       return res
         .status(400)
         .json({ success: false, error: "Invalid script id" });
     }
     const deleted = await db.deleteCallTemplate(scriptId);
     if (!deleted) {
+      failCallScriptMutationIdempotency(idempotency);
       return res
         .status(404)
         .json({ success: false, error: "Script not found" });
@@ -9705,8 +9855,11 @@ app.delete("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
       inboundDefaultScript = null;
       inboundDefaultLoadedAt = Date.now();
     }
-    res.json({ success: true });
+    const body = { success: true };
+    completeCallScriptMutationIdempotency(idempotency, 200, body);
+    res.json(body);
   } catch (error) {
+    failCallScriptMutationIdempotency(idempotency);
     res
       .status(500)
       .json({ success: false, error: "Failed to delete call script" });
@@ -9714,36 +9867,29 @@ app.delete("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
 });
 
 app.post("/api/call-scripts/:id/clone", requireAdminToken, async (req, res) => {
+  const scriptIdForIdem = Number(req.params.id);
+  const idempotency = beginCallScriptMutationIdempotency(
+    req,
+    "clone",
+    Number.isFinite(scriptIdForIdem) ? scriptIdForIdem : req.params.id,
+    req.body || {},
+  );
+  const prior = applyIdempotencyResponse(res, idempotency);
+  if (prior) return prior;
   try {
     const scriptId = Number(req.params.id);
     if (Number.isNaN(scriptId)) {
+      failCallScriptMutationIdempotency(idempotency);
       return res
         .status(400)
         .json({ success: false, error: "Invalid script id" });
     }
     const existing = await db.getCallTemplateById(scriptId);
     if (!existing) {
+      failCallScriptMutationIdempotency(idempotency);
       return res
         .status(404)
         .json({ success: false, error: "Script not found" });
-    }
-    const idempotencyKey = String(
-      req.headers["idempotency-key"] || req.headers["Idempotency-Key"] || "",
-    ).trim();
-    const now = Date.now();
-    pruneCallScriptCloneIdempotency(now);
-    const useIdempotencyKey = isSafeId(idempotencyKey, { max: 128 });
-    if (useIdempotencyKey) {
-      const prior = callScriptCloneIdempotency.get(idempotencyKey);
-      if (prior?.scriptId) {
-        const clonedScript = await db
-          .getCallTemplateById(prior.scriptId)
-          .catch(() => null);
-        if (clonedScript) {
-          return res.status(201).json({ success: true, script: clonedScript });
-        }
-        callScriptCloneIdempotency.delete(idempotencyKey);
-      }
     }
     const payload = {
       ...existing,
@@ -9751,15 +9897,12 @@ app.post("/api/call-scripts/:id/clone", requireAdminToken, async (req, res) => {
     };
     delete payload.id;
     const newId = await db.createCallTemplate(payload);
-    if (useIdempotencyKey) {
-      callScriptCloneIdempotency.set(idempotencyKey, {
-        scriptId: newId,
-        at: now,
-      });
-    }
     const script = await db.getCallTemplateById(newId);
-    res.status(201).json({ success: true, script });
+    const body = { success: true, script };
+    completeCallScriptMutationIdempotency(idempotency, 201, body);
+    res.status(201).json(body);
   } catch (error) {
+    failCallScriptMutationIdempotency(idempotency);
     res
       .status(500)
       .json({ success: false, error: "Failed to clone call script" });
@@ -13077,6 +13220,12 @@ module.exports = {
     verifyAwsWebhookAuth,
     verifyAwsStreamAuth,
     buildStreamAuthToken,
+    buildCallScriptMutationFingerprint,
+    beginCallScriptMutationIdempotency,
+    completeCallScriptMutationIdempotency,
+    failCallScriptMutationIdempotency,
+    applyIdempotencyResponse,
+    resetCallScriptMutationIdempotencyForTests,
   },
 };
 

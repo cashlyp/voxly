@@ -33,6 +33,34 @@ const { attachHmacAuth } = require('../utils/apiAuth');
 
 const CLONE_REQUEST_TTL_MS = 30000;
 const cloneRequestState = new Map();
+const MUTATION_REQUEST_TTL_MS = 15000;
+const mutationRequestState = new Map();
+const SCRIPT_ACTION_PROGRESS_MS = 5000;
+const SCRIPT_ACTION_TIMEOUT_MS = 20000;
+const SCRIPTS_CIRCUIT_FAILURE_THRESHOLD = 3;
+const SCRIPTS_CIRCUIT_OPEN_MS = 30000;
+const SCRIPTS_METRIC_WINDOW_MS = 5 * 60 * 1000;
+const SCRIPTS_ALERT_COOLDOWN_MS = 60 * 1000;
+const scriptsCircuitState = {
+  state: 'closed',
+  consecutiveFailures: 0,
+  openedAt: 0,
+  halfOpenInFlight: false,
+  lastError: null
+};
+const scriptsMetricsState = {
+  windowStart: Date.now(),
+  counts: {
+    total: 0,
+    ok: 0,
+    error: 0,
+    timeout: 0,
+    duplicate_block: 0,
+    circuit_open: 0
+  },
+  actions: {},
+  lastAlertAt: 0
+};
 
 const scriptsApi = axios.create({
   baseURL: config.scriptsApiUrl.replace(/\/+$/, ''),
@@ -42,12 +70,189 @@ const scriptsApi = axios.create({
     'x-admin-token': config.admin.apiToken
   }
 });
+const scriptsApiExecutorState = {
+  request: (requestOptions) => scriptsApi.request(requestOptions)
+};
 
 attachHmacAuth(scriptsApi, {
   secret: config.apiAuth?.hmacSecret,
   allowedOrigins: [new URL(config.scriptsApiUrl).origin],
   defaultBaseUrl: config.scriptsApiUrl
 });
+
+function toPositiveInt(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return Math.round(parsed);
+}
+
+function resetScriptsMetricsWindow(now = Date.now()) {
+  scriptsMetricsState.windowStart = now;
+  scriptsMetricsState.counts = {
+    total: 0,
+    ok: 0,
+    error: 0,
+    timeout: 0,
+    duplicate_block: 0,
+    circuit_open: 0
+  };
+  scriptsMetricsState.actions = {};
+}
+
+function maybeEmitScriptsAlert(now = Date.now()) {
+  const counts = scriptsMetricsState.counts;
+  if (now - scriptsMetricsState.lastAlertAt < SCRIPTS_ALERT_COOLDOWN_MS) {
+    return;
+  }
+  if (counts.total < 5) return;
+  const errorRate = counts.total > 0 ? counts.error / counts.total : 0;
+  const shouldAlert =
+    errorRate >= 0.4 ||
+    counts.timeout >= 3 ||
+    counts.circuit_open >= 2 ||
+    counts.duplicate_block >= 10;
+  if (!shouldAlert) {
+    return;
+  }
+  scriptsMetricsState.lastAlertAt = now;
+  console.warn('[scripts][alert] degraded command health', {
+    window_ms: SCRIPTS_METRIC_WINDOW_MS,
+    counts: { ...counts }
+  });
+}
+
+function recordScriptsMetric(action, status, durationMs = 0, meta = {}) {
+  const now = Date.now();
+  if (now - scriptsMetricsState.windowStart > SCRIPTS_METRIC_WINDOW_MS) {
+    resetScriptsMetricsWindow(now);
+  }
+  const safeAction = String(action || 'unknown').trim();
+  const safeStatus = String(status || 'unknown').trim();
+  scriptsMetricsState.counts.total += 1;
+  if (safeStatus === 'ok') scriptsMetricsState.counts.ok += 1;
+  if (safeStatus === 'error') scriptsMetricsState.counts.error += 1;
+  if (safeStatus === 'timeout') scriptsMetricsState.counts.timeout += 1;
+  if (safeStatus === 'duplicate_block') scriptsMetricsState.counts.duplicate_block += 1;
+  if (safeStatus === 'circuit_open') scriptsMetricsState.counts.circuit_open += 1;
+
+  const actionState = scriptsMetricsState.actions[safeAction] || {
+    count: 0,
+    ok: 0,
+    error: 0,
+    timeout: 0
+  };
+  actionState.count += 1;
+  if (safeStatus === 'ok') actionState.ok += 1;
+  if (safeStatus === 'error') actionState.error += 1;
+  if (safeStatus === 'timeout') actionState.timeout += 1;
+  scriptsMetricsState.actions[safeAction] = actionState;
+
+  if (meta.log) {
+    console.log('[scripts][metric]', {
+      action: safeAction,
+      status: safeStatus,
+      duration_ms: Number.isFinite(durationMs) ? Math.round(durationMs) : null
+    });
+  }
+  maybeEmitScriptsAlert(now);
+}
+
+function shouldTripScriptsCircuit(error) {
+  const code = String(error?.code || '').toUpperCase();
+  if (['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'ENOTFOUND', 'ECONNREFUSED'].includes(code)) {
+    return true;
+  }
+  if (error?.isScriptsApiError && error?.reason === 'non_json_response') {
+    return true;
+  }
+  const status = Number(error?.response?.status || 0);
+  return status >= 500;
+}
+
+function assertScriptsCircuitHealthy() {
+  if (scriptsCircuitState.state !== 'open') return;
+  const now = Date.now();
+  const openMs = toPositiveInt(config?.scripts?.circuitOpenMs, SCRIPTS_CIRCUIT_OPEN_MS);
+  if (now - scriptsCircuitState.openedAt >= openMs) {
+    scriptsCircuitState.state = 'half_open';
+    scriptsCircuitState.halfOpenInFlight = false;
+    return;
+  }
+  const err = new Error('Scripts API circuit is open. Please retry shortly.');
+  err.code = 'scripts_circuit_open';
+  err.isScriptsApiError = true;
+  throw err;
+}
+
+function markScriptsCircuitSuccess() {
+  scriptsCircuitState.state = 'closed';
+  scriptsCircuitState.consecutiveFailures = 0;
+  scriptsCircuitState.openedAt = 0;
+  scriptsCircuitState.halfOpenInFlight = false;
+  scriptsCircuitState.lastError = null;
+}
+
+function markScriptsCircuitFailure(error) {
+  if (!shouldTripScriptsCircuit(error)) return;
+  scriptsCircuitState.consecutiveFailures += 1;
+  scriptsCircuitState.lastError = String(error?.message || 'scripts_api_error');
+  const threshold = toPositiveInt(
+    config?.scripts?.circuitFailureThreshold,
+    SCRIPTS_CIRCUIT_FAILURE_THRESHOLD
+  );
+  if (scriptsCircuitState.state === 'half_open' || scriptsCircuitState.consecutiveFailures >= threshold) {
+    scriptsCircuitState.state = 'open';
+    scriptsCircuitState.openedAt = Date.now();
+    scriptsCircuitState.halfOpenInFlight = false;
+    console.warn('[scripts] circuit opened', {
+      failures: scriptsCircuitState.consecutiveFailures,
+      last_error: scriptsCircuitState.lastError
+    });
+  }
+}
+
+async function runWithActionWatchdog(ctx, actionLabel, actionName, operation) {
+  const progressMs = toPositiveInt(config?.scripts?.actionProgressMs, SCRIPT_ACTION_PROGRESS_MS);
+  const timeoutMs = toPositiveInt(config?.scripts?.actionTimeoutMs, SCRIPT_ACTION_TIMEOUT_MS);
+  const startedAt = Date.now();
+  let progressTimer = null;
+  let timeoutTimer = null;
+  let completed = false;
+
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutTimer = setTimeout(() => {
+      if (completed) return;
+      const err = new Error(`${actionLabel} timed out`);
+      err.code = 'script_action_timeout';
+      reject(err);
+    }, timeoutMs);
+  });
+
+  progressTimer = setTimeout(() => {
+    if (completed) return;
+    ctx.reply(`⏳ ${actionLabel} is taking longer than expected...`).catch(() => {});
+  }, progressMs);
+
+  try {
+    const result = await Promise.race([operation(), timeoutPromise]);
+    completed = true;
+    recordScriptsMetric(actionName, 'ok', Date.now() - startedAt);
+    return result;
+  } catch (error) {
+    completed = true;
+    if (error?.code === 'script_action_timeout') {
+      recordScriptsMetric(actionName, 'timeout', Date.now() - startedAt);
+    } else {
+      recordScriptsMetric(actionName, 'error', Date.now() - startedAt);
+    }
+    throw error;
+  } finally {
+    if (progressTimer) clearTimeout(progressTimer);
+    if (timeoutTimer) clearTimeout(timeoutTimer);
+  }
+}
 
 function styledNotice(ctx, title, lines) {
   const content = Array.isArray(lines) ? lines : [lines];
@@ -76,10 +281,30 @@ async function scriptsApiRequest(options) {
   const endpoint = `${method} ${options.url}`;
   const { retry, ...requestOptions } = options || {};
   const retryOptions = retry !== undefined ? retry : (method === 'GET' ? {} : { retries: 0 });
+  const startedAt = Date.now();
   try {
-    const response = await withRetry(() => scriptsApi.request(requestOptions), retryOptions || {});
+    assertScriptsCircuitHealthy();
+  } catch (circuitError) {
+    recordScriptsMetric(endpoint, 'circuit_open', 0);
+    throw circuitError;
+  }
+  const halfOpenRequest = scriptsCircuitState.state === 'half_open';
+  if (halfOpenRequest && scriptsCircuitState.halfOpenInFlight) {
+    const err = new Error('Scripts API circuit is probing recovery. Please retry shortly.');
+    err.code = 'scripts_circuit_open';
+    err.isScriptsApiError = true;
+    recordScriptsMetric(endpoint, 'circuit_open', 0);
+    throw err;
+  }
+  if (halfOpenRequest) {
+    scriptsCircuitState.halfOpenInFlight = true;
+  }
+  try {
+    const response = await withRetry(() => scriptsApiExecutorState.request(requestOptions), retryOptions || {});
     const status = Number(response?.status || 0);
     if (status === 204 || status === 205) {
+      markScriptsCircuitSuccess();
+      recordScriptsMetric(endpoint, 'ok', Date.now() - startedAt);
       return { success: true };
     }
     const contentType = response.headers?.['content-type'] || '';
@@ -88,6 +313,8 @@ async function scriptsApiRequest(options) {
       response.data === null ||
       response.data === '';
     if (!contentType.includes('application/json') && isEmptyBody) {
+      markScriptsCircuitSuccess();
+      recordScriptsMetric(endpoint, 'ok', Date.now() - startedAt);
       return { success: true };
     }
     if (!contentType.includes('application/json')) {
@@ -103,8 +330,18 @@ async function scriptsApiRequest(options) {
       apiError.endpoint = endpoint;
       throw apiError;
     }
+    markScriptsCircuitSuccess();
+    recordScriptsMetric(endpoint, 'ok', Date.now() - startedAt);
     return response.data;
   } catch (error) {
+    if (error?.code === 'scripts_circuit_open') {
+      throw error;
+    }
+    markScriptsCircuitFailure(error);
+    const status = Number(error?.response?.status || 0);
+    const isTimeout = error?.code === 'ECONNABORTED' || /timeout/i.test(String(error?.message || ''));
+    const metricStatus = isTimeout ? 'timeout' : (status >= 500 || shouldTripScriptsCircuit(error) ? 'error' : 'error');
+    recordScriptsMetric(endpoint, metricStatus, Date.now() - startedAt);
     if (error.response) {
       const contentType = error.response.headers?.['content-type'] || '';
       if (!contentType.includes('application/json')) {
@@ -113,11 +350,21 @@ async function scriptsApiRequest(options) {
     }
     error.scriptsApi = { endpoint };
     throw error;
+  } finally {
+    if (halfOpenRequest) {
+      scriptsCircuitState.halfOpenInFlight = false;
+    }
   }
 }
 
 function formatScriptsApiError(error, action) {
   const baseHelp = `Ensure the scripts service is reachable at ${config.scriptsApiUrl} or update SCRIPTS_API_URL.`;
+  if (error?.code === 'scripts_circuit_open') {
+    return `⚠️ ${action}: Scripts API is temporarily paused after repeated failures. Please retry in 30 seconds.`;
+  }
+  if (error?.code === 'script_action_timeout') {
+    return `❌ ${action}: Operation timed out. Please retry.`;
+  }
   if (error?.code === 'ECONNABORTED' || /timeout/i.test(String(error?.message || ''))) {
     return `❌ ${action}: Scripts API timed out. ${baseHelp}`;
   }
@@ -303,9 +550,11 @@ function beginCloneRequest(ctx, scriptId, name) {
   const now = Date.now();
   const existing = cloneRequestState.get(key);
   if (existing && existing.status === 'pending') {
+    recordScriptsMetric('clone_gate', 'duplicate_block', 0);
     return { allowed: false, key, reason: 'pending' };
   }
   if (existing && existing.status === 'done' && now - existing.timestamp < CLONE_REQUEST_TTL_MS) {
+    recordScriptsMetric('clone_gate', 'duplicate_block', 0);
     return { allowed: false, key, reason: 'recent' };
   }
   cloneRequestState.set(key, { status: 'pending', timestamp: now });
@@ -315,6 +564,62 @@ function beginCloneRequest(ctx, scriptId, name) {
 function finishCloneRequest(key, status = 'done') {
   if (!key) return;
   cloneRequestState.set(key, { status, timestamp: Date.now() });
+}
+
+function pruneMutationRequestState() {
+  const now = Date.now();
+  for (const [key, entry] of mutationRequestState.entries()) {
+    const age = now - Number(entry?.timestamp || 0);
+    if (!entry || age > MUTATION_REQUEST_TTL_MS) {
+      mutationRequestState.delete(key);
+    }
+  }
+}
+
+function buildMutationRequestKey(ctx, action, target = '') {
+  const userId = String(ctx?.from?.id || 'unknown');
+  const safeAction = String(action || 'unknown').trim().toLowerCase();
+  const safeTarget = String(target || '').trim().toLowerCase();
+  return `mut:${userId}:${safeAction}:${safeTarget}`;
+}
+
+function beginMutationRequest(ctx, action, target) {
+  pruneMutationRequestState();
+  const key = buildMutationRequestKey(ctx, action, target);
+  const now = Date.now();
+  const existing = mutationRequestState.get(key);
+  if (existing && existing.status === 'pending') {
+    recordScriptsMetric(action, 'duplicate_block', 0);
+    return { allowed: false, key, reason: 'pending' };
+  }
+  if (existing && existing.status === 'done' && now - existing.timestamp < MUTATION_REQUEST_TTL_MS) {
+    recordScriptsMetric(action, 'duplicate_block', 0);
+    return { allowed: false, key, reason: 'recent' };
+  }
+  mutationRequestState.set(key, { status: 'pending', timestamp: now });
+  return { allowed: true, key };
+}
+
+function finishMutationRequest(key, status = 'done') {
+  if (!key) return;
+  mutationRequestState.set(key, { status, timestamp: Date.now() });
+}
+
+function logScriptsError(context, error) {
+  const endpoint = error?.scriptsApi?.endpoint || `${error?.config?.method || 'GET'} ${error?.config?.url || ''}`.trim();
+  const status = error?.response?.status || null;
+  const code = error?.response?.data?.code || error?.code || null;
+  const message =
+    error?.response?.data?.error ||
+    error?.response?.data?.message ||
+    error?.message ||
+    'Unknown error';
+  console.error(`[scripts] ${context}`, {
+    endpoint,
+    status,
+    code,
+    message
+  });
 }
 
 async function promptText(
@@ -853,18 +1158,47 @@ async function clearInboundDefaultScript() {
   return data;
 }
 
-async function createCallScript(payload) {
-  const data = await scriptsApiRequest({ method: 'post', url: '/api/call-scripts', data: payload });
+async function createCallScript(payload, options = {}) {
+  const headers = {};
+  const idempotencyKey = String(options.idempotencyKey || '').trim();
+  if (idempotencyKey) {
+    headers['Idempotency-Key'] = idempotencyKey;
+  }
+  const data = await scriptsApiRequest({
+    method: 'post',
+    url: '/api/call-scripts',
+    data: payload,
+    headers: Object.keys(headers).length ? headers : undefined
+  });
   return data.script;
 }
 
-async function updateCallScript(id, payload) {
-  const data = await scriptsApiRequest({ method: 'put', url: `/api/call-scripts/${id}`, data: payload });
+async function updateCallScript(id, payload, options = {}) {
+  const headers = {};
+  const idempotencyKey = String(options.idempotencyKey || '').trim();
+  if (idempotencyKey) {
+    headers['Idempotency-Key'] = idempotencyKey;
+  }
+  const data = await scriptsApiRequest({
+    method: 'put',
+    url: `/api/call-scripts/${id}`,
+    data: payload,
+    headers: Object.keys(headers).length ? headers : undefined
+  });
   return data.script;
 }
 
-async function deleteCallScript(id) {
-  await scriptsApiRequest({ method: 'delete', url: `/api/call-scripts/${id}` });
+async function deleteCallScript(id, options = {}) {
+  const headers = {};
+  const idempotencyKey = String(options.idempotencyKey || '').trim();
+  if (idempotencyKey) {
+    headers['Idempotency-Key'] = idempotencyKey;
+  }
+  await scriptsApiRequest({
+    method: 'delete',
+    url: `/api/call-scripts/${id}`,
+    headers: Object.keys(headers).length ? headers : undefined
+  });
 }
 
 async function cloneCallScript(id, payload, options = {}) {
@@ -1001,10 +1335,15 @@ async function previewCallScript(conversation, ctx, script, ensureActive) {
   }
 
   try {
-    await httpClient.post(null, `${config.apiUrl}/outbound-call`, payload, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 30000
-    });
+    await runWithActionWatchdog(
+      ctx,
+      'Launching preview call',
+      'call_preview',
+      () => httpClient.post(null, `${config.apiUrl}/outbound-call`, payload, {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 30000
+      })
+    );
 
     await ctx.reply('✅ Preview call launched! You should receive a call shortly.');
   } catch (error) {
@@ -1101,31 +1440,57 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
   }
 
   try {
+    const mutationGate = beginMutationRequest(ctx, 'call:create', name);
+    if (!mutationGate.allowed) {
+      await ctx.reply('⚠️ Script creation is already processing or just completed. Please wait a moment.');
+      return;
+    }
+
     const apiPayload = { ...scriptPayload };
     delete apiPayload.capture_group;
-    const script = await createCallScript(apiPayload);
-    const needsCaptureUpdate = scriptPayload.requires_otp
-      || scriptPayload.default_profile
-      || scriptPayload.expected_length
-      || scriptPayload.allow_terminator
-      || scriptPayload.terminator_char;
-    if (needsCaptureUpdate) {
-      try {
-        await updateCallScript(script.id, stripUndefined({
-          requires_otp: scriptPayload.requires_otp,
-          default_profile: scriptPayload.default_profile,
-          expected_length: scriptPayload.expected_length,
-          allow_terminator: scriptPayload.allow_terminator,
-          terminator_char: scriptPayload.terminator_char
-        }));
-      } catch (updateError) {
-        console.warn('Capture settings update failed:', updateError.message);
+    try {
+      const opId = getCurrentOpId(ctx) || `user_${ctx?.from?.id || 'unknown'}`;
+      const createIdempotencyKey = `create_call_script_${name}_${opId}`.slice(0, 96);
+      const script = await runWithActionWatchdog(
+        ctx,
+        'Creating call script',
+        'call_create',
+        () => createCallScript(apiPayload, { idempotencyKey: createIdempotencyKey })
+      );
+      const needsCaptureUpdate = scriptPayload.requires_otp
+        || scriptPayload.default_profile
+        || scriptPayload.expected_length
+        || scriptPayload.allow_terminator
+        || scriptPayload.terminator_char;
+      if (needsCaptureUpdate) {
+        try {
+          await runWithActionWatchdog(
+            ctx,
+            'Applying digit capture settings',
+            'call_update_capture',
+            () => updateCallScript(script.id, stripUndefined({
+              requires_otp: scriptPayload.requires_otp,
+              default_profile: scriptPayload.default_profile,
+              expected_length: scriptPayload.expected_length,
+              allow_terminator: scriptPayload.allow_terminator,
+              terminator_char: scriptPayload.terminator_char
+            }), {
+              idempotencyKey: `update_call_script_capture_${script.id}_${opId}`.slice(0, 96)
+            })
+          );
+        } catch (updateError) {
+          console.warn('Capture settings update failed:', updateError.message);
+        }
       }
+      finishMutationRequest(mutationGate.key, 'done');
+      await storeScriptVersionSnapshot({ ...script, ...scriptPayload }, 'call', ctx);
+      await ctx.reply(`✅ Script *${escapeMarkdown(script.name)}* created successfully!`, { parse_mode: 'Markdown' });
+    } catch (error) {
+      finishMutationRequest(mutationGate.key, 'failed');
+      throw error;
     }
-    await storeScriptVersionSnapshot({ ...script, ...scriptPayload }, 'call', ctx);
-    await ctx.reply(`✅ Script *${escapeMarkdown(script.name)}* created successfully!`, { parse_mode: 'Markdown' });
   } catch (error) {
-    console.error('Failed to create script:', error);
+    logScriptsError('Failed to create script', error);
     await ctx.reply(formatScriptsApiError(error, 'Failed to create script'));
   }
 }
@@ -1239,13 +1604,32 @@ async function editCallScriptFlow(conversation, ctx, script, ensureActive) {
   }
 
   try {
+    const mutationGate = beginMutationRequest(ctx, 'call:update', script.id);
+    if (!mutationGate.allowed) {
+      await ctx.reply('⚠️ Script update is already processing or just completed. Please wait a moment.');
+      return;
+    }
+
     await storeScriptVersionSnapshot(script, 'call', ctx);
-    const apiUpdates = stripUndefined({ ...updates });
-    delete apiUpdates.capture_group;
-    const updated = await updateCallScript(script.id, apiUpdates);
-    await ctx.reply(`✅ Script *${escapeMarkdown(updated.name)}* updated.`, { parse_mode: 'Markdown' });
+    try {
+      const opId = getCurrentOpId(ctx) || `user_${ctx?.from?.id || 'unknown'}`;
+      const idempotencyKey = `update_call_script_${script.id}_${opId}`.slice(0, 96);
+      const apiUpdates = stripUndefined({ ...updates });
+      delete apiUpdates.capture_group;
+      const updated = await runWithActionWatchdog(
+        ctx,
+        'Updating call script',
+        'call_update',
+        () => updateCallScript(script.id, apiUpdates, { idempotencyKey })
+      );
+      finishMutationRequest(mutationGate.key, 'done');
+      await ctx.reply(`✅ Script *${escapeMarkdown(updated.name)}* updated.`, { parse_mode: 'Markdown' });
+    } catch (error) {
+      finishMutationRequest(mutationGate.key, 'failed');
+      throw error;
+    }
   } catch (error) {
-    console.error('Failed to update script:', error);
+    logScriptsError('Failed to update script', error);
     await ctx.reply(formatScriptsApiError(error, 'Failed to update script'));
   }
 }
@@ -1297,17 +1681,22 @@ async function cloneCallScriptFlow(conversation, ctx, script, ensureActive) {
     const opId = getCurrentOpId(ctx) || `user_${ctx?.from?.id || 'unknown'}`;
     const normalizedName = name.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48) || 'script';
     const idempotencyKey = `clone_call_script_${script.id}_${opId}_${normalizedName}`;
-    const cloned = await cloneCallScript(script.id, {
-      name,
-      description: description === undefined ? script.description : (description.length ? description : null)
-    }, {
-      idempotencyKey
-    });
+    const cloned = await runWithActionWatchdog(
+      ctx,
+      'Cloning call script',
+      'call_clone',
+      () => cloneCallScript(script.id, {
+        name,
+        description: description === undefined ? script.description : (description.length ? description : null)
+      }, {
+        idempotencyKey
+      })
+    );
     finishCloneRequest(cloneGate.key, 'done');
     await ctx.reply(`✅ Script cloned as *${escapeMarkdown(cloned.name)}*.`, { parse_mode: 'Markdown' });
   } catch (error) {
     finishCloneRequest(cloneGate.key, 'failed');
-    console.error('Failed to clone script:', error?.message || error);
+    logScriptsError('Failed to clone script', error);
     await ctx.reply(formatScriptsApiError(error, 'Failed to clone script'));
   }
 }
@@ -1328,11 +1717,29 @@ async function deleteCallScriptFlow(conversation, ctx, script, ensureActive) {
   }
 
   try {
+    const mutationGate = beginMutationRequest(ctx, 'call:delete', script.id);
+    if (!mutationGate.allowed) {
+      await ctx.reply('⚠️ Script deletion is already processing or just completed. Please wait a moment.');
+      return;
+    }
     await storeScriptVersionSnapshot(script, 'call', ctx);
-    await deleteCallScript(script.id);
-    await ctx.reply(`🗑️ Script *${escapeMarkdown(script.name)}* deleted.`, { parse_mode: 'Markdown' });
+    try {
+      const opId = getCurrentOpId(ctx) || `user_${ctx?.from?.id || 'unknown'}`;
+      const idempotencyKey = `delete_call_script_${script.id}_${opId}`.slice(0, 96);
+      await runWithActionWatchdog(
+        ctx,
+        'Deleting call script',
+        'call_delete',
+        () => deleteCallScript(script.id, { idempotencyKey })
+      );
+      finishMutationRequest(mutationGate.key, 'done');
+      await ctx.reply(`🗑️ Script *${escapeMarkdown(script.name)}* deleted.`, { parse_mode: 'Markdown' });
+    } catch (error) {
+      finishMutationRequest(mutationGate.key, 'failed');
+      throw error;
+    }
   } catch (error) {
-    console.error('Failed to delete script:', error);
+    logScriptsError('Failed to delete script', error);
     await ctx.reply(formatScriptsApiError(error, 'Failed to delete script'));
   }
 }
@@ -1384,10 +1791,17 @@ async function showCallScriptVersions(conversation, ctx, script, ensureActive) {
     await storeScriptVersionSnapshot(script, 'call', ctx);
     const payload = stripUndefined({ ...version.payload });
     delete payload.capture_group;
-    const updated = await updateCallScript(script.id, payload);
+    const opId = getCurrentOpId(ctx) || `user_${ctx?.from?.id || 'unknown'}`;
+    const idempotencyKey = `restore_call_script_${script.id}_v${versionNumber}_${opId}`.slice(0, 96);
+    const updated = await runWithActionWatchdog(
+      ctx,
+      'Restoring call script version',
+      'call_restore_version',
+      () => updateCallScript(script.id, payload, { idempotencyKey })
+    );
     await ctx.reply(`✅ Script restored to v${versionNumber} (${escapeMarkdown(updated.name)}).`, { parse_mode: 'Markdown' });
   } catch (error) {
-    console.error('Version restore failed:', error);
+    logScriptsError('Version restore failed', error);
     await ctx.reply(`❌ Failed to restore version: ${error.message}`);
   }
 }
@@ -1425,7 +1839,7 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
         try {
           script = await fetchCallScriptById(script.id);
         } catch (error) {
-          console.error('Failed to refresh call script after edit:', error);
+          logScriptsError('Failed to refresh call script after edit', error);
           await ctx.reply(formatScriptsApiError(error, 'Failed to refresh script details'));
           viewing = false;
         }
@@ -1523,11 +1937,11 @@ async function listCallScriptsFlow(conversation, ctx, ensureActive) {
 
       await showCallScriptDetail(conversation, ctx, script, safeEnsureActive);
     } catch (error) {
-      console.error('Failed to load call script details:', error);
+      logScriptsError('Failed to load call script details', error);
       await ctx.reply(formatScriptsApiError(error, 'Failed to load script details'));
     }
   } catch (error) {
-    console.error('Failed to list scripts:', error);
+    logScriptsError('Failed to list scripts', error);
     await ctx.reply(formatScriptsApiError(error, 'Failed to list call scripts'));
   }
 }
@@ -1543,7 +1957,7 @@ async function inboundDefaultScriptMenu(conversation, ctx, ensureActive) {
       current = await fetchInboundDefaultScript();
       safeEnsureActive();
     } catch (error) {
-      console.error('Failed to fetch inbound default script:', error);
+      logScriptsError('Failed to fetch inbound default script', error);
       await ctx.reply(formatScriptsApiError(error, 'Failed to load inbound default script'));
       return;
     }
@@ -1574,7 +1988,7 @@ async function inboundDefaultScriptMenu(conversation, ctx, ensureActive) {
           scripts = await fetchCallScripts();
           safeEnsureActive();
         } catch (error) {
-          console.error('Failed to fetch call scripts:', error);
+          logScriptsError('Failed to fetch call scripts', error);
           await ctx.reply(formatScriptsApiError(error, 'Failed to load call scripts'));
           break;
         }
@@ -1609,22 +2023,32 @@ async function inboundDefaultScriptMenu(conversation, ctx, ensureActive) {
         }
 
         try {
-          const result = await setInboundDefaultScript(scriptId);
+          const result = await runWithActionWatchdog(
+            ctx,
+            'Updating inbound default script',
+            'call_inbound_default_set',
+            () => setInboundDefaultScript(scriptId)
+          );
           safeEnsureActive();
           await ctx.reply(`✅ Inbound default set to ${result?.script?.name || 'selected script'}.`);
         } catch (error) {
-          console.error('Failed to set inbound default script:', error);
+          logScriptsError('Failed to set inbound default script', error);
           await ctx.reply(formatScriptsApiError(error, 'Failed to set inbound default script'));
         }
         break;
       }
       case 'clear':
         try {
-          await clearInboundDefaultScript();
+          await runWithActionWatchdog(
+            ctx,
+            'Clearing inbound default script',
+            'call_inbound_default_clear',
+            () => clearInboundDefaultScript()
+          );
           safeEnsureActive();
           await ctx.reply('✅ Inbound default reverted to built-in settings.');
         } catch (error) {
-          console.error('Failed to clear inbound default script:', error);
+          logScriptsError('Failed to clear inbound default script', error);
           await ctx.reply(formatScriptsApiError(error, 'Failed to clear inbound default script'));
         }
         break;
@@ -1753,18 +2177,47 @@ async function fetchSmsScriptByName(name, { detailed = true } = {}) {
   return script;
 }
 
-async function createSmsScript(payload) {
-  const data = await scriptsApiRequest({ method: 'post', url: '/api/sms/scripts', data: payload });
+async function createSmsScript(payload, options = {}) {
+  const headers = {};
+  const idempotencyKey = String(options.idempotencyKey || '').trim();
+  if (idempotencyKey) {
+    headers['Idempotency-Key'] = idempotencyKey;
+  }
+  const data = await scriptsApiRequest({
+    method: 'post',
+    url: '/api/sms/scripts',
+    data: payload,
+    headers: Object.keys(headers).length ? headers : undefined
+  });
   return data.script;
 }
 
-async function updateSmsScript(name, payload) {
-  const data = await scriptsApiRequest({ method: 'put', url: `/api/sms/scripts/${encodeURIComponent(name)}`, data: payload });
+async function updateSmsScript(name, payload, options = {}) {
+  const headers = {};
+  const idempotencyKey = String(options.idempotencyKey || '').trim();
+  if (idempotencyKey) {
+    headers['Idempotency-Key'] = idempotencyKey;
+  }
+  const data = await scriptsApiRequest({
+    method: 'put',
+    url: `/api/sms/scripts/${encodeURIComponent(name)}`,
+    data: payload,
+    headers: Object.keys(headers).length ? headers : undefined
+  });
   return data.script;
 }
 
-async function deleteSmsScript(name) {
-  await scriptsApiRequest({ method: 'delete', url: `/api/sms/scripts/${encodeURIComponent(name)}` });
+async function deleteSmsScript(name, options = {}) {
+  const headers = {};
+  const idempotencyKey = String(options.idempotencyKey || '').trim();
+  if (idempotencyKey) {
+    headers['Idempotency-Key'] = idempotencyKey;
+  }
+  await scriptsApiRequest({
+    method: 'delete',
+    url: `/api/sms/scripts/${encodeURIComponent(name)}`,
+    headers: Object.keys(headers).length ? headers : undefined
+  });
 }
 
 async function requestSmsScriptPreview(name, payload) {
@@ -1885,11 +2338,29 @@ async function createSmsScriptFlow(conversation, ctx) {
   };
 
   try {
-    const script = await createSmsScript(payload);
-    await storeScriptVersionSnapshot(script, 'sms', ctx);
-    await ctx.reply(`✅ SMS script *${escapeMarkdown(script.name)}* created.`, { parse_mode: 'Markdown' });
+    const mutationGate = beginMutationRequest(ctx, 'sms:create', name);
+    if (!mutationGate.allowed) {
+      await ctx.reply('⚠️ SMS script creation is already processing or just completed. Please wait a moment.');
+      return;
+    }
+    try {
+      const opId = getCurrentOpId(ctx) || `user_${ctx?.from?.id || 'unknown'}`;
+      const idempotencyKey = `create_sms_script_${name}_${opId}`.slice(0, 96);
+      const script = await runWithActionWatchdog(
+        ctx,
+        'Creating SMS script',
+        'sms_create',
+        () => createSmsScript(payload, { idempotencyKey })
+      );
+      finishMutationRequest(mutationGate.key, 'done');
+      await storeScriptVersionSnapshot(script, 'sms', ctx);
+      await ctx.reply(`✅ SMS script *${escapeMarkdown(script.name)}* created.`, { parse_mode: 'Markdown' });
+    } catch (error) {
+      finishMutationRequest(mutationGate.key, 'failed');
+      throw error;
+    }
   } catch (error) {
-    console.error('Failed to create SMS script:', error);
+    logScriptsError('Failed to create SMS script', error);
     await ctx.reply(formatScriptsApiError(error, 'Failed to create SMS script'));
   }
 }
@@ -1962,11 +2433,29 @@ async function editSmsScriptFlow(conversation, ctx, script) {
   }
 
   try {
+    const mutationGate = beginMutationRequest(ctx, 'sms:update', script.name);
+    if (!mutationGate.allowed) {
+      await ctx.reply('⚠️ SMS script update is already processing or just completed. Please wait a moment.');
+      return;
+    }
     await storeScriptVersionSnapshot(script, 'sms', ctx);
-    const updated = await updateSmsScript(script.name, stripUndefined(updates));
-    await ctx.reply(`✅ SMS script *${escapeMarkdown(updated.name)}* updated.`, { parse_mode: 'Markdown' });
+    try {
+      const opId = getCurrentOpId(ctx) || `user_${ctx?.from?.id || 'unknown'}`;
+      const idempotencyKey = `update_sms_script_${script.name}_${opId}`.slice(0, 96);
+      const updated = await runWithActionWatchdog(
+        ctx,
+        'Updating SMS script',
+        'sms_update',
+        () => updateSmsScript(script.name, stripUndefined(updates), { idempotencyKey })
+      );
+      finishMutationRequest(mutationGate.key, 'done');
+      await ctx.reply(`✅ SMS script *${escapeMarkdown(updated.name)}* updated.`, { parse_mode: 'Markdown' });
+    } catch (error) {
+      finishMutationRequest(mutationGate.key, 'failed');
+      throw error;
+    }
   } catch (error) {
-    console.error('Failed to update SMS script:', error);
+    logScriptsError('Failed to update SMS script', error);
     await ctx.reply(formatScriptsApiError(error, 'Failed to update SMS script'));
   }
 }
@@ -2011,11 +2500,26 @@ async function cloneSmsScriptFlow(conversation, ctx, script) {
     created_by: ctx.from.id.toString()
   };
 
+  const cloneGate = beginCloneRequest(ctx, script.name, name);
+  if (!cloneGate.allowed) {
+    await ctx.reply('⚠️ Clone already in progress or just completed. Please wait a moment before trying again.');
+    return;
+  }
+
   try {
-    const cloned = await createSmsScript(payload);
+    const opId = getCurrentOpId(ctx) || `user_${ctx?.from?.id || 'unknown'}`;
+    const idempotencyKey = `clone_sms_script_${script.name}_${name}_${opId}`.slice(0, 96);
+    const cloned = await runWithActionWatchdog(
+      ctx,
+      'Cloning SMS script',
+      'sms_clone',
+      () => createSmsScript(payload, { idempotencyKey })
+    );
+    finishCloneRequest(cloneGate.key, 'done');
     await ctx.reply(`✅ Script cloned as *${escapeMarkdown(cloned.name)}*.`, { parse_mode: 'Markdown' });
   } catch (error) {
-    console.error('Failed to clone SMS script:', error);
+    finishCloneRequest(cloneGate.key, 'failed');
+    logScriptsError('Failed to clone SMS script', error);
     await ctx.reply(formatScriptsApiError(error, 'Failed to clone SMS script'));
   }
 }
@@ -2033,11 +2537,29 @@ async function deleteSmsScriptFlow(conversation, ctx, script) {
   }
 
   try {
+    const mutationGate = beginMutationRequest(ctx, 'sms:delete', script.name);
+    if (!mutationGate.allowed) {
+      await ctx.reply('⚠️ SMS script deletion is already processing or just completed. Please wait a moment.');
+      return;
+    }
     await storeScriptVersionSnapshot(script, 'sms', ctx);
-    await deleteSmsScript(script.name);
-    await ctx.reply(`🗑️ Script *${escapeMarkdown(script.name)}* deleted.`, { parse_mode: 'Markdown' });
+    try {
+      const opId = getCurrentOpId(ctx) || `user_${ctx?.from?.id || 'unknown'}`;
+      const idempotencyKey = `delete_sms_script_${script.name}_${opId}`.slice(0, 96);
+      await runWithActionWatchdog(
+        ctx,
+        'Deleting SMS script',
+        'sms_delete',
+        () => deleteSmsScript(script.name, { idempotencyKey })
+      );
+      finishMutationRequest(mutationGate.key, 'done');
+      await ctx.reply(`🗑️ Script *${escapeMarkdown(script.name)}* deleted.`, { parse_mode: 'Markdown' });
+    } catch (error) {
+      finishMutationRequest(mutationGate.key, 'failed');
+      throw error;
+    }
   } catch (error) {
-    console.error('Failed to delete SMS script:', error);
+    logScriptsError('Failed to delete SMS script', error);
     await ctx.reply(formatScriptsApiError(error, 'Failed to delete SMS script'));
   }
 }
@@ -2082,13 +2604,18 @@ async function showSmsScriptVersions(conversation, ctx, script) {
       return;
     }
     await storeScriptVersionSnapshot(script, 'sms', ctx);
-    const updated = await updateSmsScript(script.name, stripUndefined(version.payload));
+    const updated = await runWithActionWatchdog(
+      ctx,
+      'Restoring SMS script version',
+      'sms_restore_version',
+      () => updateSmsScript(script.name, stripUndefined(version.payload))
+    );
     await ctx.reply(`✅ SMS script restored to v${versionNumber}.`, { parse_mode: 'Markdown' });
     try {
       script = await fetchSmsScriptByName(script.name, { detailed: true });
     } catch (_) {}
   } catch (error) {
-    console.error('SMS version restore failed:', error);
+    logScriptsError('SMS version restore failed', error);
     await ctx.reply(`❌ Failed to restore version: ${error.message}`);
   }
 }
@@ -2137,7 +2664,12 @@ async function previewSmsScript(conversation, ctx, script) {
   }
 
   try {
-    const preview = await requestSmsScriptPreview(script.name, payload);
+    const preview = await runWithActionWatchdog(
+      ctx,
+      'Sending SMS preview',
+      'sms_preview',
+      () => requestSmsScriptPreview(script.name, payload)
+    );
     const previewContent = String(preview?.content || '');
     const snippet = previewContent.substring(0, 200);
     const messageSid = preview?.message_sid || preview?.messageSid || 'n/a';
@@ -2147,7 +2679,7 @@ async function previewSmsScript(conversation, ctx, script) {
       { parse_mode: 'Markdown' }
     );
   } catch (error) {
-    console.error('Failed to send SMS preview:', error);
+    logScriptsError('Failed to send SMS preview', error);
     await ctx.reply(formatScriptsApiError(error, 'Failed to send SMS preview'));
   }
 }
@@ -2188,7 +2720,7 @@ async function showSmsScriptDetail(conversation, ctx, script) {
         try {
           script = await fetchSmsScriptByName(script.name, { detailed: true });
         } catch (error) {
-          console.error('Failed to refresh SMS script after edit:', error);
+          logScriptsError('Failed to refresh SMS script after edit', error);
           await ctx.reply(formatScriptsApiError(error, 'Failed to refresh script details'));
           viewing = false;
         }
@@ -2274,11 +2806,11 @@ async function listSmsScriptsFlow(conversation, ctx) {
 
       await showSmsScriptDetail(conversation, ctx, script);
     } catch (error) {
-      console.error('Failed to load SMS script details:', error);
+      logScriptsError('Failed to load SMS script details', error);
       await ctx.reply(formatScriptsApiError(error, 'Failed to load script details'));
     }
   } catch (error) {
-    console.error('Failed to list SMS scripts:', error);
+    logScriptsError('Failed to list SMS scripts', error);
     await ctx.reply(formatScriptsApiError(error, 'Failed to list SMS scripts'));
   }
 }
@@ -2392,6 +2924,42 @@ async function scriptsFlow(conversation, ctx) {
   }
 }
 
+function resetScriptsRuntimeStateForTests() {
+  cloneRequestState.clear();
+  mutationRequestState.clear();
+  scriptsCircuitState.state = 'closed';
+  scriptsCircuitState.consecutiveFailures = 0;
+  scriptsCircuitState.openedAt = 0;
+  scriptsCircuitState.halfOpenInFlight = false;
+  scriptsCircuitState.lastError = null;
+  resetScriptsMetricsWindow(Date.now());
+  scriptsMetricsState.lastAlertAt = 0;
+  scriptsApiExecutorState.request = (requestOptions) => scriptsApi.request(requestOptions);
+}
+
+function setScriptsApiExecutorForTests(executor) {
+  if (typeof executor === 'function') {
+    scriptsApiExecutorState.request = executor;
+    return;
+  }
+  scriptsApiExecutorState.request = (requestOptions) => scriptsApi.request(requestOptions);
+}
+
+function getScriptsCircuitSnapshot() {
+  return {
+    ...scriptsCircuitState
+  };
+}
+
+function getScriptsMetricsSnapshot() {
+  return {
+    windowStart: scriptsMetricsState.windowStart,
+    counts: { ...scriptsMetricsState.counts },
+    actions: { ...scriptsMetricsState.actions },
+    lastAlertAt: scriptsMetricsState.lastAlertAt
+  };
+}
+
 function registerScriptsCommand(bot) {
   bot.command('scripts', async (ctx) => {
     const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
@@ -2415,5 +2983,19 @@ function registerScriptsCommand(bot) {
 
 module.exports = {
   scriptsFlow,
-  registerScriptsCommand
+  registerScriptsCommand,
+  __testables: {
+    scriptsApiRequest,
+    formatScriptsApiError,
+    nonJsonResponseError,
+    beginCloneRequest,
+    finishCloneRequest,
+    beginMutationRequest,
+    finishMutationRequest,
+    runWithActionWatchdog,
+    resetScriptsRuntimeStateForTests,
+    setScriptsApiExecutorForTests,
+    getScriptsCircuitSnapshot,
+    getScriptsMetricsSnapshot
+  }
 };
