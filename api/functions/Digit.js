@@ -4065,11 +4065,12 @@ function createDigitCollectionService(options = {}) {
     if (expectation?.allow_terminator) {
       gatherOptions.finishOnKey = expectation?.terminator_char || '#';
     }
+    const allowSayFallback = options?.allowSayFallback === true;
     const sayOptions = options?.sayOptions && typeof options.sayOptions === 'object'
       ? options.sayOptions
       : null;
     const sayWithOptions = (node, text) => {
-      if (!text) return;
+      if (!text || !allowSayFallback) return;
       if (sayOptions) {
         node.say(sayOptions, text);
       } else {
@@ -4120,17 +4121,43 @@ function createDigitCollectionService(options = {}) {
       if (typeof getTwilioTtsAudioUrl === 'function') {
         try {
           if (!resolvedOptions.promptUrl && resolvedOptions.prompt) {
-            resolvedOptions.promptUrl = await getTwilioTtsAudioUrl(resolvedOptions.prompt, callConfig);
+            resolvedOptions.promptUrl = await getTwilioTtsAudioUrl(
+              resolvedOptions.prompt,
+              callConfig,
+              { forceGenerate: true }
+            );
           }
           if (!resolvedOptions.preambleUrl && resolvedOptions.preamble) {
-            resolvedOptions.preambleUrl = await getTwilioTtsAudioUrl(resolvedOptions.preamble, callConfig);
+            resolvedOptions.preambleUrl = await getTwilioTtsAudioUrl(
+              resolvedOptions.preamble,
+              callConfig,
+              { forceGenerate: true }
+            );
           }
           if (!resolvedOptions.followupUrl && resolvedOptions.followup) {
-            resolvedOptions.followupUrl = await getTwilioTtsAudioUrl(resolvedOptions.followup, callConfig);
+            resolvedOptions.followupUrl = await getTwilioTtsAudioUrl(
+              resolvedOptions.followup,
+              callConfig,
+              { forceGenerate: true }
+            );
           }
         } catch (ttsErr) {
           logDigitMetric('twilio_gather_tts_fallback', { callSid, error: ttsErr?.message || 'tts_unavailable' });
         }
+      }
+      const requiresPreambleAudio = Boolean(resolvedOptions.preamble && !resolvedOptions.preambleUrl);
+      const requiresPromptAudio = Boolean(resolvedOptions.prompt && !resolvedOptions.promptUrl);
+      const requiresFollowupAudio = Boolean(resolvedOptions.followup && !resolvedOptions.followupUrl);
+      if (requiresPreambleAudio || requiresPromptAudio || requiresFollowupAudio) {
+        logDigitMetric('twilio_gather_missing_tts_audio', {
+          callSid,
+          missing: {
+            preamble: requiresPreambleAudio,
+            prompt: requiresPromptAudio,
+            followup: requiresFollowupAudio
+          }
+        });
+        return false;
       }
       const client = twilioClient(config.twilio.accountSid, config.twilio.authToken);
       const twiml = buildTwilioGatherTwiml(callSid, currentExpectation, resolvedOptions, hostname);
@@ -4164,10 +4191,19 @@ function createDigitCollectionService(options = {}) {
     let promptUrl = options.promptUrl || null;
     if (!promptUrl && typeof getTwilioTtsAudioUrl === 'function') {
       try {
-        promptUrl = await getTwilioTtsAudioUrl(fallbackPrompt, callConfig);
+        promptUrl = await getTwilioTtsAudioUrl(fallbackPrompt, callConfig, {
+          forceGenerate: true
+        });
       } catch (ttsErr) {
         logDigitMetric('twilio_gather_fallback_tts_error', { callSid, error: ttsErr?.message || 'tts_unavailable' });
       }
+    }
+    if (!promptUrl) {
+      logDigitMetric('twilio_gather_fallback_missing_tts_audio', {
+        callSid,
+        reason: 'prompt_url_unavailable'
+      });
+      return false;
     }
     const client = twilioClient(accountSid, authToken);
     markDigitPrompted(callSid, null, 0, 'gather', {

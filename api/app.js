@@ -4496,11 +4496,17 @@ function buildDigitSummary(digitEvents = []) {
 
   const grouped = new Map();
   for (const event of digitEvents) {
-    const profile = event.profile || "generic";
+    const profile = String(event.profile || "generic").toLowerCase();
     if (!grouped.has(profile)) {
       grouped.set(profile, []);
     }
-    grouped.get(profile).push(event);
+    grouped.get(profile).push({ ...event, profile });
+  }
+  const hasSpecificProfiles = [...grouped.keys()].some(
+    (profile) => profile !== "generic",
+  );
+  if (hasSpecificProfiles) {
+    grouped.delete("generic");
   }
 
   const parts = [];
@@ -5675,6 +5681,9 @@ async function speakAndEndCall(callSid, message, reason = "completed") {
   const text = message || "Thank you for your time. Goodbye.";
   const callConfig = callConfigurations.get(callSid);
   const provider = callConfig?.provider || currentProvider;
+  const isDigitProfileClosing =
+    isCaptureActiveConfig(callConfig) ||
+    (typeof reason === "string" && /^digits?[_-]/i.test(reason));
   const session = activeCalls.get(callSid);
   if (session) {
     session.ending = true;
@@ -5785,7 +5794,9 @@ async function speakAndEndCall(callSid, message, reason = "completed") {
           }
         }
         if (!playedHostedTts) {
-          if (strictTtsPlay && shouldUseHostedTts) {
+          if (isDigitProfileClosing) {
+            response.pause({ length: 1 });
+          } else if (strictTtsPlay && shouldUseHostedTts) {
             console.warn(
               `Strict hosted TTS mode active for ${callSid}; ending call without Twilio say fallback.`,
             );

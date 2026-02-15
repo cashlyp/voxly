@@ -62,16 +62,6 @@ function createTwilioGatherHandler(deps = {}) {
           expectation = digitService.getExpectation(callSid);
         }
       }
-      if (!expectation) {
-        console.warn(`Gather webhook had no expectation for ${callSid}`);
-        const response = new VoiceResponse();
-        response.say('We could not start digit capture. Goodbye.');
-        response.hangup();
-        res.type('text/xml');
-        res.end(response.toString());
-        return;
-      }
-
       const host = resolveHost(req);
       const callConfig = callConfigurations.get(callSid) || {};
       const sayVoice = resolveTwilioSayVoice ? resolveTwilioSayVoice(callConfig) : null;
@@ -79,7 +69,6 @@ function createTwilioGatherHandler(deps = {}) {
       const usePlayForGather = Boolean(
         typeof shouldUseTwilioPlay === 'function' && shouldUseTwilioPlay(callConfig)
       );
-      const strictTtsPlay = config?.twilio?.strictTtsPlay === true;
       const ttsPrewarmEnabled = config?.twilio?.ttsPrewarmEnabled !== false;
       const safeTtsTimeoutMs = Number.isFinite(Number(ttsTimeoutMs)) && Number(ttsTimeoutMs) > 0
         ? Number(ttsTimeoutMs)
@@ -128,6 +117,25 @@ function createTwilioGatherHandler(deps = {}) {
           return null;
         }
       };
+      if (!expectation) {
+        console.warn(`Gather webhook had no expectation for ${callSid}`);
+        const response = new VoiceResponse();
+        const bootFailureMessage = 'We could not start digit capture. Goodbye.';
+        const bootFailureUrl = await resolveTtsUrl(bootFailureMessage, {
+          timeoutMs: finalPromptTtsTimeoutMs,
+          ttsOptions: { forceGenerate: true },
+          strictRequired: true
+        });
+        if (bootFailureUrl) {
+          response.play(bootFailureUrl);
+        } else {
+          response.pause({ length: 1 });
+        }
+        response.hangup();
+        res.type('text/xml');
+        res.end(response.toString());
+        return;
+      }
       const prewarmTtsMessages = (messages = []) => {
         if (!ttsPrewarmEnabled || !usePlayForGather || !getTwilioTtsAudioUrl) return;
         const uniqueMessages = [...new Set(
@@ -180,8 +188,24 @@ function createTwilioGatherHandler(deps = {}) {
               reset_buffer: options.resetBuffer === true
             });
           }
-          const promptUrl = await resolveTtsUrl(promptText);
-          const followupUrl = await resolveTtsUrl(followupText);
+          const promptUrl = await resolveTtsUrl(promptText, {
+            timeoutMs: safeTtsTimeoutMs,
+            ttsOptions: { forceGenerate: true },
+            strictRequired: true
+          });
+          const followupUrl = await resolveTtsUrl(followupText, {
+            timeoutMs: safeTtsTimeoutMs,
+            ttsOptions: { forceGenerate: true },
+            strictRequired: true
+          });
+          if (promptText && !promptUrl) {
+            console.warn(`Gather prompt audio unavailable for ${callSid}`);
+            return false;
+          }
+          if (followupText && !followupUrl) {
+            console.warn(`Gather followup audio unavailable for ${callSid}`);
+            return false;
+          }
           const twiml = digitService.buildTwilioGatherTwiml(
             callSid,
             exp,
@@ -368,30 +392,15 @@ function createTwilioGatherHandler(deps = {}) {
         callEndLocks?.set(callSid, true);
         const response = new VoiceResponse();
         if (message) {
-          if (usePlayForGather && getTwilioTtsAudioUrl) {
-            const url = await resolveTtsUrl(message, {
-              timeoutMs: finalPromptTtsTimeoutMs,
-              ttsOptions: { forceGenerate: true },
-              strictRequired: strictTtsPlay
-            });
-            if (url) {
-              response.play(url);
-            } else {
-              if (strictTtsPlay) {
-                console.warn(
-                  `Strict hosted TTS mode active for ${callSid}; hanging up without Twilio say fallback.`,
-                );
-                response.pause({ length: 1 });
-              } else if (sayOptions) {
-                response.say(sayOptions, message);
-              } else {
-                response.say(message);
-              }
-            }
-          } else if (sayOptions) {
-            response.say(sayOptions, message);
+          const url = await resolveTtsUrl(message, {
+            timeoutMs: finalPromptTtsTimeoutMs,
+            ttsOptions: { forceGenerate: true },
+            strictRequired: true
+          });
+          if (url) {
+            response.play(url);
           } else {
-            response.say(message);
+            response.pause({ length: 1 });
           }
         }
         response.hangup();

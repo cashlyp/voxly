@@ -420,6 +420,10 @@ class EnhancedWebhookService {
       }
       grouped.get(profile).push({ ...event, profile });
     }
+    const hasSpecificProfiles = [...grouped.keys()].some((profile) => profile !== 'generic');
+    if (hasSpecificProfiles) {
+      grouped.delete('generic');
+    }
 
     const profilesPresent = new Set(grouped.keys());
     const activeGroups = captureGroups.filter((group) =>
