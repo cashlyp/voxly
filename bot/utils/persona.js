@@ -395,26 +395,19 @@ async function askOptionWithButtons(
   const message = await sendMenu(ctx, prompt, { parse_mode: 'Markdown', reply_markup: keyboard });
   const expectedMessageId = message?.message_id || null;
   const expectedChatId = message?.chat?.id || ctx.chat?.id || null;
+  const fallbackOpId = getCurrentOpId(ctx);
   const activeChecker = typeof ensureActive === 'function'
     ? ensureActive
-    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+    : () => ensureOperationActive(ctx, fallbackOpId);
   let selected = null;
   while (!selected) {
-    const selectionCtx = await conversation.waitFor('callback_query:data');
+    const selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {
+      const data = callbackCtx?.callbackQuery?.data;
+      return matchesCallbackPrefix(data, prefixKey);
+    });
     activeChecker();
-    const rawData = selectionCtx?.callbackQuery?.data;
     const callbackMessageId = selectionCtx?.callbackQuery?.message?.message_id || null;
     const callbackChatId = selectionCtx?.callbackQuery?.message?.chat?.id || null;
-
-    if (!matchesCallbackPrefix(rawData, prefixKey)) {
-      try {
-        await selectionCtx.answerCallbackQuery({
-          text: 'Use the buttons in the active menu.',
-          show_alert: false
-        });
-      } catch (_) {}
-      continue;
-    }
     if (expectedMessageId && callbackMessageId && callbackMessageId !== expectedMessageId) {
       try {
         await selectionCtx.answerCallbackQuery({

@@ -527,6 +527,14 @@ function stripUndefined(payload = {}) {
   return Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined));
 }
 
+function resolveEnsureActive(ensureActive, ctx) {
+  if (typeof ensureActive === 'function') {
+    return ensureActive;
+  }
+  const opIdSnapshot = getCurrentOpId(ctx);
+  return () => ensureOperationActive(ctx, opIdSnapshot);
+}
+
 function pruneCloneRequestState() {
   const now = Date.now();
   for (const [key, entry] of cloneRequestState.entries()) {
@@ -634,9 +642,7 @@ async function promptText(
     ensureActive
   } = {}
 ) {
-  const safeEnsureActive = typeof ensureActive === 'function'
-    ? ensureActive
-    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   const hints = [];
   if (defaultValue !== null && defaultValue !== undefined && defaultValue !== '') {
     hints.push(`Current: ${defaultValue}`);
@@ -680,9 +686,7 @@ async function promptText(
 }
 
 async function confirm(conversation, ctx, prompt, ensureActive) {
-  const safeEnsureActive = typeof ensureActive === 'function'
-    ? ensureActive
-    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   const choice = await askOptionWithButtons(
     conversation,
     ctx,
@@ -697,9 +701,7 @@ async function confirm(conversation, ctx, prompt, ensureActive) {
 }
 
 async function collectPlaceholderValues(conversation, ctx, placeholders, ensureActive) {
-  const safeEnsureActive = typeof ensureActive === 'function'
-    ? ensureActive
-    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   const values = {};
   for (const placeholder of placeholders) {
     await ctx.reply(
@@ -800,9 +802,7 @@ function buildPersonaSummaryFromOverrides(overrides = {}) {
 
 async function collectPersonaConfig(conversation, ctx, defaults = {}, options = {}) {
   const { allowCancel = true, ensureActive } = options;
-  const safeEnsureActive = typeof ensureActive === 'function'
-    ? ensureActive
-    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   const businessOptions = await getBusinessOptions();
   safeEnsureActive();
 
@@ -938,9 +938,7 @@ _Current: ${getOptionLabel(TECH_LEVEL_OPTIONS, personaConfig.technical_level)}_`
 }
 
 async function collectPromptAndVoice(conversation, ctx, defaults = {}, ensureActive) {
-  const safeEnsureActive = typeof ensureActive === 'function'
-    ? ensureActive
-    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   const prompt = await promptText(
     conversation,
     ctx,
@@ -1001,9 +999,7 @@ async function collectPromptAndVoice(conversation, ctx, defaults = {}, ensureAct
 }
 
 async function collectDigitCaptureConfig(conversation, ctx, defaults = {}, ensureActive) {
-  const safeEnsureActive = typeof ensureActive === 'function'
-    ? ensureActive
-    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   const selection = await askOptionWithButtons(
     conversation,
     ctx,
@@ -1296,9 +1292,7 @@ function formatCallScriptSummary(script) {
 }
 
 async function previewCallScript(conversation, ctx, script, ensureActive) {
-  const safeEnsureActive = typeof ensureActive === 'function'
-    ? ensureActive
-    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   const phonePrompt =
     '📞 Enter the test phone number (E.164 format, e.g., +1234567890) to receive a preview call.';
   const testNumber = await promptText(conversation, ctx, phonePrompt, {
@@ -1387,9 +1381,7 @@ async function previewCallScript(conversation, ctx, script, ensureActive) {
 }
 
 async function createCallScriptFlow(conversation, ctx, ensureActive) {
-  const safeEnsureActive = typeof ensureActive === 'function'
-    ? ensureActive
-    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   const name = await promptText(
     conversation,
     ctx,
@@ -1530,9 +1522,7 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
 }
 
 async function editCallScriptFlow(conversation, ctx, script, ensureActive) {
-  const safeEnsureActive = typeof ensureActive === 'function'
-    ? ensureActive
-    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   const updates = {};
 
   const name = await promptText(
@@ -1669,9 +1659,7 @@ async function editCallScriptFlow(conversation, ctx, script, ensureActive) {
 }
 
 async function cloneCallScriptFlow(conversation, ctx, script, ensureActive) {
-  const safeEnsureActive = typeof ensureActive === 'function'
-    ? ensureActive
-    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   const name = await promptText(
     conversation,
     ctx,
@@ -1736,9 +1724,7 @@ async function cloneCallScriptFlow(conversation, ctx, script, ensureActive) {
 }
 
 async function deleteCallScriptFlow(conversation, ctx, script, ensureActive) {
-  const safeEnsureActive = typeof ensureActive === 'function'
-    ? ensureActive
-    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   const confirmed = await confirm(
     conversation,
     ctx,
@@ -1779,9 +1765,7 @@ async function deleteCallScriptFlow(conversation, ctx, script, ensureActive) {
 }
 
 async function showCallScriptVersions(conversation, ctx, script, ensureActive) {
-  const safeEnsureActive = typeof ensureActive === 'function'
-    ? ensureActive
-    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   try {
     const versions = await listScriptVersions(script.id, 'call', 8);
     safeEnsureActive();
@@ -1841,9 +1825,7 @@ async function showCallScriptVersions(conversation, ctx, script, ensureActive) {
 }
 
 async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
-  const safeEnsureActive = typeof ensureActive === 'function'
-    ? ensureActive
-    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   let viewing = true;
   while (viewing) {
     const summary = formatCallScriptSummary(script);
@@ -1898,9 +1880,7 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
 }
 
 async function listCallScriptsFlow(conversation, ctx, ensureActive) {
-  const safeEnsureActive = typeof ensureActive === 'function'
-    ? ensureActive
-    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   try {
     const scripts = await fetchCallScripts();
     safeEnsureActive();
@@ -1996,9 +1976,7 @@ async function listCallScriptsFlow(conversation, ctx, ensureActive) {
 }
 
 async function inboundDefaultScriptMenu(conversation, ctx, ensureActive) {
-  const safeEnsureActive = typeof ensureActive === 'function'
-    ? ensureActive
-    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   let open = true;
   while (open) {
     let current = null;
@@ -2116,9 +2094,7 @@ async function inboundDefaultScriptMenu(conversation, ctx, ensureActive) {
 }
 
 async function callScriptsMenu(conversation, ctx, ensureActive) {
-  const safeEnsureActive = typeof ensureActive === 'function'
-    ? ensureActive
-    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   let open = true;
   while (open) {
     try {

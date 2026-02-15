@@ -58,7 +58,8 @@ function safeEnsureActiveFactory(ctx, ensureActive) {
   if (typeof ensureActive === 'function') {
     return ensureActive;
   }
-  return () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  const opIdSnapshot = getCurrentOpId(ctx);
+  return () => ensureOperationActive(ctx, opIdSnapshot);
 }
 
 async function personaApiRequest(ctx, ensureActive, options) {
