@@ -37,6 +37,7 @@ const MENU_ACTIONS = new Set([
   'BULK_EMAIL_STATS',
   'SCRIPTS',
   'PROVIDER_STATUS',
+  'MENU_EXIT',
   'STATUS',
   'USERS',
   'USERS_LIST',

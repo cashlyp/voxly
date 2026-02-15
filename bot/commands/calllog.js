@@ -82,7 +82,10 @@ function buildCalllogMenuKeyboard(ctx) {
         .text('🔍 Search', buildCallbackData(ctx, 'CALLLOG_SEARCH'))
         .row()
         .text('📄 Call Details', buildCallbackData(ctx, 'CALLLOG_DETAILS'))
-        .text('🧾 Recent Events', buildCallbackData(ctx, 'CALLLOG_EVENTS'));
+        .text('🧾 Recent Events', buildCallbackData(ctx, 'CALLLOG_EVENTS'))
+        .row()
+        .text('⬅️ Back', buildCallbackData(ctx, 'MENU'))
+        .text('🚪 Exit', buildCallbackData(ctx, 'MENU_EXIT'));
 }
 
 function buildMainMenuKeyboard(ctx) {

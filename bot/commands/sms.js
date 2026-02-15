@@ -164,6 +164,11 @@ function buildSmsMenuKeyboard(ctx, isAdminUser) {
             .text('📊 SMS Stats', buildCallbackData(ctx, 'SMS_STATS'));
     }
 
+    keyboard
+        .row()
+        .text('⬅️ Back', buildCallbackData(ctx, 'MENU'))
+        .text('🚪 Exit', buildCallbackData(ctx, 'MENU_EXIT'));
+
     return keyboard;
 }
 
@@ -427,7 +432,10 @@ function buildBulkSmsMenuKeyboard(ctx) {
         .text('🕒 Recent Jobs', buildCallbackData(ctx, 'BULK_SMS_LIST'))
         .row()
         .text('🧾 Job Status', buildCallbackData(ctx, 'BULK_SMS_STATUS'))
-        .text('📊 Bulk Stats', buildCallbackData(ctx, 'BULK_SMS_STATS'));
+        .text('📊 Bulk Stats', buildCallbackData(ctx, 'BULK_SMS_STATS'))
+        .row()
+        .text('⬅️ Back', buildCallbackData(ctx, 'SMS'))
+        .text('🚪 Exit', buildCallbackData(ctx, 'MENU_EXIT'));
 }
 
 async function renderBulkSmsMenu(ctx) {

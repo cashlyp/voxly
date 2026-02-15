@@ -1195,6 +1195,11 @@ bot.on("callback_query:data", async (ctx) => {
         finishMetric("ok");
         break;
 
+      case "MENU_EXIT":
+        await ctx.reply("✅ Menu closed. Use /menu or /start to open it again.");
+        finishMetric("ok");
+        break;
+
       case "HEALTH":
         await handleHealthCommand(ctx);
         finishMetric("ok");

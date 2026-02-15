@@ -54,7 +54,10 @@ function buildCallerFlagsKeyboard(ctx) {
     .text('✅ Allow', buildCallbackData(ctx, 'CALLER_FLAGS_ALLOW'))
     .text('🚫 Block', buildCallbackData(ctx, 'CALLER_FLAGS_BLOCK'))
     .row()
-    .text('⚠️ Spam', buildCallbackData(ctx, 'CALLER_FLAGS_SPAM'));
+    .text('⚠️ Spam', buildCallbackData(ctx, 'CALLER_FLAGS_SPAM'))
+    .row()
+    .text('⬅️ Back', buildCallbackData(ctx, 'MENU'))
+    .text('🚪 Exit', buildCallbackData(ctx, 'MENU_EXIT'));
 }
 
 async function renderCallerFlagsMenu(ctx, note = '') {

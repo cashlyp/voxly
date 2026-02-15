@@ -69,6 +69,7 @@ const ACTION_CAPABILITIES = [
   { match: (action) => action === 'HELP', cap: 'view_help' },
   { match: (action) => action === 'GUIDE', cap: 'view_guide' },
   { match: (action) => action === 'MENU', cap: 'view_menu' },
+  { match: (action) => action === 'MENU_EXIT', cap: 'view_menu' },
   { match: (action) => action === 'HEALTH', cap: 'health' },
   { match: (action) => action === 'STATUS', cap: 'status_admin' },
   { match: (action) => action === 'CALL', cap: 'call' },

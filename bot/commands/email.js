@@ -885,7 +885,10 @@ function buildEmailMenuKeyboard(ctx) {
     .text('📬 Delivery Status', buildCallbackData(ctx, 'EMAIL_STATUS'))
     .row()
     .text('🧩 Templates', buildCallbackData(ctx, 'EMAIL_TEMPLATES'))
-    .text('🕒 History', buildCallbackData(ctx, 'EMAIL_HISTORY'));
+    .text('🕒 History', buildCallbackData(ctx, 'EMAIL_HISTORY'))
+    .row()
+    .text('⬅️ Back', buildCallbackData(ctx, 'MENU'))
+    .text('🚪 Exit', buildCallbackData(ctx, 'MENU_EXIT'));
   return keyboard;
 }
 
@@ -937,7 +940,10 @@ function buildBulkEmailMenuKeyboard(ctx) {
     .text('🧾 Job Status', buildCallbackData(ctx, 'BULK_EMAIL_STATUS'))
     .row()
     .text('🕒 History', buildCallbackData(ctx, 'BULK_EMAIL_LIST'))
-    .text('📊 Stats', buildCallbackData(ctx, 'BULK_EMAIL_STATS'));
+    .text('📊 Stats', buildCallbackData(ctx, 'BULK_EMAIL_STATS'))
+    .row()
+    .text('⬅️ Back', buildCallbackData(ctx, 'EMAIL'))
+    .text('🚪 Exit', buildCallbackData(ctx, 'MENU_EXIT'));
 }
 
 async function renderBulkEmailMenu(ctx) {

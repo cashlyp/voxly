@@ -178,7 +178,10 @@ function buildProviderHubKeyboard(ctx) {
         .row()
         .text('📧 Email', buildCallbackData(ctx, `PROVIDER_CHANNEL:${PROVIDER_CHANNELS.EMAIL}`))
         .row()
-        .text('🔄 Refresh', buildCallbackData(ctx, 'PROVIDER_STATUS'));
+        .text('🔄 Refresh', buildCallbackData(ctx, 'PROVIDER_STATUS'))
+        .row()
+        .text('⬅️ Back', buildCallbackData(ctx, 'MENU'))
+        .text('🚪 Exit', buildCallbackData(ctx, 'MENU_EXIT'));
     return keyboard;
 }
 
@@ -200,7 +203,9 @@ function buildProviderKeyboard(ctx, channel, activeProvider = '', supportedProvi
     keyboard
         .row()
         .text('🔄 Refresh', buildCallbackData(ctx, `PROVIDER_STATUS:${channel}`))
-        .text('⬅️ Back', buildCallbackData(ctx, 'PROVIDER:HOME'));
+        .text('⬅️ Back', buildCallbackData(ctx, 'PROVIDER:HOME'))
+        .row()
+        .text('🚪 Exit', buildCallbackData(ctx, 'MENU_EXIT'));
     return keyboard;
 }
 

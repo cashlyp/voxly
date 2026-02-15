@@ -27,7 +27,10 @@ function buildUsersKeyboard(ctx) {
     .text('➕ Add User', buildCallbackData(ctx, 'ADDUSER'))
     .text('⬆️ Promote User', buildCallbackData(ctx, 'PROMOTE'))
     .row()
-    .text('❌ Remove User', buildCallbackData(ctx, 'REMOVE'));
+    .text('❌ Remove User', buildCallbackData(ctx, 'REMOVE'))
+    .row()
+    .text('⬅️ Back', buildCallbackData(ctx, 'MENU'))
+    .text('🚪 Exit', buildCallbackData(ctx, 'MENU_EXIT'));
 }
 
 async function renderUsersMenu(ctx, note = '') {
