@@ -901,7 +901,9 @@ bot.on("callback_query:data", async (ctx) => {
     const isMenuExemptAction = menuExemptPrefixes.some((prefix) =>
       action.startsWith(prefix),
     );
-    const isSessionBoundAction = action.includes(":");
+    const isSessionBoundAction = /^[A-Za-z0-9_-]+:[0-9a-fA-F-]{8,}(?::|$)/.test(
+      action,
+    );
     const menuMessageId = ctx.callbackQuery?.message?.message_id;
     const menuChatId = ctx.callbackQuery?.message?.chat?.id;
     const latestMenuId = getLatestMenuMessageId(ctx, menuChatId);

@@ -368,8 +368,12 @@ async function askOptionWithButtons(
 ) {
   const keyboard = new InlineKeyboard();
   const opId = getCurrentOpId(ctx);
+  const opToken = ctx.session?.currentOp?.token || null;
   const basePrefix = prefix || 'option';
-  const prefixKey = opId ? `${basePrefix}:${opId}` : basePrefix;
+  const promptNonce = Math.random().toString(36).slice(2, 6);
+  const prefixKey = opToken
+    ? `${basePrefix}:${opToken}:${promptNonce}`
+    : `${basePrefix}:${promptNonce}`;
   const optionLookupByToken = new Map();
   const labels = options.map((option) => (formatLabel ? formatLabel(option) : formatOptionLabel(option)));
   const hasLongLabel = labels.some((label) => String(label).length > 22);
@@ -393,9 +397,8 @@ async function askOptionWithButtons(
   });
 
   const message = await sendMenu(ctx, prompt, { parse_mode: 'Markdown', reply_markup: keyboard });
-  const expectedMessageId = message?.message_id || null;
   const expectedChatId = message?.chat?.id || ctx.chat?.id || null;
-  const fallbackOpId = getCurrentOpId(ctx);
+  const fallbackOpId = opId;
   const activeChecker = typeof ensureActive === 'function'
     ? ensureActive
     : () => ensureOperationActive(ctx, fallbackOpId);
@@ -406,17 +409,7 @@ async function askOptionWithButtons(
       return matchesCallbackPrefix(data, prefixKey);
     });
     activeChecker();
-    const callbackMessageId = selectionCtx?.callbackQuery?.message?.message_id || null;
     const callbackChatId = selectionCtx?.callbackQuery?.message?.chat?.id || null;
-    if (expectedMessageId && callbackMessageId && callbackMessageId !== expectedMessageId) {
-      try {
-        await selectionCtx.answerCallbackQuery({
-          text: 'That menu is outdated. Please use the latest one.',
-          show_alert: false
-        });
-      } catch (_) {}
-      continue;
-    }
     if (expectedChatId && callbackChatId && callbackChatId !== expectedChatId) {
       try {
         await selectionCtx.answerCallbackQuery({
@@ -429,7 +422,7 @@ async function askOptionWithButtons(
 
     const selectionAction = parseCallbackData(selectionCtx.callbackQuery.data).action || selectionCtx.callbackQuery.data;
     const parts = selectionAction.split(':');
-    const selectedToken = opId ? parts.slice(2).join(':') : parts.slice(1).join(':');
+    const selectedToken = parts.length ? parts[parts.length - 1] : '';
     selected = optionLookupByToken.get(selectedToken)
       || options.find((option) => String(option.id) === selectedToken);
 
