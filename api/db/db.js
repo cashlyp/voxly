@@ -888,18 +888,43 @@ class EnhancedDatabase {
             prompt = null,
             first_message,
             business_id = null,
-            voice_model = null
+            voice_model = null,
+            requires_otp = 0,
+            default_profile = null,
+            expected_length = null,
+            allow_terminator = 0,
+            terminator_char = null
         } = payload || {};
+        const normalizedRequiresOtp = requires_otp ? 1 : 0;
+        const normalizedAllowTerminator = allow_terminator ? 1 : 0;
+        const normalizedExpectedLength =
+            expected_length === null || expected_length === undefined || expected_length === ''
+                ? null
+                : Number(expected_length);
         return new Promise((resolve, reject) => {
             const sql = `
                 INSERT INTO call_templates (
-                    name, description, prompt, first_message, business_id, voice_model, created_at, updated_at
+                    name, description, prompt, first_message, business_id, voice_model,
+                    requires_otp, default_profile, expected_length, allow_terminator, terminator_char,
+                    created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             `;
             this.db.run(
                 sql,
-                [name, description, prompt, first_message, business_id, voice_model],
+                [
+                    name,
+                    description,
+                    prompt,
+                    first_message,
+                    business_id,
+                    voice_model,
+                    normalizedRequiresOtp,
+                    default_profile,
+                    Number.isFinite(normalizedExpectedLength) ? normalizedExpectedLength : null,
+                    normalizedAllowTerminator,
+                    terminator_char
+                ],
                 function(err) {
                     if (err) {
                         reject(err);

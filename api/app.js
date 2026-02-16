@@ -9719,6 +9719,57 @@ function applyIdempotencyResponse(res, idem) {
   return false;
 }
 
+function normalizeCallTemplateName(value = "") {
+  const trimmed = String(value || "").trim();
+  return trimmed.slice(0, 80);
+}
+
+async function findCallTemplateNameCollision(name, excludeId = null) {
+  const normalized = normalizeCallTemplateName(name);
+  if (!normalized) return null;
+  const scripts = await db.getCallTemplates();
+  const normalizedLower = normalized.toLowerCase();
+  const excluded = Number(excludeId);
+  return (
+    (scripts || []).find((script) => {
+      const scriptName = normalizeCallTemplateName(script?.name || "").toLowerCase();
+      if (!scriptName || scriptName !== normalizedLower) {
+        return false;
+      }
+      if (Number.isFinite(excluded) && Number(script?.id) === excluded) {
+        return false;
+      }
+      return true;
+    }) || null
+  );
+}
+
+async function suggestCallTemplateName(baseName, excludeId = null) {
+  const fallbackBase = normalizeCallTemplateName(baseName) || "Call Script";
+  const scripts = await db.getCallTemplates().catch(() => []);
+  const excluded = Number(excludeId);
+  const existingNames = new Set(
+    (scripts || [])
+      .filter((script) => !(Number.isFinite(excluded) && Number(script?.id) === excluded))
+      .map((script) => normalizeCallTemplateName(script?.name || "").toLowerCase())
+      .filter(Boolean),
+  );
+
+  if (!existingNames.has(fallbackBase.toLowerCase())) {
+    return fallbackBase;
+  }
+
+  for (let index = 2; index < 1000; index += 1) {
+    const suffix = ` ${index}`;
+    const maxBaseLength = Math.max(1, 80 - suffix.length);
+    const candidate = `${fallbackBase.slice(0, maxBaseLength)}${suffix}`;
+    if (!existingNames.has(candidate.toLowerCase())) {
+      return candidate;
+    }
+  }
+  return `${fallbackBase.slice(0, 75)} ${Date.now().toString().slice(-4)}`;
+}
+
 // Call script endpoints for bot script management
 app.get("/api/call-scripts", requireAdminToken, async (req, res) => {
   try {
@@ -9763,18 +9814,34 @@ app.post("/api/call-scripts", requireAdminToken, async (req, res) => {
   const prior = applyIdempotencyResponse(res, idempotency);
   if (prior) return prior;
   try {
-    const { name, first_message } = req.body || {};
-    if (!name || !first_message) {
+    const requestBody = isPlainObject(req.body) ? req.body : {};
+    const normalizedName = normalizeCallTemplateName(requestBody.name);
+    const firstMessage = String(requestBody.first_message || "").trim();
+    if (!normalizedName || !firstMessage) {
       failCallScriptMutationIdempotency(idempotency);
       return res
         .status(400)
         .json({ success: false, error: "name and first_message are required" });
     }
-    const id = await db.createCallTemplate(req.body);
+    const duplicate = await findCallTemplateNameCollision(normalizedName);
+    if (duplicate) {
+      failCallScriptMutationIdempotency(idempotency);
+      return res.status(409).json({
+        success: false,
+        error: `Script '${normalizedName}' already exists`,
+        code: "SCRIPT_NAME_DUPLICATE",
+        suggested_name: await suggestCallTemplateName(`${normalizedName} Copy`),
+      });
+    }
+    const id = await db.createCallTemplate({
+      ...requestBody,
+      name: normalizedName,
+      first_message: firstMessage,
+    });
     const script = await db.getCallTemplateById(id);
-    const body = { success: true, script };
-    completeCallScriptMutationIdempotency(idempotency, 201, body);
-    res.status(201).json(body);
+    const responseBody = { success: true, script };
+    completeCallScriptMutationIdempotency(idempotency, 201, responseBody);
+    res.status(201).json(responseBody);
   } catch (error) {
     failCallScriptMutationIdempotency(idempotency);
     res
@@ -9794,6 +9861,7 @@ app.put("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
   const prior = applyIdempotencyResponse(res, idempotency);
   if (prior) return prior;
   try {
+    const requestBody = isPlainObject(req.body) ? req.body : {};
     const scriptId = Number(req.params.id);
     if (Number.isNaN(scriptId)) {
       failCallScriptMutationIdempotency(idempotency);
@@ -9801,7 +9869,28 @@ app.put("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
         .status(400)
         .json({ success: false, error: "Invalid script id" });
     }
-    const updated = await db.updateCallTemplate(scriptId, req.body || {});
+    const updates = { ...requestBody };
+    if (updates.name !== undefined) {
+      const normalizedName = normalizeCallTemplateName(updates.name);
+      if (!normalizedName) {
+        failCallScriptMutationIdempotency(idempotency);
+        return res
+          .status(400)
+          .json({ success: false, error: "name cannot be empty" });
+      }
+      const duplicate = await findCallTemplateNameCollision(normalizedName, scriptId);
+      if (duplicate) {
+        failCallScriptMutationIdempotency(idempotency);
+        return res.status(409).json({
+          success: false,
+          error: `Script '${normalizedName}' already exists`,
+          code: "SCRIPT_NAME_DUPLICATE",
+          suggested_name: await suggestCallTemplateName(normalizedName, scriptId),
+        });
+      }
+      updates.name = normalizedName;
+    }
+    const updated = await db.updateCallTemplate(scriptId, updates);
     if (!updated) {
       failCallScriptMutationIdempotency(idempotency);
       return res
@@ -9813,9 +9902,9 @@ app.put("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
       inboundDefaultScript = script || null;
       inboundDefaultLoadedAt = Date.now();
     }
-    const body = { success: true, script };
-    completeCallScriptMutationIdempotency(idempotency, 200, body);
-    res.json(body);
+    const responseBody = { success: true, script };
+    completeCallScriptMutationIdempotency(idempotency, 200, responseBody);
+    res.json(responseBody);
   } catch (error) {
     failCallScriptMutationIdempotency(idempotency);
     res
@@ -9877,6 +9966,7 @@ app.post("/api/call-scripts/:id/clone", requireAdminToken, async (req, res) => {
   const prior = applyIdempotencyResponse(res, idempotency);
   if (prior) return prior;
   try {
+    const requestBody = isPlainObject(req.body) ? req.body : {};
     const scriptId = Number(req.params.id);
     if (Number.isNaN(scriptId)) {
       failCallScriptMutationIdempotency(idempotency);
@@ -9891,16 +9981,51 @@ app.post("/api/call-scripts/:id/clone", requireAdminToken, async (req, res) => {
         .status(404)
         .json({ success: false, error: "Script not found" });
     }
+    const normalizedName = normalizeCallTemplateName(
+      requestBody.name || `${existing.name} Copy`,
+    );
+    if (!normalizedName) {
+      failCallScriptMutationIdempotency(idempotency);
+      return res
+        .status(400)
+        .json({ success: false, error: "name is required for clone" });
+    }
+    const duplicate = await findCallTemplateNameCollision(normalizedName);
+    if (duplicate) {
+      failCallScriptMutationIdempotency(idempotency);
+      return res.status(409).json({
+        success: false,
+        error: `Script '${normalizedName}' already exists`,
+        code: "SCRIPT_NAME_DUPLICATE",
+        suggested_name: await suggestCallTemplateName(normalizedName),
+      });
+    }
+
+    const hasDescription = Object.prototype.hasOwnProperty.call(
+      requestBody,
+      "description",
+    );
     const payload = {
-      ...existing,
-      name: req.body?.name || `${existing.name} Copy`,
+      name: normalizedName,
+      description: hasDescription
+        ? requestBody.description || null
+        : existing.description || null,
+      prompt: existing.prompt || null,
+      first_message: existing.first_message,
+      business_id: existing.business_id || null,
+      voice_model: existing.voice_model || null,
+      requires_otp: existing.requires_otp ? 1 : 0,
+      default_profile: existing.default_profile || null,
+      expected_length:
+        existing.expected_length === undefined ? null : existing.expected_length,
+      allow_terminator: existing.allow_terminator ? 1 : 0,
+      terminator_char: existing.terminator_char || null,
     };
-    delete payload.id;
     const newId = await db.createCallTemplate(payload);
     const script = await db.getCallTemplateById(newId);
-    const body = { success: true, script };
-    completeCallScriptMutationIdempotency(idempotency, 201, body);
-    res.status(201).json(body);
+    const responseBody = { success: true, script };
+    completeCallScriptMutationIdempotency(idempotency, 201, responseBody);
+    res.status(201).json(responseBody);
   } catch (error) {
     failCallScriptMutationIdempotency(idempotency);
     res

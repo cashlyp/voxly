@@ -1700,9 +1700,14 @@ async function cloneCallScriptFlow(conversation, ctx, script, ensureActive) {
   }
 
   try {
-    const opId = getCurrentOpId(ctx) || `user_${ctx?.from?.id || 'unknown'}`;
-    const normalizedName = name.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48) || 'script';
-    const idempotencyKey = `clone_call_script_${script.id}_${opId}_${normalizedName}`;
+    const normalizedName = name
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 42) || 'script';
+    const stableActor = String(ctx?.from?.id || 'unknown').replace(/[^0-9a-z_-]/gi, '').slice(0, 20) || 'user';
+    const idempotencyKey = `clone_call_script_${stableActor}_${script.id}_${normalizedName}`.slice(0, 96);
     const cloned = await runWithActionWatchdog(
       ctx,
       'Cloning call script',
