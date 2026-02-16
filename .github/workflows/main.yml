@@ -41,7 +41,6 @@ jobs:
             # Deploy API
             cd api
             npm install
-            npm run db:migrate
             pm2 startOrRestart ecosystem.config.js --env production
 
             # Deploy Bot

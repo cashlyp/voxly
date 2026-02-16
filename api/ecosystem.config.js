@@ -1,101 +1,68 @@
+const path = require('path');
+
+const rootDir = path.resolve(__dirname, '..');
+const logDir = path.join(rootDir, 'logs', 'api');
+
 module.exports = {
   apps: [
     {
       name: 'API',
-      script: './app.js',
-      cwd: '/home/ubuntu/voicednut/api', // Update with your actual path
-      instances: 1, // You can scale this if needed
-      exec_mode: 'fork', // Use 'cluster' for load balancing if needed
-      
-      // Environment variables
+      script: 'app.js',
+      cwd: __dirname,
+      instances: 1,
+      exec_mode: 'fork',
+
       env: {
         NODE_ENV: 'production',
         PORT: 1337,
         FORCE_COLOR: '1',
       },
-      
-      // Restart policy
-      restart_delay: 2000,
-      max_restarts: 5,
-      min_uptime: '10s',
-      
-      // Logging
-      log_file: '/home/ubuntu/voicednut/logs/api/combined.log',
-      out_file: '/home/ubuntu/voicednut/logs/api/out.log',
-      error_file: '/home/ubuntu/voicednut/logs/api/error.log',
-      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
-      
-      // Advanced options
-      watch: false, // Set to true in development
-      ignore_watch: [
-        'node_modules',
-        'logs',
-        'db/*.db',
-        '.git'
-      ],
-      
-      // Memory and CPU limits
-      max_memory_restart: '1G',
-      
-      // Process management
-      kill_timeout: 5000,
-      wait_ready: true,
-      listen_timeout: 3000,
-      
-      // Health monitoring
-      health_check_grace_period: 3000,
-      
-      // Auto restart conditions
-      node_args: '--max-old-space-size=1024',
-      
-      // Merge logs
-      merge_logs: true,
-      
-      // Time zone
-      time: true,
-      
-      // Auto restart on file changes (development only)
-      autorestart: true,
-      
-      // Environment-specific settings
+
       env_production: {
         NODE_ENV: 'production',
         PORT: 1337,
         FORCE_COLOR: '1',
-        // Add your production environment variables here
-        // SERVER: process.env.SERVER,
-        // TWILIO_ACCOUNT_SID: process.env.TWILIO_ACCOUNT_SID,
-        // TWILIO_AUTH_TOKEN: process.env.TWILIO_AUTH_TOKEN,
-        // FROM_NUMBER: process.env.FROM_NUMBER,
-        // OPENAI_API_KEY: process.env.OPENAI_API_KEY
       },
-      
+
       env_development: {
         NODE_ENV: 'development',
         PORT: 1337,
-        watch: true
+        FORCE_COLOR: '1',
       },
-      
-      // Error handling
-      crash_restart_delay: 1000,
-      
-      // Custom startup script (if needed)
-      // pre_restart_script: './scripts/pre-restart.sh',
-      // post_restart_script: './scripts/post-restart.sh'
-    }
+
+      autorestart: true,
+      restart_delay: 3000,
+      exp_backoff_restart_delay: 200,
+      max_restarts: 15,
+      min_uptime: '15s',
+      kill_timeout: 10000,
+      max_memory_restart: '1G',
+      node_args: '--max-old-space-size=1024',
+
+      watch: false,
+      ignore_watch: ['node_modules', 'logs', 'db/*.db', '.git'],
+
+      log_file: path.join(logDir, 'combined.log'),
+      out_file: path.join(logDir, 'out.log'),
+      error_file: path.join(logDir, 'error.log'),
+      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+      merge_logs: true,
+      time: true,
+    },
   ],
-  
+
   deploy: {
     production: {
       user: 'ubuntu',
-      host: 'ec2-18-118-121-26.us-east-2.compute.amazonaws.com', // Update with your EC2 public IP or domain
+      host: 'ec2-18-118-121-26.us-east-2.compute.amazonaws.com',
       ref: 'origin/main',
-      repo: 'git@github.com:ednutlabs/voicednut.git', // Update with your repo
+      repo: 'git@github.com:ednutlabs/voicednut.git',
       path: '/home/ubuntu/voicednut',
       'pre-setup': 'apt-get install git -y',
       'post-setup': 'ls -la',
       'pre-deploy': 'pm2 startOrRestart ecosystem.config.js --env production',
-      'post-deploy': 'npm install && pm2 reload ecosystem.config.js --env production && pm2 save'
-    }
-  }
+      'post-deploy':
+        'npm install && pm2 reload ecosystem.config.js --env production && pm2 save',
+    },
+  },
 };
