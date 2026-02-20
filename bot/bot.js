@@ -112,10 +112,8 @@ bot.use(async (ctx, next) => {
   const text = ctx.message?.text || ctx.callbackQuery?.data;
   if (text && text.startsWith("/")) {
     const command = text.split(" ")[0].toLowerCase();
-    if (command !== "/cancel") {
-      await cancelActiveFlow(ctx, `command:${command}`);
-      await clearMenuMessages(ctx);
-    }
+    await cancelActiveFlow(ctx, `command:${command}`);
+    await clearMenuMessages(ctx);
     ctx.session.lastCommand = command;
     ctx.session.currentOp = null;
   }
@@ -424,7 +422,7 @@ async function validateTemplatesApiConnectivity() {
 }
 
 // Import dependencies
-const { getUser, expireInactiveUsers } = require("./db/db");
+const { getUser, expireInactiveUsers, closeDb } = require("./db/db");
 const { callFlow, registerCallCommand } = require("./commands/call");
 const {
   smsFlow,
@@ -1395,19 +1393,42 @@ const TELEGRAM_COMMANDS_USER = [
   { command: "sms", description: "Open SMS center" },
   { command: "email", description: "Open Email center" },
 ];
+const COMMAND_SYNC_DEBOUNCE_MS = 60 * 1000;
+const commandSyncState = new Map();
+
+function buildCommandsFingerprint(commands = []) {
+  return commands
+    .map((item) => `${item.command}:${item.description}`)
+    .join("|");
+}
 
 async function syncChatCommands(ctx, access) {
   if (!ctx.chat || ctx.chat.type !== "private") {
     return;
   }
+  const chatId = String(ctx.chat.id);
   const commands = access.user
     ? access.isAdmin
       ? TELEGRAM_COMMANDS
       : TELEGRAM_COMMANDS_USER
     : TELEGRAM_COMMANDS_GUEST;
+  const fingerprint = buildCommandsFingerprint(commands);
+  const now = Date.now();
+  const cached = commandSyncState.get(chatId);
+  if (
+    cached &&
+    cached.fingerprint === fingerprint &&
+    now - cached.updatedAt < COMMAND_SYNC_DEBOUNCE_MS
+  ) {
+    return;
+  }
   try {
     await bot.api.setMyCommands(commands, {
       scope: { type: "chat", chat_id: ctx.chat.id },
+    });
+    commandSyncState.set(chatId, {
+      fingerprint,
+      updatedAt: now,
     });
   } catch (error) {
     console.warn("Failed to sync chat commands:", error?.message || error);
@@ -1424,7 +1445,7 @@ bot.on("message:text", async (ctx) => {
   }
 
   await ctx.reply(
-    "👋 Use the current buttons or /cancel. You can also use /help or /menu.",
+    "👋 Use the current buttons. You can also use /help or /menu.",
   );
 });
 
@@ -1438,7 +1459,7 @@ async function bootstrap() {
 
   console.log("🚀 Starting Voice Call Bot...");
   try {
-    await bot.api.setMyCommands(TELEGRAM_COMMANDS);
+    await bot.api.setMyCommands(TELEGRAM_COMMANDS_GUEST);
     console.log("✅ Telegram commands registered");
     await bot.start();
     console.log("✅ Voice Call Bot is running!");
@@ -1448,5 +1469,41 @@ async function bootstrap() {
     process.exit(1);
   }
 }
+
+let isShuttingDown = false;
+
+async function shutdown(signal, exitCode = 0) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log(`🛑 Shutting down bot (${signal})...`);
+  try {
+    bot.stop();
+  } catch (error) {
+    console.error("Bot stop error:", error?.message || error);
+  }
+  try {
+    await closeDb();
+  } catch (error) {
+    console.error("Database shutdown error:", error?.message || error);
+  }
+  process.exit(exitCode);
+}
+
+process.on("SIGINT", () => {
+  void shutdown("SIGINT");
+});
+
+process.on("SIGTERM", () => {
+  void shutdown("SIGTERM");
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled promise rejection in bot:", reason);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught exception in bot:", error);
+  void shutdown("uncaughtException", 1);
+});
 
 bootstrap();

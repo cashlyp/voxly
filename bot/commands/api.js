@@ -32,6 +32,37 @@ async function replyApiError(ctx, error, fallback, options = {}) {
     return ctx.reply(message, options);
 }
 
+async function fetchHealthSnapshot(options = {}) {
+    const privileged = options.privileged === true;
+    const timeout = Number.isFinite(Number(options.timeout))
+        ? Number(options.timeout)
+        : 8000;
+    const headers = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json'
+    };
+    try {
+        return await httpClient.get(
+            null,
+            `${config.apiUrl}${privileged ? '/ready' : '/health'}`,
+            {
+                timeout,
+                headers,
+                admin: privileged
+            }
+        );
+    } catch (error) {
+        if (privileged && Number(error?.response?.status || 0) === 404) {
+            return httpClient.get(null, `${config.apiUrl}/health`, {
+                timeout,
+                headers,
+                admin: true
+            });
+        }
+        throw error;
+    }
+}
+
 async function handleStatusCommand(ctx) {
     try {
         const user = await new Promise(r => getUser(ctx.from.id, r));
@@ -44,16 +75,9 @@ async function handleStatusCommand(ctx) {
         await ctx.reply('🔍 Checking system status...');
 
         const startTime = Date.now();
-        const healthHeaders = {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json'
-        };
-        if (config.admin?.apiToken) {
-            healthHeaders['x-admin-token'] = config.admin.apiToken;
-        }
-        const response = await httpClient.get(null, `${config.apiUrl}/health`, {
-            timeout: 15000,
-            headers: healthHeaders
+        const response = await fetchHealthSnapshot({
+            privileged: true,
+            timeout: 15000
         });
         const responseTime = Date.now() - startTime;
 
@@ -166,16 +190,14 @@ async function handleHealthCommand(ctx) {
         if (!user) {
             return ctx.reply('❌ You are not authorized to use this bot.');
         }
+        const adminStatus = await new Promise(r => isAdmin(ctx.from.id, r));
 
         const startTime = Date.now();
 
         try {
-            const response = await httpClient.get(null, `${config.apiUrl}/health`, {
-                timeout: 8000,
-                headers: {
-                    'Accept': 'application/json',
-                    'Content-Type': 'application/json'
-                }
+            const response = await fetchHealthSnapshot({
+                privileged: adminStatus,
+                timeout: 8000
             });
             const responseTime = Date.now() - startTime;
 
@@ -185,6 +207,20 @@ async function handleHealthCommand(ctx) {
             message += `🤖 Bot: ✅ Responsive\n`;
             message += `🌐 API: ${health.status === 'healthy' ? '✅' : '⚠️'} ${escapeHtml(health.status || 'responding')}\n`;
             message += `⚡ Response Time: ${responseTime}ms\n`;
+            if (!adminStatus) {
+                if (health.readiness) {
+                    message += `${buildHtmlLine('🔐', 'Readiness', health.readiness)}\n`;
+                }
+                if (health.public === true) {
+                    message += `${buildHtmlLine('🌍', 'Visibility', 'Public status')}\n`;
+                }
+                message += `${buildHtmlLine('⏰', 'Checked', new Date().toLocaleTimeString())}`;
+                await ctx.reply(message, {
+                    parse_mode: 'HTML',
+                    reply_markup: buildMainMenuReplyMarkup(ctx)
+                });
+                return;
+            }
 
             if (health.active_calls !== undefined) {
                 message += `${buildHtmlLine('📞', 'Active Calls', health.active_calls)}\n`;
@@ -192,6 +228,10 @@ async function handleHealthCommand(ctx) {
 
             if (health.services?.database?.connected !== undefined) {
                 message += `${buildHtmlLine('🗄️', 'Database', `${health.services.database.connected ? '✅' : '❌'} ${health.services.database.connected ? 'Connected' : 'Disconnected'}`)}\n`;
+            }
+
+            if (health.services?.webhook_service?.status) {
+                message += `${buildHtmlLine('📡', 'Webhook Service', health.services.webhook_service.status)}\n`;
             }
 
             message += `${buildHtmlLine('⏰', 'Checked', new Date().toLocaleTimeString())}`;

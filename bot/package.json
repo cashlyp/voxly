@@ -7,7 +7,7 @@
     "start": "node .",
     "dev": "nodemon .",
     "setup": "node setup-env.js",
-    "test": "node ./test/callback-desync-recovery.test.js"
+    "test": "node ./test/run-tests.js"
   },
   "dependencies": {
     "@grammyjs/conversations": "^1.2.0",
