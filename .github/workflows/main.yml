@@ -21,11 +21,12 @@ jobs:
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            # Ensure PM2 is in PATH
-            export PATH=$PATH:/home/ubuntu/.npm-global/bin
+            # Ensure PM2 is available in non-interactive SSH shell
+            export PATH=$PATH:/home/ubuntu/.nvm/versions/node/v20.20.0/bin
+            PM2_BIN=/home/ubuntu/.nvm/versions/node/v20.20.0/bin/pm2
 
             # Navigate to project root
-            cd /home/ubuntu/voicednut
+            cd /home/ubuntu/voxly
 
             # Keep only api + bot checked out on EC2
             git fetch origin main
@@ -35,18 +36,18 @@ jobs:
             git pull --ff-only origin main
 
             # Kill PM2 daemon and delete all processes
-            pm2 kill
-            pm2 delete all
+            $PM2_BIN kill
+            $PM2_BIN delete all
 
             # Deploy API
             cd api
             npm install
-            pm2 startOrRestart ecosystem.config.js --env production
+            $PM2_BIN startOrRestart ecosystem.config.js --env production
 
             # Deploy Bot
             cd ../bot
             npm install
-            pm2 startOrRestart ecosystem.config.js --env production
+            $PM2_BIN startOrRestart ecosystem.config.js --env production
 
             # Save PM2 process list
-            pm2 save
+            $PM2_BIN save
