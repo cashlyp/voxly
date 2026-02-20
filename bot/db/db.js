@@ -8,17 +8,6 @@ const db = new sqlite3.Database(dbPath);
 const { userId, username } = require('../config').admin;
 
 db.serialize(() => {
-  db.exec(`
-    PRAGMA foreign_keys = ON;
-    PRAGMA journal_mode = WAL;
-    PRAGMA synchronous = NORMAL;
-    PRAGMA busy_timeout = 5000;
-  `, (err) => {
-    if (err) {
-      console.error('Database pragma initialization error:', err.message);
-    }
-  });
-
   db.run(`CREATE TABLE IF NOT EXISTS users (
     telegram_id INTEGER PRIMARY KEY,
     username TEXT,

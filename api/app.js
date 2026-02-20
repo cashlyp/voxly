@@ -7220,18 +7220,8 @@ async function startServer(options = {}) {
 
     // Initialize database first
     console.log("Initializing enhanced database...");
-    db = new Database({
-      startupIntegrityCheck: config.database?.startupIntegrityCheck !== false,
-      autoRebuildOnCorrupt: config.database?.autoRebuildOnCorrupt === true,
-      corruptBackupDir: config.database?.corruptBackupDir || undefined,
-    });
+    db = new Database();
     await db.initialize();
-    const startupRecoveryState = db.getStartupRecoveryState?.();
-    if (startupRecoveryState?.rebuilt) {
-      console.warn("⚠️ Database was rebuilt during startup due to corruption", {
-        backup_files: startupRecoveryState.backup_files || [],
-      });
-    }
     const schemaGuard = await db.ensureSchemaGuardrails({
       expectedVersion: Number(config.database?.schemaVersion) || 2,
       strict: config.database?.schemaStrict !== false,

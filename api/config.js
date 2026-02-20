@@ -656,13 +656,6 @@ module.exports = {
   database: {
     schemaVersion: Number(readEnv("DB_SCHEMA_VERSION") || "2"),
     schemaStrict: String(readEnv("DB_SCHEMA_STRICT") || "true").toLowerCase() === "true",
-    startupIntegrityCheck:
-      String(readEnv("DB_STARTUP_INTEGRITY_CHECK") || "true").toLowerCase() ===
-      "true",
-    autoRebuildOnCorrupt:
-      String(readEnv("DB_AUTO_REBUILD_ON_CORRUPT") || "true").toLowerCase() ===
-      "true",
-    corruptBackupDir: readEnv("DB_CORRUPT_BACKUP_DIR") || "",
   },
   admin: {
     apiToken: adminApiToken,
