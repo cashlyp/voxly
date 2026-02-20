@@ -1428,14 +1428,30 @@ async function fetchCallScripts() {
       const normalizedName = String(
         item.name ?? item.script_name ?? item.template_name ?? `Script ${index + 1}`
       ).trim();
+      const parsedVersion = Number(item.version ?? item.script_version ?? 1);
       if (!normalizedName) return null;
       return {
         ...item,
         id: normalizedId,
+        version: Number.isFinite(parsedVersion) && parsedVersion > 0
+          ? Math.max(1, Math.floor(parsedVersion))
+          : 1,
         name: normalizedName,
         description: item.description ?? item.summary ?? item.notes ?? null,
         prompt: item.prompt ?? item.script_prompt ?? null,
         first_message: item.first_message ?? item.firstMessage ?? null,
+        payment_policy:
+          (item.payment_policy && typeof item.payment_policy === 'object')
+            ? item.payment_policy
+            : (() => {
+              if (!item.payment_policy || typeof item.payment_policy !== 'string') return null;
+              try {
+                const parsed = JSON.parse(item.payment_policy);
+                return parsed && typeof parsed === 'object' ? parsed : null;
+              } catch (_) {
+                return null;
+              }
+            })(),
         payment_enabled:
           item.payment_enabled ?? item.paymentEnabled ?? false,
         payment_connector:
@@ -1545,6 +1561,9 @@ async function cloneCallScript(id, payload, options = {}) {
 function formatCallScriptSummary(script) {
   const summary = [];
   summary.push(`📛 *${escapeMarkdown(script.name)}*`);
+  if (Number.isFinite(Number(script.version)) && Number(script.version) > 0) {
+    summary.push(`🧬 Version: v${Math.floor(Number(script.version))}`);
+  }
   if (script.description) {
     summary.push(`📝 ${escapeMarkdown(script.description)}`);
   }

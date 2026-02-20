@@ -512,6 +512,151 @@ function normalizePaymentSettings(input = {}, options = {}) {
   };
 }
 
+function normalizePaymentPolicy(input = {}, options = {}) {
+  const errors = [];
+  const warnings = [];
+  const source = input && typeof input === "object" ? input : {};
+  const normalized = {};
+
+  const parseNumberRange = (value, { field, min, max, integer = true }) => {
+    if (value === undefined || value === null || String(value).trim() === "") {
+      return null;
+    }
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      errors.push(`${field} must be a number.`);
+      return null;
+    }
+    const candidate = integer ? Math.floor(parsed) : parsed;
+    if (candidate < min || candidate > max) {
+      errors.push(`${field} must be between ${min} and ${max}.`);
+      return null;
+    }
+    return candidate;
+  };
+
+  const maxAttemptsPerCall = parseNumberRange(source.max_attempts_per_call, {
+    field: "payment_policy.max_attempts_per_call",
+    min: 1,
+    max: 10,
+  });
+  if (maxAttemptsPerCall !== null) {
+    normalized.max_attempts_per_call = maxAttemptsPerCall;
+  }
+
+  const retryCooldownMs = parseNumberRange(source.retry_cooldown_ms, {
+    field: "payment_policy.retry_cooldown_ms",
+    min: 0,
+    max: 900000,
+  });
+  if (retryCooldownMs !== null) {
+    normalized.retry_cooldown_ms = retryCooldownMs;
+  }
+
+  const minInteractions = parseNumberRange(
+    source.min_interactions_before_payment,
+    {
+      field: "payment_policy.min_interactions_before_payment",
+      min: 0,
+      max: 25,
+    },
+  );
+  if (minInteractions !== null) {
+    normalized.min_interactions_before_payment = minInteractions;
+  }
+
+  const startHour = parseNumberRange(source.allowed_start_hour_utc, {
+    field: "payment_policy.allowed_start_hour_utc",
+    min: 0,
+    max: 23,
+  });
+  if (startHour !== null) {
+    normalized.allowed_start_hour_utc = startHour;
+  }
+
+  const endHour = parseNumberRange(source.allowed_end_hour_utc, {
+    field: "payment_policy.allowed_end_hour_utc",
+    min: 0,
+    max: 23,
+  });
+  if (endHour !== null) {
+    normalized.allowed_end_hour_utc = endHour;
+  }
+  if (
+    startHour !== null &&
+    endHour !== null &&
+    startHour === endHour
+  ) {
+    warnings.push(
+      "payment_policy.allowed_start_hour_utc equals allowed_end_hour_utc; payment will be allowed 24 hours.",
+    );
+  }
+
+  if (source.sms_fallback_on_failure !== undefined) {
+    normalized.sms_fallback_on_failure = normalizeBooleanFlag(
+      source.sms_fallback_on_failure,
+      true,
+    );
+  }
+  if (source.sms_fallback_on_timeout !== undefined) {
+    normalized.sms_fallback_on_timeout = normalizeBooleanFlag(
+      source.sms_fallback_on_timeout,
+      true,
+    );
+  }
+  if (source.sms_fallback_message !== undefined) {
+    const text = String(source.sms_fallback_message || "").trim();
+    normalized.sms_fallback_message = text ? text.slice(0, 240) : null;
+  }
+
+  if (source.trigger_mode !== undefined) {
+    const mode = String(source.trigger_mode || "")
+      .trim()
+      .toLowerCase();
+    if (["manual", "assisted", "auto"].includes(mode)) {
+      normalized.trigger_mode = mode;
+    } else if (mode) {
+      errors.push(
+        "payment_policy.trigger_mode must be one of manual, assisted, or auto.",
+      );
+    }
+  }
+
+  return {
+    normalized,
+    errors,
+    warnings,
+  };
+}
+
+function parsePaymentPolicy(value) {
+  if (!value) return null;
+  if (typeof value === "object" && !Array.isArray(value)) {
+    return { ...value };
+  }
+  try {
+    const parsed = JSON.parse(String(value));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return null;
+    }
+    return parsed;
+  } catch (_) {
+    return null;
+  }
+}
+
+function normalizeScriptTemplateRecord(template = null) {
+  if (!template || typeof template !== "object") return template;
+  const normalized = { ...template };
+  const parsedVersion = Number(normalized.version);
+  normalized.version =
+    Number.isFinite(parsedVersion) && parsedVersion > 0
+      ? Math.max(1, Math.floor(parsedVersion))
+      : 1;
+  normalized.payment_policy = parsePaymentPolicy(normalized.payment_policy);
+  return normalized;
+}
+
 const SCRIPT_BOUND_PAYMENT_OPTION_FIELDS = Object.freeze([
   "payment_connector",
   "payment_amount",
@@ -521,6 +666,8 @@ const SCRIPT_BOUND_PAYMENT_OPTION_FIELDS = Object.freeze([
   "payment_failure_message",
   "payment_retry_message",
 ]);
+
+const SCRIPT_BOUND_PAYMENT_POLICY_FIELDS = Object.freeze(["payment_policy"]);
 
 function hasScriptBoundPaymentOverride(input = {}) {
   const payload = input && typeof input === "object" ? input : {};
@@ -542,6 +689,26 @@ function hasScriptBoundPaymentOverride(input = {}) {
   });
 }
 
+function hasScriptBoundPaymentPolicyOverride(input = {}) {
+  const payload = input && typeof input === "object" ? input : {};
+  return SCRIPT_BOUND_PAYMENT_POLICY_FIELDS.some((field) => {
+    if (!Object.prototype.hasOwnProperty.call(payload, field)) {
+      return false;
+    }
+    const value = payload[field];
+    if (value === undefined || value === null) {
+      return false;
+    }
+    if (typeof value === "string") {
+      return value.trim() !== "";
+    }
+    if (typeof value === "object") {
+      return !Array.isArray(value) && Object.keys(value).length > 0;
+    }
+    return true;
+  });
+}
+
 function assertScriptBoundPayment(payload = {}, scriptId = null) {
   if (normalizeScriptId(scriptId)) {
     return;
@@ -553,6 +720,122 @@ function assertScriptBoundPayment(payload = {}, scriptId = null) {
   error.code = "payment_requires_script";
   error.status = 400;
   throw error;
+}
+
+function assertScriptBoundPaymentPolicy(payload = {}, scriptId = null) {
+  if (normalizeScriptId(scriptId)) {
+    return;
+  }
+  if (!hasScriptBoundPaymentPolicyOverride(payload)) {
+    return;
+  }
+  const error = new Error("Payment policy requires a valid script_id.");
+  error.code = "payment_policy_requires_script";
+  error.status = 400;
+  throw error;
+}
+
+function applyTemplateTokens(template = "", values = {}) {
+  let rendered = String(template || "");
+  Object.entries(values || {}).forEach(([key, value]) => {
+    const safeValue = value === undefined || value === null ? "" : String(value);
+    rendered = rendered.replace(
+      new RegExp(`\\{${String(key).replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\}`, "g"),
+      safeValue,
+    );
+  });
+  return rendered;
+}
+
+function buildPaymentSmsFallbackLink(
+  callSid,
+  session = {},
+  callConfig = {},
+  options = {},
+) {
+  const fallback = config.payment?.smsFallback || {};
+  if (fallback.enabled !== true) return null;
+  const template = String(fallback.urlTemplate || "").trim();
+  if (!template) return null;
+  const secret = String(fallback.secret || "").trim();
+  if (!secret) return null;
+
+  const ttlSeconds = Number.isFinite(Number(fallback.ttlSeconds))
+    ? Math.max(60, Math.floor(Number(fallback.ttlSeconds)))
+    : 900;
+  const expiresAtMs = Date.now() + ttlSeconds * 1000;
+  const expiresAtIso = new Date(expiresAtMs).toISOString();
+  const tokenPayload = {
+    call_sid: callSid || null,
+    payment_id: session?.payment_id || null,
+    amount: session?.amount || null,
+    currency: session?.currency || null,
+    reason: options.reason || null,
+    exp: Math.floor(expiresAtMs / 1000),
+  };
+  const token = Buffer.from(stableStringify(tokenPayload)).toString("base64url");
+  const signature = crypto
+    .createHmac("sha256", secret)
+    .update(token)
+    .digest("hex")
+    .slice(0, 32);
+
+  const values = {
+    call_sid: callSid || "",
+    payment_id: session?.payment_id || "",
+    amount: session?.amount || "",
+    currency: session?.currency || "",
+    reason: options.reason || "",
+    token,
+    signature,
+    expires_at: expiresAtIso,
+    script_id: callConfig?.script_id || "",
+    script_version: callConfig?.script_version || "",
+  };
+  const rendered = applyTemplateTokens(template, values).trim();
+  if (!rendered) return null;
+
+  try {
+    const url = new URL(rendered);
+    if (!url.searchParams.has("token")) {
+      url.searchParams.set("token", token);
+    }
+    if (!url.searchParams.has("sig")) {
+      url.searchParams.set("sig", signature);
+    }
+    if (!url.searchParams.has("exp")) {
+      url.searchParams.set("exp", String(Math.floor(expiresAtMs / 1000)));
+    }
+    if (!url.searchParams.has("call_sid") && callSid) {
+      url.searchParams.set("call_sid", String(callSid));
+    }
+    if (!url.searchParams.has("payment_id") && session?.payment_id) {
+      url.searchParams.set("payment_id", String(session.payment_id));
+    }
+    return {
+      url: url.toString(),
+      token,
+      signature,
+      expires_at: expiresAtIso,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function buildPaymentSmsFallbackMessage(context = {}) {
+  const fallback = config.payment?.smsFallback || {};
+  const template = String(
+    fallback.messageTemplate || "Complete your payment securely here: {payment_url}",
+  ).trim();
+  return applyTemplateTokens(template, {
+    payment_url: context.payment_url || "",
+    amount: context.amount || "",
+    currency: context.currency || "",
+    payment_id: context.payment_id || "",
+  })
+    .trim()
+    .slice(0, 240);
 }
 
 function buildCallCapabilities(callConfig = {}, options = {}) {
@@ -1068,6 +1351,9 @@ function buildInboundCallConfig(callSid, payload = {}, options = {}) {
     route.prompt || route.first_message || route.firstMessage,
   );
   const fallbackScript = !hasRoutePrompt ? inboundDefaultScript : null;
+  const routePaymentPolicy = parsePaymentPolicy(route.payment_policy);
+  const effectivePaymentPolicy =
+    routePaymentPolicy || fallbackScript?.payment_policy || null;
   const inboundPayment = normalizePaymentSettings(route, {
     provider,
     requireConnectorWhenEnabled: false,
@@ -1089,6 +1375,11 @@ function buildInboundCallConfig(callSid, payload = {}, options = {}) {
     route_label: routeLabel,
     script: route.script || fallbackScript?.name || null,
     script_id: route.script_id || fallbackScript?.id || null,
+    script_version:
+      normalizeScriptId(route.script_id || fallbackScript?.id) &&
+      Number.isFinite(Number(route.script_version || fallbackScript?.version))
+        ? Math.max(1, Math.floor(Number(route.script_version || fallbackScript?.version)))
+        : null,
     emotion: route.emotion || null,
     urgency: route.urgency || null,
     technical_level: route.technical_level || null,
@@ -1108,6 +1399,7 @@ function buildInboundCallConfig(callSid, payload = {}, options = {}) {
     payment_success_message: inboundPayment.payment_success_message || null,
     payment_failure_message: inboundPayment.payment_failure_message || null,
     payment_retry_message: inboundPayment.payment_retry_message || null,
+    payment_policy: effectivePaymentPolicy,
     payment_state: inboundPayment.payment_enabled === true ? "ready" : "disabled",
     payment_state_updated_at: createdAt,
     payment_session: null,
@@ -1160,7 +1452,9 @@ async function refreshInboundDefaultScript(force = false) {
   }
 
   try {
-    const script = await db.getCallTemplateById(scriptId);
+    const script = normalizeScriptTemplateRecord(
+      await db.getCallTemplateById(scriptId),
+    );
     if (!script) {
       inboundDefaultScriptId = null;
       inboundDefaultScript = null;
@@ -1260,6 +1554,9 @@ async function ensureCallRecord(
       provider_metadata: callConfig.provider_metadata || null,
       business_id: callConfig.business_id || null,
       route_label: callConfig.route_label || null,
+      script: callConfig.script || null,
+      script_id: callConfig.script_id || null,
+      script_version: callConfig.script_version || null,
       purpose: callConfig.purpose || null,
       voice_model: callConfig.voice_model || null,
       flow_state: callConfig.flow_state || "normal",
@@ -1278,6 +1575,7 @@ async function ensureCallRecord(
       payment_success_message: callConfig.payment_success_message || null,
       payment_failure_message: callConfig.payment_failure_message || null,
       payment_retry_message: callConfig.payment_retry_message || null,
+      payment_policy: callConfig.payment_policy || null,
       payment_state: callConfig.payment_state || (callConfig.payment_enabled === true ? "ready" : "disabled"),
       payment_state_updated_at:
         callConfig.payment_state_updated_at || new Date().toISOString(),
@@ -1329,6 +1627,9 @@ async function hydrateCallConfigFromDb(callSid) {
     business_id: state?.business_id || null,
     script: state?.script || null,
     script_id: state?.script_id || null,
+    script_version: Number.isFinite(Number(state?.script_version))
+      ? Math.max(1, Math.floor(Number(state.script_version)))
+      : null,
     emotion: state?.emotion || null,
     urgency: state?.urgency || null,
     technical_level: state?.technical_level || null,
@@ -1348,6 +1649,7 @@ async function hydrateCallConfigFromDb(callSid) {
     payment_success_message: state?.payment_success_message || null,
     payment_failure_message: state?.payment_failure_message || null,
     payment_retry_message: state?.payment_retry_message || null,
+    payment_policy: parsePaymentPolicy(state?.payment_policy),
     payment_state:
       state?.payment_state ||
       (normalizeBooleanFlag(state?.payment_enabled, false) ? "ready" : "disabled"),
@@ -3821,6 +4123,12 @@ app.set("trust proxy", 1);
 const allowedCorsOrigins = Array.isArray(config.server?.corsOrigins)
   ? config.server.corsOrigins.filter(Boolean)
   : [];
+const allowAllCorsInDev = !isProduction && allowedCorsOrigins.length === 0;
+if (isProduction && allowedCorsOrigins.length === 0) {
+  console.warn(
+    "CORS_ORIGINS is empty in production; browser origins will be denied by default.",
+  );
+}
 
 app.use(
   helmet({
@@ -3831,8 +4139,11 @@ app.use(
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (!origin || !allowedCorsOrigins.length) {
+      if (!origin) {
         return callback(null, true);
+      }
+      if (!allowedCorsOrigins.length) {
+        return callback(null, allowAllCorsInDev);
       }
       if (allowedCorsOrigins.includes(origin)) {
         return callback(null, true);
@@ -3866,6 +4177,31 @@ const apiLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 });
+const bypassPathLimiter = rateLimit({
+  windowMs: config.server?.rateLimit?.windowMs || 60000,
+  max: Math.max(
+    60,
+    Math.floor((config.server?.rateLimit?.max || 300) / 2),
+  ),
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+function shouldApplyBypassPathRateLimit(req) {
+  if (!shouldBypassHmac(req)) return false;
+  const path = req.path || "";
+  if (req.method === "OPTIONS") return false;
+  if (
+    req.method === "GET" &&
+    (path === "/" ||
+      path === "/favicon.ico" ||
+      path === "/health" ||
+      path === "/status")
+  ) {
+    return false;
+  }
+  return true;
+}
 
 function sanitizeTelemetryValue(value) {
   if (value == null) return null;
@@ -3920,6 +4256,12 @@ app.use((req, res, next) => {
     return next();
   }
   return apiLimiter(req, res, next);
+});
+app.use((req, res, next) => {
+  if (!shouldApplyBypassPathRateLimit(req)) {
+    return next();
+  }
+  return bypassPathLimiter(req, res, next);
 });
 
 const PORT = config.server?.port || 3000;
@@ -4746,7 +5088,16 @@ function buildTelephonyImplementations(callSid, gptService = null) {
           message: "A payment session is already in progress.",
         };
       }
-      const result = await digitService.requestPhonePayment(callSid, args);
+      const activeSession = activeCalls.get(callSid);
+      const interactionCount = Number.isFinite(
+        Number(activeSession?.interactionCount),
+      )
+        ? Math.max(0, Math.floor(Number(activeSession.interactionCount)))
+        : 0;
+      const result = await digitService.requestPhonePayment(callSid, {
+        ...args,
+        interaction_count: interactionCount,
+      });
       if (result?.status === "started") {
         queuePersistCallRuntimeState(callSid, {
           snapshot: {
@@ -5059,6 +5410,7 @@ function buildCallbackPayload(callRecord, callState) {
     business_id: callState?.business_id || callRecord?.business_id || null,
     script: callState?.script || callRecord?.script || null,
     script_id: callState?.script_id || callRecord?.script_id || null,
+    script_version: callState?.script_version || callRecord?.script_version || null,
     purpose: callState?.purpose || callRecord?.purpose || null,
     emotion: callState?.emotion || callRecord?.emotion || null,
     urgency: callState?.urgency || callRecord?.urgency || null,
@@ -5084,6 +5436,16 @@ function buildCallbackPayload(callRecord, callState) {
     collection_speak_confirmation:
       callState?.collection_speak_confirmation ||
       callRecord?.collection_speak_confirmation,
+    payment_enabled: normalizeBooleanFlag(callState?.payment_enabled, false),
+    payment_connector: callState?.payment_connector || null,
+    payment_amount: callState?.payment_amount || null,
+    payment_currency: callState?.payment_currency || null,
+    payment_description: callState?.payment_description || null,
+    payment_start_message: callState?.payment_start_message || null,
+    payment_success_message: callState?.payment_success_message || null,
+    payment_failure_message: callState?.payment_failure_message || null,
+    payment_retry_message: callState?.payment_retry_message || null,
+    payment_policy: parsePaymentPolicy(callState?.payment_policy),
   };
 }
 
@@ -6934,6 +7296,10 @@ async function startServer(options = {}) {
       healthProvider: getDigitSystemHealth,
       setCallFlowState,
       getPaymentFeatureConfig: () => getPaymentFeatureConfig(),
+      buildPaymentSmsFallbackLink: (callSid, session, callConfig, opts = {}) =>
+        buildPaymentSmsFallbackLink(callSid, session, callConfig, opts),
+      buildPaymentSmsFallbackMessage: (context = {}) =>
+        buildPaymentSmsFallbackMessage(context),
     });
     if (typeof webhookService.setDigitTokenResolver === "function") {
       webhookService.setDigitTokenResolver((callSid, tokenRef) => {
@@ -10432,6 +10798,7 @@ function callScriptPaymentFieldTouched(payload = {}) {
     "payment_amount",
     "payment_currency",
     "payment_description",
+    "payment_policy",
     "payment_start_message",
     "payment_success_message",
     "payment_failure_message",
@@ -10491,7 +10858,9 @@ async function suggestCallTemplateName(baseName, excludeId = null) {
 // Call script endpoints for bot script management
 app.get("/api/call-scripts", requireAdminToken, async (req, res) => {
   try {
-    const scripts = await db.getCallTemplates();
+    const scripts = (await db.getCallTemplates()).map((item) =>
+      normalizeScriptTemplateRecord(item),
+    );
     res.json({ success: true, scripts });
   } catch (error) {
     res
@@ -10508,13 +10877,15 @@ app.get("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
         .status(400)
         .json({ success: false, error: "Invalid script id" });
     }
-    const script = await db.getCallTemplateById(scriptId);
+    const script = normalizeScriptTemplateRecord(
+      await db.getCallTemplateById(scriptId),
+    );
     if (!script) {
       return res
         .status(404)
         .json({ success: false, error: "Script not found" });
     }
-    res.json({ success: true, script });
+    res.json({ success: true, script: normalizeScriptTemplateRecord(script) });
   } catch (error) {
     res
       .status(500)
@@ -10562,17 +10933,51 @@ app.post("/api/call-scripts", requireAdminToken, async (req, res) => {
         error: paymentSettings.errors.join(" "),
       });
     }
+    let paymentPolicyWarnings = [];
+    let normalizedPaymentPolicy = null;
+    if (Object.prototype.hasOwnProperty.call(requestBody, "payment_policy")) {
+      const rawPolicy = requestBody.payment_policy;
+      if (
+        typeof rawPolicy === "string" &&
+        rawPolicy.trim() &&
+        !parsePaymentPolicy(rawPolicy)
+      ) {
+        failCallScriptMutationIdempotency(idempotency);
+        return res.status(400).json({
+          success: false,
+          error: "payment_policy must be a valid JSON object.",
+        });
+      }
+      const paymentPolicy = normalizePaymentPolicy(
+        parsePaymentPolicy(rawPolicy) || {},
+      );
+      if (paymentPolicy.errors.length) {
+        failCallScriptMutationIdempotency(idempotency);
+        return res.status(400).json({
+          success: false,
+          error: paymentPolicy.errors.join(" "),
+        });
+      }
+      paymentPolicyWarnings = paymentPolicy.warnings;
+      normalizedPaymentPolicy =
+        Object.keys(paymentPolicy.normalized).length > 0
+          ? paymentPolicy.normalized
+          : null;
+    }
     const id = await db.createCallTemplate({
       ...requestBody,
       name: normalizedName,
       first_message: firstMessage,
       ...paymentSettings.normalized,
+      payment_policy: normalizedPaymentPolicy,
     });
-    const script = await db.getCallTemplateById(id);
+    const script = normalizeScriptTemplateRecord(
+      await db.getCallTemplateById(id),
+    );
     const responseBody = {
       success: true,
       script,
-      warnings: paymentSettings.warnings,
+      warnings: [...paymentSettings.warnings, ...paymentPolicyWarnings],
     };
     completeCallScriptMutationIdempotency(idempotency, 201, responseBody);
     res.status(201).json(responseBody);
@@ -10603,7 +11008,9 @@ app.put("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
         .status(400)
         .json({ success: false, error: "Invalid script id" });
     }
-    const existing = await db.getCallTemplateById(scriptId);
+    const existing = normalizeScriptTemplateRecord(
+      await db.getCallTemplateById(scriptId),
+    );
     if (!existing) {
       failCallScriptMutationIdempotency(idempotency);
       return res
@@ -10668,6 +11075,35 @@ app.put("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
       paymentWarnings = paymentSettings.warnings;
       Object.assign(updates, paymentSettings.normalized);
     }
+    if (Object.prototype.hasOwnProperty.call(requestBody, "payment_policy")) {
+      const rawPolicy = requestBody.payment_policy;
+      if (
+        typeof rawPolicy === "string" &&
+        rawPolicy.trim() &&
+        !parsePaymentPolicy(rawPolicy)
+      ) {
+        failCallScriptMutationIdempotency(idempotency);
+        return res.status(400).json({
+          success: false,
+          error: "payment_policy must be a valid JSON object.",
+        });
+      }
+      const paymentPolicy = normalizePaymentPolicy(
+        parsePaymentPolicy(rawPolicy) || {},
+      );
+      if (paymentPolicy.errors.length) {
+        failCallScriptMutationIdempotency(idempotency);
+        return res.status(400).json({
+          success: false,
+          error: paymentPolicy.errors.join(" "),
+        });
+      }
+      updates.payment_policy =
+        Object.keys(paymentPolicy.normalized).length > 0
+          ? paymentPolicy.normalized
+          : null;
+      paymentWarnings = [...paymentWarnings, ...paymentPolicy.warnings];
+    }
     const updated = await db.updateCallTemplate(scriptId, updates);
     if (!updated) {
       failCallScriptMutationIdempotency(idempotency);
@@ -10675,7 +11111,9 @@ app.put("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
         .status(404)
         .json({ success: false, error: "Script not found" });
     }
-    const script = await db.getCallTemplateById(scriptId);
+    const script = normalizeScriptTemplateRecord(
+      await db.getCallTemplateById(scriptId),
+    );
     if (inboundDefaultScriptId === scriptId) {
       inboundDefaultScript = script || null;
       inboundDefaultLoadedAt = Date.now();
@@ -10752,7 +11190,8 @@ app.post("/api/call-scripts/:id/clone", requireAdminToken, async (req, res) => {
         .status(400)
         .json({ success: false, error: "Invalid script id" });
     }
-    const existing = await db.getCallTemplateById(scriptId);
+    const existingRaw = await db.getCallTemplateById(scriptId);
+    const existing = normalizeScriptTemplateRecord(existingRaw);
     if (!existing) {
       failCallScriptMutationIdempotency(idempotency);
       return res
@@ -10803,6 +11242,7 @@ app.post("/api/call-scripts/:id/clone", requireAdminToken, async (req, res) => {
       payment_amount: existing.payment_amount || null,
       payment_currency: existing.payment_currency || null,
       payment_description: existing.payment_description || null,
+      payment_policy: existing.payment_policy || null,
       payment_start_message: existing.payment_start_message || null,
       payment_success_message: existing.payment_success_message || null,
       payment_failure_message: existing.payment_failure_message || null,
@@ -10823,7 +11263,9 @@ app.post("/api/call-scripts/:id/clone", requireAdminToken, async (req, res) => {
       ...payload,
       ...paymentSettings.normalized,
     });
-    const script = await db.getCallTemplateById(newId);
+    const script = normalizeScriptTemplateRecord(
+      await db.getCallTemplateById(newId),
+    );
     const responseBody = {
       success: true,
       script,
@@ -10867,7 +11309,9 @@ app.put("/api/inbound/default-script", requireAdminToken, async (req, res) => {
         .status(400)
         .json({ success: false, error: "script_id is required" });
     }
-    const script = await db.getCallTemplateById(scriptId);
+    const script = normalizeScriptTemplateRecord(
+      await db.getCallTemplateById(scriptId),
+    );
     if (!script) {
       return res
         .status(404)
@@ -10987,6 +11431,7 @@ async function buildRetryPayload(callSid) {
     business_id: callState?.business_id || null,
     script: callState?.script || null,
     script_id: callState?.script_id || null,
+    script_version: callState?.script_version || null,
     purpose: callState?.purpose || null,
     emotion: callState?.emotion || null,
     urgency: callState?.urgency || null,
@@ -11007,6 +11452,7 @@ async function buildRetryPayload(callSid) {
     payment_success_message: callState?.payment_success_message || null,
     payment_failure_message: callState?.payment_failure_message || null,
     payment_retry_message: callState?.payment_retry_message || null,
+    payment_policy: parsePaymentPolicy(callState?.payment_policy),
   };
 }
 
@@ -11226,6 +11672,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
     business_id,
     script,
     script_id,
+    script_version,
     purpose,
     emotion,
     urgency,
@@ -11246,12 +11693,14 @@ async function placeOutboundCall(payload, hostOverride = null) {
     payment_success_message,
     payment_failure_message,
     payment_retry_message,
+    payment_policy,
   } = payload || {};
   const payloadObject =
     payload && typeof payload === "object" ? payload : {};
   const hasPayloadField = (field) =>
     Object.prototype.hasOwnProperty.call(payloadObject, field);
   assertScriptBoundPayment(payloadObject, script_id);
+  assertScriptBoundPaymentPolicy(payloadObject, script_id);
 
   if (!number || !prompt || !first_message) {
     throw new Error(
@@ -11279,30 +11728,56 @@ async function placeOutboundCall(payload, hostOverride = null) {
     `Generated ${functionSystem.functions.length} functions for ${functionSystem.context.industry} industry`,
   );
 
+  const callWarnings = [];
+  const normalizedScriptId = normalizeScriptId(script_id);
+  const requestedScriptVersion = Number(script_version);
+  let resolvedScriptVersion =
+    Number.isFinite(requestedScriptVersion) && requestedScriptVersion > 0
+      ? Math.max(1, Math.floor(requestedScriptVersion))
+      : null;
   let scriptPolicy = {};
   let scriptPaymentDefaults = {};
-  if (script_id) {
+  let scriptPaymentPolicy = null;
+  if (normalizedScriptId) {
     try {
-      const tpl = await db.getCallTemplateById(Number(script_id));
+      const tpl = normalizeScriptTemplateRecord(
+        await db.getCallTemplateById(Number(normalizedScriptId)),
+      );
       if (tpl) {
-        scriptPolicy = {
-          requires_otp: !!tpl.requires_otp,
-          default_profile: tpl.default_profile || null,
-          expected_length: tpl.expected_length || null,
-          allow_terminator: !!tpl.allow_terminator,
-          terminator_char: tpl.terminator_char || null,
-        };
-        scriptPaymentDefaults = {
-          payment_enabled: normalizeBooleanFlag(tpl.payment_enabled, false),
-          payment_connector: tpl.payment_connector || null,
-          payment_amount: tpl.payment_amount || null,
-          payment_currency: tpl.payment_currency || null,
-          payment_description: tpl.payment_description || null,
-          payment_start_message: tpl.payment_start_message || null,
-          payment_success_message: tpl.payment_success_message || null,
-          payment_failure_message: tpl.payment_failure_message || null,
-          payment_retry_message: tpl.payment_retry_message || null,
-        };
+        const currentTemplateVersion =
+          Number.isFinite(Number(tpl.version)) && Number(tpl.version) > 0
+            ? Math.max(1, Math.floor(Number(tpl.version)))
+            : 1;
+        if (!resolvedScriptVersion) {
+          resolvedScriptVersion = currentTemplateVersion;
+        }
+        const versionMatches =
+          !resolvedScriptVersion || resolvedScriptVersion === currentTemplateVersion;
+        if (versionMatches) {
+          scriptPolicy = {
+            requires_otp: !!tpl.requires_otp,
+            default_profile: tpl.default_profile || null,
+            expected_length: tpl.expected_length || null,
+            allow_terminator: !!tpl.allow_terminator,
+            terminator_char: tpl.terminator_char || null,
+          };
+          scriptPaymentDefaults = {
+            payment_enabled: normalizeBooleanFlag(tpl.payment_enabled, false),
+            payment_connector: tpl.payment_connector || null,
+            payment_amount: tpl.payment_amount || null,
+            payment_currency: tpl.payment_currency || null,
+            payment_description: tpl.payment_description || null,
+            payment_start_message: tpl.payment_start_message || null,
+            payment_success_message: tpl.payment_success_message || null,
+            payment_failure_message: tpl.payment_failure_message || null,
+            payment_retry_message: tpl.payment_retry_message || null,
+          };
+          scriptPaymentPolicy = tpl.payment_policy || null;
+        } else {
+          callWarnings.push(
+            `Script version mismatch for script_id ${normalizedScriptId}: requested v${resolvedScriptVersion}, current v${currentTemplateVersion}. Using pinned payload settings.`,
+          );
+        }
       }
     } catch (err) {
       console.error("Script metadata load error:", err);
@@ -11322,7 +11797,11 @@ async function placeOutboundCall(payload, hostOverride = null) {
       }, script_requires_otp=${scriptPolicy?.requires_otp ? "true" : "false"}`
     : null;
   const keypadOverride = keypadRequired
-    ? resolveKeypadProviderOverride(collection_profile, scriptPolicy, script_id)
+    ? resolveKeypadProviderOverride(
+        collection_profile,
+        scriptPolicy,
+        normalizedScriptId,
+      )
     : null;
 
   const readiness = getProviderReadiness();
@@ -11373,7 +11852,6 @@ async function placeOutboundCall(payload, hostOverride = null) {
     ? healthyProviders
     : availableProviders;
   let lastError = null;
-  const callWarnings = [];
 
   for (const provider of attemptProviders) {
     try {
@@ -11548,12 +12026,57 @@ async function placeOutboundCall(payload, hostOverride = null) {
       ? payment_retry_message
       : scriptPaymentDefaults.payment_retry_message,
   };
+  let payloadPaymentPolicy = null;
+  if (hasPayloadField("payment_policy")) {
+    const rawPayloadPaymentPolicy = payment_policy;
+    const clearRequested =
+      rawPayloadPaymentPolicy === null ||
+      rawPayloadPaymentPolicy === undefined ||
+      (typeof rawPayloadPaymentPolicy === "string" &&
+        rawPayloadPaymentPolicy.trim() === "");
+    if (!clearRequested) {
+      payloadPaymentPolicy = parsePaymentPolicy(rawPayloadPaymentPolicy);
+      if (!payloadPaymentPolicy) {
+        const error = new Error(
+          "payment_policy must be a valid JSON object.",
+        );
+        error.code = "payment_policy_invalid";
+        error.status = 400;
+        throw error;
+      }
+    }
+  }
+  const mergedPaymentPolicyInput = hasPayloadField("payment_policy")
+    ? payloadPaymentPolicy
+    : scriptPaymentPolicy;
+  const normalizedPaymentPolicyResult = normalizePaymentPolicy(
+    mergedPaymentPolicyInput || {},
+  );
+  if (normalizedPaymentPolicyResult.errors.length) {
+    const error = new Error(normalizedPaymentPolicyResult.errors.join(" "));
+    error.code = "payment_policy_invalid";
+    error.status = 400;
+    throw error;
+  }
+  if (normalizedPaymentPolicyResult.warnings.length) {
+    callWarnings.push(...normalizedPaymentPolicyResult.warnings);
+  }
+  const normalizedPaymentPolicy =
+    Object.keys(normalizedPaymentPolicyResult.normalized).length > 0
+      ? normalizedPaymentPolicyResult.normalized
+      : null;
   const normalizedPayment = normalizePaymentSettings(mergedPaymentInput, {
     provider: selectedProvider || currentProvider,
     requireConnectorWhenEnabled: false,
-    hasScript: Boolean(script_id),
+    hasScript: Boolean(normalizedScriptId),
     enforceFeatureGate: true,
   });
+  if (normalizedPayment.errors.length) {
+    const error = new Error(normalizedPayment.errors.join(" "));
+    error.code = "payment_validation_error";
+    error.status = 400;
+    throw error;
+  }
   if (normalizedPayment.warnings.length) {
     callWarnings.push(...normalizedPayment.warnings);
   }
@@ -11575,7 +12098,8 @@ async function placeOutboundCall(payload, hostOverride = null) {
     purpose: purpose || null,
     business_id: business_id || null,
     script: script || null,
-    script_id: script_id || null,
+    script_id: normalizedScriptId || null,
+    script_version: resolvedScriptVersion || null,
     emotion: emotion || null,
     urgency: urgency || null,
     technical_level: technical_level || null,
@@ -11600,6 +12124,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
       normalizedPayment.normalized.payment_failure_message || null,
     payment_retry_message:
       normalizedPayment.normalized.payment_retry_message || null,
+    payment_policy: normalizedPaymentPolicy,
     payment_state: paymentEnabled ? "ready" : "disabled",
     payment_state_updated_at: createdAt,
     payment_session: null,
@@ -11649,7 +12174,8 @@ async function placeOutboundCall(payload, hostOverride = null) {
       customer_name: customer_name || null,
       business_id: business_id || null,
       script: script || null,
-      script_id: script_id || null,
+      script_id: normalizedScriptId || null,
+      script_version: resolvedScriptVersion || null,
       purpose: purpose || null,
       emotion: emotion || null,
       urgency: urgency || null,
@@ -11683,6 +12209,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
         normalizedPayment.normalized.payment_failure_message || null,
       payment_retry_message:
         normalizedPayment.normalized.payment_retry_message || null,
+      payment_policy: normalizedPaymentPolicy,
       payment_state: callConfig.payment_state || (paymentEnabled ? "ready" : "disabled"),
       payment_state_updated_at:
         callConfig.payment_state_updated_at || new Date().toISOString(),
@@ -12125,12 +12652,16 @@ function truncatePrompt(value, limit = 800) {
 async function applyScriptInjection(callSid, scriptId, userId) {
   if (!callSid || !scriptId) return { ok: false, error: "missing_script" };
   if (!db) return { ok: false, error: "db_unavailable" };
-  const script = await db.getCallTemplateById(scriptId);
+  const script = normalizeScriptTemplateRecord(
+    await db.getCallTemplateById(scriptId),
+  );
   if (!script) return { ok: false, error: "script_not_found" };
   const callConfig = callConfigurations.get(callSid);
   if (!callConfig) return { ok: false, error: "call_not_active" };
   callConfig.script = script.name || callConfig.script;
   callConfig.script_id = script.id || callConfig.script_id;
+  callConfig.script_version = script.version || callConfig.script_version || 1;
+  callConfig.payment_policy = script.payment_policy || null;
   if (script.prompt) {
     callConfig.prompt = script.prompt;
   }
@@ -12150,6 +12681,8 @@ async function applyScriptInjection(callSid, scriptId, userId) {
     .updateCallState(callSid, "script_injected", {
       script_id: script.id,
       script_name: script.name || null,
+      script_version: script.version || null,
+      payment_policy: script.payment_policy || null,
       user_id: userId || null,
       at: new Date().toISOString(),
     })
@@ -14477,6 +15010,7 @@ registerStatusRoutes(app, {
   config,
   verifyHmacSignature,
   hasAdminToken,
+  requireOutboundAuthorization,
   refreshInboundDefaultScript,
   getInboundHealthContext,
   supportedProviders: SUPPORTED_PROVIDERS,
@@ -14641,6 +15175,109 @@ app.post("/api/payment/reconcile", requireAdminToken, async (req, res) => {
       status,
       error.code || "payment_reconcile_failed",
       error.message || "Failed to reconcile stale payment sessions",
+      req.requestId,
+    );
+  }
+});
+
+app.get("/api/payment/analytics", requireAdminToken, async (req, res) => {
+  try {
+    if (!db?.getPaymentFunnelAnalytics) {
+      return res.status(503).json({
+        success: false,
+        error: "Payment analytics is not available",
+      });
+    }
+    const hours = Number(req.query?.hours);
+    const limit = Number(req.query?.limit);
+    const rows = await db.getPaymentFunnelAnalytics({ hours, limit });
+    const toNumber = (value) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : 0;
+    };
+    const toRate = (num, den) => {
+      if (!den) return 0;
+      return Number(((num / den) * 100).toFixed(2));
+    };
+    const items = (rows || []).map((row) => {
+      const callsTotal = toNumber(row.calls_total);
+      const offered = toNumber(row.offered);
+      const requested = toNumber(row.requested);
+      const captureStarted = toNumber(row.capture_started);
+      const completed = toNumber(row.completed);
+      const failed = toNumber(row.failed);
+      return {
+        script_id: row.script_id || null,
+        script_version: Number.isFinite(Number(row.script_version))
+          ? Math.max(1, Math.floor(Number(row.script_version)))
+          : null,
+        provider: row.provider || null,
+        calls_total: callsTotal,
+        offered,
+        requested,
+        capture_started: captureStarted,
+        completed,
+        failed,
+        conversion_offer_to_request_pct: toRate(requested, offered),
+        conversion_request_to_complete_pct: toRate(completed, requested),
+        conversion_offer_to_complete_pct: toRate(completed, offered),
+        failure_rate_pct: toRate(failed, requested || offered),
+      };
+    });
+    const summary = items.reduce(
+      (acc, item) => {
+        acc.calls_total += item.calls_total;
+        acc.offered += item.offered;
+        acc.requested += item.requested;
+        acc.capture_started += item.capture_started;
+        acc.completed += item.completed;
+        acc.failed += item.failed;
+        return acc;
+      },
+      {
+        calls_total: 0,
+        offered: 0,
+        requested: 0,
+        capture_started: 0,
+        completed: 0,
+        failed: 0,
+      },
+    );
+    summary.conversion_offer_to_request_pct = toRate(
+      summary.requested,
+      summary.offered,
+    );
+    summary.conversion_request_to_complete_pct = toRate(
+      summary.completed,
+      summary.requested,
+    );
+    summary.conversion_offer_to_complete_pct = toRate(
+      summary.completed,
+      summary.offered,
+    );
+    summary.failure_rate_pct = toRate(
+      summary.failed,
+      summary.requested || summary.offered,
+    );
+
+    return res.json({
+      success: true,
+      window_hours: Number.isFinite(hours) && hours > 0 ? hours : 24 * 7,
+      items,
+      summary,
+      request_id: req.requestId || null,
+    });
+  } catch (error) {
+    console.error("payment_analytics_error", {
+      request_id: req.requestId || null,
+      error: redactSensitiveLogValue(error.message || "payment_analytics_failed"),
+      code: error.code || null,
+    });
+    return sendApiError(
+      res,
+      500,
+      error.code || "payment_analytics_failed",
+      error.message || "Failed to fetch payment analytics",
       req.requestId,
     );
   }

@@ -68,6 +68,7 @@ describe('Outbound call payment payload wiring', () => {
         user_chat_id: '999',
         script: 'custom',
         script_id: 42,
+        script_version: 7,
         payment_enabled: true,
         payment_connector: 'Pay Connector A',
         payment_amount: '49.99',
@@ -95,6 +96,7 @@ describe('Outbound call payment payload wiring', () => {
         business_id: undefined,
         script: 'custom',
         script_id: 42,
+        script_version: 7,
         purpose: undefined,
         emotion: undefined,
         urgency: undefined,
@@ -115,6 +117,7 @@ describe('Outbound call payment payload wiring', () => {
         payment_success_message: undefined,
         payment_failure_message: undefined,
         payment_retry_message: undefined,
+        payment_policy: undefined,
       },
       'api.example.test',
     );
@@ -174,6 +177,105 @@ describe('Outbound call payment payload wiring', () => {
       'payment_requires_script',
       'Payment settings require a valid script_id.',
       'req_2',
+      expect.any(Object),
+    );
+  });
+
+  test('returns validation error when payment_policy is provided without script_id', async () => {
+    const paymentError = new Error('Payment policy requires a valid script_id.');
+    paymentError.code = 'payment_policy_requires_script';
+    paymentError.status = 400;
+
+    const placeOutboundCall = jest.fn().mockRejectedValue(paymentError);
+    const sendApiError = jest.fn();
+    const app = createAppStub();
+
+    registerCallRoutes(app, {
+      requireOutboundAuthorization: jest.fn((req, res, next) => next && next()),
+      sendApiError,
+      resolveHost: jest.fn(() => 'api.example.test'),
+      config: { server: { hostname: 'api.example.test' } },
+      placeOutboundCall,
+      buildErrorDetails: (error) => error?.message || null,
+      getCurrentProvider: () => 'twilio',
+      parseBoundedInteger: (value, { defaultValue }) => defaultValue,
+      normalizeCallRecordForApi: (row) => row,
+      getDb: () => null,
+      getDigitService: () => null,
+      getCallDirection: () => 'outbound',
+    });
+
+    const handler = app.routes['POST /outbound-call'];
+    const req = {
+      requestId: 'req_3',
+      body: {
+        number: '+15555550123',
+        prompt: 'Prompt',
+        first_message: 'Hello',
+        payment_policy: { min_interactions_before_payment: 2 },
+      },
+      headers: {},
+    };
+    const res = createResMock();
+
+    await handler(req, res);
+
+    expect(sendApiError).toHaveBeenCalledWith(
+      res,
+      400,
+      'payment_policy_requires_script',
+      'Payment policy requires a valid script_id.',
+      'req_3',
+      expect.any(Object),
+    );
+  });
+
+  test('returns validation error when payment_policy is invalid', async () => {
+    const paymentError = new Error('payment_policy must be a valid JSON object.');
+    paymentError.code = 'payment_policy_invalid';
+    paymentError.status = 400;
+
+    const placeOutboundCall = jest.fn().mockRejectedValue(paymentError);
+    const sendApiError = jest.fn();
+    const app = createAppStub();
+
+    registerCallRoutes(app, {
+      requireOutboundAuthorization: jest.fn((req, res, next) => next && next()),
+      sendApiError,
+      resolveHost: jest.fn(() => 'api.example.test'),
+      config: { server: { hostname: 'api.example.test' } },
+      placeOutboundCall,
+      buildErrorDetails: (error) => error?.message || null,
+      getCurrentProvider: () => 'twilio',
+      parseBoundedInteger: (value, { defaultValue }) => defaultValue,
+      normalizeCallRecordForApi: (row) => row,
+      getDb: () => null,
+      getDigitService: () => null,
+      getCallDirection: () => 'outbound',
+    });
+
+    const handler = app.routes['POST /outbound-call'];
+    const req = {
+      requestId: 'req_4',
+      body: {
+        number: '+15555550123',
+        prompt: 'Prompt',
+        first_message: 'Hello',
+        script_id: 77,
+        payment_policy: '{bad-json',
+      },
+      headers: {},
+    };
+    const res = createResMock();
+
+    await handler(req, res);
+
+    expect(sendApiError).toHaveBeenCalledWith(
+      res,
+      400,
+      'payment_policy_invalid',
+      'payment_policy must be a valid JSON object.',
+      'req_4',
       expect.any(Object),
     );
   });

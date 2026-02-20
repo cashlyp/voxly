@@ -52,6 +52,7 @@ function createOutboundCallHandler(ctx = {}) {
         business_id: req.body?.business_id,
         script: req.body?.script,
         script_id: req.body?.script_id,
+        script_version: req.body?.script_version,
         purpose: req.body?.purpose,
         emotion: req.body?.emotion,
         urgency: req.body?.urgency,
@@ -72,6 +73,7 @@ function createOutboundCallHandler(ctx = {}) {
         payment_success_message: req.body?.payment_success_message,
         payment_failure_message: req.body?.payment_failure_message,
         payment_retry_message: req.body?.payment_retry_message,
+        payment_policy: req.body?.payment_policy,
       };
 
       const host = resolveHost(req) || config.server?.hostname;
@@ -98,11 +100,18 @@ function createOutboundCallHandler(ctx = {}) {
     } catch (error) {
       const message = String(error?.message || "");
       const paymentRequiresScript = error?.code === "payment_requires_script";
+      const paymentPolicyRequiresScript =
+        error?.code === "payment_policy_requires_script";
+      const paymentPolicyInvalid = error?.code === "payment_policy_invalid";
+      const paymentValidationError = error?.code === "payment_validation_error";
       const isValidation =
         paymentRequiresScript ||
+        paymentPolicyRequiresScript ||
+        paymentPolicyInvalid ||
+        paymentValidationError ||
         message.includes("Missing required fields") ||
         message.includes("Invalid phone number format");
-      const status = paymentRequiresScript
+      const status = paymentRequiresScript || paymentPolicyRequiresScript
         ? 400
         : isValidation
           ? 400
@@ -116,11 +125,21 @@ function createOutboundCallHandler(ctx = {}) {
         status,
         paymentRequiresScript
           ? "payment_requires_script"
-          : isValidation
-            ? "validation_error"
-            : "outbound_call_failed",
+          : paymentPolicyRequiresScript
+            ? "payment_policy_requires_script"
+            : paymentPolicyInvalid
+              ? "payment_policy_invalid"
+              : paymentValidationError
+                ? "payment_validation_error"
+            : isValidation
+              ? "validation_error"
+              : "outbound_call_failed",
         paymentRequiresScript
           ? "Payment settings require a valid script_id."
+          : paymentPolicyRequiresScript
+            ? "Payment policy requires a valid script_id."
+            : paymentPolicyInvalid || paymentValidationError
+              ? message || "Invalid payment configuration."
           : "Failed to create outbound call",
         req.requestId || null,
         { details: buildErrorDetails(error) },
@@ -849,6 +868,10 @@ function createSearchCallsHandler(ctx = {}) {
 }
 
 function registerCallRoutes(app, ctx = {}) {
+  const requireOutboundAuthorization =
+    typeof ctx.requireOutboundAuthorization === "function"
+      ? ctx.requireOutboundAuthorization
+      : (_req, _res, next) => next();
   const handleOutboundCall = createOutboundCallHandler(ctx);
   const handleGetCallDetails = createGetCallDetailsHandler(ctx);
   const handleGetTranscriptAudio = createGetTranscriptAudioHandler(ctx);
@@ -858,14 +881,18 @@ function registerCallRoutes(app, ctx = {}) {
 
   app.post(
     "/outbound-call",
-    ctx.requireOutboundAuthorization,
+    requireOutboundAuthorization,
     handleOutboundCall,
   );
-  app.get("/api/calls/:callSid", handleGetCallDetails);
-  app.get("/api/calls/:callSid/transcript/audio", handleGetTranscriptAudio);
-  app.get("/api/calls", handleListCalls);
-  app.get("/api/calls/list", handleListCallsFiltered);
-  app.get("/api/calls/search", handleSearchCalls);
+  app.get("/api/calls/:callSid", requireOutboundAuthorization, handleGetCallDetails);
+  app.get(
+    "/api/calls/:callSid/transcript/audio",
+    requireOutboundAuthorization,
+    handleGetTranscriptAudio,
+  );
+  app.get("/api/calls", requireOutboundAuthorization, handleListCalls);
+  app.get("/api/calls/list", requireOutboundAuthorization, handleListCallsFiltered);
+  app.get("/api/calls/search", requireOutboundAuthorization, handleSearchCalls);
 }
 
 module.exports = { registerCallRoutes };

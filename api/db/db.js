@@ -20,19 +20,40 @@ class EnhancedDatabase {
                     return;
                 }
                 console.log('Connected to enhanced SQLite database');
-                this.createEnhancedTables().then(() => {
-                    this.initializeSMSTables().then(() => {
-                        this.initializeEmailTables().then(() => {
-                            this.ensureEmailDlqColumns().then(() => {
-                                this.ensureEmailQueueColumns().then(() => {
-                                    this.isInitialized = true;
-                                    console.log('✅ Enhanced database initialization complete');
-                                    resolve();
+                this.applyStartupPragmas().then(() => {
+                    this.createEnhancedTables().then(() => {
+                        this.initializeSMSTables().then(() => {
+                            this.initializeEmailTables().then(() => {
+                                this.ensureEmailDlqColumns().then(() => {
+                                    this.ensureEmailQueueColumns().then(() => {
+                                        this.isInitialized = true;
+                                        console.log('✅ Enhanced database initialization complete');
+                                        resolve();
+                                    }).catch(reject);
                                 }).catch(reject);
                             }).catch(reject);
                         }).catch(reject);
                     }).catch(reject);
                 }).catch(reject);
+            });
+        });
+    }
+
+    async applyStartupPragmas() {
+        const pragmaStatements = [
+            'PRAGMA foreign_keys = ON',
+            'PRAGMA journal_mode = WAL',
+            'PRAGMA synchronous = NORMAL',
+            'PRAGMA busy_timeout = 5000'
+        ];
+        return new Promise((resolve, reject) => {
+            this.db.exec(`${pragmaStatements.join(';')};`, (err) => {
+                if (err) {
+                    console.error('Error applying SQLite startup pragmas:', err);
+                    reject(err);
+                    return;
+                }
+                resolve();
             });
         });
     }
@@ -136,6 +157,7 @@ class EnhancedDatabase {
                 description TEXT,
                 prompt TEXT,
                 first_message TEXT,
+                version INTEGER DEFAULT 1,
                 business_id TEXT,
                 voice_model TEXT,
                 requires_otp INTEGER DEFAULT 0,
@@ -148,6 +170,7 @@ class EnhancedDatabase {
                 payment_amount TEXT,
                 payment_currency TEXT,
                 payment_description TEXT,
+                payment_policy TEXT,
                 payment_start_message TEXT,
                 payment_success_message TEXT,
                 payment_failure_message TEXT,
@@ -363,6 +386,7 @@ class EnhancedDatabase {
 
         await this.ensureCallColumns(['digit_summary', 'digit_count', 'last_otp', 'last_otp_masked', 'direction']);
         await this.ensureTemplateColumns([
+            'version',
             'requires_otp',
             'default_profile',
             'expected_length',
@@ -373,6 +397,7 @@ class EnhancedDatabase {
             'payment_amount',
             'payment_currency',
             'payment_description',
+            'payment_policy',
             'payment_start_message',
             'payment_success_message',
             'payment_failure_message',
@@ -532,7 +557,9 @@ class EnhancedDatabase {
         });
         for (const column of columns) {
             if (existingNames.has(column)) continue;
-            if (column === 'requires_otp') {
+            if (column === 'version') {
+                await addColumn('version', 'INTEGER DEFAULT 1');
+            } else if (column === 'requires_otp') {
                 await addColumn('requires_otp', 'INTEGER DEFAULT 0');
             } else if (column === 'default_profile') {
                 await addColumn('default_profile', 'TEXT');
@@ -552,6 +579,8 @@ class EnhancedDatabase {
                 await addColumn('payment_currency', 'TEXT');
             } else if (column === 'payment_description') {
                 await addColumn('payment_description', 'TEXT');
+            } else if (column === 'payment_policy') {
+                await addColumn('payment_policy', 'TEXT');
             } else if (column === 'payment_start_message') {
                 await addColumn('payment_start_message', 'TEXT');
             } else if (column === 'payment_success_message') {
@@ -865,6 +894,71 @@ class EnhancedDatabase {
         });
     }
 
+    async getPaymentFunnelAnalytics(options = {}) {
+        const hours = Number.isFinite(Number(options.hours))
+            ? Math.max(1, Math.min(24 * 90, Math.floor(Number(options.hours))))
+            : 24 * 7;
+        const limit = Number.isFinite(Number(options.limit))
+            ? Math.max(1, Math.min(250, Math.floor(Number(options.limit))))
+            : 100;
+
+        return new Promise((resolve, reject) => {
+            const sql = `
+                WITH created AS (
+                    SELECT
+                        cs.call_sid AS call_sid,
+                        CASE
+                            WHEN json_extract(cs.data, '$.payment_enabled') IN (1, '1', 'true', 'TRUE') THEN 1
+                            ELSE 0
+                        END AS payment_enabled,
+                        json_extract(cs.data, '$.script_id') AS script_id,
+                        COALESCE(json_extract(cs.data, '$.script_version'), 1) AS script_version,
+                        json_extract(cs.data, '$.provider') AS provider,
+                        cs.timestamp AS created_at
+                    FROM call_states cs
+                    WHERE cs.state = 'call_created'
+                      AND cs.timestamp >= datetime('now', '-' || ? || ' hours')
+                ),
+                grouped AS (
+                    SELECT
+                        c.call_sid AS call_sid,
+                        c.payment_enabled AS payment_enabled,
+                        c.script_id AS script_id,
+                        c.script_version AS script_version,
+                        c.provider AS provider,
+                        MAX(CASE WHEN s.state = 'payment_session_requested' THEN 1 ELSE 0 END) AS requested,
+                        MAX(CASE WHEN s.state = 'payment_session_started' THEN 1 ELSE 0 END) AS capture_started,
+                        MAX(CASE WHEN s.state = 'payment_session_completed' THEN 1 ELSE 0 END) AS completed,
+                        MAX(CASE WHEN s.state IN ('payment_session_failed', 'payment_session_reconciled', 'payment_session_start_failed') THEN 1 ELSE 0 END) AS failed
+                    FROM created c
+                    LEFT JOIN call_states s ON s.call_sid = c.call_sid
+                    GROUP BY c.call_sid
+                )
+                SELECT
+                    script_id,
+                    script_version,
+                    provider,
+                    COUNT(*) AS calls_total,
+                    SUM(payment_enabled) AS offered,
+                    SUM(requested) AS requested,
+                    SUM(capture_started) AS capture_started,
+                    SUM(completed) AS completed,
+                    SUM(failed) AS failed
+                FROM grouped
+                GROUP BY script_id, script_version, provider
+                ORDER BY completed DESC, offered DESC, calls_total DESC
+                LIMIT ?
+            `;
+            this.db.all(sql, [hours, limit], (err, rows) => {
+                if (err) {
+                    reject(err);
+                    return;
+                }
+                resolve(rows || []);
+            });
+        });
+    }
+
     async getCallerFlag(phone_number) {
         if (!phone_number) return null;
         return new Promise((resolve, reject) => {
@@ -945,9 +1039,10 @@ class EnhancedDatabase {
     async getCallTemplates() {
         return new Promise((resolve, reject) => {
             const sql = `
-                SELECT id, name, description, prompt, first_message, business_id, voice_model,
+                SELECT id, name, description, prompt, first_message, version, business_id, voice_model,
                        requires_otp, default_profile, expected_length, allow_terminator, terminator_char,
                        payment_enabled, payment_connector, payment_amount, payment_currency, payment_description,
+                       payment_policy,
                        payment_start_message, payment_success_message, payment_failure_message, payment_retry_message,
                        created_at, updated_at
                 FROM call_templates
@@ -966,9 +1061,10 @@ class EnhancedDatabase {
     async getCallTemplateById(id) {
         return new Promise((resolve, reject) => {
             const sql = `
-                SELECT id, name, description, prompt, first_message, business_id, voice_model,
+                SELECT id, name, description, prompt, first_message, version, business_id, voice_model,
                        requires_otp, default_profile, expected_length, allow_terminator, terminator_char,
                        payment_enabled, payment_connector, payment_amount, payment_currency, payment_description,
+                       payment_policy,
                        payment_start_message, payment_success_message, payment_failure_message, payment_retry_message,
                        created_at, updated_at
                 FROM call_templates
@@ -990,6 +1086,7 @@ class EnhancedDatabase {
             description = null,
             prompt = null,
             first_message,
+            version = 1,
             business_id = null,
             voice_model = null,
             requires_otp = 0,
@@ -1002,11 +1099,16 @@ class EnhancedDatabase {
             payment_amount = null,
             payment_currency = null,
             payment_description = null,
+            payment_policy = null,
             payment_start_message = null,
             payment_success_message = null,
             payment_failure_message = null,
             payment_retry_message = null
         } = payload || {};
+        const normalizedVersionParsed = Number(version);
+        const normalizedVersion = Number.isFinite(normalizedVersionParsed) && normalizedVersionParsed > 0
+            ? Math.max(1, Math.floor(normalizedVersionParsed))
+            : 1;
         const normalizedRequiresOtp = requires_otp ? 1 : 0;
         const normalizedAllowTerminator = allow_terminator ? 1 : 0;
         const normalizedExpectedLength =
@@ -1028,6 +1130,19 @@ class EnhancedDatabase {
         const normalizedPaymentDescription = payment_description
             ? String(payment_description).trim().slice(0, 240)
             : null;
+        let normalizedPaymentPolicy = null;
+        if (payment_policy !== null && payment_policy !== undefined && payment_policy !== '') {
+            if (typeof payment_policy === 'string') {
+                const trimmed = String(payment_policy).trim();
+                normalizedPaymentPolicy = trimmed || null;
+            } else {
+                try {
+                    normalizedPaymentPolicy = JSON.stringify(payment_policy);
+                } catch (_) {
+                    normalizedPaymentPolicy = null;
+                }
+            }
+        }
         const normalizedPaymentStartMessage = payment_start_message
             ? String(payment_start_message).trim().slice(0, 240)
             : null;
@@ -1043,13 +1158,14 @@ class EnhancedDatabase {
         return new Promise((resolve, reject) => {
             const sql = `
                 INSERT INTO call_templates (
-                    name, description, prompt, first_message, business_id, voice_model,
+                    name, description, prompt, first_message, version, business_id, voice_model,
                     requires_otp, default_profile, expected_length, allow_terminator, terminator_char,
                     payment_enabled, payment_connector, payment_amount, payment_currency, payment_description,
+                    payment_policy,
                     payment_start_message, payment_success_message, payment_failure_message, payment_retry_message,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             `;
             this.db.run(
                 sql,
@@ -1058,6 +1174,7 @@ class EnhancedDatabase {
                     description,
                     prompt,
                     first_message,
+                    normalizedVersion,
                     business_id,
                     voice_model,
                     normalizedRequiresOtp,
@@ -1070,6 +1187,7 @@ class EnhancedDatabase {
                     normalizedPaymentAmount,
                     normalizedPaymentCurrency,
                     normalizedPaymentDescription,
+                    normalizedPaymentPolicy,
                     normalizedPaymentStartMessage,
                     normalizedPaymentSuccessMessage,
                     normalizedPaymentFailureMessage,
@@ -1106,6 +1224,7 @@ class EnhancedDatabase {
             payment_amount: 'payment_amount',
             payment_currency: 'payment_currency',
             payment_description: 'payment_description',
+            payment_policy: 'payment_policy',
             payment_start_message: 'payment_start_message',
             payment_success_message: 'payment_success_message',
             payment_failure_message: 'payment_failure_message',
@@ -1126,6 +1245,18 @@ class EnhancedDatabase {
                     value = normalized ? normalized.slice(0, 3) : null;
                 } else if (key === 'payment_description') {
                     value = value ? String(value).trim().slice(0, 240) : null;
+                } else if (key === 'payment_policy') {
+                    if (value === null || value === undefined || value === '') {
+                        value = null;
+                    } else if (typeof value === 'string') {
+                        value = String(value).trim() || null;
+                    } else {
+                        try {
+                            value = JSON.stringify(value);
+                        } catch (_) {
+                            value = null;
+                        }
+                    }
                 } else if (
                     key === 'payment_start_message'
                     || key === 'payment_success_message'
@@ -1141,6 +1272,7 @@ class EnhancedDatabase {
         if (!fields.length) {
             return 0;
         }
+        fields.push('version = COALESCE(version, 1) + 1');
         fields.push('updated_at = CURRENT_TIMESTAMP');
         values.push(id);
         return new Promise((resolve, reject) => {

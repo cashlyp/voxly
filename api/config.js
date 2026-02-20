@@ -299,6 +299,25 @@ const paymentReconcileStaleSeconds = Number(
 const paymentReconcileBatchSize = Number(
   readEnv("PAYMENT_RECONCILE_BATCH_SIZE") || "20",
 );
+const paymentSmsFallbackEnabled =
+  String(readEnv("PAYMENT_SMS_FALLBACK_ENABLED") || "false").toLowerCase() ===
+  "true";
+const paymentSmsFallbackUrlTemplate =
+  readEnv("PAYMENT_SMS_FALLBACK_URL_TEMPLATE") || "";
+const paymentSmsFallbackMessageTemplate =
+  readEnv("PAYMENT_SMS_FALLBACK_MESSAGE_TEMPLATE") ||
+  "Complete your payment securely here: {payment_url}";
+const paymentSmsFallbackTtlSeconds = Number(
+  readEnv("PAYMENT_SMS_FALLBACK_TTL_SECONDS") || "900",
+);
+const paymentSmsFallbackSecret =
+  readEnv("PAYMENT_SMS_FALLBACK_SECRET") ||
+  readEnv("API_SECRET") ||
+  readEnv("ADMIN_API_TOKEN") ||
+  "";
+const paymentSmsFallbackMaxPerCall = Number(
+  readEnv("PAYMENT_SMS_FALLBACK_MAX_PER_CALL") || "1",
+);
 
 function loadPrivateKey(rawValue) {
   if (!rawValue) {
@@ -900,6 +919,20 @@ module.exports = {
       batchSize: Number.isFinite(paymentReconcileBatchSize)
         ? Math.max(1, Math.min(100, Math.floor(paymentReconcileBatchSize)))
         : 20,
+    },
+    smsFallback: {
+      enabled: paymentSmsFallbackEnabled,
+      urlTemplate: String(paymentSmsFallbackUrlTemplate || "").trim(),
+      messageTemplate: String(paymentSmsFallbackMessageTemplate || "")
+        .trim()
+        .slice(0, 240),
+      ttlSeconds: Number.isFinite(paymentSmsFallbackTtlSeconds)
+        ? Math.max(60, Math.min(86400, Math.floor(paymentSmsFallbackTtlSeconds)))
+        : 900,
+      secret: String(paymentSmsFallbackSecret || "").trim(),
+      maxPerCall: Number.isFinite(paymentSmsFallbackMaxPerCall)
+        ? Math.max(1, Math.min(5, Math.floor(paymentSmsFallbackMaxPerCall)))
+        : 1,
     },
   },
   webhook: {

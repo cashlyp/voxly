@@ -184,7 +184,13 @@ async function selectCallScript(conversation, ctx, ensureActive) {
     script: script.name,
     script_id: script.id
   };
+  if (Number.isFinite(Number(script.version)) && Number(script.version) > 0) {
+    payloadUpdates.script_version = Math.max(1, Math.floor(Number(script.version)));
+  }
   const summary = [`Script: ${script.name}`];
+  if (payloadUpdates.script_version) {
+    summary.push(`Version: v${payloadUpdates.script_version}`);
+  }
 
   const scriptPaymentEnabled =
     script.payment_enabled === true ||
@@ -219,6 +225,9 @@ async function selectCallScript(conversation, ctx, ensureActive) {
     summary.push(
       `Payment defaults: ${payloadUpdates.payment_currency || 'USD'} ${payloadUpdates.payment_amount || '(amount at runtime)'}`
     );
+  }
+  if (script.payment_policy && typeof script.payment_policy === 'object') {
+    payloadUpdates.payment_policy = script.payment_policy;
   }
 
   if (script.description) {

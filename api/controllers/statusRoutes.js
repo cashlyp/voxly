@@ -159,9 +159,10 @@ function createHealthHandler(ctx = {}) {
       const adminOk = hasAdminToken(req);
       if (!hmacOk && !adminOk) {
         return res.json({
-          status: "healthy",
+          status: "ok",
           timestamp: new Date().toISOString(),
           public: true,
+          readiness: "restricted",
         });
       }
       if (!db) {
@@ -372,13 +373,18 @@ function createGptObservabilityHandler(ctx = {}) {
 }
 
 function registerStatusRoutes(app, ctx = {}) {
+  const requireOutboundAuthorization =
+    typeof ctx.requireOutboundAuthorization === "function"
+      ? ctx.requireOutboundAuthorization
+      : (_req, _res, next) => next();
   const handleGetCallStatus = createGetCallStatusHandler(ctx);
   const handleSystemStatus = createSystemStatusHandler(ctx);
   const handleHealth = createHealthHandler(ctx);
   const handleGptObservability = createGptObservabilityHandler(ctx);
 
-  app.get("/api/calls/:callSid/status", handleGetCallStatus);
-  app.get("/api/observability/gpt", handleGptObservability);
+  app.get("/api/calls/:callSid/status", requireOutboundAuthorization, handleGetCallStatus);
+  app.get("/api/observability/gpt", requireOutboundAuthorization, handleGptObservability);
+  app.get("/ready", requireOutboundAuthorization, handleHealth);
   app.get("/status", handleSystemStatus);
   app.get("/health", handleHealth);
 }

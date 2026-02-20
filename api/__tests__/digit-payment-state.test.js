@@ -42,6 +42,7 @@ function buildService(overrides = {}) {
   const db = {
     updateCallState: jest.fn().mockResolvedValue(undefined),
     getLatestCallState: jest.fn().mockResolvedValue(null),
+    getCall: jest.fn().mockResolvedValue({ phone_number: '+15550001111' }),
     reserveProviderEventIdempotency: jest
       .fn()
       .mockResolvedValue({ reserved: true }),
@@ -58,6 +59,7 @@ function buildService(overrides = {}) {
     config: {
       server: { hostname: 'api.example.test' },
       twilio: { accountSid: 'AC123', authToken: 'token' },
+      payment: { smsFallback: { enabled: false, maxPerCall: 1 } },
       ...(overrides.config || {}),
     },
     twilioClient:
@@ -73,6 +75,7 @@ function buildService(overrides = {}) {
     clearSilenceTimer: jest.fn(),
     queuePendingDigitAction: jest.fn(),
     getTwilioTtsAudioUrl: jest.fn().mockResolvedValue('https://audio.test/prompt.mp3'),
+    smsService: overrides.smsService || null,
     getPaymentFeatureConfig:
       overrides.getPaymentFeatureConfig ||
       (() => ({
@@ -87,6 +90,8 @@ function buildService(overrides = {}) {
         retry_cooldown_ms: 0,
         webhook_idempotency_ttl_ms: 300000,
       })),
+    buildPaymentSmsFallbackLink: overrides.buildPaymentSmsFallbackLink || null,
+    buildPaymentSmsFallbackMessage: overrides.buildPaymentSmsFallbackMessage || null,
   });
 
   return { service, db, callConfigurations };
@@ -264,6 +269,98 @@ describe('Digit payment state + idempotency', () => {
       expect.objectContaining({
         payment_state: 'failed',
         reconcile_reason: 'payment_reconcile_stale',
+      }),
+    );
+  });
+
+  test('requestPhonePayment honors script policy min interactions', async () => {
+    const callConfigurations = new Map();
+    callConfigurations.set('CA600', {
+      provider: 'twilio',
+      payment_enabled: true,
+      payment_amount: '12.00',
+      payment_connector: 'ConnectorZ',
+      flow_state: 'normal',
+      payment_policy: {
+        min_interactions_before_payment: 2,
+      },
+    });
+
+    const { service } = buildService({ callConfigurations });
+    const result = await service.requestPhonePayment('CA600', {
+      interaction_count: 1,
+    });
+    expect(result).toMatchObject({
+      error: 'payment_not_ready',
+      required_interactions: 2,
+      current_interactions: 1,
+    });
+  });
+
+  test('handleTwilioPaymentCompletion sends SMS fallback on failed payment', async () => {
+    const callConfigurations = new Map();
+    callConfigurations.set('CA700', {
+      provider: 'twilio',
+      payment_enabled: true,
+      payment_in_progress: true,
+      payment_state: 'active',
+      payment_session: {
+        payment_id: 'pay_7',
+        amount: '33.00',
+        currency: 'USD',
+        payment_connector: 'ConnectorSMS',
+      },
+      payment_policy: {
+        sms_fallback_on_failure: true,
+      },
+    });
+
+    const smsService = {
+      sendSMS: jest.fn().mockResolvedValue({ message_sid: 'SM123' }),
+    };
+    const { service } = buildService({
+      callConfigurations,
+      smsService,
+      config: {
+        payment: {
+          smsFallback: {
+            enabled: true,
+            maxPerCall: 1,
+          },
+        },
+      },
+      buildPaymentSmsFallbackLink: jest.fn().mockReturnValue({
+        url: 'https://pay.example.test/link',
+        expires_at: new Date(Date.now() + 300000).toISOString(),
+      }),
+      buildPaymentSmsFallbackMessage: jest.fn().mockReturnValue(
+        'Complete your payment securely here: https://pay.example.test/link',
+      ),
+    });
+
+    const result = await service.handleTwilioPaymentCompletion(
+      'CA700',
+      {
+        Result: 'failed',
+        PaymentAmount: '33.00',
+        PaymentCurrency: 'USD',
+      },
+      {
+        paymentId: 'pay_7',
+        hostname: 'api.example.test',
+      },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.success).toBe(false);
+    expect(result.summary?.sms_fallback_sent).toBe(true);
+    expect(smsService.sendSMS).toHaveBeenCalledTimes(1);
+    expect(smsService.sendSMS).toHaveBeenCalledWith(
+      '+15550001111',
+      expect.stringContaining('Complete your payment securely here'),
+      null,
+      expect.objectContaining({
+        idempotencyKey: expect.stringContaining('CA700:payment:sms_fallback'),
       }),
     );
   });

@@ -357,7 +357,9 @@ function createDigitCollectionService(options = {}) {
     riskEvaluator = null,
     healthProvider = null,
     setCallFlowState = null,
-    getPaymentFeatureConfig = null
+    getPaymentFeatureConfig = null,
+    buildPaymentSmsFallbackLink = null,
+    buildPaymentSmsFallbackMessage = null
   } = options;
 
   const {
@@ -4360,19 +4362,69 @@ function createDigitCollectionService(options = {}) {
     return getPaymentProviderAdapter(resolvePaymentProvider(callConfig));
   }
 
-  function getPaymentRiskControls() {
+  function parsePaymentPolicy(callConfig = {}) {
+    const raw = callConfig?.payment_policy;
+    if (!raw) return {};
+    if (typeof raw === 'object' && !Array.isArray(raw)) {
+      return { ...raw };
+    }
+    try {
+      const parsed = JSON.parse(String(raw));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+      return parsed;
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function isPaymentAllowedAtHour(policy = {}, now = new Date()) {
+    const startHour = Number(policy.allowed_start_hour_utc);
+    const endHour = Number(policy.allowed_end_hour_utc);
+    if (
+      !Number.isFinite(startHour)
+      || !Number.isFinite(endHour)
+      || startHour < 0
+      || startHour > 23
+      || endHour < 0
+      || endHour > 23
+    ) {
+      return true;
+    }
+    if (startHour === endHour) return true;
+    const hour = now.getUTCHours();
+    if (startHour < endHour) {
+      return hour >= startHour && hour < endHour;
+    }
+    return hour >= startHour || hour < endHour;
+  }
+
+  function getPaymentRiskControls(callConfig = {}) {
     const cfg = getPaymentFeatureRuntimeConfig();
+    const policy = parsePaymentPolicy(callConfig);
     const maxAttempts = Number(cfg?.max_attempts_per_call);
     const retryCooldownMs = Number(cfg?.retry_cooldown_ms);
+    const policyMaxAttempts = Number(policy?.max_attempts_per_call);
+    const policyRetryCooldownMs = Number(policy?.retry_cooldown_ms);
+    const policyMinInteractions = Number(policy?.min_interactions_before_payment);
     return {
       maxAttemptsPerCall:
-        Number.isFinite(maxAttempts) && maxAttempts > 0
-          ? Math.max(1, Math.floor(maxAttempts))
-          : 3,
+        Number.isFinite(policyMaxAttempts) && policyMaxAttempts > 0
+          ? Math.max(1, Math.floor(policyMaxAttempts))
+          : Number.isFinite(maxAttempts) && maxAttempts > 0
+            ? Math.max(1, Math.floor(maxAttempts))
+            : 3,
       retryCooldownMs:
-        Number.isFinite(retryCooldownMs) && retryCooldownMs >= 0
-          ? Math.max(0, Math.floor(retryCooldownMs))
-          : 20000
+        Number.isFinite(policyRetryCooldownMs) && policyRetryCooldownMs >= 0
+          ? Math.max(0, Math.floor(policyRetryCooldownMs))
+          : Number.isFinite(retryCooldownMs) && retryCooldownMs >= 0
+            ? Math.max(0, Math.floor(retryCooldownMs))
+            : 20000,
+      minInteractionsBeforePayment:
+        Number.isFinite(policyMinInteractions) && policyMinInteractions >= 0
+          ? Math.max(0, Math.floor(policyMinInteractions))
+          : 0,
+      allowedAtCurrentHour: isPaymentAllowedAtHour(policy),
+      policy
     };
   }
 
@@ -4644,6 +4696,104 @@ function createDigitCollectionService(options = {}) {
     return response.toString();
   }
 
+  function shouldAttemptPaymentSmsFallback(callConfig = {}, reason = 'failed') {
+    if (!smsService || typeof smsService.sendSMS !== 'function') return false;
+    const fallbackConfig = config?.payment?.smsFallback || {};
+    if (fallbackConfig.enabled !== true) return false;
+    const policy = parsePaymentPolicy(callConfig);
+    const normalizedReason = String(reason || '').trim().toLowerCase();
+    if (
+      normalizedReason === 'failed'
+      && policy.sms_fallback_on_failure !== undefined
+      && policy.sms_fallback_on_failure !== true
+    ) {
+      return false;
+    }
+    if (
+      normalizedReason === 'timeout'
+      && policy.sms_fallback_on_timeout !== undefined
+      && policy.sms_fallback_on_timeout !== true
+    ) {
+      return false;
+    }
+    const maxPerCall = Number(fallbackConfig.maxPerCall);
+    const allowedMaxPerCall =
+      Number.isFinite(maxPerCall) && maxPerCall > 0
+        ? Math.max(1, Math.floor(maxPerCall))
+        : 1;
+    const sentCount = Number(callConfig?.payment_sms_fallback_sent_count || 0);
+    return !(Number.isFinite(sentCount) && sentCount >= allowedMaxPerCall);
+  }
+
+  async function sendPaymentSmsFallback(callSid, session = {}, callConfig = {}, reason = 'failed') {
+    if (!callSid) return { sent: false, reason: 'missing_call_sid' };
+    if (!shouldAttemptPaymentSmsFallback(callConfig, reason)) {
+      return { sent: false, reason: 'disabled_or_limited' };
+    }
+    if (typeof buildPaymentSmsFallbackLink !== 'function') {
+      return { sent: false, reason: 'link_builder_unavailable' };
+    }
+
+    let phoneNumber = String(callConfig?.customer_phone || callConfig?.phone_number || '').trim();
+    if (!phoneNumber && db?.getCall) {
+      const callRecord = await db.getCall(callSid).catch(() => null);
+      phoneNumber = String(callRecord?.phone_number || '').trim();
+    }
+    if (!phoneNumber) {
+      return { sent: false, reason: 'missing_phone_number' };
+    }
+
+    const linkPayload = buildPaymentSmsFallbackLink(callSid, session, callConfig, { reason });
+    if (!linkPayload?.url) {
+      return { sent: false, reason: 'fallback_url_not_available' };
+    }
+    const policy = parsePaymentPolicy(callConfig);
+    const policyMessage = String(policy?.sms_fallback_message || '').trim();
+    const defaultMessage = `Complete your payment securely here: ${linkPayload.url}`;
+    const renderedMessage = typeof buildPaymentSmsFallbackMessage === 'function'
+      ? buildPaymentSmsFallbackMessage({
+        payment_url: linkPayload.url,
+        amount: session?.amount || '',
+        currency: session?.currency || '',
+        payment_id: session?.payment_id || ''
+      })
+      : defaultMessage;
+    const message = (policyMessage || renderedMessage || defaultMessage).trim().slice(0, 240);
+    if (!message) {
+      return { sent: false, reason: 'empty_message' };
+    }
+
+    await smsService.sendSMS(phoneNumber, message, null, {
+      idempotencyKey: `${callSid}:payment:sms_fallback:${session?.payment_id || 'na'}:${reason}`,
+      userChatId: callConfig?.user_chat_id || null
+    });
+
+    const nextSentCount = Number(callConfig?.payment_sms_fallback_sent_count || 0) + 1;
+    callConfig.payment_sms_fallback_sent_count = nextSentCount;
+    callConfig.payment_sms_fallback_sent_at = new Date().toISOString();
+    callConfigurations.set(callSid, callConfig);
+
+    if (db?.updateCallState) {
+      await db.updateCallState(callSid, 'payment_sms_fallback_sent', {
+        payment_id: session?.payment_id || null,
+        reason,
+        to: phoneNumber,
+        message: message,
+        payment_url: linkPayload.url,
+        expires_at: linkPayload.expires_at || null,
+        count: nextSentCount,
+        at: new Date().toISOString()
+      }).catch(() => {});
+    }
+
+    webhookService.addLiveEvent(
+      callSid,
+      '📩 Sent secure payment link via SMS',
+      { force: true }
+    );
+    return { sent: true, reason: null, to: phoneNumber, url: linkPayload.url };
+  }
+
   async function resolvePaymentSession(callSid, paymentId = '') {
     const callConfig = callConfigurations.get(callSid) || {};
     let session = callConfig?.payment_session && typeof callConfig.payment_session === 'object'
@@ -4758,7 +4908,35 @@ function createDigitCollectionService(options = {}) {
         message: `Payment amount must be at most ${maxAmount.toFixed(2)}.`
       };
     }
-    const riskControls = getPaymentRiskControls();
+    const riskControls = getPaymentRiskControls(callConfig);
+    if (riskControls.allowedAtCurrentHour !== true) {
+      return {
+        error: 'payment_time_window_restricted',
+        message: 'Payment is currently restricted by script policy schedule.'
+      };
+    }
+    const interactionCount = Number(
+      args.interaction_count
+      ?? args.interactionCount
+      ?? callConfig.interaction_count
+      ?? 0
+    );
+    const safeInteractionCount =
+      Number.isFinite(interactionCount) && interactionCount >= 0
+        ? Math.floor(interactionCount)
+        : 0;
+    if (
+      Number.isFinite(riskControls.minInteractionsBeforePayment)
+      && riskControls.minInteractionsBeforePayment > 0
+      && safeInteractionCount < riskControls.minInteractionsBeforePayment
+    ) {
+      return {
+        error: 'payment_not_ready',
+        message: `Payment can start after ${riskControls.minInteractionsBeforePayment} interactions.`,
+        required_interactions: riskControls.minInteractionsBeforePayment,
+        current_interactions: safeInteractionCount
+      };
+    }
     const previousAttempts = Number(callConfig.payment_attempt_count);
     const safeAttempts = Number.isFinite(previousAttempts) && previousAttempts >= 0
       ? Math.floor(previousAttempts)
@@ -5213,6 +5391,24 @@ function createDigitCollectionService(options = {}) {
       }
     }
 
+    let smsFallbackResult = null;
+    if (!success) {
+      try {
+        smsFallbackResult = await sendPaymentSmsFallback(
+          callSid,
+          session || {},
+          persistedConfig || callConfig || {},
+          'failed'
+        );
+      } catch (error) {
+        logDigitMetric('payment_sms_fallback_error', {
+          callSid,
+          reason: 'failed',
+          error: String(error?.message || error || 'unknown_error')
+        });
+      }
+    }
+
     webhookService.addLiveEvent(
       callSid,
       success
@@ -5221,7 +5417,15 @@ function createDigitCollectionService(options = {}) {
       { force: true }
     );
 
-    return { ok: true, success, summary, twiml: buildPaymentCompletionTwiml(success, session, host) };
+    return {
+      ok: true,
+      success,
+      summary: {
+        ...summary,
+        sms_fallback_sent: smsFallbackResult?.sent === true
+      },
+      twiml: buildPaymentCompletionTwiml(success, session, host)
+    };
   }
 
   async function handleTwilioPaymentStatus(callSid, payload = {}, options = {}) {
@@ -5351,7 +5555,30 @@ function createDigitCollectionService(options = {}) {
       '⚠️ Payment timed out. Returning to normal call flow.',
       { force: true }
     );
-    return { ok: true, reconciled: true, state: PAYMENT_STATES.FAILED, summary };
+    let smsFallbackResult = null;
+    try {
+      smsFallbackResult = await sendPaymentSmsFallback(
+        callSid,
+        session || {},
+        persistedConfig || callConfig || {},
+        'timeout'
+      );
+    } catch (error) {
+      logDigitMetric('payment_sms_fallback_error', {
+        callSid,
+        reason: 'timeout',
+        error: String(error?.message || error || 'unknown_error')
+      });
+    }
+    return {
+      ok: true,
+      reconciled: true,
+      state: PAYMENT_STATES.FAILED,
+      summary: {
+        ...summary,
+        sms_fallback_sent: smsFallbackResult?.sent === true
+      }
+    };
   }
 
   function formatOtpForDisplay(digits, mode = otpDisplayMode, expectedLength = null) {
