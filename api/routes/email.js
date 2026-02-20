@@ -117,6 +117,18 @@ const RETRYABLE_NETWORK_CODES = new Set([
   'ECONNABORTED',
 ]);
 
+function isSqliteCorruptionError(error) {
+  const code = String(error?.code || '').toUpperCase();
+  const message = String(error?.message || '').toLowerCase();
+  if (code === 'SQLITE_CORRUPT' || code === 'SQLITE_NOTADB') {
+    return true;
+  }
+  return (
+    message.includes('database disk image is malformed') ||
+    message.includes('file is not a database')
+  );
+}
+
 function normalizeProviderName(value) {
   return String(value || '').trim().toLowerCase();
 }
@@ -455,6 +467,9 @@ class EmailService {
     );
     this.providerCircuits = new Map();
     this.providerEventsLastCleanupMs = 0;
+    this.corruptDbPauseMs = 60000;
+    this.corruptDbBackoffUntilMs = 0;
+    this.lastCorruptDbLogAtMs = 0;
   }
 
   resolveProvider(providerOverride = null) {
@@ -926,6 +941,10 @@ class EmailService {
 
   async processQueue({ limit = 10 } = {}) {
     if (this.processing) return;
+    const nowMs = Date.now();
+    if (this.corruptDbBackoffUntilMs > nowMs) {
+      return;
+    }
     this.processing = true;
     try {
       const nowMs = Date.now();
@@ -963,6 +982,17 @@ class EmailService {
         }
       }
     } catch (err) {
+      if (isSqliteCorruptionError(err)) {
+        this.corruptDbBackoffUntilMs = Date.now() + this.corruptDbPauseMs;
+        if (Date.now() - this.lastCorruptDbLogAtMs > 10000) {
+          this.lastCorruptDbLogAtMs = Date.now();
+          this.logger.error('Email queue paused due to SQLite corruption:', {
+            error: previewForLog(err.message),
+            pause_ms: this.corruptDbPauseMs,
+          });
+        }
+        return;
+      }
       this.logger.error('Email queue processing error:', err.message);
     } finally {
       this.processing = false;

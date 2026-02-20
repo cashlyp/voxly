@@ -54,6 +54,9 @@ Keep the Twilio credentials in place if you want a rapid rollback path—switchi
 - `EMAIL_REQUEST_TIMEOUT_MS` sets HTTP timeout for SendGrid/Mailgun/SES provider calls.
 - `EMAIL_DLQ_ALERT_THRESHOLD` emits health alerts when open email DLQ entries exceed the threshold.
 - `EMAIL_DLQ_MAX_REPLAYS` limits replay attempts for a single email DLQ entry.
+- `DB_STARTUP_INTEGRITY_CHECK` runs `PRAGMA quick_check` on startup.
+- `DB_AUTO_REBUILD_ON_CORRUPT` quarantines corrupted `data.db`/WAL/SHM files and rebuilds schema so API can boot.
+- `DB_CORRUPT_BACKUP_DIR` overrides where quarantined DB files are stored.
 - Admin DLQ control endpoints:
   - `GET /admin/call-jobs/dlq`
   - `POST /admin/call-jobs/dlq/:id/replay`

@@ -47,6 +47,18 @@ function escapeMarkdownV2(value) {
 const DIGIT_TOKEN_REF_REGEX = /(vault:\/\/digits\/[^\s/]+\/tok_[A-Za-z0-9_]+|tok_[A-Za-z0-9_]+)/g;
 const DEFAULT_SIGNAL_BAR_GLYPHS = ['▂', '▃', '▄', '▅', '▆'];
 
+function isSqliteCorruptionError(error) {
+  const code = String(error?.code || '').toUpperCase();
+  const message = String(error?.message || '').toLowerCase();
+  if (code === 'SQLITE_CORRUPT' || code === 'SQLITE_NOTADB') {
+    return true;
+  }
+  return (
+    message.includes('database disk image is malformed') ||
+    message.includes('file is not a database')
+  );
+}
+
 function buildSignalBars(strength, max = 5, empty = '░') {
   const maxBars = Number.isFinite(max) ? Math.max(1, Math.floor(max)) : 5;
   const safeStrength = Number.isFinite(strength) ? strength : 0;
@@ -179,6 +191,9 @@ class EnhancedWebhookService {
     this.transcriptMaxWaitMs = 10 * 60 * 1000;
     this.terminalStatusSent = new Map();
     this.digitTokenResolver = null;
+    this.corruptDbPauseMs = 60000;
+    this.corruptDbBackoffUntilMs = 0;
+    this.lastCorruptDbLogAtMs = 0;
   }
 
   normalizeStatus(value) {
@@ -683,6 +698,9 @@ class EnhancedWebhookService {
     if (!this.db.isInitialized) {
       return;
     }
+    if (this.corruptDbBackoffUntilMs > Date.now()) {
+      return;
+    }
 
     if (this.notificationProcessing) {
       this.notificationOverlapSkips += 1;
@@ -717,6 +735,17 @@ class EnhancedWebhookService {
         }
       }
     } catch (error) {
+      if (isSqliteCorruptionError(error)) {
+        this.corruptDbBackoffUntilMs = Date.now() + this.corruptDbPauseMs;
+        if (Date.now() - this.lastCorruptDbLogAtMs > 10000) {
+          this.lastCorruptDbLogAtMs = Date.now();
+          console.error('❌ Notification processor paused due to SQLite corruption:', {
+            error: error?.message || String(error),
+            pause_ms: this.corruptDbPauseMs,
+          });
+        }
+        return;
+      }
       console.error('❌ Error processing notifications:', error);
     } finally {
       this.notificationProcessing = false;

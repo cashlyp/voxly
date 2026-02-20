@@ -129,6 +129,43 @@ function createSystemStatusHandler(ctx = {}) {
   };
 }
 
+function isSqliteCorruptionError(error) {
+  const code = String(error?.code || "").toUpperCase();
+  const message = String(error?.message || "").toLowerCase();
+  if (code === "SQLITE_CORRUPT" || code === "SQLITE_NOTADB") {
+    return true;
+  }
+  return (
+    message.includes("database disk image is malformed") ||
+    message.includes("file is not a database")
+  );
+}
+
+function buildDegradedHealthPayload(error, options = {}) {
+  const timestamp = options.timestamp || new Date().toISOString();
+  const dbCorrupt = isSqliteCorruptionError(error);
+  const message = String(error?.message || "health_check_failed");
+  return {
+    status: dbCorrupt ? "degraded" : "unhealthy",
+    timestamp,
+    enhanced_features: true,
+    error: message,
+    code: dbCorrupt ? "database_corrupt" : "health_check_failed",
+    services: {
+      database: {
+        connected: false,
+        error: message,
+      },
+      webhook_service: {
+        status: "error",
+        reason: dbCorrupt
+          ? "Database corruption detected"
+          : "Database connection failed",
+      },
+    },
+  };
+}
+
 function createHealthHandler(ctx = {}) {
   const {
     config,
@@ -149,26 +186,69 @@ function createHealthHandler(ctx = {}) {
   } = ctx;
 
   return async function handleHealth(req, res) {
+    const timestamp = new Date().toISOString();
+    const isReadinessProbe = req.path === "/ready";
     try {
       const db =
         typeof ctx.getDb === "function"
           ? ctx.getDb()
           : ctx.db;
+      if (!isReadinessProbe) {
+        if (!db) {
+          return res.json({
+            status: "degraded",
+            timestamp,
+            public: true,
+            readiness: "degraded",
+            enhanced_features: true,
+            services: {
+              database: {
+                connected: false,
+                error: "Database unavailable",
+              },
+            },
+          });
+        }
+        try {
+          await db.healthCheck();
+          return res.json({
+            status: "healthy",
+            timestamp,
+            public: true,
+            readiness: "ready",
+          });
+        } catch (error) {
+          const payload = buildDegradedHealthPayload(error, { timestamp });
+          if (isSqliteCorruptionError(error)) {
+            console.error(
+              "Public health check detected database corruption:",
+              error?.message || error,
+            );
+          } else {
+            console.error("Public health check error:", error);
+          }
+          return res.json({
+            ...payload,
+            public: true,
+            readiness: "degraded",
+          });
+        }
+      }
+
       const hmacSecret = config.apiAuth?.hmacSecret;
       const hmacOk = hmacSecret ? verifyHmacSignature(req).ok : false;
       const adminOk = hasAdminToken(req);
       if (!hmacOk && !adminOk) {
-        return res.json({
-          status: "ok",
-          timestamp: new Date().toISOString(),
-          public: true,
-          readiness: "restricted",
+        return res.status(401).json({
+          status: "unauthorized",
+          timestamp,
+          error: "Unauthorized",
         });
       }
       if (!db) {
-        return res.status(500).json({
+        return res.status(503).json({
           status: "unhealthy",
-          timestamp: new Date().toISOString(),
+          timestamp,
           enhanced_features: true,
           error: "Database unavailable",
         });
@@ -220,7 +300,7 @@ function createHealthHandler(ctx = {}) {
 
       return res.json({
         status: "healthy",
-        timestamp: new Date().toISOString(),
+        timestamp,
         enhanced_features: true,
         services: {
           database: {
@@ -257,22 +337,8 @@ function createHealthHandler(ctx = {}) {
       });
     } catch (error) {
       console.error("Enhanced health check error:", error);
-      return res.status(500).json({
-        status: "unhealthy",
-        timestamp: new Date().toISOString(),
-        enhanced_features: true,
-        error: error.message,
-        services: {
-          database: {
-            connected: false,
-            error: error.message,
-          },
-          webhook_service: {
-            status: "error",
-            reason: "Database connection failed",
-          },
-        },
-      });
+      const payload = buildDegradedHealthPayload(error, { timestamp });
+      return res.status(503).json(payload);
     }
   };
 }

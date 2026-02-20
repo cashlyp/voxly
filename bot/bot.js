@@ -395,15 +395,21 @@ bot.catch(async (err) => {
 async function validateTemplatesApiConnectivity() {
   const healthUrl = new URL("/health", config.scriptsApiUrl).toString();
   try {
-    const response = await httpClient.get(null, healthUrl, { timeout: 5000 });
+    const response = await httpClient.get(null, healthUrl, {
+      timeout: 5000,
+      admin: false,
+    });
     const contentType = response.headers?.["content-type"] || "";
     if (!contentType.includes("application/json")) {
       throw new Error(
         `healthcheck returned ${contentType || "unknown"} content`,
       );
     }
-    if (response.data?.status && response.data.status !== "healthy") {
-      throw new Error(`service reported status "${response.data.status}"`);
+    const status = String(response.data?.status || "").toLowerCase();
+    if (status && status !== "healthy" && status !== "ok") {
+      console.warn(
+        `⚠️ Templates API reachable but reported status "${status}"`,
+      );
     }
     console.log(`✅ Templates API reachable (${healthUrl})`);
   } catch (error) {

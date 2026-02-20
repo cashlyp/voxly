@@ -1,17 +1,54 @@
 const sqlite3 = require('sqlite3').verbose();
+const fs = require('fs');
 const path = require('path');
 
 class EnhancedDatabase {
-    constructor() {
+    constructor(options = {}) {
         this.db = null;
         this.isInitialized = false;
-        this.dbPath = path.join(__dirname, 'data.db');
+        this.dbPath = options.dbPath || path.join(__dirname, 'data.db');
         this.emailDlqColumnsEnsured = false;
         this.emailQueueColumnsEnsured = false;
         this.outboundRateLastCleanupMs = 0;
+        this.startupIntegrityCheck = options.startupIntegrityCheck !== false;
+        this.autoRebuildOnCorrupt = options.autoRebuildOnCorrupt === true;
+        this.corruptBackupDir =
+            options.corruptBackupDir ||
+            path.join(path.dirname(this.dbPath), 'corrupt-backups');
+        this.startupRecoveryState = {
+            rebuilt: false,
+            backup_files: [],
+            checked: false,
+            integrity: 'unknown',
+        };
     }
 
     async initialize() {
+        this.isInitialized = false;
+        try {
+            await this.openDatabaseConnection();
+            await this.applyStartupPragmas();
+            if (this.startupIntegrityCheck) {
+                await this.runStartupIntegrityCheck();
+            }
+            await this.initializeSchemaAndRuntimeTables();
+            this.isInitialized = true;
+            console.log('✅ Enhanced database initialization complete');
+        } catch (error) {
+            if (this.isCorruptionError(error) && this.autoRebuildOnCorrupt) {
+                console.error(
+                    '⚠️ SQLite corruption detected during startup. Rebuilding database from clean schema...',
+                    error.message,
+                );
+                await this.rebuildCorruptedDatabase();
+                return;
+            }
+            await this.safeCloseActiveConnection();
+            throw error;
+        }
+    }
+
+    async openDatabaseConnection() {
         return new Promise((resolve, reject) => {
             this.db = new sqlite3.Database(this.dbPath, (err) => {
                 if (err) {
@@ -20,23 +57,114 @@ class EnhancedDatabase {
                     return;
                 }
                 console.log('Connected to enhanced SQLite database');
-                this.applyStartupPragmas().then(() => {
-                    this.createEnhancedTables().then(() => {
-                        this.initializeSMSTables().then(() => {
-                            this.initializeEmailTables().then(() => {
-                                this.ensureEmailDlqColumns().then(() => {
-                                    this.ensureEmailQueueColumns().then(() => {
-                                        this.isInitialized = true;
-                                        console.log('✅ Enhanced database initialization complete');
-                                        resolve();
-                                    }).catch(reject);
-                                }).catch(reject);
-                            }).catch(reject);
-                        }).catch(reject);
-                    }).catch(reject);
-                }).catch(reject);
+                resolve();
             });
         });
+    }
+
+    async initializeSchemaAndRuntimeTables() {
+        await this.createEnhancedTables();
+        await this.initializeSMSTables();
+        await this.initializeEmailTables();
+        await this.ensureEmailDlqColumns();
+        await this.ensureEmailQueueColumns();
+    }
+
+    async runStartupIntegrityCheck() {
+        const result = await this.readPragmaResult('PRAGMA quick_check');
+        this.startupRecoveryState.checked = true;
+        this.startupRecoveryState.integrity = result;
+        if (result !== 'ok') {
+            const error = new Error(`SQLite integrity check failed: ${result}`);
+            error.code = 'SQLITE_CORRUPT';
+            throw error;
+        }
+    }
+
+    async readPragmaResult(statement) {
+        return new Promise((resolve, reject) => {
+            this.db.get(statement, [], (err, row) => {
+                if (err) {
+                    reject(err);
+                    return;
+                }
+                if (!row || typeof row !== 'object') {
+                    resolve('unknown');
+                    return;
+                }
+                const first = Object.values(row)[0];
+                resolve(String(first || '').trim().toLowerCase() || 'unknown');
+            });
+        });
+    }
+
+    isCorruptionError(error) {
+        const code = String(error?.code || '').toUpperCase();
+        const message = String(error?.message || '').toLowerCase();
+        if (code === 'SQLITE_CORRUPT' || code === 'SQLITE_NOTADB') {
+            return true;
+        }
+        return (
+            message.includes('database disk image is malformed') ||
+            message.includes('file is not a database') ||
+            message.includes('sqlite_corrupt')
+        );
+    }
+
+    async rebuildCorruptedDatabase() {
+        await this.safeCloseActiveConnection();
+        const backupFiles = await this.quarantineDatabaseFiles();
+        this.startupRecoveryState = {
+            rebuilt: true,
+            backup_files: backupFiles,
+            checked: this.startupIntegrityCheck,
+            integrity: 'rebuild',
+        };
+        await this.openDatabaseConnection();
+        await this.applyStartupPragmas();
+        await this.initializeSchemaAndRuntimeTables();
+        this.isInitialized = true;
+        console.log('✅ Rebuilt SQLite database from clean schema');
+    }
+
+    async quarantineDatabaseFiles() {
+        await fs.promises.mkdir(this.corruptBackupDir, { recursive: true });
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const candidates = [this.dbPath, `${this.dbPath}-wal`, `${this.dbPath}-shm`];
+        const moved = [];
+        for (const source of candidates) {
+            if (!fs.existsSync(source)) {
+                continue;
+            }
+            const baseName = path.basename(source);
+            const destination = path.join(
+                this.corruptBackupDir,
+                `${baseName}.corrupt.${stamp}.bak`,
+            );
+            await fs.promises.rename(source, destination);
+            moved.push(destination);
+        }
+        if (moved.length > 0) {
+            console.warn(
+                `⚠️ Corrupted SQLite files moved to ${this.corruptBackupDir}`,
+            );
+        }
+        return moved;
+    }
+
+    async safeCloseActiveConnection() {
+        if (!this.db) return;
+        const activeDb = this.db;
+        this.db = null;
+        await new Promise((resolve) => {
+            activeDb.close(() => resolve());
+        });
+    }
+
+    getStartupRecoveryState() {
+        return {
+            ...this.startupRecoveryState,
+        };
     }
 
     async applyStartupPragmas() {
