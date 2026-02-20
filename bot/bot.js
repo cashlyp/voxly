@@ -427,6 +427,59 @@ async function validateTemplatesApiConnectivity() {
   }
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+}
+
+function extractTelegramStartError(error) {
+  const code =
+    Number(error?.error_code) ||
+    Number(error?.payload?.error_code) ||
+    Number(error?.response?.error_code) ||
+    null;
+  const description = String(
+    error?.description ||
+      error?.payload?.description ||
+      error?.response?.description ||
+      error?.message ||
+      "",
+  );
+  return { code, description };
+}
+
+function isPollingConflictError(error) {
+  const { code, description } = extractTelegramStartError(error);
+  if (code === 409) return true;
+  const normalized = description.toLowerCase();
+  return (
+    normalized.includes("terminated by other getupdates request") ||
+    (normalized.includes("getupdates") && normalized.includes("409")) ||
+    normalized.includes("conflict")
+  );
+}
+
+function getStartupRetryDelayMs(attempt) {
+  const baseMs = 2000;
+  const maxMs = 60000;
+  const expDelay = Math.min(maxMs, baseMs * Math.pow(2, Math.max(0, attempt - 1)));
+  const jitter = Math.round(expDelay * 0.2 * (Math.random() * 2 - 1));
+  return Math.max(500, expDelay + jitter);
+}
+
+async function attemptPollingConflictRecovery() {
+  try {
+    await bot.api.deleteWebhook({ drop_pending_updates: true });
+    console.warn("⚠️ Cleared Telegram webhook to recover polling conflict");
+    return true;
+  } catch (error) {
+    console.warn(
+      "⚠️ Failed to clear Telegram webhook during polling conflict recovery:",
+      error?.message || error,
+    );
+    return false;
+  }
+}
+
 // Import dependencies
 const { getUser, expireInactiveUsers, closeDb } = require("./db/db");
 const { callFlow, registerCallCommand } = require("./commands/call");
@@ -1460,19 +1513,43 @@ async function bootstrap() {
     await validateTemplatesApiConnectivity();
   } catch (error) {
     console.error(`❌ ${error.message}`);
-    process.exit(1);
+    console.warn(
+      "⚠️ Continuing bot startup despite Templates API warmup failure; commands may be degraded until API recovers.",
+    );
   }
 
-  console.log("🚀 Starting Voice Call Bot...");
-  try {
-    await bot.api.setMyCommands(TELEGRAM_COMMANDS_GUEST);
-    console.log("✅ Telegram commands registered");
-    await bot.start();
-    console.log("✅ Voice Call Bot is running!");
-    console.log("🔄 Polling for updates...");
-  } catch (error) {
-    console.error("❌ Failed to start bot:", error);
-    process.exit(1);
+  let attempt = 0;
+  while (!isShuttingDown) {
+    attempt += 1;
+    if (attempt === 1) {
+      console.log("🚀 Starting Voice Call Bot...");
+    } else {
+      console.log(`🔁 Retrying bot startup (attempt ${attempt})...`);
+    }
+    try {
+      await bot.api.setMyCommands(TELEGRAM_COMMANDS_GUEST);
+      console.log("✅ Telegram commands registered");
+      await bot.start();
+      console.log("✅ Voice Call Bot is running!");
+      console.log("🔄 Polling for updates...");
+      return;
+    } catch (error) {
+      if (isShuttingDown) {
+        return;
+      }
+      const conflict = isPollingConflictError(error);
+      const { code, description } = extractTelegramStartError(error);
+      console.error("❌ Failed to start bot:", error);
+      if (conflict) {
+        console.warn(
+          `⚠️ Telegram polling conflict detected (code=${code || "unknown"}): ${description || "no description"}`,
+        );
+        await attemptPollingConflictRecovery();
+      }
+      const delayMs = getStartupRetryDelayMs(attempt);
+      console.warn(`⏳ Bot startup retry scheduled in ${delayMs}ms`);
+      await sleep(delayMs);
+    }
   }
 }
 

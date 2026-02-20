@@ -7315,7 +7315,7 @@ async function startServer(options = {}) {
 
     // Start HTTP server
     if (listen) {
-      app.listen(PORT, () => {
+      const server = app.listen(PORT, () => {
         console.log(`✅ Enhanced Adaptive API server running on port ${PORT}`);
         console.log(
           `🎭 System ready - Personality Engine & Dynamic Functions active`,
@@ -7324,6 +7324,15 @@ async function startServer(options = {}) {
         console.log(
           `📞 Twilio Media Stream track mode: ${TWILIO_STREAM_TRACK}`,
         );
+      });
+      server.on("error", (error) => {
+        console.error("❌ API listen error:", error);
+        if (error?.code === "EADDRINUSE") {
+          console.error(
+            `❌ Port ${PORT} is already in use. Stop the existing process or change PORT.`,
+          );
+        }
+        process.exit(1);
       });
     }
   } catch (error) {
