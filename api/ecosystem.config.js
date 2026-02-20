@@ -8,24 +8,12 @@ module.exports = {
     {
       name: 'API',
       script: 'app.js',
-      cwd: __dirname,
+      cwd: '/home/ubuntu/voxly/api',
       instances: 1,
       exec_mode: 'fork',
 
       env: {
         NODE_ENV: 'production',
-        PORT: 1337,
-        FORCE_COLOR: '1',
-      },
-
-      env_production: {
-        NODE_ENV: 'production',
-        PORT: 1337,
-        FORCE_COLOR: '1',
-      },
-
-      env_development: {
-        NODE_ENV: 'development',
         PORT: 1337,
         FORCE_COLOR: '1',
       },
@@ -54,7 +42,7 @@ module.exports = {
   deploy: {
     production: {
       user: 'ubuntu',
-      host: 'ec2-18-118-121-26.us-east-2.compute.amazonaws.com',
+      host: '3.135.63.195',
       ref: 'origin/main',
       repo: 'git@github.com:cashlyp/voxly.git',
       path: '/home/ubuntu/voxly',

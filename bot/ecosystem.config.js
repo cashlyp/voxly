@@ -8,20 +8,12 @@ module.exports = {
     {
       name: 'BOT',
       script: 'bot.js',
-      cwd: __dirname,
+      cwd: '/home/ubuntu/voxly/bot',
       instances: 1,
       exec_mode: 'fork',
 
       env: {
         NODE_ENV: 'production',
-      },
-
-      env_production: {
-        NODE_ENV: 'production',
-      },
-
-      env_development: {
-        NODE_ENV: 'development',
       },
 
       autorestart: true,

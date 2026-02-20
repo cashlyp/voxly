@@ -1478,7 +1478,7 @@ async function shutdown(signal, exitCode = 0) {
   isShuttingDown = true;
   console.log(`🛑 Shutting down bot (${signal})...`);
   try {
-    bot.stop();
+   await bot.stop();
   } catch (error) {
     console.error("Bot stop error:", error?.message || error);
   }
