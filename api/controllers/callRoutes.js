@@ -63,6 +63,15 @@ function createOutboundCallHandler(ctx = {}) {
         collection_max_retries: req.body?.collection_max_retries,
         collection_mask_for_gpt: req.body?.collection_mask_for_gpt,
         collection_speak_confirmation: req.body?.collection_speak_confirmation,
+        payment_enabled: req.body?.payment_enabled,
+        payment_connector: req.body?.payment_connector,
+        payment_amount: req.body?.payment_amount,
+        payment_currency: req.body?.payment_currency,
+        payment_description: req.body?.payment_description,
+        payment_start_message: req.body?.payment_start_message,
+        payment_success_message: req.body?.payment_success_message,
+        payment_failure_message: req.body?.payment_failure_message,
+        payment_retry_message: req.body?.payment_retry_message,
       };
 
       const host = resolveHost(req) || config.server?.hostname;
@@ -73,6 +82,7 @@ function createOutboundCallHandler(ctx = {}) {
         call_sid: result.callId,
         to: payload.number,
         status: result.callStatus,
+        warnings: Array.isArray(result.warnings) ? result.warnings : [],
         provider:
           result.provider ||
           (typeof getCurrentProvider === "function"
@@ -87,10 +97,16 @@ function createOutboundCallHandler(ctx = {}) {
       });
     } catch (error) {
       const message = String(error?.message || "");
+      const paymentRequiresScript = error?.code === "payment_requires_script";
       const isValidation =
+        paymentRequiresScript ||
         message.includes("Missing required fields") ||
         message.includes("Invalid phone number format");
-      const status = isValidation ? 400 : 500;
+      const status = paymentRequiresScript
+        ? 400
+        : isValidation
+          ? 400
+          : 500;
       console.error(
         "Error creating enhanced adaptive outbound call:",
         buildErrorDetails(error),
@@ -98,8 +114,14 @@ function createOutboundCallHandler(ctx = {}) {
       return sendApiError(
         res,
         status,
-        isValidation ? "validation_error" : "outbound_call_failed",
-        "Failed to create outbound call",
+        paymentRequiresScript
+          ? "payment_requires_script"
+          : isValidation
+            ? "validation_error"
+            : "outbound_call_failed",
+        paymentRequiresScript
+          ? "Payment settings require a valid script_id."
+          : "Failed to create outbound call",
         req.requestId || null,
         { details: buildErrorDetails(error) },
       );

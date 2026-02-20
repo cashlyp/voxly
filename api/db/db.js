@@ -143,6 +143,15 @@ class EnhancedDatabase {
                 expected_length INTEGER,
                 allow_terminator INTEGER DEFAULT 0,
                 terminator_char TEXT,
+                payment_enabled INTEGER DEFAULT 0,
+                payment_connector TEXT,
+                payment_amount TEXT,
+                payment_currency TEXT,
+                payment_description TEXT,
+                payment_start_message TEXT,
+                payment_success_message TEXT,
+                payment_failure_message TEXT,
+                payment_retry_message TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
@@ -353,7 +362,22 @@ class EnhancedDatabase {
         }
 
         await this.ensureCallColumns(['digit_summary', 'digit_count', 'last_otp', 'last_otp_masked', 'direction']);
-        await this.ensureTemplateColumns(['requires_otp', 'default_profile', 'expected_length', 'allow_terminator', 'terminator_char']);
+        await this.ensureTemplateColumns([
+            'requires_otp',
+            'default_profile',
+            'expected_length',
+            'allow_terminator',
+            'terminator_char',
+            'payment_enabled',
+            'payment_connector',
+            'payment_amount',
+            'payment_currency',
+            'payment_description',
+            'payment_start_message',
+            'payment_success_message',
+            'payment_failure_message',
+            'payment_retry_message'
+        ]);
         await this.ensureNotificationColumns(['last_attempt_at', 'next_attempt_at']);
 
         // Create comprehensive indexes for optimal performance
@@ -518,6 +542,24 @@ class EnhancedDatabase {
                 await addColumn('allow_terminator', 'INTEGER DEFAULT 0');
             } else if (column === 'terminator_char') {
                 await addColumn('terminator_char', 'TEXT');
+            } else if (column === 'payment_enabled') {
+                await addColumn('payment_enabled', 'INTEGER DEFAULT 0');
+            } else if (column === 'payment_connector') {
+                await addColumn('payment_connector', 'TEXT');
+            } else if (column === 'payment_amount') {
+                await addColumn('payment_amount', 'TEXT');
+            } else if (column === 'payment_currency') {
+                await addColumn('payment_currency', 'TEXT');
+            } else if (column === 'payment_description') {
+                await addColumn('payment_description', 'TEXT');
+            } else if (column === 'payment_start_message') {
+                await addColumn('payment_start_message', 'TEXT');
+            } else if (column === 'payment_success_message') {
+                await addColumn('payment_success_message', 'TEXT');
+            } else if (column === 'payment_failure_message') {
+                await addColumn('payment_failure_message', 'TEXT');
+            } else if (column === 'payment_retry_message') {
+                await addColumn('payment_retry_message', 'TEXT');
             }
         }
     }
@@ -766,6 +808,63 @@ class EnhancedDatabase {
         });
     }
 
+    async listStalePaymentSessions(options = {}) {
+        const olderThanSeconds = Number.isFinite(Number(options.olderThanSeconds))
+            ? Math.max(60, Math.floor(Number(options.olderThanSeconds)))
+            : 240;
+        const limit = Number.isFinite(Number(options.limit))
+            ? Math.max(1, Math.min(100, Math.floor(Number(options.limit))))
+            : 20;
+
+        return new Promise((resolve, reject) => {
+            const sql = `
+                WITH payment_markers AS (
+                    SELECT
+                        cs.call_sid AS call_sid,
+                        MAX(CASE
+                            WHEN cs.state IN ('payment_session_requested', 'payment_session_started')
+                            THEN cs.sequence_number
+                            ELSE NULL
+                        END) AS active_seq,
+                        MAX(CASE
+                            WHEN cs.state IN ('payment_session_completed', 'payment_session_failed')
+                            THEN cs.sequence_number
+                            ELSE NULL
+                        END) AS terminal_seq,
+                        MAX(CASE
+                            WHEN cs.state IN ('payment_session_requested', 'payment_session_started')
+                            THEN cs.timestamp
+                            ELSE NULL
+                        END) AS active_at
+                    FROM call_states cs
+                    GROUP BY cs.call_sid
+                )
+                SELECT
+                    pm.call_sid,
+                    pm.active_seq,
+                    pm.terminal_seq,
+                    pm.active_at,
+                    c.status AS call_status,
+                    c.direction AS call_direction,
+                    c.phone_number AS phone_number
+                FROM payment_markers pm
+                LEFT JOIN calls c ON c.call_sid = pm.call_sid
+                WHERE pm.active_seq IS NOT NULL
+                  AND (pm.terminal_seq IS NULL OR pm.terminal_seq < pm.active_seq)
+                  AND pm.active_at <= datetime('now', '-' || ? || ' seconds')
+                ORDER BY pm.active_at ASC
+                LIMIT ?
+            `;
+            this.db.all(sql, [olderThanSeconds, limit], (err, rows) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(rows || []);
+                }
+            });
+        });
+    }
+
     async getCallerFlag(phone_number) {
         if (!phone_number) return null;
         return new Promise((resolve, reject) => {
@@ -848,6 +947,8 @@ class EnhancedDatabase {
             const sql = `
                 SELECT id, name, description, prompt, first_message, business_id, voice_model,
                        requires_otp, default_profile, expected_length, allow_terminator, terminator_char,
+                       payment_enabled, payment_connector, payment_amount, payment_currency, payment_description,
+                       payment_start_message, payment_success_message, payment_failure_message, payment_retry_message,
                        created_at, updated_at
                 FROM call_templates
                 ORDER BY id DESC
@@ -867,6 +968,8 @@ class EnhancedDatabase {
             const sql = `
                 SELECT id, name, description, prompt, first_message, business_id, voice_model,
                        requires_otp, default_profile, expected_length, allow_terminator, terminator_char,
+                       payment_enabled, payment_connector, payment_amount, payment_currency, payment_description,
+                       payment_start_message, payment_success_message, payment_failure_message, payment_retry_message,
                        created_at, updated_at
                 FROM call_templates
                 WHERE id = ?
@@ -893,7 +996,16 @@ class EnhancedDatabase {
             default_profile = null,
             expected_length = null,
             allow_terminator = 0,
-            terminator_char = null
+            terminator_char = null,
+            payment_enabled = 0,
+            payment_connector = null,
+            payment_amount = null,
+            payment_currency = null,
+            payment_description = null,
+            payment_start_message = null,
+            payment_success_message = null,
+            payment_failure_message = null,
+            payment_retry_message = null
         } = payload || {};
         const normalizedRequiresOtp = requires_otp ? 1 : 0;
         const normalizedAllowTerminator = allow_terminator ? 1 : 0;
@@ -901,14 +1013,43 @@ class EnhancedDatabase {
             expected_length === null || expected_length === undefined || expected_length === ''
                 ? null
                 : Number(expected_length);
+        const normalizedPaymentEnabled = payment_enabled ? 1 : 0;
+        const paymentAmountParsed = Number(payment_amount);
+        const normalizedPaymentAmount =
+            Number.isFinite(paymentAmountParsed) && paymentAmountParsed > 0
+                ? paymentAmountParsed.toFixed(2)
+                : null;
+        const normalizedPaymentCurrency = payment_currency
+            ? String(payment_currency).trim().toUpperCase().slice(0, 3)
+            : null;
+        const normalizedPaymentConnector = payment_connector
+            ? String(payment_connector).trim().slice(0, 120)
+            : null;
+        const normalizedPaymentDescription = payment_description
+            ? String(payment_description).trim().slice(0, 240)
+            : null;
+        const normalizedPaymentStartMessage = payment_start_message
+            ? String(payment_start_message).trim().slice(0, 240)
+            : null;
+        const normalizedPaymentSuccessMessage = payment_success_message
+            ? String(payment_success_message).trim().slice(0, 240)
+            : null;
+        const normalizedPaymentFailureMessage = payment_failure_message
+            ? String(payment_failure_message).trim().slice(0, 240)
+            : null;
+        const normalizedPaymentRetryMessage = payment_retry_message
+            ? String(payment_retry_message).trim().slice(0, 240)
+            : null;
         return new Promise((resolve, reject) => {
             const sql = `
                 INSERT INTO call_templates (
                     name, description, prompt, first_message, business_id, voice_model,
                     requires_otp, default_profile, expected_length, allow_terminator, terminator_char,
+                    payment_enabled, payment_connector, payment_amount, payment_currency, payment_description,
+                    payment_start_message, payment_success_message, payment_failure_message, payment_retry_message,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             `;
             this.db.run(
                 sql,
@@ -923,7 +1064,16 @@ class EnhancedDatabase {
                     default_profile,
                     Number.isFinite(normalizedExpectedLength) ? normalizedExpectedLength : null,
                     normalizedAllowTerminator,
-                    terminator_char
+                    terminator_char,
+                    normalizedPaymentEnabled,
+                    normalizedPaymentConnector,
+                    normalizedPaymentAmount,
+                    normalizedPaymentCurrency,
+                    normalizedPaymentDescription,
+                    normalizedPaymentStartMessage,
+                    normalizedPaymentSuccessMessage,
+                    normalizedPaymentFailureMessage,
+                    normalizedPaymentRetryMessage
                 ],
                 function(err) {
                     if (err) {
@@ -950,12 +1100,42 @@ class EnhancedDatabase {
             default_profile: 'default_profile',
             expected_length: 'expected_length',
             allow_terminator: 'allow_terminator',
-            terminator_char: 'terminator_char'
+            terminator_char: 'terminator_char',
+            payment_enabled: 'payment_enabled',
+            payment_connector: 'payment_connector',
+            payment_amount: 'payment_amount',
+            payment_currency: 'payment_currency',
+            payment_description: 'payment_description',
+            payment_start_message: 'payment_start_message',
+            payment_success_message: 'payment_success_message',
+            payment_failure_message: 'payment_failure_message',
+            payment_retry_message: 'payment_retry_message'
         };
         Object.entries(mapping).forEach(([key, column]) => {
             if (payload[key] !== undefined) {
+                let value = payload[key];
+                if (key === 'payment_enabled') {
+                    value = value ? 1 : 0;
+                } else if (key === 'payment_connector') {
+                    value = value ? String(value).trim().slice(0, 120) : null;
+                } else if (key === 'payment_amount') {
+                    const parsed = Number(value);
+                    value = Number.isFinite(parsed) && parsed > 0 ? parsed.toFixed(2) : null;
+                } else if (key === 'payment_currency') {
+                    const normalized = String(value || '').trim().toUpperCase();
+                    value = normalized ? normalized.slice(0, 3) : null;
+                } else if (key === 'payment_description') {
+                    value = value ? String(value).trim().slice(0, 240) : null;
+                } else if (
+                    key === 'payment_start_message'
+                    || key === 'payment_success_message'
+                    || key === 'payment_failure_message'
+                    || key === 'payment_retry_message'
+                ) {
+                    value = value ? String(value).trim().slice(0, 240) : null;
+                }
                 fields.push(`${column} = ?`);
-                values.push(payload[key]);
+                values.push(value);
             }
         });
         if (!fields.length) {

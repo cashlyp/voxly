@@ -441,6 +441,55 @@ function buildDigitCaptureSummary(script = {}) {
   return parts.join(' • ');
 }
 
+function isPaymentEnabled(value) {
+  return value === true || value === 1 || String(value || '').trim().toLowerCase() === 'true';
+}
+
+function parsePositiveAmountInput(rawValue = '') {
+  const cleaned = String(rawValue || '').trim().replace(/[$,\s]/g, '');
+  if (!cleaned) return null;
+  if (!/^\d+(\.\d{1,2})?$/.test(cleaned)) return null;
+  const amount = Number(cleaned);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  return amount.toFixed(2);
+}
+
+function normalizeCurrencyInput(rawValue = '') {
+  const normalized = String(rawValue || '').trim().toUpperCase();
+  if (!normalized) return null;
+  if (!/^[A-Z]{3}$/.test(normalized)) return null;
+  return normalized;
+}
+
+function normalizePaymentMessageInput(rawValue = '') {
+  const normalized = String(rawValue || '').trim();
+  if (!normalized) return null;
+  return normalized.slice(0, 240);
+}
+
+function buildPaymentDefaultsSummary(script = {}) {
+  if (!isPaymentEnabled(script.payment_enabled)) return 'Disabled';
+  const connector = String(script.payment_connector || '').trim();
+  const amount = String(script.payment_amount || '').trim();
+  const currency = String(script.payment_currency || 'USD').trim().toUpperCase();
+  const summary = [`Enabled${connector ? ` (${connector})` : ''}`];
+  if (amount) {
+    summary.push(`${currency || 'USD'} ${amount}`);
+  } else {
+    summary.push('Amount set during call');
+  }
+  const customMessages = [
+    script.payment_start_message,
+    script.payment_success_message,
+    script.payment_failure_message,
+    script.payment_retry_message
+  ].filter((value) => String(value || '').trim()).length;
+  if (customMessages > 0) {
+    summary.push(`${customMessages} custom prompt${customMessages > 1 ? 's' : ''}`);
+  }
+  return summary.join(' • ');
+}
+
 function validateCallScriptPayload(payload = {}) {
   const errors = [];
   const warnings = [];
@@ -467,6 +516,32 @@ function validateCallScriptPayload(payload = {}) {
     if (!Number.isFinite(len) || len < 1) {
       errors.push('Expected length must be a positive number.');
     }
+  }
+  const paymentEnabled = isPaymentEnabled(payload.payment_enabled);
+  if (paymentEnabled && !String(payload.payment_connector || '').trim()) {
+    errors.push('Payment connector is required when payment defaults are enabled.');
+  }
+  if (payload.payment_amount !== null && payload.payment_amount !== undefined && payload.payment_amount !== '') {
+    if (!parsePositiveAmountInput(payload.payment_amount)) {
+      errors.push('Payment amount must be a positive number with up to 2 decimals.');
+    }
+  }
+  if (payload.payment_currency) {
+    if (!normalizeCurrencyInput(payload.payment_currency)) {
+      errors.push('Payment currency must be a 3-letter code (for example USD).');
+    }
+  }
+  ['payment_start_message', 'payment_success_message', 'payment_failure_message', 'payment_retry_message']
+    .forEach((field) => {
+      if (payload[field] !== undefined && payload[field] !== null) {
+        const text = String(payload[field]).trim();
+        if (text.length > 240) {
+          errors.push(`${field} cannot exceed 240 characters.`);
+        }
+      }
+    });
+  if (paymentEnabled && !payload.payment_currency) {
+    warnings.push('Payment currency not set; API will default to USD.');
   }
   if (payload.capture_group) {
     const promptText = `${payload.prompt || ''} ${payload.first_message || ''}`.toLowerCase();
@@ -501,6 +576,15 @@ function buildCallScriptSnapshot(script = {}) {
     expected_length: script.expected_length ?? null,
     allow_terminator: !!script.allow_terminator,
     terminator_char: script.terminator_char ?? null,
+    payment_enabled: isPaymentEnabled(script.payment_enabled),
+    payment_connector: script.payment_connector ?? null,
+    payment_amount: script.payment_amount ?? null,
+    payment_currency: script.payment_currency ?? null,
+    payment_description: script.payment_description ?? null,
+    payment_start_message: script.payment_start_message ?? null,
+    payment_success_message: script.payment_success_message ?? null,
+    payment_failure_message: script.payment_failure_message ?? null,
+    payment_retry_message: script.payment_retry_message ?? null,
     capture_group: script.capture_group ?? null
   };
 }
@@ -1125,6 +1209,199 @@ async function collectDigitCaptureConfig(conversation, ctx, defaults = {}, ensur
   return capture;
 }
 
+async function collectPaymentDefaultsConfig(conversation, ctx, defaults = {}, ensureActive) {
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
+  const currentlyEnabled = isPaymentEnabled(defaults.payment_enabled);
+  const choice = await askOptionWithButtons(
+    conversation,
+    ctx,
+    currentlyEnabled
+      ? '💳 Payment defaults are currently enabled for this script. Update them?'
+      : '💳 Add payment defaults to this script?',
+    [
+      { id: 'no', label: '🚫 Disabled' },
+      { id: 'yes', label: '✅ Enabled' }
+    ],
+    { prefix: 'call-script-payment-defaults', columns: 2, ensureActive: safeEnsureActive }
+  );
+
+  if (!choice || choice.id === 'no') {
+    return {
+      payment_enabled: false,
+      payment_connector: null,
+      payment_amount: null,
+      payment_currency: null,
+      payment_description: null,
+      payment_start_message: null,
+      payment_success_message: null,
+      payment_failure_message: null,
+      payment_retry_message: null
+    };
+  }
+
+  const connector = await promptText(
+    conversation,
+    ctx,
+    '💳 Enter Twilio payment connector name.',
+    {
+      allowEmpty: false,
+      allowSkip: !!defaults.payment_connector,
+      defaultValue: defaults.payment_connector || undefined,
+      parse: (value) => value.trim(),
+      ensureActive: safeEnsureActive
+    }
+  );
+  if (connector === null) return null;
+  const resolvedConnector = connector === undefined
+    ? String(defaults.payment_connector || '').trim()
+    : String(connector || '').trim();
+  if (!resolvedConnector) {
+    await ctx.reply('❌ Payment connector is required when payment defaults are enabled.');
+    return null;
+  }
+
+  const amount = await promptText(
+    conversation,
+    ctx,
+    '💵 Optional default amount (example 49.99) or type skip.',
+    {
+      allowEmpty: true,
+      allowSkip: true,
+      defaultValue: defaults.payment_amount || '',
+      parse: (value) => {
+        const parsed = parsePositiveAmountInput(value);
+        if (!parsed) {
+          throw new Error('Amount must be a positive value with up to 2 decimals.');
+        }
+        return parsed;
+      },
+      ensureActive: safeEnsureActive
+    }
+  );
+  if (amount === null) return null;
+
+  const currency = await promptText(
+    conversation,
+    ctx,
+    '💱 Optional default currency (3-letter code, example USD) or type skip.',
+    {
+      allowEmpty: true,
+      allowSkip: true,
+      defaultValue: defaults.payment_currency || 'USD',
+      parse: (value) => {
+        const normalized = normalizeCurrencyInput(value);
+        if (!normalized) {
+          throw new Error('Currency must be a 3-letter code.');
+        }
+        return normalized;
+      },
+      ensureActive: safeEnsureActive
+    }
+  );
+  if (currency === null) return null;
+
+  const description = await promptText(
+    conversation,
+    ctx,
+    '🧾 Optional payment description (or type skip).',
+    {
+      allowEmpty: true,
+      allowSkip: true,
+      defaultValue: defaults.payment_description || '',
+      parse: (value) => value.trim().slice(0, 240),
+      ensureActive: safeEnsureActive
+    }
+  );
+  if (description === null) return null;
+
+  const startMessage = await promptText(
+    conversation,
+    ctx,
+    '🗣️ Optional message before payment capture starts (or type skip).',
+    {
+      allowEmpty: true,
+      allowSkip: true,
+      defaultValue: defaults.payment_start_message || '',
+      parse: (value) => normalizePaymentMessageInput(value),
+      ensureActive: safeEnsureActive
+    }
+  );
+  if (startMessage === null) return null;
+
+  const successMessage = await promptText(
+    conversation,
+    ctx,
+    '✅ Optional success message after payment completes (or type skip).',
+    {
+      allowEmpty: true,
+      allowSkip: true,
+      defaultValue: defaults.payment_success_message || '',
+      parse: (value) => normalizePaymentMessageInput(value),
+      ensureActive: safeEnsureActive
+    }
+  );
+  if (successMessage === null) return null;
+
+  const failureMessage = await promptText(
+    conversation,
+    ctx,
+    '⚠️ Optional failure message after payment fails (or type skip).',
+    {
+      allowEmpty: true,
+      allowSkip: true,
+      defaultValue: defaults.payment_failure_message || '',
+      parse: (value) => normalizePaymentMessageInput(value),
+      ensureActive: safeEnsureActive
+    }
+  );
+  if (failureMessage === null) return null;
+
+  const retryMessage = await promptText(
+    conversation,
+    ctx,
+    '🔁 Optional retry/timeout guidance message (or type skip).',
+    {
+      allowEmpty: true,
+      allowSkip: true,
+      defaultValue: defaults.payment_retry_message || '',
+      parse: (value) => normalizePaymentMessageInput(value),
+      ensureActive: safeEnsureActive
+    }
+  );
+  if (retryMessage === null) return null;
+
+  return {
+    payment_enabled: true,
+    payment_connector: resolvedConnector,
+    payment_amount:
+      amount === undefined ? defaults.payment_amount || null : amount || null,
+    payment_currency:
+      currency === undefined
+        ? (defaults.payment_currency || 'USD')
+        : (currency || 'USD'),
+    payment_description:
+      description === undefined
+        ? (defaults.payment_description || null)
+        : (description || null),
+    payment_start_message:
+      startMessage === undefined
+        ? (defaults.payment_start_message || null)
+        : (startMessage || null),
+    payment_success_message:
+      successMessage === undefined
+        ? (defaults.payment_success_message || null)
+        : (successMessage || null),
+    payment_failure_message:
+      failureMessage === undefined
+        ? (defaults.payment_failure_message || null)
+        : (failureMessage || null),
+    payment_retry_message:
+      retryMessage === undefined
+        ? (defaults.payment_retry_message || null)
+        : (retryMessage || null)
+  };
+}
+
 async function fetchCallScripts() {
   const data = await scriptsApiRequest({ method: 'get', url: '/api/call-scripts' });
   const payload = Array.isArray(data)
@@ -1158,7 +1435,25 @@ async function fetchCallScripts() {
         name: normalizedName,
         description: item.description ?? item.summary ?? item.notes ?? null,
         prompt: item.prompt ?? item.script_prompt ?? null,
-        first_message: item.first_message ?? item.firstMessage ?? null
+        first_message: item.first_message ?? item.firstMessage ?? null,
+        payment_enabled:
+          item.payment_enabled ?? item.paymentEnabled ?? false,
+        payment_connector:
+          item.payment_connector ?? item.paymentConnector ?? null,
+        payment_amount:
+          item.payment_amount ?? item.paymentAmount ?? null,
+        payment_currency:
+          item.payment_currency ?? item.paymentCurrency ?? null,
+        payment_description:
+          item.payment_description ?? item.paymentDescription ?? null,
+        payment_start_message:
+          item.payment_start_message ?? item.paymentStartMessage ?? null,
+        payment_success_message:
+          item.payment_success_message ?? item.paymentSuccessMessage ?? null,
+        payment_failure_message:
+          item.payment_failure_message ?? item.paymentFailureMessage ?? null,
+        payment_retry_message:
+          item.payment_retry_message ?? item.paymentRetryMessage ?? null
       };
     })
     .filter(Boolean);
@@ -1264,6 +1559,22 @@ function formatCallScriptSummary(script) {
 
   const captureSummary = buildDigitCaptureSummary(script);
   summary.push(`🔢 Digit capture: ${escapeMarkdown(captureSummary)}`);
+  summary.push(`💳 Payment defaults: ${escapeMarkdown(buildPaymentDefaultsSummary(script))}`);
+  if (isPaymentEnabled(script.payment_enabled) && script.payment_description) {
+    summary.push(`🧾 Payment note: ${escapeMarkdown(String(script.payment_description).slice(0, 160))}`);
+  }
+  if (isPaymentEnabled(script.payment_enabled) && script.payment_start_message) {
+    summary.push(`🗣️ Payment intro: ${escapeMarkdown(String(script.payment_start_message).slice(0, 160))}`);
+  }
+  if (isPaymentEnabled(script.payment_enabled) && script.payment_success_message) {
+    summary.push(`✅ Payment success line: ${escapeMarkdown(String(script.payment_success_message).slice(0, 160))}`);
+  }
+  if (isPaymentEnabled(script.payment_enabled) && script.payment_failure_message) {
+    summary.push(`⚠️ Payment failure line: ${escapeMarkdown(String(script.payment_failure_message).slice(0, 160))}`);
+  }
+  if (isPaymentEnabled(script.payment_enabled) && script.payment_retry_message) {
+    summary.push(`🔁 Payment retry line: ${escapeMarkdown(String(script.payment_retry_message).slice(0, 160))}`);
+  }
 
   if (script.voice_model) {
     summary.push(`🎤 Voice model: ${escapeMarkdown(script.voice_model)}`);
@@ -1361,6 +1672,33 @@ async function previewCallScript(conversation, ctx, script, ensureActive) {
   if (persona.technical_level) {
     payload.technical_level = persona.technical_level;
   }
+  if (isPaymentEnabled(script.payment_enabled)) {
+    payload.payment_enabled = true;
+    if (script.payment_connector) {
+      payload.payment_connector = String(script.payment_connector).trim();
+    }
+    if (script.payment_amount) {
+      payload.payment_amount = String(script.payment_amount).trim();
+    }
+    if (script.payment_currency) {
+      payload.payment_currency = String(script.payment_currency).trim().toUpperCase();
+    }
+    if (script.payment_description) {
+      payload.payment_description = String(script.payment_description).trim().slice(0, 240);
+    }
+    if (script.payment_start_message) {
+      payload.payment_start_message = String(script.payment_start_message).trim().slice(0, 240);
+    }
+    if (script.payment_success_message) {
+      payload.payment_success_message = String(script.payment_success_message).trim().slice(0, 240);
+    }
+    if (script.payment_failure_message) {
+      payload.payment_failure_message = String(script.payment_failure_message).trim().slice(0, 240);
+    }
+    if (script.payment_retry_message) {
+      payload.payment_retry_message = String(script.payment_retry_message).trim().slice(0, 240);
+    }
+  }
 
   try {
     await runWithActionWatchdog(
@@ -1435,6 +1773,12 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
     await ctx.reply('ℹ️ Capture groups are guidance-only; the API still infers groups from the prompt text.');
   }
 
+  const paymentConfig = await collectPaymentDefaultsConfig(conversation, ctx, {}, safeEnsureActive);
+  if (!paymentConfig) {
+    await ctx.reply('❌ Script creation cancelled.');
+    return;
+  }
+
   const scriptPayload = {
     name,
     description: description === undefined ? null : (description.length ? description : null),
@@ -1448,6 +1792,15 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
     expected_length: captureConfig.expected_length || null,
     allow_terminator: captureConfig.allow_terminator || false,
     terminator_char: captureConfig.terminator_char || null,
+    payment_enabled: paymentConfig.payment_enabled === true,
+    payment_connector: paymentConfig.payment_connector || null,
+    payment_amount: paymentConfig.payment_amount || null,
+    payment_currency: paymentConfig.payment_currency || null,
+    payment_description: paymentConfig.payment_description || null,
+    payment_start_message: paymentConfig.payment_start_message || null,
+    payment_success_message: paymentConfig.payment_success_message || null,
+    payment_failure_message: paymentConfig.payment_failure_message || null,
+    payment_retry_message: paymentConfig.payment_retry_message || null,
     capture_group: captureConfig.capture_group || null
   };
 
@@ -1605,6 +1958,24 @@ async function editCallScriptFlow(conversation, ctx, script, ensureActive) {
     updates.allow_terminator = captureConfig.allow_terminator || false;
     updates.terminator_char = captureConfig.terminator_char || null;
     updates.capture_group = captureConfig.capture_group || null;
+  }
+
+  const adjustPayment = await confirm(conversation, ctx, 'Update payment defaults?', safeEnsureActive);
+  if (adjustPayment) {
+    const paymentConfig = await collectPaymentDefaultsConfig(conversation, ctx, script, safeEnsureActive);
+    if (!paymentConfig) {
+      await ctx.reply('❌ Update cancelled.');
+      return;
+    }
+    updates.payment_enabled = paymentConfig.payment_enabled === true;
+    updates.payment_connector = paymentConfig.payment_connector || null;
+    updates.payment_amount = paymentConfig.payment_amount || null;
+    updates.payment_currency = paymentConfig.payment_currency || null;
+    updates.payment_description = paymentConfig.payment_description || null;
+    updates.payment_start_message = paymentConfig.payment_start_message || null;
+    updates.payment_success_message = paymentConfig.payment_success_message || null;
+    updates.payment_failure_message = paymentConfig.payment_failure_message || null;
+    updates.payment_retry_message = paymentConfig.payment_retry_message || null;
   }
 
   if (Object.keys(updates).length === 0) {

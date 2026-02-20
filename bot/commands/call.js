@@ -2,13 +2,8 @@ const config = require('../config');
 const httpClient = require('../utils/httpClient');
 const { getUser } = require('../db/db');
 const {
-  getBusinessOptions,
   findBusinessOption,
-  MOOD_OPTIONS,
-  URGENCY_OPTIONS,
-  TECH_LEVEL_OPTIONS,
   askOptionWithButtons,
-  getOptionLabel
 } = require('../utils/persona');
 const { extractScriptVariables } = require('../utils/scripts');
 const {
@@ -189,8 +184,43 @@ async function selectCallScript(conversation, ctx, ensureActive) {
     script: script.name,
     script_id: script.id
   };
-
   const summary = [`Script: ${script.name}`];
+
+  const scriptPaymentEnabled =
+    script.payment_enabled === true ||
+    script.payment_enabled === 1 ||
+    String(script.payment_enabled || '').toLowerCase() === 'true';
+  if (scriptPaymentEnabled) {
+    payloadUpdates.payment_enabled = true;
+    if (script.payment_connector) {
+      payloadUpdates.payment_connector = String(script.payment_connector).trim();
+    }
+    if (script.payment_amount) {
+      payloadUpdates.payment_amount = String(script.payment_amount).trim();
+    }
+    if (script.payment_currency) {
+      payloadUpdates.payment_currency = String(script.payment_currency).trim().toUpperCase();
+    }
+    if (script.payment_description) {
+      payloadUpdates.payment_description = String(script.payment_description).trim().slice(0, 240);
+    }
+    if (script.payment_start_message) {
+      payloadUpdates.payment_start_message = String(script.payment_start_message).trim().slice(0, 240);
+    }
+    if (script.payment_success_message) {
+      payloadUpdates.payment_success_message = String(script.payment_success_message).trim().slice(0, 240);
+    }
+    if (script.payment_failure_message) {
+      payloadUpdates.payment_failure_message = String(script.payment_failure_message).trim().slice(0, 240);
+    }
+    if (script.payment_retry_message) {
+      payloadUpdates.payment_retry_message = String(script.payment_retry_message).trim().slice(0, 240);
+    }
+    summary.push(
+      `Payment defaults: ${payloadUpdates.payment_currency || 'USD'} ${payloadUpdates.payment_amount || '(amount at runtime)'}`
+    );
+  }
+
   if (script.description) {
     summary.push(`Description: ${script.description}`);
   }
@@ -245,174 +275,6 @@ async function selectCallScript(conversation, ctx, ensureActive) {
   };
 }
 
-async function promptScriptFallback(conversation, ctx, reason = 'empty') {
-  const message = reason === 'empty'
-    ? '⚠️ No call scripts found. You can create one with /scripts or build a custom persona now.'
-    : 'No script selected. You can build a custom persona or cancel.';
-  const selection = await askOptionWithButtons(
-    conversation,
-    ctx,
-    message,
-    [
-      { id: 'custom', label: '🛠️ Build custom persona' },
-      { id: 'cancel', label: '❌ Cancel' }
-    ],
-    { prefix: 'call-script-fallback', columns: 1 }
-  );
-  return selection?.id || null;
-}
-
-async function buildCustomCallConfig(conversation, ctx, ensureActive, businessOptions) {
-  const personaOptions = Array.isArray(businessOptions) && businessOptions.length ? businessOptions : await getBusinessOptions();
-  const selectedBusiness = await askOptionWithButtons(
-    conversation,
-    ctx,
-    '🎭 *Select service type / persona:*\nTap the option that best matches this call.',
-    personaOptions,
-    {
-      prefix: 'persona',
-      columns: 2,
-      formatLabel: (option) => (option.custom ? '✍️ Custom Prompt' : option.label)
-    }
-  );
-  ensureActive();
-
-  if (!selectedBusiness) {
-    await ctx.reply('❌ Invalid persona selection. Please try again.');
-    return null;
-  }
-
-  const resolvedBusinessId = selectedBusiness.id || config.defaultBusinessId;
-  const payloadUpdates = {
-    channel: 'voice',
-    business_id: resolvedBusinessId,
-    voice_model: config.defaultVoiceModel,
-    script: selectedBusiness.custom ? 'custom' : resolvedBusinessId,
-    purpose: selectedBusiness.defaultPurpose || config.defaultPurpose
-  };
-  const summary = [];
-
-  if (selectedBusiness.custom) {
-    await ctx.reply('✍️ Enter the agent prompt (describe how the AI should behave):');
-    const { text: prompt } = await waitForConversationText(conversation, ctx, {
-      ensureActive,
-      invalidMessage: '⚠️ Please send the prompt as text.'
-    });
-    if (!prompt) {
-      await ctx.reply('❌ Please provide a valid prompt.');
-      return null;
-    }
-
-    await ctx.reply('💬 Enter the first message the agent will say:');
-    const { text: firstMessage } = await waitForConversationText(conversation, ctx, {
-      ensureActive,
-      invalidMessage: '⚠️ Please send the first message as text.'
-    });
-    if (!firstMessage) {
-      await ctx.reply('❌ Please provide a valid first message.');
-      return null;
-    }
-
-    payloadUpdates.prompt = prompt;
-    payloadUpdates.first_message = firstMessage;
-    summary.push('Persona: Custom prompt');
-    summary.push(`Prompt: ${prompt.substring(0, 120)}${prompt.length > 120 ? '...' : ''}`);
-    summary.push(`First message: ${firstMessage.substring(0, 120)}${firstMessage.length > 120 ? '...' : ''}`);
-    payloadUpdates.purpose = 'custom';
-  } else {
-    const availablePurposes = selectedBusiness.purposes || [];
-    let selectedPurpose = availablePurposes.find((p) => p.id === selectedBusiness.defaultPurpose) || availablePurposes[0];
-
-    if (availablePurposes.length > 1) {
-      selectedPurpose = await askOptionWithButtons(
-        conversation,
-        ctx,
-        '🎯 *Select call purpose:*\nChoose the specific workflow for this call.',
-        availablePurposes,
-        {
-          prefix: 'purpose',
-          columns: 1,
-          formatLabel: (option) => `${option.emoji || '•'} ${option.label}`
-        }
-      );
-      ensureActive();
-    }
-
-    selectedPurpose = selectedPurpose || availablePurposes[0];
-    if (selectedPurpose?.id && selectedPurpose.id !== 'general') {
-      payloadUpdates.purpose = selectedPurpose.id;
-    }
-
-    const recommendedEmotion = selectedPurpose?.defaultEmotion || 'neutral';
-    const moodSelection = await askOptionWithButtons(
-      conversation,
-      ctx,
-      `🎙️ *Tone preference*\nRecommended: *${recommendedEmotion}*.`,
-      MOOD_OPTIONS,
-      { prefix: 'tone', columns: 2 }
-    );
-    ensureActive();
-    if (moodSelection.id !== 'auto') {
-      payloadUpdates.emotion = moodSelection.id;
-    }
-
-    const recommendedUrgency = selectedPurpose?.defaultUrgency || 'normal';
-    const urgencySelection = await askOptionWithButtons(
-      conversation,
-      ctx,
-      `⏱️ *Urgency level*\nRecommended: *${recommendedUrgency}*.`,
-      URGENCY_OPTIONS,
-      { prefix: 'urgency', columns: 2 }
-    );
-    ensureActive();
-    if (urgencySelection.id !== 'auto') {
-      payloadUpdates.urgency = urgencySelection.id;
-    }
-
-    const techSelection = await askOptionWithButtons(
-      conversation,
-      ctx,
-      '🧠 *Caller technical level*\nHow comfortable is the caller with technical details?',
-      TECH_LEVEL_OPTIONS,
-      { prefix: 'tech', columns: 2 }
-    );
-    ensureActive();
-    if (techSelection.id !== 'auto') {
-      payloadUpdates.technical_level = techSelection.id;
-    }
-
-    summary.push(`Persona: ${selectedBusiness.label}`);
-    if (selectedPurpose?.label) {
-      summary.push(`Purpose: ${selectedPurpose.label}`);
-    }
-
-    const toneSummary = moodSelection.id === 'auto'
-      ? `${moodSelection.label} (${getOptionLabel(MOOD_OPTIONS, recommendedEmotion)})`
-      : moodSelection.label;
-    const urgencySummary = urgencySelection.id === 'auto'
-      ? `${urgencySelection.label} (${getOptionLabel(URGENCY_OPTIONS, recommendedUrgency)})`
-      : urgencySelection.label;
-    const techSummary = techSelection.id === 'auto'
-      ? getOptionLabel(TECH_LEVEL_OPTIONS, 'general')
-      : techSelection.label;
-
-    summary.push(`Tone: ${toneSummary}`);
-    summary.push(`Urgency: ${urgencySummary}`);
-    summary.push(`Technical level: ${techSummary}`);
-  }
-
-  return {
-    payloadUpdates,
-    summary,
-    meta: {
-      scriptName: selectedBusiness?.label || selectedBusiness?.id || 'Custom',
-      scriptDescription: 'Custom persona configuration',
-      personaLabel: selectedBusiness?.label || selectedBusiness?.id || 'Custom',
-      scriptVoiceModel: null
-    }
-  };
-}
-
 async function callFlow(conversation, ctx) {
   const opId = startOperation(ctx, 'call');
   const flow = ensureFlow(ctx, 'call', { step: 'start' });
@@ -435,10 +297,6 @@ async function callFlow(conversation, ctx) {
       return;
     }
     flow.touch('authorized');
-
-    const businessOptions = await getBusinessOptions();
-    ensureActive();
-    flow.touch('business-options');
 
     const prefill = ctx.session.meta?.prefill || {};
     let number = prefill.phoneNumber || null;
@@ -482,47 +340,24 @@ async function callFlow(conversation, ctx) {
       }
     }
 
-    const configurationMode = await askOptionWithButtons(
-      conversation,
-      ctx,
-      '⚙️ How would you like to configure this call?',
-      [
-        { id: 'script', label: '📁 Use call script' },
-        { id: 'custom', label: '🛠️ Build custom persona' }
-      ],
-      { prefix: 'call-config', columns: 1 }
-    );
-    ensureActive();
-
     let configuration = null;
-    if (configurationMode.id === 'script') {
-      const selection = await selectCallScript(conversation, ctx, ensureActive);
-      if (selection?.status === 'ok') {
-        configuration = selection;
-      } else if (selection?.status === 'empty' || selection?.status === 'back') {
-        const fallbackChoice = await promptScriptFallback(
-          conversation,
-          ctx,
-          selection?.status === 'empty' ? 'empty' : 'back'
-        );
-        ensureActive();
-        if (fallbackChoice !== 'custom') {
-          await ctx.reply('❌ Call setup cancelled.');
-          return;
-        }
-      } else if (selection?.status === 'error') {
-        await safeReset(ctx, 'call_script_error', {
-          message: '⚠️ Unable to load call scripts.',
-          menuHint: '📋 Check API credentials or use /call to try again.'
-        });
-        return;
-      }
+    const selection = await selectCallScript(conversation, ctx, ensureActive);
+    if (selection?.status === 'ok') {
+      configuration = selection;
+    } else if (selection?.status === 'empty') {
+      await ctx.reply('⚠️ No call scripts found. Use /scripts to create one before calling.');
+      return;
+    } else if (selection?.status === 'back') {
+      await ctx.reply('❌ Call setup cancelled.');
+      return;
+    } else if (selection?.status === 'error') {
+      await safeReset(ctx, 'call_script_error', {
+        message: '⚠️ Unable to load call scripts.',
+        menuHint: '📋 Check API credentials or use /call to try again.'
+      });
+      return;
     }
     flow.touch('mode-selected');
-
-    if (!configuration) {
-      configuration = await buildCustomCallConfig(conversation, ctx, ensureActive, businessOptions);
-    }
 
     if (!configuration) {
       await ctx.reply('❌ Call setup cancelled.');
@@ -625,6 +460,29 @@ async function callFlow(conversation, ctx) {
     }
     if (hasAutoFields) {
       detailLines.push(tipLine('⚙️', 'Mode: Auto'));
+    }
+    if (payload.payment_enabled) {
+      const connectorLabel = escapeMarkdown(payload.payment_connector || 'configured');
+      const amountLabel = payload.payment_amount
+        ? `${payload.payment_currency || 'USD'} ${payload.payment_amount}`
+        : 'amount set during call';
+      detailLines.push(buildLine('💳', 'Payment', `Enabled (${connectorLabel})`));
+      detailLines.push(buildLine('💵', 'Charge', amountLabel));
+      if (payload.payment_description) {
+        detailLines.push(buildLine('🧾', 'Payment note', escapeMarkdown(payload.payment_description)));
+      }
+      if (payload.payment_start_message) {
+        detailLines.push(buildLine('🗣️', 'Payment intro', escapeMarkdown(payload.payment_start_message)));
+      }
+      if (payload.payment_success_message) {
+        detailLines.push(buildLine('✅', 'Payment success', escapeMarkdown(payload.payment_success_message)));
+      }
+      if (payload.payment_failure_message) {
+        detailLines.push(buildLine('⚠️', 'Payment failure', escapeMarkdown(payload.payment_failure_message)));
+      }
+      if (payload.payment_retry_message) {
+        detailLines.push(buildLine('🔁', 'Payment retry', escapeMarkdown(payload.payment_retry_message)));
+      }
     }
 
     const replyOptions = { parse_mode: 'Markdown' };

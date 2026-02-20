@@ -262,6 +262,43 @@ const webhookRetryMaxAttempts = Number(
 const webhookTelegramTimeoutMs = Number(
   readEnv("WEBHOOK_TELEGRAM_TIMEOUT_MS") || "15000",
 );
+const paymentFeatureEnabled =
+  String(readEnv("PAYMENT_FEATURE_ENABLED") || "true").toLowerCase() === "true";
+const paymentKillSwitch =
+  String(readEnv("PAYMENT_KILL_SWITCH") || "false").toLowerCase() === "true";
+const paymentAllowTwilio =
+  String(readEnv("PAYMENT_ALLOW_TWILIO") || "true").toLowerCase() === "true";
+const paymentRequireScriptOptIn =
+  String(readEnv("PAYMENT_REQUIRE_SCRIPT_OPT_IN") || "false").toLowerCase() ===
+  "true";
+const paymentDefaultCurrency =
+  String(readEnv("PAYMENT_DEFAULT_CURRENCY") || "USD")
+    .trim()
+    .toUpperCase()
+    .slice(0, 3) || "USD";
+const paymentMinAmount = Number(readEnv("PAYMENT_MIN_AMOUNT") || "0");
+const paymentMaxAmount = Number(readEnv("PAYMENT_MAX_AMOUNT") || "0");
+const paymentWebhookIdempotencyTtlMs = Number(
+  readEnv("PAYMENT_WEBHOOK_IDEMPOTENCY_TTL_MS") || "300000",
+);
+const paymentMaxAttemptsPerCall = Number(
+  readEnv("PAYMENT_MAX_ATTEMPTS_PER_CALL") || "3",
+);
+const paymentRetryCooldownMs = Number(
+  readEnv("PAYMENT_RETRY_COOLDOWN_MS") || "20000",
+);
+const paymentReconcileEnabled =
+  String(readEnv("PAYMENT_RECONCILE_ENABLED") || "true").toLowerCase() ===
+  "true";
+const paymentReconcileIntervalMs = Number(
+  readEnv("PAYMENT_RECONCILE_INTERVAL_MS") || "120000",
+);
+const paymentReconcileStaleSeconds = Number(
+  readEnv("PAYMENT_RECONCILE_STALE_SECONDS") || "240",
+);
+const paymentReconcileBatchSize = Number(
+  readEnv("PAYMENT_RECONCILE_BATCH_SIZE") || "20",
+);
 
 function loadPrivateKey(rawValue) {
   if (!rawValue) {
@@ -834,6 +871,36 @@ module.exports = {
     firstMediaMs: callSloFirstMediaMs,
     answerDelayMs: callSloAnswerDelayMs,
     sttFailureThreshold: callSloSttFailures,
+  },
+  payment: {
+    enabled: paymentFeatureEnabled,
+    killSwitch: paymentKillSwitch,
+    allowTwilio: paymentAllowTwilio,
+    requireScriptOptIn: paymentRequireScriptOptIn,
+    defaultCurrency: paymentDefaultCurrency,
+    minAmount: Number.isFinite(paymentMinAmount) ? paymentMinAmount : 0,
+    maxAmount: Number.isFinite(paymentMaxAmount) ? paymentMaxAmount : 0,
+    maxAttemptsPerCall: Number.isFinite(paymentMaxAttemptsPerCall)
+      ? Math.max(1, Math.floor(paymentMaxAttemptsPerCall))
+      : 3,
+    retryCooldownMs: Number.isFinite(paymentRetryCooldownMs)
+      ? Math.max(0, Math.floor(paymentRetryCooldownMs))
+      : 20000,
+    webhookIdempotencyTtlMs: Number.isFinite(paymentWebhookIdempotencyTtlMs)
+      ? paymentWebhookIdempotencyTtlMs
+      : 300000,
+    reconcile: {
+      enabled: paymentReconcileEnabled,
+      intervalMs: Number.isFinite(paymentReconcileIntervalMs)
+        ? Math.max(15000, Math.floor(paymentReconcileIntervalMs))
+        : 120000,
+      staleSeconds: Number.isFinite(paymentReconcileStaleSeconds)
+        ? Math.max(60, Math.floor(paymentReconcileStaleSeconds))
+        : 240,
+      batchSize: Number.isFinite(paymentReconcileBatchSize)
+        ? Math.max(1, Math.min(100, Math.floor(paymentReconcileBatchSize)))
+        : 20,
+    },
   },
   webhook: {
     retryBaseMs: webhookRetryBaseMs,

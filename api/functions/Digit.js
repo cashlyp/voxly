@@ -188,6 +188,75 @@ const CAPTURE_TRANSITIONS = Object.freeze({
     [CAPTURE_EVENTS.RESET]: CAPTURE_STATES.IDLE
   }
 });
+const PAYMENT_STATES = Object.freeze({
+  DISABLED: 'disabled',
+  READY: 'ready',
+  REQUESTED: 'requested',
+  ACTIVE: 'active',
+  COMPLETED: 'completed',
+  FAILED: 'failed'
+});
+const PAYMENT_STATE_ALIASES = Object.freeze({
+  disabled: PAYMENT_STATES.DISABLED,
+  ready: PAYMENT_STATES.READY,
+  requested: PAYMENT_STATES.REQUESTED,
+  pending: PAYMENT_STATES.REQUESTED,
+  active: PAYMENT_STATES.ACTIVE,
+  started: PAYMENT_STATES.ACTIVE,
+  collecting: PAYMENT_STATES.ACTIVE,
+  in_progress: PAYMENT_STATES.ACTIVE,
+  completed: PAYMENT_STATES.COMPLETED,
+  success: PAYMENT_STATES.COMPLETED,
+  failed: PAYMENT_STATES.FAILED,
+  error: PAYMENT_STATES.FAILED
+});
+const PAYMENT_TRANSITIONS = Object.freeze({
+  [PAYMENT_STATES.DISABLED]: new Set([PAYMENT_STATES.READY]),
+  [PAYMENT_STATES.READY]: new Set([
+    PAYMENT_STATES.REQUESTED,
+    PAYMENT_STATES.ACTIVE,
+    PAYMENT_STATES.COMPLETED,
+    PAYMENT_STATES.FAILED,
+    PAYMENT_STATES.DISABLED
+  ]),
+  [PAYMENT_STATES.REQUESTED]: new Set([
+    PAYMENT_STATES.ACTIVE,
+    PAYMENT_STATES.COMPLETED,
+    PAYMENT_STATES.FAILED,
+    PAYMENT_STATES.READY,
+    PAYMENT_STATES.DISABLED
+  ]),
+  [PAYMENT_STATES.ACTIVE]: new Set([
+    PAYMENT_STATES.COMPLETED,
+    PAYMENT_STATES.FAILED,
+    PAYMENT_STATES.READY,
+    PAYMENT_STATES.DISABLED
+  ]),
+  [PAYMENT_STATES.COMPLETED]: new Set([
+    PAYMENT_STATES.REQUESTED,
+    PAYMENT_STATES.READY,
+    PAYMENT_STATES.DISABLED
+  ]),
+  [PAYMENT_STATES.FAILED]: new Set([
+    PAYMENT_STATES.REQUESTED,
+    PAYMENT_STATES.READY,
+    PAYMENT_STATES.DISABLED
+  ])
+});
+const PAYMENT_TERMINAL_STATES = new Set([
+  PAYMENT_STATES.COMPLETED,
+  PAYMENT_STATES.FAILED,
+  PAYMENT_STATES.DISABLED
+]);
+const PAYMENT_PROVIDER_ADAPTERS = Object.freeze({
+  twilio: {
+    id: 'twilio',
+    label: 'Twilio Pay',
+    buildStartUrl: (host, callSid, paymentId) => `https://${host}/webhook/twilio-pay/start?callSid=${encodeURIComponent(callSid)}&paymentId=${encodeURIComponent(paymentId)}`,
+    buildCompleteUrl: (host, callSid, paymentId) => `https://${host}/webhook/twilio-pay/complete?callSid=${encodeURIComponent(callSid)}&paymentId=${encodeURIComponent(paymentId)}`,
+    buildStatusUrl: (host, callSid, paymentId) => `https://${host}/webhook/twilio-pay/status?callSid=${encodeURIComponent(callSid)}&paymentId=${encodeURIComponent(paymentId)}`
+  }
+});
 const GROUP_MIN_SCORE = 2;
 const GROUP_MIN_CONFIDENCE = 0.75;
 const GLOBAL_IDEMPOTENCY_TTL_MS = 120000;
@@ -287,7 +356,8 @@ function createDigitCollectionService(options = {}) {
     smsService = null,
     riskEvaluator = null,
     healthProvider = null,
-    setCallFlowState = null
+    setCallFlowState = null,
+    getPaymentFeatureConfig = null
   } = options;
 
   const {
@@ -4230,6 +4300,1060 @@ function createDigitCollectionService(options = {}) {
     return true;
   }
 
+  function getPaymentFeatureRuntimeConfig() {
+    if (typeof getPaymentFeatureConfig !== 'function') return null;
+    try {
+      const cfg = getPaymentFeatureConfig();
+      return cfg && typeof cfg === 'object' ? cfg : null;
+    } catch (error) {
+      logDigitMetric('payment_feature_config_error', {
+        error: String(error?.message || error || 'unknown_error')
+      });
+      return null;
+    }
+  }
+
+  function isPaymentFeatureEnabledForCall(callConfig = {}) {
+    const cfg = getPaymentFeatureRuntimeConfig();
+    if (!cfg) return { enabled: true, reason: null, config: null };
+    if (cfg.enabled !== true) {
+      return { enabled: false, reason: 'feature_disabled', config: cfg };
+    }
+    if (cfg.kill_switch === true) {
+      return { enabled: false, reason: 'kill_switch', config: cfg };
+    }
+    const provider = resolvePaymentProvider(callConfig);
+    const adapter = getPaymentProviderAdapter(provider);
+    if (!adapter) {
+      return { enabled: false, reason: 'unsupported_provider', config: cfg };
+    }
+    if (provider === 'twilio' && cfg.allow_twilio !== true) {
+      return { enabled: false, reason: 'twilio_disabled', config: cfg };
+    }
+    if (cfg.require_script_opt_in === true) {
+      const hasScript = Boolean(
+        callConfig?.script_id
+        || callConfig?.script
+        || callConfig?.script_policy?.script_id
+      );
+      if (!hasScript) {
+        return { enabled: false, reason: 'script_required', config: cfg };
+      }
+    }
+    return { enabled: true, reason: null, config: cfg };
+  }
+
+  function resolvePaymentProvider(callConfig = {}) {
+    return String(
+      callConfig.provider
+      || (typeof getCurrentProvider === 'function' ? getCurrentProvider() : config?.platform?.provider)
+      || ''
+    ).trim().toLowerCase();
+  }
+
+  function getPaymentProviderAdapter(provider = '') {
+    const normalized = String(provider || '').trim().toLowerCase();
+    return PAYMENT_PROVIDER_ADAPTERS[normalized] || null;
+  }
+
+  function getPaymentAdapterForCall(callConfig = {}) {
+    return getPaymentProviderAdapter(resolvePaymentProvider(callConfig));
+  }
+
+  function getPaymentRiskControls() {
+    const cfg = getPaymentFeatureRuntimeConfig();
+    const maxAttempts = Number(cfg?.max_attempts_per_call);
+    const retryCooldownMs = Number(cfg?.retry_cooldown_ms);
+    return {
+      maxAttemptsPerCall:
+        Number.isFinite(maxAttempts) && maxAttempts > 0
+          ? Math.max(1, Math.floor(maxAttempts))
+          : 3,
+      retryCooldownMs:
+        Number.isFinite(retryCooldownMs) && retryCooldownMs >= 0
+          ? Math.max(0, Math.floor(retryCooldownMs))
+          : 20000
+    };
+  }
+
+  function getPaymentWebhookTtlMs() {
+    const cfg = getPaymentFeatureRuntimeConfig();
+    const parsed = Number(cfg?.webhook_idempotency_ttl_ms);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.max(1000, Math.round(parsed));
+    }
+    return 5 * 60 * 1000;
+  }
+
+  function stableSerializeForHash(value) {
+    if (value === null || value === undefined) return 'null';
+    if (typeof value !== 'object') return JSON.stringify(value);
+    if (Array.isArray(value)) {
+      return `[${value.map((entry) => stableSerializeForHash(entry)).join(',')}]`;
+    }
+    const keys = Object.keys(value).sort();
+    const entries = keys.map((key) => `${JSON.stringify(key)}:${stableSerializeForHash(value[key])}`);
+    return `{${entries.join(',')}}`;
+  }
+
+  function hashWebhookPayload(payload = {}) {
+    try {
+      return crypto.createHash('sha1').update(stableSerializeForHash(payload)).digest('hex');
+    } catch (_) {
+      return crypto.createHash('sha1').update(String(Date.now())).digest('hex');
+    }
+  }
+
+  function normalizePaymentState(state, fallback = PAYMENT_STATES.READY) {
+    const key = String(state || '').trim().toLowerCase().replace(/\s+/g, '_');
+    return PAYMENT_STATE_ALIASES[key] || fallback;
+  }
+
+  function normalizePaymentResult(value = '') {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (!normalized) return 'unknown';
+    if (
+      normalized === 'success'
+      || normalized === 'successful'
+      || normalized === 'approved'
+    ) {
+      return 'success';
+    }
+    if (
+      normalized === 'failed'
+      || normalized === 'failure'
+      || normalized === 'declined'
+      || normalized === 'error'
+    ) {
+      return 'failed';
+    }
+    return normalized;
+  }
+
+  function getCurrentPaymentState(callConfig = {}) {
+    if (callConfig?.payment_state) {
+      return normalizePaymentState(callConfig.payment_state, PAYMENT_STATES.READY);
+    }
+    const hasExplicitEnabledFlag = Object.prototype.hasOwnProperty.call(callConfig || {}, 'payment_enabled');
+    if (hasExplicitEnabledFlag && callConfig?.payment_enabled !== true) {
+      return PAYMENT_STATES.DISABLED;
+    }
+    if (callConfig?.payment_in_progress === true) return PAYMENT_STATES.ACTIVE;
+    const lastResult = normalizePaymentResult(callConfig?.payment_last_result?.result || '');
+    if (lastResult === 'success') return PAYMENT_STATES.COMPLETED;
+    if (lastResult === 'failed') return PAYMENT_STATES.FAILED;
+    return PAYMENT_STATES.READY;
+  }
+
+  function buildPaymentStatePayload(callConfig = {}, extra = {}) {
+    return {
+      ...extra,
+      payment_state: callConfig?.payment_state || getCurrentPaymentState(callConfig),
+      payment_state_updated_at: callConfig?.payment_state_updated_at || new Date().toISOString(),
+      payment_attempt_count: Number.isFinite(Number(callConfig?.payment_attempt_count))
+        ? Math.max(0, Math.floor(Number(callConfig.payment_attempt_count)))
+        : 0,
+      payment_attempt_last_at: callConfig?.payment_attempt_last_at || null
+    };
+  }
+
+  function transitionPaymentState(callSid, nextState, meta = {}) {
+    if (!callSid) {
+      return { ok: false, reason: 'missing_call_sid' };
+    }
+    const callConfig = callConfigurations.get(callSid) || {};
+    const previousState = getCurrentPaymentState(callConfig);
+    const targetState = normalizePaymentState(nextState, previousState);
+    if (!targetState) {
+      return { ok: false, reason: 'invalid_state', previous_state: previousState };
+    }
+    const allowedTargets = PAYMENT_TRANSITIONS[previousState] || new Set();
+    if (previousState !== targetState && !allowedTargets.has(targetState)) {
+      logDigitMetric('payment_state_ignored', {
+        callSid,
+        state: previousState,
+        attempted: targetState,
+        reason: meta.reason || 'invalid_transition'
+      });
+      void emitAuditEvent(callSid, 'PaymentStateInvalidTransition', {
+        source: 'system',
+        reason: meta.reason || 'invalid_transition',
+        state_from: previousState,
+        state_to: targetState
+      });
+      return {
+        ok: false,
+        reason: 'invalid_transition',
+        previous_state: previousState,
+        target_state: targetState,
+        callConfig
+      };
+    }
+
+    const updatedAt = String(meta.updated_at || new Date().toISOString());
+    callConfig.payment_state = targetState;
+    callConfig.payment_state_updated_at = updatedAt;
+    if (meta.payment_in_progress !== undefined) {
+      callConfig.payment_in_progress = meta.payment_in_progress === true;
+    }
+    if (meta.payment_session !== undefined) {
+      callConfig.payment_session = meta.payment_session;
+    }
+    if (meta.payment_last_result !== undefined) {
+      callConfig.payment_last_result = meta.payment_last_result;
+    }
+    callConfigurations.set(callSid, callConfig);
+
+    if (previousState !== targetState) {
+      logDigitMetric('payment_state_transition', {
+        callSid,
+        from: previousState,
+        to: targetState,
+        reason: meta.reason || null
+      });
+      void emitAuditEvent(callSid, 'PaymentStateTransition', {
+        source: 'system',
+        reason: meta.reason || null,
+        state_from: previousState,
+        state_to: targetState
+      });
+    }
+    return {
+      ok: true,
+      previous_state: previousState,
+      state: targetState,
+      callConfig
+    };
+  }
+
+  async function reservePaymentWebhookIdempotency(callSid, payload = {}, options = {}) {
+    const source = String(options.source || 'twilio_pay_webhook').trim() || 'twilio_pay_webhook';
+    const paymentId = String(
+      options.paymentId || payload?.paymentId || payload?.PaymentSid || payload?.payment_id || ''
+    ).trim() || 'na';
+    const eventType = String(options.eventType || payload?.PaymentEvent || payload?.event || 'event').trim().toLowerCase() || 'event';
+    const payloadHash = hashWebhookPayload(payload);
+    const eventKey = `${source}:${callSid || 'unknown'}:${paymentId}:${eventType}:${payloadHash}`;
+    const ttlMs = getPaymentWebhookTtlMs();
+
+    if (markIdempotentAction(`payment_webhook:${eventKey}`, ttlMs)) {
+      return {
+        reserved: false,
+        duplicate: true,
+        source: 'memory',
+        event_key: eventKey,
+        payload_hash: payloadHash
+      };
+    }
+
+    if (db?.reserveProviderEventIdempotency) {
+      try {
+        const persisted = await db.reserveProviderEventIdempotency({
+          source,
+          payload_hash: payloadHash,
+          event_key: eventKey,
+          ttl_ms: ttlMs
+        });
+        if (persisted?.reserved !== true) {
+          return {
+            reserved: false,
+            duplicate: true,
+            source: 'db',
+            event_key: eventKey,
+            payload_hash: payloadHash
+          };
+        }
+      } catch (error) {
+        logDigitMetric('payment_webhook_idempotency_db_error', {
+          callSid,
+          source,
+          error: String(error?.message || error || 'unknown_error')
+        });
+      }
+    }
+
+    return {
+      reserved: true,
+      duplicate: false,
+      source: 'fresh',
+      event_key: eventKey,
+      payload_hash: payloadHash
+    };
+  }
+
+  function derivePaymentStateFromStatus(eventType = '', result = '') {
+    const event = String(eventType || '').trim().toLowerCase();
+    const normalizedResult = normalizePaymentResult(result);
+    if (normalizedResult === 'success') return PAYMENT_STATES.COMPLETED;
+    if (normalizedResult === 'failed') return PAYMENT_STATES.FAILED;
+    if (/(complete|captured|approved|authorize|success)/.test(event)) {
+      return PAYMENT_STATES.COMPLETED;
+    }
+    if (/(fail|declin|error|cancel)/.test(event)) {
+      return PAYMENT_STATES.FAILED;
+    }
+    if (/(start|initiat|process|collect|token)/.test(event)) {
+      return PAYMENT_STATES.ACTIVE;
+    }
+    return null;
+  }
+
+  function resolvePaymentVoiceMessages(callConfig = {}, args = {}) {
+    const normalize = (value, fallback = null) => {
+      const text = String(value || '').trim();
+      if (!text) return fallback;
+      return text.slice(0, 240);
+    };
+    return {
+      start_message: normalize(
+        args.start_message ?? args.startMessage ?? callConfig.payment_start_message,
+        null
+      ),
+      success_message: normalize(
+        args.success_message ?? args.successMessage ?? callConfig.payment_success_message,
+        'Payment processed successfully.'
+      ),
+      failure_message: normalize(
+        args.failure_message ?? args.failureMessage ?? callConfig.payment_failure_message,
+        'We were unable to process that payment. Let\'s continue.'
+      ),
+      retry_message: normalize(
+        args.retry_message ?? args.retryMessage ?? callConfig.payment_retry_message,
+        null
+      )
+    };
+  }
+
+  function buildPaymentCompletionTwiml(success, session = null, host = '') {
+    if (!VoiceResponse) return null;
+    const response = new VoiceResponse();
+    const successMessage = String(session?.success_message || 'Payment processed successfully.').trim().slice(0, 240);
+    const failureMessage = String(session?.failure_message || 'We were unable to process that payment. Let\'s continue.').trim().slice(0, 240);
+    response.say(success ? successMessage : failureMessage);
+    if (!success) {
+      const retryMessage = String(session?.retry_message || '').trim().slice(0, 240);
+      if (retryMessage) {
+        response.say(retryMessage);
+      }
+    }
+    if (host) {
+      response.redirect({ method: 'POST' }, `https://${host}/incoming?resume=1`);
+    } else {
+      response.hangup();
+    }
+    return response.toString();
+  }
+
+  async function resolvePaymentSession(callSid, paymentId = '') {
+    const callConfig = callConfigurations.get(callSid) || {};
+    let session = callConfig?.payment_session && typeof callConfig.payment_session === 'object'
+      ? { ...callConfig.payment_session }
+      : null;
+
+    if (
+      session
+      && paymentId
+      && session.payment_id
+      && String(session.payment_id) !== String(paymentId)
+    ) {
+      session = null;
+    }
+
+    if (!session && db?.getLatestCallState) {
+      const fallback = await db.getLatestCallState(callSid, 'payment_session_requested').catch(() => null);
+      if (fallback && typeof fallback === 'object') {
+        session = {
+          payment_id: fallback.payment_id || paymentId || null,
+          amount: fallback.amount || null,
+          currency: fallback.currency || 'USD',
+          provider: fallback.payment_provider || resolvePaymentProvider(callConfig),
+          payment_connector: fallback.payment_connector || null,
+          description: fallback.description || null,
+          start_message: fallback.start_message || null,
+          success_message: fallback.success_message || 'Payment processed successfully.',
+          failure_message: fallback.failure_message || 'We were unable to process that payment. Let\'s continue.',
+          retry_message: fallback.retry_message || null,
+          requested_at: fallback.requested_at || null
+        };
+      }
+    }
+
+    return { callConfig, session };
+  }
+
+  async function requestPhonePayment(callSid, args = {}) {
+    const callConfig = callConfigurations.get(callSid) || {};
+    const flowState = String(callConfig.flow_state || '').trim().toLowerCase();
+    if (
+      callConfig.digit_capture_active === true
+      || flowState === 'capture_active'
+      || flowState === 'capture_pending'
+    ) {
+      return {
+        error: 'capture_active',
+        message: 'Cannot start payment while digit capture is active.'
+      };
+    }
+    if (callConfig.payment_in_progress === true || flowState === 'payment_active') {
+      return {
+        error: 'payment_in_progress',
+        message: 'A payment session is already in progress.'
+      };
+    }
+    const paymentFeature = isPaymentFeatureEnabledForCall(callConfig);
+    if (!paymentFeature.enabled) {
+      const reasonCode = String(paymentFeature.reason || '').trim().toLowerCase();
+      if (reasonCode === 'unsupported_provider') {
+        return {
+          error: 'unsupported_provider',
+          message: 'Phone payment is currently supported only for Twilio calls.'
+        };
+      }
+      const reasonMessages = {
+        feature_disabled: 'Phone payment is currently disabled by system policy.',
+        kill_switch: 'Phone payment is temporarily unavailable right now.',
+        twilio_disabled: 'Twilio phone payments are currently disabled by system policy.',
+        script_required: 'Phone payment requires a script-enabled call.'
+      };
+      return {
+        error: 'payment_feature_disabled',
+        reason: paymentFeature.reason || null,
+        message: reasonMessages[reasonCode] || 'Phone payment is currently unavailable.'
+      };
+    }
+    const provider = resolvePaymentProvider(callConfig);
+    const paymentAdapter = getPaymentAdapterForCall(callConfig);
+    if (!paymentAdapter) {
+      return {
+        error: 'unsupported_provider',
+        message: 'Phone payment is currently supported only for Twilio calls.'
+      };
+    }
+    if (callConfig.payment_enabled !== true) {
+      return {
+        error: 'payment_not_enabled',
+        message: 'Payment is not enabled for this call. Set payment_enabled=true when creating the call.'
+      };
+    }
+    const amountNumber = Number(
+      args.amount ?? callConfig.payment_amount ?? callConfig?.payment_session?.amount
+    );
+    if (!Number.isFinite(amountNumber) || amountNumber <= 0) {
+      return {
+        error: 'invalid_amount',
+        message: 'A positive payment amount is required.'
+      };
+    }
+    const minAmount = Number(paymentFeature?.config?.min_amount);
+    const maxAmount = Number(paymentFeature?.config?.max_amount);
+    if (Number.isFinite(minAmount) && minAmount > 0 && amountNumber < minAmount) {
+      return {
+        error: 'invalid_amount',
+        message: `Payment amount must be at least ${minAmount.toFixed(2)}.`
+      };
+    }
+    if (Number.isFinite(maxAmount) && maxAmount > 0 && amountNumber > maxAmount) {
+      return {
+        error: 'invalid_amount',
+        message: `Payment amount must be at most ${maxAmount.toFixed(2)}.`
+      };
+    }
+    const riskControls = getPaymentRiskControls();
+    const previousAttempts = Number(callConfig.payment_attempt_count);
+    const safeAttempts = Number.isFinite(previousAttempts) && previousAttempts >= 0
+      ? Math.floor(previousAttempts)
+      : 0;
+    if (
+      Number.isFinite(riskControls.maxAttemptsPerCall)
+      && riskControls.maxAttemptsPerCall > 0
+      && safeAttempts >= riskControls.maxAttemptsPerCall
+    ) {
+      return {
+        error: 'payment_attempt_limit',
+        message: `Payment retry limit reached for this call (${riskControls.maxAttemptsPerCall}).`
+      };
+    }
+    const lastAttemptAtMs = Date.parse(callConfig.payment_attempt_last_at || '');
+    if (
+      Number.isFinite(lastAttemptAtMs)
+      && riskControls.retryCooldownMs > 0
+      && Date.now() - lastAttemptAtMs < riskControls.retryCooldownMs
+    ) {
+      const retryAfterMs = Math.max(0, riskControls.retryCooldownMs - (Date.now() - lastAttemptAtMs));
+      return {
+        error: 'payment_retry_cooldown',
+        message: 'Please wait before retrying payment.',
+        retry_after_ms: retryAfterMs
+      };
+    }
+    const currency = String(
+      args.currency
+      || callConfig.payment_currency
+      || paymentFeature?.config?.default_currency
+      || 'USD'
+    ).trim().toUpperCase();
+    const paymentConnector = String(args.payment_connector || callConfig.payment_connector || '').trim();
+    if (!paymentConnector) {
+      return {
+        error: 'missing_payment_connector',
+        message: 'Missing payment connector. Set payment_connector in call payload or tool args.'
+      };
+    }
+    const host = config?.server?.hostname;
+    if (!host) {
+      return {
+        error: 'missing_server_hostname',
+        message: 'Server hostname is not configured.'
+      };
+    }
+    const accountSid = config?.twilio?.accountSid;
+    const authToken = config?.twilio?.authToken;
+    if (!accountSid || !authToken || !twilioClient) {
+      return {
+        error: 'twilio_credentials_missing',
+        message: 'Twilio credentials are not configured.'
+      };
+    }
+
+    const messages = resolvePaymentVoiceMessages(callConfig, args);
+    const paymentId = `pay_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    const session = {
+      payment_id: paymentId,
+      amount: amountNumber.toFixed(2),
+      currency: currency || 'USD',
+      provider,
+      payment_connector: paymentConnector,
+      description: String(args.description || callConfig.payment_description || '').trim().slice(0, 240),
+      start_message: messages.start_message || null,
+      success_message: messages.success_message,
+      failure_message: messages.failure_message,
+      retry_message: messages.retry_message || null,
+      requested_at: new Date().toISOString()
+    };
+
+    const requestedTransition = transitionPaymentState(callSid, PAYMENT_STATES.REQUESTED, {
+      reason: 'payment_session_requested',
+      payment_in_progress: true,
+      payment_session: session,
+      payment_last_result: null
+    });
+    if (!requestedTransition.ok) {
+      return {
+        error: 'payment_state_invalid',
+        message: 'Payment state is not ready for a new session.'
+      };
+    }
+    const activeConfig = requestedTransition.callConfig || callConfig;
+    activeConfig.payment_attempt_count = safeAttempts + 1;
+    activeConfig.payment_attempt_last_at = new Date().toISOString();
+    callConfigurations.set(callSid, activeConfig);
+    if (typeof setCallFlowState === 'function') {
+      setCallFlowState(
+        callSid,
+        {
+          flow_state: 'payment_active',
+          flow_state_reason: 'payment_session_requested',
+          call_mode: 'payment_capture',
+          digit_capture_active: false
+        },
+        { callConfig: activeConfig, source: 'digit.requestPhonePayment' }
+      );
+    }
+
+    if (db?.updateCallState) {
+      await db.updateCallState(callSid, 'payment_session_requested', buildPaymentStatePayload(activeConfig, {
+        payment_id: session.payment_id,
+        amount: session.amount,
+        currency: session.currency,
+        payment_connector: session.payment_connector,
+        description: session.description || null,
+        start_message: session.start_message || null,
+        success_message: session.success_message || null,
+        failure_message: session.failure_message || null,
+        retry_message: session.retry_message || null,
+        payment_provider: provider,
+        payment_attempt_count: activeConfig.payment_attempt_count,
+        payment_attempt_last_at: activeConfig.payment_attempt_last_at,
+        requested_at: session.requested_at
+      })).catch(() => {});
+    }
+
+    const startUrl = paymentAdapter.buildStartUrl(host, callSid, session.payment_id);
+    const client = twilioClient(accountSid, authToken);
+    try {
+      await client.calls(callSid).update({ url: startUrl, method: 'POST' });
+    } catch (error) {
+      const failedTransition = transitionPaymentState(callSid, PAYMENT_STATES.FAILED, {
+        reason: 'payment_start_failed',
+        payment_in_progress: false,
+        payment_session: null
+      });
+      const failedConfig = failedTransition.callConfig || callConfig;
+      if (typeof setCallFlowState === 'function') {
+        setCallFlowState(
+          callSid,
+          {
+            flow_state: 'normal',
+            flow_state_reason: 'payment_start_failed',
+            call_mode: 'normal',
+            digit_capture_active: false
+          },
+          { callConfig: failedConfig, source: 'digit.requestPhonePayment.error' }
+        );
+      }
+      if (db?.updateCallState) {
+        await db.updateCallState(callSid, 'payment_session_start_failed', buildPaymentStatePayload(failedConfig, {
+          payment_id: session.payment_id,
+          error: String(error?.message || error || 'payment_start_failed'),
+          at: new Date().toISOString()
+        })).catch(() => {});
+      }
+      return {
+        error: 'payment_start_failed',
+        message: 'Unable to start payment session right now.'
+      };
+    }
+    webhookService.addLiveEvent(
+      callSid,
+      `💳 Payment started (${session.currency} ${session.amount})`,
+      { force: true }
+    );
+    return {
+      status: 'started',
+      payment_id: session.payment_id,
+      amount: session.amount,
+      currency: session.currency
+    };
+  }
+
+  async function buildTwilioPaymentTwiml(callSid, options = {}) {
+    if (!callSid) {
+      return { ok: false, code: 'missing_call_sid', message: 'Missing CallSid' };
+    }
+    if (!VoiceResponse) {
+      return { ok: false, code: 'missing_voice_response', message: 'VoiceResponse not configured' };
+    }
+    const host = String(options.hostname || config?.server?.hostname || '').trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+    if (!host) {
+      return { ok: false, code: 'missing_server_hostname', message: 'Server hostname not configured' };
+    }
+
+    const { callConfig, session } = await resolvePaymentSession(callSid, options.paymentId || '');
+    const paymentFeature = isPaymentFeatureEnabledForCall(callConfig || {});
+    if (!paymentFeature.enabled) {
+      const fallback = new VoiceResponse();
+      fallback.say('Phone payment is currently unavailable. Returning to the call flow.');
+      fallback.redirect({ method: 'POST' }, `https://${host}/incoming?resume=1`);
+      const failedTransition = transitionPaymentState(callSid, PAYMENT_STATES.FAILED, {
+        reason: 'payment_feature_disabled',
+        payment_in_progress: false,
+        payment_session: null
+      });
+      if (db?.updateCallState) {
+        await db.updateCallState(callSid, 'payment_session_blocked', buildPaymentStatePayload(
+          failedTransition.callConfig || callConfig,
+          {
+            payment_id: options.paymentId || null,
+            reason: paymentFeature.reason || 'payment_feature_disabled',
+            at: new Date().toISOString()
+          }
+        )).catch(() => {});
+      }
+      return {
+        ok: false,
+        code: 'payment_feature_disabled',
+        message: 'Payment feature disabled',
+        twiml: fallback.toString()
+      };
+    }
+    if (!session) {
+      const fallback = new VoiceResponse();
+      fallback.say('A payment session is not available right now. Returning to the call.');
+      fallback.redirect({ method: 'POST' }, `https://${host}/incoming?resume=1`);
+      const failedTransition = transitionPaymentState(callSid, PAYMENT_STATES.FAILED, {
+        reason: 'payment_session_missing',
+        payment_in_progress: false,
+        payment_session: null
+      });
+      if (db?.updateCallState) {
+        await db.updateCallState(callSid, 'payment_session_missing', buildPaymentStatePayload(
+          failedTransition.callConfig || callConfig,
+          {
+            payment_id: options.paymentId || null,
+            at: new Date().toISOString()
+          }
+        )).catch(() => {});
+      }
+      return {
+        ok: false,
+        code: 'payment_session_missing',
+        message: 'Payment session not found',
+        twiml: fallback.toString()
+      };
+    }
+
+    const amountNumber = Number(session.amount);
+    const amount = Number.isFinite(amountNumber) && amountNumber > 0 ? amountNumber.toFixed(2) : null;
+    const paymentConnector = String(session.payment_connector || '').trim();
+    const paymentAdapter = getPaymentAdapterForCall(callConfig || {});
+    if (!paymentAdapter) {
+      return { ok: false, code: 'unsupported_provider', message: 'Unsupported payment provider' };
+    }
+    if (!amount || !paymentConnector) {
+      const fallback = new VoiceResponse();
+      fallback.say('Payment setup is incomplete. Returning to the call flow.');
+      fallback.redirect({ method: 'POST' }, `https://${host}/incoming?resume=1`);
+      const failedTransition = transitionPaymentState(callSid, PAYMENT_STATES.FAILED, {
+        reason: 'payment_setup_incomplete',
+        payment_in_progress: false,
+        payment_session: null
+      });
+      if (db?.updateCallState) {
+        await db.updateCallState(callSid, 'payment_session_setup_incomplete', buildPaymentStatePayload(
+          failedTransition.callConfig || callConfig,
+          {
+            payment_id: options.paymentId || session?.payment_id || null,
+            at: new Date().toISOString()
+          }
+        )).catch(() => {});
+      }
+      return {
+        ok: false,
+        code: 'payment_setup_incomplete',
+        message: 'Payment amount or connector missing',
+        twiml: fallback.toString()
+      };
+    }
+
+    const resolvedPaymentId = String(session.payment_id || options.paymentId || '').trim();
+    const actionUrl = paymentAdapter.buildCompleteUrl(host, callSid, resolvedPaymentId);
+    const statusUrl = paymentAdapter.buildStatusUrl(host, callSid, resolvedPaymentId);
+
+    const response = new VoiceResponse();
+    const startMessage = String(session.start_message || '').trim();
+    if (startMessage) {
+      response.say(startMessage.slice(0, 240));
+    }
+    const payAttrs = {
+      paymentConnector,
+      chargeAmount: amount,
+      action: actionUrl,
+      method: 'POST',
+      statusCallback: statusUrl,
+      statusCallbackMethod: 'POST'
+    };
+    const normalizedCurrency = String(session.currency || 'USD').trim().toUpperCase();
+    if (/^[A-Z]{3}$/.test(normalizedCurrency)) {
+      payAttrs.currency = normalizedCurrency;
+    }
+    const description = String(session.description || '').trim().slice(0, 240);
+    if (description) {
+      payAttrs.description = description;
+    }
+    const pay = response.pay(payAttrs);
+    pay.prompt({ for: 'payment-card-number' }).say('Please enter your card number, then press pound.');
+    pay.prompt({ for: 'expiration-date' }).say('Enter your card expiration date.');
+    pay.prompt({ for: 'security-code' }).say('Enter the card security code.');
+    pay.prompt({ for: 'postal-code' }).say('Enter your billing ZIP code.');
+
+    let persistedConfig = callConfig;
+    if (callConfig && typeof callConfig === 'object') {
+      const transitioned = transitionPaymentState(callSid, PAYMENT_STATES.ACTIVE, {
+        reason: 'payment_session_started',
+        payment_in_progress: true,
+        payment_session: {
+          ...session,
+          payment_id: resolvedPaymentId || null,
+          amount
+        }
+      });
+      persistedConfig = transitioned.callConfig || callConfig;
+      persistedConfig.payment_session = {
+        ...session,
+        payment_id: resolvedPaymentId || null,
+        amount
+      };
+      callConfigurations.set(callSid, persistedConfig);
+      if (typeof setCallFlowState === 'function') {
+        setCallFlowState(
+          callSid,
+          {
+            flow_state: 'payment_active',
+            flow_state_reason: 'payment_session_started',
+            call_mode: 'payment_capture',
+            digit_capture_active: false
+          },
+          { callConfig: persistedConfig, source: 'digit.buildTwilioPaymentTwiml' }
+        );
+      }
+    }
+    if (db?.updateCallState) {
+      await db.updateCallState(callSid, 'payment_session_started', buildPaymentStatePayload(persistedConfig, {
+        payment_id: resolvedPaymentId || null,
+        amount,
+        currency: normalizedCurrency,
+        payment_connector: paymentConnector,
+        payment_provider: paymentAdapter?.id || 'twilio',
+        start_message: session?.start_message || null,
+        success_message: session?.success_message || null,
+        failure_message: session?.failure_message || null,
+        retry_message: session?.retry_message || null,
+        started_at: new Date().toISOString()
+      })).catch(() => {});
+    }
+    webhookService.addLiveEvent(
+      callSid,
+      `💳 Payment capture started (${normalizedCurrency} ${amount})`,
+      { force: true }
+    );
+    return {
+      ok: true,
+      twiml: response.toString(),
+      session: {
+        ...session,
+        payment_id: resolvedPaymentId || null,
+        amount,
+        currency: normalizedCurrency
+      }
+    };
+  }
+
+  async function handleTwilioPaymentCompletion(callSid, payload = {}, options = {}) {
+    if (!callSid) {
+      return { ok: false, code: 'missing_call_sid', message: 'Missing CallSid' };
+    }
+    const host = String(options.hostname || config?.server?.hostname || '').trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+    const { callConfig, session } = await resolvePaymentSession(callSid, options.paymentId || '');
+    const result = normalizePaymentResult(
+      payload?.Result || payload?.result || payload?.PaymentResult || ''
+    );
+    const success = result === 'success';
+    const normalizedPaymentId = String(options.paymentId || session?.payment_id || '').trim();
+    const idempotency = await reservePaymentWebhookIdempotency(callSid, payload, {
+      source: 'twilio_pay_complete',
+      paymentId: normalizedPaymentId || null,
+      eventType: result || 'unknown'
+    });
+    if (idempotency.duplicate) {
+      const existingSummary =
+        callConfig?.payment_last_result && typeof callConfig.payment_last_result === 'object'
+          ? { ...callConfig.payment_last_result }
+          : null;
+      const existingResult = normalizePaymentResult(existingSummary?.result || result);
+      const duplicateSuccess = existingResult === 'success';
+      return {
+        ok: true,
+        duplicate: true,
+        success: duplicateSuccess,
+        summary: existingSummary,
+        twiml: buildPaymentCompletionTwiml(duplicateSuccess, session, host)
+      };
+    }
+    const summary = {
+      payment_id: normalizedPaymentId || null,
+      result,
+      payment_provider: String(session?.provider || resolvePaymentProvider(callConfig || {})) || 'twilio',
+      amount: payload?.PaymentAmount || session?.amount || null,
+      currency: payload?.PaymentCurrency || session?.currency || null,
+      confirmation_code:
+        payload?.PaymentConfirmationCode
+        || payload?.payment_confirmation_code
+        || null,
+      payment_token:
+        payload?.PaymentToken
+        || payload?.payment_token
+        || null,
+      card_type:
+        payload?.PaymentCardType
+        || payload?.payment_card_type
+        || null,
+      error_code:
+        payload?.PaymentErrorCode
+        || payload?.payment_error_code
+        || null,
+      error_message:
+        payload?.PaymentError
+        || payload?.payment_error
+        || null,
+      completed_at: new Date().toISOString()
+    };
+
+    const transitioned = transitionPaymentState(
+      callSid,
+      success ? PAYMENT_STATES.COMPLETED : PAYMENT_STATES.FAILED,
+      {
+        reason: success ? 'payment_completed' : 'payment_failed',
+        payment_in_progress: false,
+        payment_last_result: summary,
+        payment_session: null
+      }
+    );
+    const persistedConfig = transitioned.callConfig || callConfig;
+
+    if (db?.updateCallState) {
+      await db.updateCallState(
+        callSid,
+        success ? 'payment_session_completed' : 'payment_session_failed',
+        buildPaymentStatePayload(persistedConfig, summary)
+      ).catch(() => {});
+    }
+    if (persistedConfig && typeof persistedConfig === 'object') {
+      callConfigurations.set(callSid, persistedConfig);
+      if (typeof setCallFlowState === 'function') {
+        setCallFlowState(
+          callSid,
+          {
+            flow_state: 'normal',
+            flow_state_reason: success ? 'payment_completed' : 'payment_failed',
+            call_mode: 'normal',
+            digit_capture_active: false
+          },
+          { callConfig: persistedConfig, source: 'digit.handleTwilioPaymentCompletion' }
+        );
+      }
+    }
+
+    webhookService.addLiveEvent(
+      callSid,
+      success
+        ? '✅ Payment completed'
+        : `⚠️ Payment failed (${summary.error_code || 'unknown'})`,
+      { force: true }
+    );
+
+    return { ok: true, success, summary, twiml: buildPaymentCompletionTwiml(success, session, host) };
+  }
+
+  async function handleTwilioPaymentStatus(callSid, payload = {}, options = {}) {
+    if (!callSid) {
+      return { ok: false, code: 'missing_call_sid', message: 'Missing CallSid' };
+    }
+    const eventType = String(
+      payload?.PaymentEvent
+      || payload?.payment_event
+      || payload?.EventType
+      || payload?.event
+      || 'unknown'
+    ).trim();
+    const result = normalizePaymentResult(payload?.Result || payload?.result || '');
+    const paymentId = options.paymentId || payload?.paymentId || payload?.PaymentSid || null;
+    const idempotency = await reservePaymentWebhookIdempotency(callSid, payload, {
+      source: 'twilio_pay_status',
+      paymentId,
+      eventType
+    });
+    if (idempotency.duplicate) {
+      return { ok: true, event: eventType, result, duplicate: true };
+    }
+
+    const derivedState = derivePaymentStateFromStatus(eventType, result);
+    let persistedConfig = callConfigurations.get(callSid) || {};
+    if (derivedState) {
+      const transitionMeta = {
+        reason: 'payment_status_event'
+      };
+      if (derivedState === PAYMENT_STATES.COMPLETED || derivedState === PAYMENT_STATES.FAILED) {
+        transitionMeta.payment_in_progress = false;
+        transitionMeta.payment_session = null;
+        transitionMeta.payment_last_result = {
+          payment_id: paymentId || null,
+          result,
+          payment_provider: resolvePaymentProvider(persistedConfig || {}),
+          event: eventType,
+          completed_at: new Date().toISOString()
+        };
+      }
+      const transitioned = transitionPaymentState(callSid, derivedState, transitionMeta);
+      persistedConfig = transitioned.callConfig || persistedConfig;
+    }
+
+    if (db?.updateCallState) {
+      await db.updateCallState(callSid, 'payment_status_event', buildPaymentStatePayload(persistedConfig, {
+        payment_id: paymentId,
+        event: eventType,
+        result,
+        at: new Date().toISOString()
+      })).catch(() => {});
+    }
+    return { ok: true, event: eventType, result };
+  }
+
+  async function reconcilePaymentSession(callSid, options = {}) {
+    if (!callSid) {
+      return { ok: false, code: 'missing_call_sid', message: 'Missing CallSid' };
+    }
+    const reason = String(options.reason || 'payment_reconcile_timeout').trim() || 'payment_reconcile_timeout';
+    const { callConfig, session } = await resolvePaymentSession(callSid, options.paymentId || '');
+    const state = getCurrentPaymentState(callConfig || {});
+    const flowState = String(callConfig?.flow_state || '').trim().toLowerCase();
+    const activeLike = (
+      callConfig?.payment_in_progress === true
+      || state === PAYMENT_STATES.REQUESTED
+      || state === PAYMENT_STATES.ACTIVE
+      || flowState === 'payment_active'
+    );
+    if (!activeLike && PAYMENT_TERMINAL_STATES.has(state)) {
+      return { ok: true, reconciled: false, state, reason: 'already_terminal' };
+    }
+    if (!activeLike && !session) {
+      return { ok: true, reconciled: false, state, reason: 'no_active_payment_session' };
+    }
+
+    const summary = {
+      payment_id: session?.payment_id || null,
+      result: 'failed',
+      amount: session?.amount || null,
+      currency: session?.currency || null,
+      error_code: 'reconcile_timeout',
+      error_message: String(options.message || 'Payment session timed out before completion webhook was confirmed.').slice(0, 240),
+      completed_at: new Date().toISOString(),
+      source: options.source || 'payment_reconcile_worker'
+    };
+
+    const transitioned = transitionPaymentState(callSid, PAYMENT_STATES.FAILED, {
+      reason,
+      payment_in_progress: false,
+      payment_session: null,
+      payment_last_result: summary
+    });
+    const persistedConfig = transitioned.callConfig || callConfig || {};
+    persistedConfig.payment_attempt_reconciled_at = new Date().toISOString();
+    callConfigurations.set(callSid, persistedConfig);
+
+    if (typeof setCallFlowState === 'function') {
+      setCallFlowState(
+        callSid,
+        {
+          flow_state: 'normal',
+          flow_state_reason: 'payment_reconciled',
+          call_mode: 'normal',
+          digit_capture_active: false
+        },
+        { callConfig: persistedConfig, source: 'digit.reconcilePaymentSession' }
+      );
+    }
+
+    if (db?.updateCallState) {
+      await db.updateCallState(
+        callSid,
+        'payment_session_reconciled',
+        buildPaymentStatePayload(persistedConfig, {
+          ...summary,
+          reconcile_reason: reason,
+          stale_since: options.staleSince || null,
+          reconciled_at: new Date().toISOString()
+        })
+      ).catch(() => {});
+    }
+
+    webhookService.addLiveEvent(
+      callSid,
+      '⚠️ Payment timed out. Returning to normal call flow.',
+      { force: true }
+    );
+    return { ok: true, reconciled: true, state: PAYMENT_STATES.FAILED, summary };
+  }
+
   function formatOtpForDisplay(digits, mode = otpDisplayMode, expectedLength = null) {
     const safeDigits = String(digits || '').replace(/\D/g, '');
     if (mode === 'raw') {
@@ -4906,6 +6030,14 @@ function createDigitCollectionService(options = {}) {
   }
 
   async function requestDigitCollection(callSid, args = {}, gptService = null) {
+    const initialConfig = callConfigurations.get(callSid) || {};
+    const initialFlowState = String(initialConfig.flow_state || '').trim().toLowerCase();
+    if (initialConfig.payment_in_progress === true || initialFlowState === 'payment_active') {
+      return {
+        error: 'payment_in_progress',
+        message: 'Digit capture is unavailable while payment is in progress.'
+      };
+    }
     if (digitCollectionPlans.has(callSid)) {
       clearDigitPlan(callSid);
     }
@@ -5032,6 +6164,14 @@ function createDigitCollectionService(options = {}) {
   }
 
   async function requestDigitCollectionPlan(callSid, args = {}, gptService = null) {
+    const initialConfig = callConfigurations.get(callSid) || {};
+    const initialFlowState = String(initialConfig.flow_state || '').trim().toLowerCase();
+    if (initialConfig.payment_in_progress === true || initialFlowState === 'payment_active') {
+      return {
+        error: 'payment_in_progress',
+        message: 'Digit capture is unavailable while payment is in progress.'
+      };
+    }
     let steps = Array.isArray(args.steps) ? args.steps : [];
     const groupFromArgs = normalizeGroupId(args.group_id);
     if (!steps.length && groupFromArgs) {
@@ -6151,6 +7291,11 @@ function createDigitCollectionService(options = {}) {
     handleSecureCaptureInput,
     getOtpContext,
     handleCollectionResult,
+    requestPhonePayment,
+    buildTwilioPaymentTwiml,
+    handleTwilioPaymentCompletion,
+    handleTwilioPaymentStatus,
+    reconcilePaymentSession,
     hasExpectation: (callSid) => digitCollectionManager.expectations.has(callSid),
     getCaptureState,
     inferDigitExpectationFromText,

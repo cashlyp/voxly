@@ -836,6 +836,116 @@ function createTwilioStreamWebhookHandler(ctx = {}) {
   };
 }
 
+function resolveWebhookHost(ctx = {}, req = null) {
+  const fromResolver =
+    typeof ctx.resolveHost === "function" ? ctx.resolveHost(req) : null;
+  const fromConfig = ctx.config?.server?.hostname || null;
+  const fromHeader =
+    req?.headers?.["x-forwarded-host"] || req?.headers?.host || null;
+  return String(fromResolver || fromConfig || fromHeader || "")
+    .trim()
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/+$/, "");
+}
+
+function createTwilioPayStartHandler(ctx = {}) {
+  const { requireValidTwilioSignature } = ctx;
+  return async function handleTwilioPayStart(req, res) {
+    try {
+      if (!requireValidTwilioSignature(req, res, "/webhook/twilio-pay/start")) {
+        return;
+      }
+      const callSid = String(req.body?.CallSid || req.query?.callSid || "").trim();
+      const paymentId = String(
+        req.query?.paymentId || req.body?.paymentId || "",
+      ).trim();
+      if (!callSid) {
+        return res.status(400).send("Missing CallSid");
+      }
+      const digitService = getDigitService(ctx);
+      if (!digitService?.buildTwilioPaymentTwiml) {
+        return res.status(200).send("OK");
+      }
+      const host = resolveWebhookHost(ctx, req);
+      const result = await digitService.buildTwilioPaymentTwiml(callSid, {
+        paymentId,
+        hostname: host,
+      });
+      if (result?.twiml) {
+        res.type("text/xml");
+        res.end(result.twiml);
+        return;
+      }
+      res.status(200).send("OK");
+    } catch (error) {
+      console.error("Twilio pay start webhook error:", error);
+      res.status(200).send("OK");
+    }
+  };
+}
+
+function createTwilioPayCompleteHandler(ctx = {}) {
+  const { requireValidTwilioSignature } = ctx;
+  return async function handleTwilioPayComplete(req, res) {
+    try {
+      if (!requireValidTwilioSignature(req, res, "/webhook/twilio-pay/complete")) {
+        return;
+      }
+      const callSid = String(req.body?.CallSid || req.query?.callSid || "").trim();
+      const paymentId = String(
+        req.query?.paymentId || req.body?.paymentId || "",
+      ).trim();
+      if (!callSid) {
+        return res.status(400).send("Missing CallSid");
+      }
+      const digitService = getDigitService(ctx);
+      if (!digitService?.handleTwilioPaymentCompletion) {
+        return res.status(200).send("OK");
+      }
+      const host = resolveWebhookHost(ctx, req);
+      const result = await digitService.handleTwilioPaymentCompletion(
+        callSid,
+        req.body || {},
+        { paymentId, hostname: host },
+      );
+      if (result?.twiml) {
+        res.type("text/xml");
+        res.end(result.twiml);
+        return;
+      }
+      res.status(200).send("OK");
+    } catch (error) {
+      console.error("Twilio pay complete webhook error:", error);
+      res.status(200).send("OK");
+    }
+  };
+}
+
+function createTwilioPayStatusHandler(ctx = {}) {
+  const { requireValidTwilioSignature } = ctx;
+  return async function handleTwilioPayStatus(req, res) {
+    try {
+      if (!requireValidTwilioSignature(req, res, "/webhook/twilio-pay/status")) {
+        return;
+      }
+      const callSid = String(req.body?.CallSid || req.query?.callSid || "").trim();
+      if (!callSid) {
+        return res.status(200).send("OK");
+      }
+      const digitService = getDigitService(ctx);
+      if (digitService?.handleTwilioPaymentStatus) {
+        await digitService.handleTwilioPaymentStatus(callSid, req.body || {}, {
+          paymentId:
+            req.query?.paymentId || req.body?.paymentId || req.body?.PaymentSid || null,
+        });
+      }
+    } catch (error) {
+      console.error("Twilio pay status webhook error:", error);
+    }
+    res.status(200).send("OK");
+  };
+}
+
 function createSmsWebhookHandler(ctx = {}) {
   const {
     requireValidTwilioSignature,
@@ -1661,6 +1771,12 @@ function registerWebhookRoutes(app, ctx = {}) {
     ctx.handleCallStatusWebhook || createCallStatusWebhookHandler(ctx);
   const handleTwilioStreamWebhook =
     ctx.handleTwilioStreamWebhook || createTwilioStreamWebhookHandler(ctx);
+  const handleTwilioPayStart =
+    ctx.handleTwilioPayStart || createTwilioPayStartHandler(ctx);
+  const handleTwilioPayComplete =
+    ctx.handleTwilioPayComplete || createTwilioPayCompleteHandler(ctx);
+  const handleTwilioPayStatus =
+    ctx.handleTwilioPayStatus || createTwilioPayStatusHandler(ctx);
   const handleSmsWebhook = ctx.handleSmsWebhook || createSmsWebhookHandler(ctx);
   const handleSmsStatusWebhook =
     ctx.handleSmsStatusWebhook || createSmsStatusWebhookHandler(ctx);
@@ -1688,6 +1804,9 @@ function registerWebhookRoutes(app, ctx = {}) {
   app.post("/webhook/aws/status", handleAwsStatusWebhook);
   app.post("/webhook/call-status", handleCallStatusWebhook);
   app.post("/webhook/twilio-stream", handleTwilioStreamWebhook);
+  app.post("/webhook/twilio-pay/start", handleTwilioPayStart);
+  app.post("/webhook/twilio-pay/complete", handleTwilioPayComplete);
+  app.post("/webhook/twilio-pay/status", handleTwilioPayStatus);
   app.post("/webhook/sms", handleSmsWebhook);
   app.post("/webhook/sms-status", handleSmsStatusWebhook);
   app.post("/webhook/email", handleEmailWebhook);

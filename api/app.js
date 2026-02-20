@@ -145,6 +145,7 @@ const callRuntimePersistTimers = new Map(); // callSid -> timeoutId
 const callRuntimePendingWrites = new Map(); // callSid -> patch
 const callToolInFlight = new Map(); // callSid -> { tool, startedAt }
 let callJobProcessing = false;
+let paymentReconcileRunning = false;
 let backgroundWorkersStarted = false;
 const outboundRateBuckets = new Map(); // namespace:key -> { count, windowStart }
 const callLifecycleCleanupTimers = new Map();
@@ -160,6 +161,44 @@ const KEYPAD_PROVIDER_OVERRIDE_SETTING_KEY = "keypad_provider_overrides_v1";
 const CALL_PROVIDER_SETTING_KEY = "call_provider_v1";
 const SMS_PROVIDER_SETTING_KEY = "sms_provider_v1";
 const EMAIL_PROVIDER_SETTING_KEY = "email_provider_v1";
+const PAYMENT_FEATURE_SETTING_KEY = "payment_feature_config_v1";
+
+const defaultPaymentFeatureConfig = Object.freeze({
+  enabled: config.payment?.enabled !== false,
+  kill_switch: config.payment?.killSwitch === true,
+  allow_twilio: config.payment?.allowTwilio !== false,
+  require_script_opt_in: config.payment?.requireScriptOptIn === true,
+  default_currency: String(config.payment?.defaultCurrency || "USD")
+    .trim()
+    .toUpperCase()
+    .slice(0, 3) || "USD",
+  min_amount:
+    Number.isFinite(Number(config.payment?.minAmount)) &&
+    Number(config.payment?.minAmount) > 0
+      ? Number(config.payment?.minAmount)
+      : 0,
+  max_amount:
+    Number.isFinite(Number(config.payment?.maxAmount)) &&
+    Number(config.payment?.maxAmount) > 0
+      ? Number(config.payment?.maxAmount)
+      : 0,
+  max_attempts_per_call:
+    Number.isFinite(Number(config.payment?.maxAttemptsPerCall)) &&
+    Number(config.payment?.maxAttemptsPerCall) > 0
+      ? Math.max(1, Math.floor(Number(config.payment?.maxAttemptsPerCall)))
+      : 3,
+  retry_cooldown_ms:
+    Number.isFinite(Number(config.payment?.retryCooldownMs)) &&
+    Number(config.payment?.retryCooldownMs) >= 0
+      ? Math.max(0, Math.floor(Number(config.payment?.retryCooldownMs)))
+      : 20000,
+  webhook_idempotency_ttl_ms:
+    Number.isFinite(Number(config.payment?.webhookIdempotencyTtlMs)) &&
+    Number(config.payment?.webhookIdempotencyTtlMs) > 0
+      ? Number(config.payment?.webhookIdempotencyTtlMs)
+      : 300000,
+});
+let paymentFeatureConfig = { ...defaultPaymentFeatureConfig };
 
 function stableStringify(value) {
   if (value === null || typeof value !== "object") {
@@ -184,6 +223,7 @@ const FLOW_STATE_DEFAULTS = Object.freeze({
   normal: { call_mode: "normal", digit_capture_active: false },
   capture_pending: { call_mode: "dtmf_capture", digit_capture_active: true },
   capture_active: { call_mode: "dtmf_capture", digit_capture_active: true },
+  payment_active: { call_mode: "payment_capture", digit_capture_active: false },
   ending: { call_mode: "normal", digit_capture_active: false },
 });
 
@@ -198,6 +238,357 @@ function normalizeFlowStateKey(value) {
 function getFlowStateDefaults(flowState) {
   const key = normalizeFlowStateKey(flowState);
   return FLOW_STATE_DEFAULTS[key] || null;
+}
+
+function normalizeBooleanFlag(value, fallback = false) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (value === true || value === 1) return true;
+  const normalized = String(value).trim().toLowerCase();
+  return ["1", "true", "yes", "on"].includes(normalized);
+}
+
+function sanitizePaymentFeatureConfig(raw = {}, previous = {}) {
+  const base = {
+    ...defaultPaymentFeatureConfig,
+    ...(previous && typeof previous === "object" ? previous : {}),
+  };
+  const next = { ...base };
+
+  if (raw.enabled !== undefined) {
+    next.enabled = normalizeBooleanFlag(raw.enabled, base.enabled);
+  }
+  if (raw.kill_switch !== undefined || raw.killSwitch !== undefined) {
+    next.kill_switch = normalizeBooleanFlag(
+      raw.kill_switch ?? raw.killSwitch,
+      base.kill_switch,
+    );
+  }
+  if (raw.allow_twilio !== undefined || raw.allowTwilio !== undefined) {
+    next.allow_twilio = normalizeBooleanFlag(
+      raw.allow_twilio ?? raw.allowTwilio,
+      base.allow_twilio,
+    );
+  }
+  if (
+    raw.require_script_opt_in !== undefined ||
+    raw.requireScriptOptIn !== undefined
+  ) {
+    next.require_script_opt_in = normalizeBooleanFlag(
+      raw.require_script_opt_in ?? raw.requireScriptOptIn,
+      base.require_script_opt_in,
+    );
+  }
+  if (raw.default_currency !== undefined || raw.defaultCurrency !== undefined) {
+    const candidate = String(
+      raw.default_currency ?? raw.defaultCurrency ?? base.default_currency,
+    )
+      .trim()
+      .toUpperCase();
+    if (/^[A-Z]{3}$/.test(candidate)) {
+      next.default_currency = candidate;
+    }
+  }
+  if (raw.min_amount !== undefined || raw.minAmount !== undefined) {
+    const parsed = Number(raw.min_amount ?? raw.minAmount);
+    next.min_amount = Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  }
+  if (raw.max_amount !== undefined || raw.maxAmount !== undefined) {
+    const parsed = Number(raw.max_amount ?? raw.maxAmount);
+    next.max_amount = Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  }
+  if (
+    raw.max_attempts_per_call !== undefined ||
+    raw.maxAttemptsPerCall !== undefined
+  ) {
+    const parsed = Number(raw.max_attempts_per_call ?? raw.maxAttemptsPerCall);
+    next.max_attempts_per_call =
+      Number.isFinite(parsed) && parsed > 0
+        ? Math.max(1, Math.floor(parsed))
+        : 3;
+  }
+  if (
+    raw.retry_cooldown_ms !== undefined ||
+    raw.retryCooldownMs !== undefined
+  ) {
+    const parsed = Number(raw.retry_cooldown_ms ?? raw.retryCooldownMs);
+    next.retry_cooldown_ms =
+      Number.isFinite(parsed) && parsed >= 0
+        ? Math.max(0, Math.floor(parsed))
+        : 20000;
+  }
+  if (
+    next.min_amount > 0 &&
+    next.max_amount > 0 &&
+    next.min_amount > next.max_amount
+  ) {
+    const swap = next.min_amount;
+    next.min_amount = next.max_amount;
+    next.max_amount = swap;
+  }
+  if (
+    raw.webhook_idempotency_ttl_ms !== undefined ||
+    raw.webhookIdempotencyTtlMs !== undefined
+  ) {
+    const parsed = Number(
+      raw.webhook_idempotency_ttl_ms ?? raw.webhookIdempotencyTtlMs,
+    );
+    next.webhook_idempotency_ttl_ms =
+      Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : 300000;
+  }
+  return next;
+}
+
+function getPaymentFeatureConfig() {
+  return sanitizePaymentFeatureConfig(paymentFeatureConfig, {});
+}
+
+function isPaymentFeatureEnabledForProvider(provider, options = {}) {
+  const cfg = getPaymentFeatureConfig();
+  if (cfg.enabled !== true) return false;
+  if (cfg.kill_switch === true) return false;
+  const normalizedProvider = String(provider || "")
+    .trim()
+    .toLowerCase();
+  if (normalizedProvider === "twilio") {
+    if (cfg.allow_twilio !== true) return false;
+  } else {
+    return false;
+  }
+  if (
+    cfg.require_script_opt_in === true &&
+    normalizeBooleanFlag(options.hasScript, false) !== true
+  ) {
+    return false;
+  }
+  return true;
+}
+
+async function loadPaymentFeatureConfig() {
+  paymentFeatureConfig = sanitizePaymentFeatureConfig(paymentFeatureConfig, {});
+  if (!db?.getSetting) return paymentFeatureConfig;
+  try {
+    const raw = await db.getSetting(PAYMENT_FEATURE_SETTING_KEY);
+    if (!raw) return paymentFeatureConfig;
+    const parsed = JSON.parse(raw);
+    paymentFeatureConfig = sanitizePaymentFeatureConfig(parsed, paymentFeatureConfig);
+  } catch (error) {
+    console.error("Failed to load payment feature config:", error);
+  }
+  return paymentFeatureConfig;
+}
+
+async function persistPaymentFeatureConfig() {
+  if (!db?.setSetting) return;
+  try {
+    await db.setSetting(
+      PAYMENT_FEATURE_SETTING_KEY,
+      JSON.stringify(getPaymentFeatureConfig()),
+    );
+  } catch (error) {
+    console.error("Failed to persist payment feature config:", error);
+  }
+}
+
+function normalizePaymentSettings(input = {}, options = {}) {
+  const errors = [];
+  const warnings = [];
+  const featureConfig = getPaymentFeatureConfig();
+  const normalizeMessage = (value) => {
+    const text = String(value || "").trim();
+    return text ? text.slice(0, 240) : null;
+  };
+  const defaultCurrency = String(
+    options.defaultCurrency || featureConfig.default_currency || "USD",
+  )
+    .trim()
+    .toUpperCase();
+  const requireConnectorWhenEnabled = options.requireConnectorWhenEnabled === true;
+  const hasScript = normalizeBooleanFlag(options.hasScript, false);
+  const enforceFeatureGate = options.enforceFeatureGate !== false;
+  const provider = String(
+    options.provider || input?.provider || currentProvider || "",
+  )
+    .trim()
+    .toLowerCase();
+
+  const normalizedConnector = String(input?.payment_connector || "")
+    .trim()
+    .slice(0, 120);
+  const hasAmountInput =
+    input?.payment_amount !== undefined &&
+    input?.payment_amount !== null &&
+    String(input.payment_amount).trim() !== "";
+  const parsedAmount = Number(input?.payment_amount);
+  const normalizedAmount = hasAmountInput
+    ? Number.isFinite(parsedAmount) && parsedAmount > 0
+      ? parsedAmount.toFixed(2)
+      : null
+    : null;
+  if (hasAmountInput && !normalizedAmount) {
+    errors.push("payment_amount must be a positive number when provided.");
+  }
+
+  const hasCurrencyInput =
+    input?.payment_currency !== undefined &&
+    input?.payment_currency !== null &&
+    String(input.payment_currency).trim() !== "";
+  const normalizedCurrencyInput = String(input?.payment_currency || "")
+    .trim()
+    .toUpperCase();
+  if (hasCurrencyInput && !/^[A-Z]{3}$/.test(normalizedCurrencyInput)) {
+    errors.push("payment_currency must be a 3-letter currency code.");
+  }
+
+  let normalizedEnabled = normalizeBooleanFlag(input?.payment_enabled, false);
+  const normalizedCurrency = hasCurrencyInput
+    ? normalizedCurrencyInput
+    : normalizedEnabled
+      ? defaultCurrency
+      : null;
+
+  if (normalizedEnabled && provider && provider !== "twilio") {
+    normalizedEnabled = false;
+    warnings.push(
+      `Payment defaults were saved as disabled because active provider is ${provider.toUpperCase()} (Twilio required).`,
+    );
+  }
+  if (
+    normalizedEnabled &&
+    enforceFeatureGate &&
+    !isPaymentFeatureEnabledForProvider(provider, { hasScript })
+  ) {
+    normalizedEnabled = false;
+    warnings.push("Payment was disabled by runtime feature controls.");
+  }
+  if (normalizedEnabled && requireConnectorWhenEnabled && !normalizedConnector) {
+    errors.push("payment_connector is required when payment_enabled is true.");
+  }
+  if (normalizedAmount) {
+    const amountNumber = Number(normalizedAmount);
+    if (
+      featureConfig.min_amount > 0 &&
+      Number.isFinite(amountNumber) &&
+      amountNumber < featureConfig.min_amount
+    ) {
+      errors.push(
+        `payment_amount must be at least ${featureConfig.min_amount.toFixed(2)}.`,
+      );
+    }
+    if (
+      featureConfig.max_amount > 0 &&
+      Number.isFinite(amountNumber) &&
+      amountNumber > featureConfig.max_amount
+    ) {
+      errors.push(
+        `payment_amount must be at most ${featureConfig.max_amount.toFixed(2)}.`,
+      );
+    }
+  }
+
+  return {
+    normalized: {
+      payment_enabled: normalizedEnabled,
+      payment_connector: normalizedConnector || null,
+      payment_amount: normalizedAmount,
+      payment_currency: normalizedCurrency,
+      payment_description: String(input?.payment_description || "")
+        .trim()
+        .slice(0, 240) || null,
+      payment_start_message: normalizeMessage(
+        input?.payment_start_message ?? input?.paymentStartMessage,
+      ),
+      payment_success_message: normalizeMessage(
+        input?.payment_success_message ?? input?.paymentSuccessMessage,
+      ),
+      payment_failure_message: normalizeMessage(
+        input?.payment_failure_message ?? input?.paymentFailureMessage,
+      ),
+      payment_retry_message: normalizeMessage(
+        input?.payment_retry_message ?? input?.paymentRetryMessage,
+      ),
+    },
+    errors,
+    warnings,
+  };
+}
+
+const SCRIPT_BOUND_PAYMENT_OPTION_FIELDS = Object.freeze([
+  "payment_connector",
+  "payment_amount",
+  "payment_description",
+  "payment_start_message",
+  "payment_success_message",
+  "payment_failure_message",
+  "payment_retry_message",
+]);
+
+function hasScriptBoundPaymentOverride(input = {}) {
+  const payload = input && typeof input === "object" ? input : {};
+  if (normalizeBooleanFlag(payload.payment_enabled, false)) {
+    return true;
+  }
+  return SCRIPT_BOUND_PAYMENT_OPTION_FIELDS.some((field) => {
+    if (!Object.prototype.hasOwnProperty.call(payload, field)) {
+      return false;
+    }
+    const value = payload[field];
+    if (value === undefined || value === null) {
+      return false;
+    }
+    if (typeof value === "string") {
+      return value.trim() !== "";
+    }
+    return true;
+  });
+}
+
+function assertScriptBoundPayment(payload = {}, scriptId = null) {
+  if (normalizeScriptId(scriptId)) {
+    return;
+  }
+  if (!hasScriptBoundPaymentOverride(payload)) {
+    return;
+  }
+  const error = new Error("Payment settings require a valid script_id.");
+  error.code = "payment_requires_script";
+  error.status = 400;
+  throw error;
+}
+
+function buildCallCapabilities(callConfig = {}, options = {}) {
+  const provider = String(
+    options.provider || callConfig?.provider || currentProvider || "",
+  )
+    .trim()
+    .toLowerCase();
+  const existing =
+    callConfig?.capabilities && typeof callConfig.capabilities === "object"
+      ? callConfig.capabilities
+      : {};
+
+  const capture =
+    existing.capture !== undefined ? existing.capture === true : true;
+  const transfer =
+    existing.transfer !== undefined ? existing.transfer === true : true;
+  const paymentConfigured =
+    isPaymentFeatureEnabledForProvider(provider, {
+      hasScript:
+        options.hasScript !== undefined
+          ? options.hasScript
+          : Boolean(callConfig?.script_id),
+    }) &&
+    normalizeBooleanFlag(callConfig?.payment_enabled, false);
+  const payment =
+    existing.payment !== undefined
+      ? existing.payment === true && paymentConfigured
+      : paymentConfigured;
+
+  return {
+    capture,
+    transfer,
+    payment,
+    provider: provider || null,
+  };
 }
 
 function buildProviderEventFingerprint(source, dedupePayload = {}) {
@@ -677,6 +1068,12 @@ function buildInboundCallConfig(callSid, payload = {}, options = {}) {
     route.prompt || route.first_message || route.firstMessage,
   );
   const fallbackScript = !hasRoutePrompt ? inboundDefaultScript : null;
+  const inboundPayment = normalizePaymentSettings(route, {
+    provider,
+    requireConnectorWhenEnabled: false,
+    hasScript: Boolean(route.script_id || fallbackScript?.id),
+    enforceFeatureGate: true,
+  }).normalized;
   const callConfig = {
     prompt,
     first_message: firstMessage,
@@ -702,6 +1099,19 @@ function buildInboundCallConfig(callSid, payload = {}, options = {}) {
     collection_max_retries: route.collection_max_retries || null,
     collection_mask_for_gpt: route.collection_mask_for_gpt,
     collection_speak_confirmation: route.collection_speak_confirmation,
+    payment_enabled: inboundPayment.payment_enabled === true,
+    payment_connector: inboundPayment.payment_connector || null,
+    payment_amount: inboundPayment.payment_amount || null,
+    payment_currency: inboundPayment.payment_currency || null,
+    payment_description: inboundPayment.payment_description || null,
+    payment_start_message: inboundPayment.payment_start_message || null,
+    payment_success_message: inboundPayment.payment_success_message || null,
+    payment_failure_message: inboundPayment.payment_failure_message || null,
+    payment_retry_message: inboundPayment.payment_retry_message || null,
+    payment_state: inboundPayment.payment_enabled === true ? "ready" : "disabled",
+    payment_state_updated_at: createdAt,
+    payment_session: null,
+    payment_last_result: null,
     firstMediaTimeoutMs:
       route.first_media_timeout_ms ||
       route.firstMediaTimeoutMs ||
@@ -713,6 +1123,7 @@ function buildInboundCallConfig(callSid, payload = {}, options = {}) {
     digit_capture_active: false,
     inbound,
   };
+  callConfig.capabilities = buildCallCapabilities(callConfig, { provider });
   return { callConfig, functionSystem };
 }
 
@@ -857,6 +1268,19 @@ async function ensureCallRecord(
         callConfig.flow_state_updated_at || new Date().toISOString(),
       call_mode: callConfig.call_mode || "normal",
       digit_capture_active: callConfig.digit_capture_active === true,
+      capabilities: callConfig.capabilities || buildCallCapabilities(callConfig),
+      payment_enabled: callConfig.payment_enabled === true,
+      payment_connector: callConfig.payment_connector || null,
+      payment_amount: callConfig.payment_amount || null,
+      payment_currency: callConfig.payment_currency || null,
+      payment_description: callConfig.payment_description || null,
+      payment_start_message: callConfig.payment_start_message || null,
+      payment_success_message: callConfig.payment_success_message || null,
+      payment_failure_message: callConfig.payment_failure_message || null,
+      payment_retry_message: callConfig.payment_retry_message || null,
+      payment_state: callConfig.payment_state || (callConfig.payment_enabled === true ? "ready" : "disabled"),
+      payment_state_updated_at:
+        callConfig.payment_state_updated_at || new Date().toISOString(),
     });
     return await db.getCall(callSid);
   } catch (error) {
@@ -915,6 +1339,25 @@ async function hydrateCallConfigFromDb(callSid) {
     collection_max_retries: state?.collection_max_retries || null,
     collection_mask_for_gpt: state?.collection_mask_for_gpt,
     collection_speak_confirmation: state?.collection_speak_confirmation,
+    payment_enabled: normalizeBooleanFlag(state?.payment_enabled, false),
+    payment_connector: state?.payment_connector || null,
+    payment_amount: state?.payment_amount || null,
+    payment_currency: state?.payment_currency || null,
+    payment_description: state?.payment_description || null,
+    payment_start_message: state?.payment_start_message || null,
+    payment_success_message: state?.payment_success_message || null,
+    payment_failure_message: state?.payment_failure_message || null,
+    payment_retry_message: state?.payment_retry_message || null,
+    payment_state:
+      state?.payment_state ||
+      (normalizeBooleanFlag(state?.payment_enabled, false) ? "ready" : "disabled"),
+    payment_state_updated_at: state?.payment_state_updated_at || createdAt,
+    payment_session: null,
+    payment_last_result: state?.payment_last_result || null,
+    capabilities:
+      state?.capabilities && typeof state.capabilities === "object"
+        ? state.capabilities
+        : null,
     script_policy: state?.script_policy || null,
     flow_state: state?.flow_state || "normal",
     flow_state_updated_at: state?.flow_state_updated_at || createdAt,
@@ -926,6 +1369,9 @@ async function hydrateCallConfigFromDb(callSid) {
       state?.flow_state === "capture_pending",
     inbound: false,
   };
+  if (!callConfig.capabilities) {
+    callConfig.capabilities = buildCallCapabilities(callConfig);
+  }
 
   callConfigurations.set(callSid, callConfig);
   callFunctionSystems.set(callSid, functionSystem);
@@ -4057,6 +4503,57 @@ const telephonyTools = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "start_payment",
+      description:
+        "Start a secure phone payment step for this live call. Twilio provider only.",
+      parameters: {
+        type: "object",
+        properties: {
+          amount: {
+            type: "number",
+            description: "Charge amount in major units (for example 49.99).",
+          },
+          currency: {
+            type: "string",
+            description: "Three-letter currency code (for example USD).",
+          },
+          payment_connector: {
+            type: "string",
+            description:
+              "Twilio Pay Connector name configured in your Twilio account.",
+          },
+          description: {
+            type: "string",
+            description: "Short transaction description shown to processors.",
+          },
+          start_message: {
+            type: "string",
+            description:
+              "Optional spoken line before card capture begins.",
+          },
+          success_message: {
+            type: "string",
+            description:
+              "Short spoken line after successful payment before resuming the call.",
+          },
+          failure_message: {
+            type: "string",
+            description:
+              "Short spoken line after failed payment before resuming the call.",
+          },
+          retry_message: {
+            type: "string",
+            description:
+              "Optional spoken line for recoverable payment retries/timeouts.",
+          },
+        },
+        required: ["amount"],
+      },
+    },
+  },
 ];
 
 function buildTelephonyImplementations(callSid, gptService = null) {
@@ -4192,11 +4689,27 @@ function buildTelephonyImplementations(callSid, gptService = null) {
       if (!digitService) {
         return { error: "Digit service not ready" };
       }
+      const callConfig = callConfigurations.get(callSid) || {};
+      const flowState = normalizeFlowStateKey(callConfig.flow_state || "normal");
+      if (callConfig.payment_in_progress === true || flowState === "payment_active") {
+        return {
+          error: "payment_in_progress",
+          message: "Digit capture is temporarily unavailable while payment is in progress.",
+        };
+      }
       return digitService.requestDigitCollection(callSid, args, gptService);
     },
     collect_multiple_digits: async (args = {}) => {
       if (!digitService) {
         return { error: "Digit service not ready" };
+      }
+      const callConfig = callConfigurations.get(callSid) || {};
+      const flowState = normalizeFlowStateKey(callConfig.flow_state || "normal");
+      if (callConfig.payment_in_progress === true || flowState === "payment_active") {
+        return {
+          error: "payment_in_progress",
+          message: "Digit capture is temporarily unavailable while payment is in progress.",
+        };
       }
       return digitService.requestDigitCollectionPlan(callSid, args, gptService);
     },
@@ -4211,6 +4724,42 @@ function buildTelephonyImplementations(callSid, gptService = null) {
         console.error("play_disclosure handler error:", err);
       }
       return payload;
+    },
+    start_payment: async (args = {}) => {
+      if (!digitService?.requestPhonePayment) {
+        return {
+          error: "payment_service_unavailable",
+          message: "Payment service is not ready.",
+        };
+      }
+      const callConfig = callConfigurations.get(callSid) || {};
+      const flowState = normalizeFlowStateKey(callConfig.flow_state || "normal");
+      if (isCaptureActiveConfig(callConfig) || flowState === "capture_pending") {
+        return {
+          error: "capture_active",
+          message: "Cannot start payment while digit capture is active.",
+        };
+      }
+      if (callConfig.payment_in_progress === true || flowState === "payment_active") {
+        return {
+          error: "payment_in_progress",
+          message: "A payment session is already in progress.",
+        };
+      }
+      const result = await digitService.requestPhonePayment(callSid, args);
+      if (result?.status === "started") {
+        queuePersistCallRuntimeState(callSid, {
+          snapshot: {
+            payment_in_progress: true,
+            payment_session: {
+              payment_id: result.payment_id || null,
+              amount: result.amount || null,
+              currency: result.currency || null,
+            },
+          },
+        });
+      }
+      return result;
     },
   };
   return Object.fromEntries(
@@ -4230,6 +4779,7 @@ function applyTelephonyTools(
 ) {
   const allowTransfer = options.allowTransfer !== false;
   const allowDigitCollection = options.allowDigitCollection !== false;
+  const allowPayment = options.allowPayment === true;
   const normalizedName = (tool) =>
     String(tool?.function?.name || "")
       .trim()
@@ -4249,6 +4799,7 @@ function applyTelephonyTools(
         (name === "collect_digits" || name === "collect_multiple_digits")
       )
         return false;
+      if (!allowPayment && name === "start_payment") return false;
       return true;
     },
   );
@@ -4261,6 +4812,7 @@ function applyTelephonyTools(
       (name === "collect_digits" || name === "collect_multiple_digits")
     )
       return false;
+    if (!allowPayment && name === "start_payment") return false;
     return true;
   });
 
@@ -4278,6 +4830,9 @@ function applyTelephonyTools(
     delete combinedImpl.collect_digits;
     delete combinedImpl.collect_multiple_digits;
   }
+  if (!allowPayment) {
+    delete combinedImpl.start_payment;
+  }
   gptService.setDynamicFunctions(combinedTools, combinedImpl);
 }
 
@@ -4288,17 +4843,29 @@ function getCallToolOptions(callSid, callConfig = {}) {
   const hasToolLock = Boolean(
     callConfig?.tool_in_progress || (callSid && callToolInFlight.has(callSid)),
   );
-  const policyAllowsTransfer = isDigitIntent;
-  const policyAllowsDigitCollection = isDigitIntent;
+  const capabilities = buildCallCapabilities(callConfig);
+  const policyAllowsTransfer = capabilities.transfer === true && isDigitIntent;
+  const policyAllowsDigitCollection =
+    capabilities.capture === true && isDigitIntent;
+  const policyAllowsPayment = capabilities.payment === true;
   const phaseAllowsTransfer = flowState !== "ending";
   const phaseAllowsDigitCollection =
-    flowState !== "ending" && flowState !== "capture_active";
+    flowState !== "ending" &&
+    flowState !== "capture_active" &&
+    flowState !== "payment_active";
+  const phaseAllowsPayment =
+    flowState !== "ending" &&
+    flowState !== "capture_active" &&
+    flowState !== "payment_active";
   return {
     allowTransfer: policyAllowsTransfer && phaseAllowsTransfer && !hasToolLock,
     allowDigitCollection:
       policyAllowsDigitCollection && phaseAllowsDigitCollection && !hasToolLock,
+    allowPayment: policyAllowsPayment && phaseAllowsPayment && !hasToolLock,
     policyAllowsTransfer,
     policyAllowsDigitCollection,
+    policyAllowsPayment,
+    capabilities,
     flowState,
     hasToolLock,
   };
@@ -5693,6 +6260,80 @@ function estimateSpeechDurationMs(text = "") {
   return Math.max(1600, Math.min(12000, estimated));
 }
 
+async function runPaymentReconciliation(options = {}) {
+  if (!db?.listStalePaymentSessions || paymentReconcileRunning) {
+    return { ok: false, skipped: true, reason: "not_ready" };
+  }
+  const reconcileEnabled = config.payment?.reconcile?.enabled !== false;
+  if (!reconcileEnabled && options.force !== true) {
+    return { ok: true, skipped: true, reason: "disabled" };
+  }
+  paymentReconcileRunning = true;
+  try {
+    const staleSeconds = Number.isFinite(Number(options.staleSeconds))
+      ? Math.max(60, Math.floor(Number(options.staleSeconds)))
+      : Number(config.payment?.reconcile?.staleSeconds) || 240;
+    const limit = Number.isFinite(Number(options.limit))
+      ? Math.max(1, Math.min(100, Math.floor(Number(options.limit))))
+      : Number(config.payment?.reconcile?.batchSize) || 20;
+    const rows = await db.listStalePaymentSessions({
+      olderThanSeconds: staleSeconds,
+      limit,
+    });
+    let reconciled = 0;
+    let skipped = 0;
+    let failed = 0;
+    for (const row of rows) {
+      const callSid = String(row?.call_sid || "").trim();
+      if (!callSid || !digitService?.reconcilePaymentSession) {
+        skipped += 1;
+        continue;
+      }
+      try {
+        const result = await digitService.reconcilePaymentSession(callSid, {
+          reason: "payment_reconcile_stale",
+          source: options.source || "payment_reconcile_worker",
+          staleSince: row?.active_at || null,
+        });
+        if (result?.reconciled === true) {
+          reconciled += 1;
+        } else {
+          skipped += 1;
+        }
+      } catch (error) {
+        failed += 1;
+        console.error("payment_reconcile_call_error", {
+          call_sid: callSid,
+          error: String(error?.message || error || "unknown_error"),
+        });
+      }
+    }
+    const payload = {
+      scanned: rows.length,
+      reconciled,
+      skipped,
+      failed,
+      stale_seconds: staleSeconds,
+      limit,
+      source: options.source || "worker",
+      at: new Date().toISOString(),
+    };
+    db.logServiceHealth?.("payment_reconcile", "run", payload).catch(() => {});
+    return { ok: true, ...payload };
+  } catch (error) {
+    db
+      .logServiceHealth?.("payment_reconcile", "error", {
+        source: options.source || "worker",
+        error: String(error?.message || error || "payment_reconcile_failed"),
+        at: new Date().toISOString(),
+      })
+      .catch(() => {});
+    throw error;
+  } finally {
+    paymentReconcileRunning = false;
+  }
+}
+
 function startBackgroundWorkers() {
   if (backgroundWorkersStarted) return;
   backgroundWorkersStarted = true;
@@ -5712,6 +6353,22 @@ function startBackgroundWorkers() {
 
     smsService.reconcileStaleOutboundStatuses().catch((error) => {
       console.error("❌ Initial SMS reconcile run failed:", error);
+    });
+  }
+
+  if (config.payment?.reconcile?.enabled !== false) {
+    setInterval(() => {
+      runPaymentReconciliation({
+        source: "payment_reconcile_interval",
+      }).catch((error) => {
+        console.error("❌ Payment reconcile worker error:", error);
+      });
+    }, Number(config.payment?.reconcile?.intervalMs) || 120000);
+
+    runPaymentReconciliation({
+      source: "payment_reconcile_startup",
+    }).catch((error) => {
+      console.error("❌ Initial payment reconcile run failed:", error);
     });
   }
 
@@ -6238,6 +6895,7 @@ async function startServer(options = {}) {
     await loadStoredCallProvider();
     await loadStoredSmsProvider();
     await loadStoredEmailProvider();
+    await loadPaymentFeatureConfig();
     await refreshInboundDefaultScript(true);
     await loadKeypadProviderOverrides();
     logStartupRuntimeProfile();
@@ -6275,6 +6933,7 @@ async function startServer(options = {}) {
       smsService,
       healthProvider: getDigitSystemHealth,
       setCallFlowState,
+      getPaymentFeatureConfig: () => getPaymentFeatureConfig(),
     });
     if (typeof webhookService.setDigitTokenResolver === "function") {
       webhookService.setDigitTokenResolver((callSid, tokenRef) => {
@@ -9379,6 +10038,48 @@ app.post(
   },
 );
 
+app.get("/admin/payment/feature", requireAdminToken, async (req, res) => {
+  try {
+    const paymentConfig = getPaymentFeatureConfig();
+    return res.json({
+      success: true,
+      feature: paymentConfig,
+      twilio_ready: getProviderReadiness()?.twilio === true,
+    });
+  } catch (error) {
+    console.error("Failed to fetch payment feature config:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch payment feature config",
+    });
+  }
+});
+
+app.post("/admin/payment/feature", requireAdminToken, async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    paymentFeatureConfig = sanitizePaymentFeatureConfig(body, paymentFeatureConfig);
+    await persistPaymentFeatureConfig();
+
+    // Refresh dynamic tool exposure for active calls immediately.
+    for (const callSid of activeCalls.keys()) {
+      refreshActiveCallTools(callSid);
+    }
+
+    return res.json({
+      success: true,
+      feature: getPaymentFeatureConfig(),
+      twilio_ready: getProviderReadiness()?.twilio === true,
+    });
+  } catch (error) {
+    console.error("Failed to update payment feature config:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to update payment feature config",
+    });
+  }
+});
+
 app.get("/admin/call-jobs/dlq", requireAdminToken, async (req, res) => {
   try {
     if (!db) {
@@ -9724,6 +10425,23 @@ function normalizeCallTemplateName(value = "") {
   return trimmed.slice(0, 80);
 }
 
+function callScriptPaymentFieldTouched(payload = {}) {
+  const fields = [
+    "payment_enabled",
+    "payment_connector",
+    "payment_amount",
+    "payment_currency",
+    "payment_description",
+    "payment_start_message",
+    "payment_success_message",
+    "payment_failure_message",
+    "payment_retry_message",
+  ];
+  return fields.some((field) =>
+    Object.prototype.hasOwnProperty.call(payload || {}, field),
+  );
+}
+
 async function findCallTemplateNameCollision(name, excludeId = null) {
   const normalized = normalizeCallTemplateName(name);
   if (!normalized) return null;
@@ -9833,13 +10551,29 @@ app.post("/api/call-scripts", requireAdminToken, async (req, res) => {
         suggested_name: await suggestCallTemplateName(`${normalizedName} Copy`),
       });
     }
+    const paymentSettings = normalizePaymentSettings(requestBody, {
+      provider: currentProvider,
+      requireConnectorWhenEnabled: true,
+    });
+    if (paymentSettings.errors.length) {
+      failCallScriptMutationIdempotency(idempotency);
+      return res.status(400).json({
+        success: false,
+        error: paymentSettings.errors.join(" "),
+      });
+    }
     const id = await db.createCallTemplate({
       ...requestBody,
       name: normalizedName,
       first_message: firstMessage,
+      ...paymentSettings.normalized,
     });
     const script = await db.getCallTemplateById(id);
-    const responseBody = { success: true, script };
+    const responseBody = {
+      success: true,
+      script,
+      warnings: paymentSettings.warnings,
+    };
     completeCallScriptMutationIdempotency(idempotency, 201, responseBody);
     res.status(201).json(responseBody);
   } catch (error) {
@@ -9869,6 +10603,14 @@ app.put("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
         .status(400)
         .json({ success: false, error: "Invalid script id" });
     }
+    const existing = await db.getCallTemplateById(scriptId);
+    if (!existing) {
+      failCallScriptMutationIdempotency(idempotency);
+      return res
+        .status(404)
+        .json({ success: false, error: "Script not found" });
+    }
+
     const updates = { ...requestBody };
     if (updates.name !== undefined) {
       const normalizedName = normalizeCallTemplateName(updates.name);
@@ -9890,6 +10632,42 @@ app.put("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
       }
       updates.name = normalizedName;
     }
+    let paymentWarnings = [];
+    if (callScriptPaymentFieldTouched(requestBody)) {
+      const paymentSettings = normalizePaymentSettings(
+        {
+          payment_enabled: updates.payment_enabled ?? existing.payment_enabled,
+          payment_connector:
+            updates.payment_connector ?? existing.payment_connector,
+          payment_amount: updates.payment_amount ?? existing.payment_amount,
+          payment_currency:
+            updates.payment_currency ?? existing.payment_currency,
+          payment_description:
+            updates.payment_description ?? existing.payment_description,
+          payment_start_message:
+            updates.payment_start_message ?? existing.payment_start_message,
+          payment_success_message:
+            updates.payment_success_message ?? existing.payment_success_message,
+          payment_failure_message:
+            updates.payment_failure_message ?? existing.payment_failure_message,
+          payment_retry_message:
+            updates.payment_retry_message ?? existing.payment_retry_message,
+        },
+        {
+          provider: currentProvider,
+          requireConnectorWhenEnabled: true,
+        },
+      );
+      if (paymentSettings.errors.length) {
+        failCallScriptMutationIdempotency(idempotency);
+        return res.status(400).json({
+          success: false,
+          error: paymentSettings.errors.join(" "),
+        });
+      }
+      paymentWarnings = paymentSettings.warnings;
+      Object.assign(updates, paymentSettings.normalized);
+    }
     const updated = await db.updateCallTemplate(scriptId, updates);
     if (!updated) {
       failCallScriptMutationIdempotency(idempotency);
@@ -9902,7 +10680,7 @@ app.put("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
       inboundDefaultScript = script || null;
       inboundDefaultLoadedAt = Date.now();
     }
-    const responseBody = { success: true, script };
+    const responseBody = { success: true, script, warnings: paymentWarnings };
     completeCallScriptMutationIdempotency(idempotency, 200, responseBody);
     res.json(responseBody);
   } catch (error) {
@@ -10020,10 +10798,37 @@ app.post("/api/call-scripts/:id/clone", requireAdminToken, async (req, res) => {
         existing.expected_length === undefined ? null : existing.expected_length,
       allow_terminator: existing.allow_terminator ? 1 : 0,
       terminator_char: existing.terminator_char || null,
+      payment_enabled: normalizeBooleanFlag(existing.payment_enabled, false),
+      payment_connector: existing.payment_connector || null,
+      payment_amount: existing.payment_amount || null,
+      payment_currency: existing.payment_currency || null,
+      payment_description: existing.payment_description || null,
+      payment_start_message: existing.payment_start_message || null,
+      payment_success_message: existing.payment_success_message || null,
+      payment_failure_message: existing.payment_failure_message || null,
+      payment_retry_message: existing.payment_retry_message || null,
     };
-    const newId = await db.createCallTemplate(payload);
+    const paymentSettings = normalizePaymentSettings(payload, {
+      provider: currentProvider,
+      requireConnectorWhenEnabled: true,
+    });
+    if (paymentSettings.errors.length) {
+      failCallScriptMutationIdempotency(idempotency);
+      return res.status(400).json({
+        success: false,
+        error: paymentSettings.errors.join(" "),
+      });
+    }
+    const newId = await db.createCallTemplate({
+      ...payload,
+      ...paymentSettings.normalized,
+    });
     const script = await db.getCallTemplateById(newId);
-    const responseBody = { success: true, script };
+    const responseBody = {
+      success: true,
+      script,
+      warnings: paymentSettings.warnings,
+    };
     completeCallScriptMutationIdempotency(idempotency, 201, responseBody);
     res.status(201).json(responseBody);
   } catch (error) {
@@ -10193,6 +10998,15 @@ async function buildRetryPayload(callSid) {
     collection_max_retries: callState?.collection_max_retries || null,
     collection_mask_for_gpt: callState?.collection_mask_for_gpt,
     collection_speak_confirmation: callState?.collection_speak_confirmation,
+    payment_enabled: normalizeBooleanFlag(callState?.payment_enabled, false),
+    payment_connector: callState?.payment_connector || null,
+    payment_amount: callState?.payment_amount || null,
+    payment_currency: callState?.payment_currency || null,
+    payment_description: callState?.payment_description || null,
+    payment_start_message: callState?.payment_start_message || null,
+    payment_success_message: callState?.payment_success_message || null,
+    payment_failure_message: callState?.payment_failure_message || null,
+    payment_retry_message: callState?.payment_retry_message || null,
   };
 }
 
@@ -10423,7 +11237,21 @@ async function placeOutboundCall(payload, hostOverride = null) {
     collection_max_retries,
     collection_mask_for_gpt,
     collection_speak_confirmation,
+    payment_enabled,
+    payment_connector,
+    payment_amount,
+    payment_currency,
+    payment_description,
+    payment_start_message,
+    payment_success_message,
+    payment_failure_message,
+    payment_retry_message,
   } = payload || {};
+  const payloadObject =
+    payload && typeof payload === "object" ? payload : {};
+  const hasPayloadField = (field) =>
+    Object.prototype.hasOwnProperty.call(payloadObject, field);
+  assertScriptBoundPayment(payloadObject, script_id);
 
   if (!number || !prompt || !first_message) {
     throw new Error(
@@ -10452,6 +11280,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
   );
 
   let scriptPolicy = {};
+  let scriptPaymentDefaults = {};
   if (script_id) {
     try {
       const tpl = await db.getCallTemplateById(Number(script_id));
@@ -10462,6 +11291,17 @@ async function placeOutboundCall(payload, hostOverride = null) {
           expected_length: tpl.expected_length || null,
           allow_terminator: !!tpl.allow_terminator,
           terminator_char: tpl.terminator_char || null,
+        };
+        scriptPaymentDefaults = {
+          payment_enabled: normalizeBooleanFlag(tpl.payment_enabled, false),
+          payment_connector: tpl.payment_connector || null,
+          payment_amount: tpl.payment_amount || null,
+          payment_currency: tpl.payment_currency || null,
+          payment_description: tpl.payment_description || null,
+          payment_start_message: tpl.payment_start_message || null,
+          payment_success_message: tpl.payment_success_message || null,
+          payment_failure_message: tpl.payment_failure_message || null,
+          payment_retry_message: tpl.payment_retry_message || null,
         };
       }
     } catch (err) {
@@ -10533,6 +11373,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
     ? healthyProviders
     : availableProviders;
   let lastError = null;
+  const callWarnings = [];
 
   for (const provider of attemptProviders) {
     try {
@@ -10678,6 +11519,49 @@ async function placeOutboundCall(payload, hostOverride = null) {
   }
 
   const createdAt = new Date().toISOString();
+  const mergedPaymentInput = {
+    payment_enabled: hasPayloadField("payment_enabled")
+      ? payment_enabled
+      : scriptPaymentDefaults.payment_enabled,
+    payment_connector: hasPayloadField("payment_connector")
+      ? payment_connector
+      : scriptPaymentDefaults.payment_connector,
+    payment_amount: hasPayloadField("payment_amount")
+      ? payment_amount
+      : scriptPaymentDefaults.payment_amount,
+    payment_currency: hasPayloadField("payment_currency")
+      ? payment_currency
+      : scriptPaymentDefaults.payment_currency,
+    payment_description: hasPayloadField("payment_description")
+      ? payment_description
+      : scriptPaymentDefaults.payment_description,
+    payment_start_message: hasPayloadField("payment_start_message")
+      ? payment_start_message
+      : scriptPaymentDefaults.payment_start_message,
+    payment_success_message: hasPayloadField("payment_success_message")
+      ? payment_success_message
+      : scriptPaymentDefaults.payment_success_message,
+    payment_failure_message: hasPayloadField("payment_failure_message")
+      ? payment_failure_message
+      : scriptPaymentDefaults.payment_failure_message,
+    payment_retry_message: hasPayloadField("payment_retry_message")
+      ? payment_retry_message
+      : scriptPaymentDefaults.payment_retry_message,
+  };
+  const normalizedPayment = normalizePaymentSettings(mergedPaymentInput, {
+    provider: selectedProvider || currentProvider,
+    requireConnectorWhenEnabled: false,
+    hasScript: Boolean(script_id),
+    enforceFeatureGate: true,
+  });
+  if (normalizedPayment.warnings.length) {
+    callWarnings.push(...normalizedPayment.warnings);
+  }
+  const paymentEnabled = normalizedPayment.normalized.payment_enabled === true;
+  const normalizedPaymentCurrency =
+    normalizedPayment.normalized.payment_currency || null;
+  const normalizedPaymentAmount =
+    normalizedPayment.normalized.payment_amount || null;
   const callConfig = {
     prompt: prompt,
     first_message: first_message,
@@ -10702,6 +11586,24 @@ async function placeOutboundCall(payload, hostOverride = null) {
     collection_max_retries: collection_max_retries || null,
     collection_mask_for_gpt: collection_mask_for_gpt,
     collection_speak_confirmation: collection_speak_confirmation,
+    payment_enabled: paymentEnabled,
+    payment_connector: normalizedPayment.normalized.payment_connector || null,
+    payment_amount: normalizedPaymentAmount,
+    payment_currency: normalizedPaymentCurrency || "USD",
+    payment_description:
+      normalizedPayment.normalized.payment_description || null,
+    payment_start_message:
+      normalizedPayment.normalized.payment_start_message || null,
+    payment_success_message:
+      normalizedPayment.normalized.payment_success_message || null,
+    payment_failure_message:
+      normalizedPayment.normalized.payment_failure_message || null,
+    payment_retry_message:
+      normalizedPayment.normalized.payment_retry_message || null,
+    payment_state: paymentEnabled ? "ready" : "disabled",
+    payment_state_updated_at: createdAt,
+    payment_session: null,
+    payment_last_result: null,
     script_policy: scriptPolicy,
     flow_state: "normal",
     flow_state_updated_at: createdAt,
@@ -10709,6 +11611,9 @@ async function placeOutboundCall(payload, hostOverride = null) {
     digit_capture_active: false,
     inbound: false,
   };
+  callConfig.capabilities = buildCallCapabilities(callConfig, {
+    provider: selectedProvider || currentProvider,
+  });
 
   callConfigurations.set(callId, callConfig);
   callFunctionSystems.set(callId, functionSystem);
@@ -10764,6 +11669,24 @@ async function placeOutboundCall(payload, hostOverride = null) {
       collection_max_retries: collection_max_retries || null,
       collection_mask_for_gpt: collection_mask_for_gpt,
       collection_speak_confirmation: collection_speak_confirmation,
+      payment_enabled: paymentEnabled,
+      payment_connector: normalizedPayment.normalized.payment_connector || null,
+      payment_amount: normalizedPaymentAmount,
+      payment_currency: normalizedPaymentCurrency || "USD",
+      payment_description:
+        normalizedPayment.normalized.payment_description || null,
+      payment_start_message:
+        normalizedPayment.normalized.payment_start_message || null,
+      payment_success_message:
+        normalizedPayment.normalized.payment_success_message || null,
+      payment_failure_message:
+        normalizedPayment.normalized.payment_failure_message || null,
+      payment_retry_message:
+        normalizedPayment.normalized.payment_retry_message || null,
+      payment_state: callConfig.payment_state || (paymentEnabled ? "ready" : "disabled"),
+      payment_state_updated_at:
+        callConfig.payment_state_updated_at || new Date().toISOString(),
+      capabilities: callConfig.capabilities,
       flow_state: callConfig.flow_state || "normal",
       flow_state_reason: callConfig.flow_state_reason || "call_created",
       flow_state_updated_at:
@@ -10795,6 +11718,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
     callStatus,
     functionSystem,
     provider: selectedProvider || currentProvider,
+    warnings: callWarnings,
   };
 }
 
@@ -13565,6 +14489,7 @@ registerStatusRoutes(app, {
 });
 
 registerWebhookRoutes(app, {
+  config,
   handleTwilioGatherWebhook,
   requireValidTwilioSignature,
   requireValidAwsWebhook,
@@ -13609,6 +14534,7 @@ registerWebhookRoutes(app, {
   webhookService,
   buildVonageTalkHangupNcco,
   buildVonageUnavailableNcco,
+  buildTwilioStreamTwiml,
   getCallConfigurations: () => callConfigurations,
   getCallFunctionSystems: () => callFunctionSystems,
   getCallDirections: () => callDirections,
@@ -13680,6 +14606,41 @@ app.post("/api/sms/reconcile", requireAdminToken, async (req, res) => {
       status,
       error.code || "sms_reconcile_failed",
       error.message || "Failed to reconcile stale SMS statuses",
+      req.requestId,
+    );
+  }
+});
+
+app.post("/api/payment/reconcile", requireAdminToken, async (req, res) => {
+  try {
+    const result = await runWithTimeout(
+      runPaymentReconciliation({
+        force: true,
+        source: "payment_reconcile_api",
+        staleSeconds: req.body?.stale_seconds,
+        limit: req.body?.limit,
+      }),
+      Number(config.outboundLimits?.handlerTimeoutMs) || 30000,
+      "payment reconcile handler",
+      "payment_handler_timeout",
+    );
+    return res.json({
+      success: true,
+      ...result,
+      request_id: req.requestId || null,
+    });
+  } catch (error) {
+    const status = error.code === "payment_handler_timeout" ? 504 : 500;
+    console.error("payment_reconcile_error", {
+      request_id: req.requestId || null,
+      error: redactSensitiveLogValue(error.message || "payment_reconcile_failed"),
+      code: error.code || null,
+    });
+    return sendApiError(
+      res,
+      status,
+      error.code || "payment_reconcile_failed",
+      error.message || "Failed to reconcile stale payment sessions",
       req.requestId,
     );
   }
