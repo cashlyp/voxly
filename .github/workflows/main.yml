@@ -23,7 +23,6 @@ jobs:
           script: |
             # Ensure PM2 is available in non-interactive SSH shell
             export PATH=$PATH:/home/ubuntu/.nvm/versions/node/v20.20.0/bin
-            PM2_BIN=/home/ubuntu/.nvm/versions/node/v20.20.0/bin/pm2
 
             # Navigate to project root
             cd /home/ubuntu/voxly
@@ -36,18 +35,18 @@ jobs:
             git pull --ff-only origin main
 
             # Kill PM2 daemon and delete all processes
-            $PM2_BIN kill
-            $PM2_BIN delete all
+            pm2 kill
+            pm2 delete all
 
             # Deploy API
             cd api
             npm install
-            $PM2_BIN startOrRestart ecosystem.config.js --env production
+            pm2 startOrRestart ecosystem.config.js --env production
 
             # Deploy Bot
             cd ../bot
             npm install
-            $PM2_BIN startOrRestart ecosystem.config.js --env production
+            pm2 startOrRestart ecosystem.config.js --env production
 
             # Save PM2 process list
-            $PM2_BIN save
+            pm2 save
