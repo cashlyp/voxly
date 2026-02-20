@@ -4,6 +4,11 @@ const { getUser } = require('../db/db');
 const {
   findBusinessOption,
   askOptionWithButtons,
+  getBusinessOptions,
+  MOOD_OPTIONS,
+  URGENCY_OPTIONS,
+  TECH_LEVEL_OPTIONS,
+  getOptionLabel
 } = require('../utils/persona');
 const { extractScriptVariables } = require('../utils/scripts');
 const {
@@ -106,28 +111,188 @@ async function fetchCallScriptById(id) {
   return data.script;
 }
 
+async function selectCustomPersonaFallback(conversation, ctx, ensureActive) {
+  let businessOptions = [];
+  try {
+    businessOptions = await getBusinessOptions();
+    ensureActive();
+  } catch (error) {
+    await ctx.reply(httpClient.getUserMessage(error, 'Unable to load persona options.'));
+    return { status: 'error' };
+  }
+
+  const personaChoices = (Array.isArray(businessOptions) ? businessOptions : [])
+    .filter((option) => option && option.id)
+    .map((option) => ({
+      id: option.id,
+      label: option.custom ? '✍️ Custom Persona' : `${option.emoji || '🎭'} ${option.label}`
+    }));
+
+  if (!personaChoices.length) {
+    personaChoices.push({ id: 'custom', label: '✍️ Custom Persona' });
+  }
+  personaChoices.push({ id: 'back', label: '⬅️ Back' });
+
+  const personaSelection = await askOptionWithButtons(
+    conversation,
+    ctx,
+    '🎭 *Custom Call Setup*\nChoose a persona profile or use fully custom mode.',
+    personaChoices,
+    { prefix: 'call-persona', columns: 1 }
+  );
+  ensureActive();
+
+  if (!personaSelection || personaSelection.id === 'back') {
+    return { status: 'back' };
+  }
+
+  const selectedBusiness = findBusinessOption(personaSelection.id) || {
+    id: 'custom',
+    label: 'Custom Persona',
+    custom: true
+  };
+  const payloadUpdates = {
+    channel: 'voice',
+    script: 'custom'
+  };
+  if (!selectedBusiness.custom) {
+    payloadUpdates.business_id = selectedBusiness.id;
+  } else {
+    payloadUpdates.business_id = config.defaultBusinessId;
+  }
+
+  const summary = ['Script: Custom setup'];
+  summary.push(`Persona: ${selectedBusiness.label || 'Custom Persona'}`);
+
+  let recommendedEmotion = selectedBusiness.defaultEmotion || 'neutral';
+  let recommendedUrgency = selectedBusiness.defaultUrgency || 'normal';
+  let recommendedTech = selectedBusiness.defaultTechnicalLevel || 'general';
+
+  const availablePurposes = Array.isArray(selectedBusiness.purposes) ? selectedBusiness.purposes : [];
+  if (!selectedBusiness.custom && availablePurposes.length > 0) {
+    let selectedPurpose =
+      availablePurposes.find((item) => item.id === selectedBusiness.defaultPurpose) ||
+      availablePurposes[0];
+    if (availablePurposes.length > 1) {
+      const selectedPurposeChoice = await askOptionWithButtons(
+        conversation,
+        ctx,
+        '🎯 *Choose call purpose:*\nThis helps tune the voice behavior.',
+        availablePurposes.map((purpose) => ({
+          id: purpose.id,
+          label: `${purpose.emoji || '•'} ${purpose.label || purpose.id}`
+        })),
+        { prefix: 'call-purpose', columns: 1 }
+      );
+      ensureActive();
+      selectedPurpose =
+        availablePurposes.find((item) => item.id === selectedPurposeChoice?.id) ||
+        selectedPurpose;
+    }
+
+    if (selectedPurpose?.id) {
+      payloadUpdates.purpose = selectedPurpose.id;
+      summary.push(`Purpose: ${selectedPurpose.label || selectedPurpose.id}`);
+      recommendedEmotion = selectedPurpose.defaultEmotion || recommendedEmotion;
+      recommendedUrgency = selectedPurpose.defaultUrgency || recommendedUrgency;
+      recommendedTech = selectedPurpose.defaultTechnicalLevel || recommendedTech;
+    }
+  }
+
+  const toneSelection = await askOptionWithButtons(
+    conversation,
+    ctx,
+    `🎙️ *Tone preference*\nRecommended: *${getOptionLabel(MOOD_OPTIONS, recommendedEmotion)}*.`,
+    MOOD_OPTIONS,
+    { prefix: 'call-tone', columns: 2 }
+  );
+  ensureActive();
+  if (toneSelection?.id && toneSelection.id !== 'auto') {
+    payloadUpdates.emotion = toneSelection.id;
+    summary.push(`Tone: ${toneSelection.label}`);
+  } else if (toneSelection?.label) {
+    summary.push(`Tone: ${toneSelection.label} (${getOptionLabel(MOOD_OPTIONS, recommendedEmotion)})`);
+  }
+
+  const urgencySelection = await askOptionWithButtons(
+    conversation,
+    ctx,
+    `⏱️ *Urgency level*\nRecommended: *${getOptionLabel(URGENCY_OPTIONS, recommendedUrgency)}*.`,
+    URGENCY_OPTIONS,
+    { prefix: 'call-urgency', columns: 2 }
+  );
+  ensureActive();
+  if (urgencySelection?.id && urgencySelection.id !== 'auto') {
+    payloadUpdates.urgency = urgencySelection.id;
+    summary.push(`Urgency: ${urgencySelection.label}`);
+  } else if (urgencySelection?.label) {
+    summary.push(`Urgency: ${urgencySelection.label} (${getOptionLabel(URGENCY_OPTIONS, recommendedUrgency)})`);
+  }
+
+  const techSelection = await askOptionWithButtons(
+    conversation,
+    ctx,
+    `🧠 *Technical level*\nRecommended: *${getOptionLabel(TECH_LEVEL_OPTIONS, recommendedTech)}*.`,
+    TECH_LEVEL_OPTIONS,
+    { prefix: 'call-tech', columns: 2 }
+  );
+  ensureActive();
+  if (techSelection?.id && techSelection.id !== 'auto') {
+    payloadUpdates.technical_level = techSelection.id;
+    summary.push(`Technical level: ${techSelection.label}`);
+  } else if (techSelection?.label) {
+    summary.push(`Technical level: ${techSelection.label} (${getOptionLabel(TECH_LEVEL_OPTIONS, recommendedTech)})`);
+  }
+
+  await ctx.reply('🧠 Enter custom prompt instructions (type skip to keep API defaults).');
+  const { text: promptText } = await waitForConversationText(conversation, ctx, {
+    ensureActive,
+    invalidMessage: '⚠️ Please type prompt text or "skip".'
+  });
+  if (promptText && promptText.toLowerCase() !== 'skip') {
+    payloadUpdates.prompt = promptText;
+  }
+
+  await ctx.reply('🗣️ Enter the first message for this call (type skip for default greeting).');
+  const { text: firstMessageText } = await waitForConversationText(conversation, ctx, {
+    ensureActive,
+    invalidMessage: '⚠️ Please type first message text or "skip".'
+  });
+  if (firstMessageText && firstMessageText.toLowerCase() !== 'skip') {
+    payloadUpdates.first_message = firstMessageText;
+  }
+
+  return {
+    status: 'ok',
+    payloadUpdates,
+    summary,
+    meta: {
+      scriptName: 'Custom setup',
+      scriptDescription: 'Manual persona and prompt configuration',
+      personaLabel: selectedBusiness.label || 'Custom Persona',
+      scriptVoiceModel: null
+    }
+  };
+}
+
 async function selectCallScript(conversation, ctx, ensureActive) {
-  let scripts;
+  let scripts = [];
   try {
     scripts = await fetchCallScripts();
     ensureActive();
   } catch (error) {
-    await ctx.reply(httpClient.getUserMessage(error, 'Unable to load call scripts.'));
-    return { status: 'error' };
-  }
-
-  if (!scripts.length) {
-    await ctx.reply('ℹ️ No call scripts found. Use /scripts to create one.');
-    return { status: 'empty' };
+    await ctx.reply(httpClient.getUserMessage(error, 'Unable to load call scripts. You can still continue with custom setup.'));
+    scripts = [];
   }
 
   const options = scripts.map((script) => ({ id: script.id.toString(), label: `📄 ${script.name}` }));
+  options.push({ id: 'custom', label: '✍️ Custom persona setup' });
   options.push({ id: 'back', label: '⬅️ Back' });
 
   const selection = await askOptionWithButtons(
     conversation,
     ctx,
-    '📚 *Call Scripts*\nChoose a script to use for this call.',
+    '📚 *Call Setup*\nChoose a script or continue with custom persona setup.',
     options,
     { prefix: 'call-script', columns: 1 }
   );
@@ -135,6 +300,9 @@ async function selectCallScript(conversation, ctx, ensureActive) {
 
   if (selection.id === 'back') {
     return { status: 'back' };
+  }
+  if (selection.id === 'custom') {
+    return selectCustomPersonaFallback(conversation, ctx, ensureActive);
   }
 
   const scriptId = Number(selection.id);
