@@ -7,7 +7,14 @@ const {
   isAdmin,
   saveScriptVersion,
   listScriptVersions,
-  getScriptVersion
+  getScriptVersion,
+  getScriptDraft,
+  saveScriptDraft,
+  deleteScriptDraft,
+  getScriptLifecycle,
+  listScriptLifecycle,
+  upsertScriptLifecycle,
+  deleteScriptLifecycle
 } = require('../db/db');
 const {
   getBusinessOptions,
@@ -37,10 +44,27 @@ const MUTATION_REQUEST_TTL_MS = 15000;
 const mutationRequestState = new Map();
 const SCRIPT_ACTION_PROGRESS_MS = 5000;
 const SCRIPT_ACTION_TIMEOUT_MS = 20000;
+const SCRIPT_SELECTION_PAGE_SIZE = 10;
 const SCRIPTS_CIRCUIT_FAILURE_THRESHOLD = 3;
 const SCRIPTS_CIRCUIT_OPEN_MS = 30000;
 const SCRIPTS_METRIC_WINDOW_MS = 5 * 60 * 1000;
 const SCRIPTS_ALERT_COOLDOWN_MS = 60 * 1000;
+const PAGE_NAV_PREV = '__page_prev__';
+const PAGE_NAV_NEXT = '__page_next__';
+const PAGE_NAV_BACK = '__page_back__';
+const SCRIPT_STATUS_DRAFT = 'draft';
+const SCRIPT_STATUS_REVIEW = 'review';
+const SCRIPT_STATUS_ACTIVE = 'active';
+const SCRIPT_STATUS_ARCHIVED = 'archived';
+const CALL_OBJECTIVE_DEFINITIONS = Object.freeze([
+  { id: 'collect_payment', label: 'Collect Payment' },
+  { id: 'verify_identity', label: 'Verify Identity' },
+  { id: 'appointment_confirm', label: 'Appointment Confirm' },
+  { id: 'service_recovery', label: 'Service Recovery' },
+  { id: 'general_outreach', label: 'General Outreach' }
+]);
+const CALL_OBJECTIVE_ID_SET = new Set(CALL_OBJECTIVE_DEFINITIONS.map((entry) => entry.id));
+const CALL_OBJECTIVE_DEFAULT = 'general_outreach';
 const scriptsCircuitState = {
   state: 'closed',
   consecutiveFailures: 0,
@@ -490,6 +514,73 @@ function buildPaymentDefaultsSummary(script = {}) {
   return summary.join(' • ');
 }
 
+function normalizeObjectiveTagsList(value) {
+  if (value === undefined || value === null) return [];
+  let list = [];
+  if (Array.isArray(value)) {
+    list = value;
+  } else if (typeof value === 'string') {
+    const trimmed = String(value || '').trim();
+    if (!trimmed) return [];
+    if (trimmed.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          list = parsed;
+        }
+      } catch (_) {
+        return [];
+      }
+    } else {
+      list = trimmed.split(',');
+    }
+  } else {
+    return [];
+  }
+  const normalized = list
+    .map((entry) => String(entry || '').trim().toLowerCase())
+    .filter((entry) => CALL_OBJECTIVE_ID_SET.has(entry));
+  return Array.from(new Set(normalized)).slice(0, 12);
+}
+
+function getObjectiveLabel(id) {
+  const match = CALL_OBJECTIVE_DEFINITIONS.find((entry) => entry.id === id);
+  return match ? match.label : id;
+}
+
+function formatObjectiveTags(tags = []) {
+  const normalized = normalizeObjectiveTagsList(tags);
+  if (!normalized.length) return 'Auto';
+  return normalized.map((id) => getObjectiveLabel(id)).join(', ');
+}
+
+function normalizeOptionalCapabilityFlag(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (value === true || value === 1) return true;
+  if (value === false || value === 0) return false;
+  const normalized = String(value).trim().toLowerCase();
+  if (!normalized || normalized === 'auto' || normalized === 'inherit') return null;
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  return null;
+}
+
+function inferScriptSupportsPayment(script = {}) {
+  const explicit = normalizeOptionalCapabilityFlag(script.supports_payment);
+  if (explicit !== null) return explicit;
+  return isPaymentEnabled(script.payment_enabled);
+}
+
+function inferScriptSupportsDigitCapture(script = {}) {
+  const explicit = normalizeOptionalCapabilityFlag(script.supports_digit_capture);
+  if (explicit !== null) return explicit;
+  if (script.requires_otp) return true;
+  if (String(script.default_profile || '').trim()) return true;
+  const expectedLength = Number(script.expected_length);
+  if (Number.isFinite(expectedLength) && expectedLength > 0) return true;
+  return false;
+}
+
 function validateCallScriptPayload(payload = {}) {
   const errors = [];
   const warnings = [];
@@ -550,7 +641,354 @@ function validateCallScriptPayload(payload = {}) {
       warnings.push(`Capture group "${payload.capture_group}" is set but the prompt does not mention "${keyword}".`);
     }
   }
+  const objectiveTags = normalizeObjectiveTagsList(payload.objective_tags);
+  if (
+    Object.prototype.hasOwnProperty.call(payload, 'objective_tags') &&
+    !objectiveTags.length &&
+    String(payload.objective_tags || '').trim()
+  ) {
+    warnings.push('Objective tags were provided but none matched supported objectives.');
+  }
+  const supportsPayment = normalizeOptionalCapabilityFlag(payload.supports_payment);
+  const supportsDigitCapture = normalizeOptionalCapabilityFlag(payload.supports_digit_capture);
+  if (objectiveTags.includes('collect_payment') && supportsPayment === false) {
+    warnings.push('Objective tag "Collect Payment" conflicts with supports_payment=false.');
+  }
+  if (objectiveTags.includes('verify_identity') && supportsDigitCapture === false) {
+    warnings.push('Objective tag "Verify Identity" conflicts with supports_digit_capture=false.');
+  }
+  if (supportsPayment === true && !isPaymentEnabled(payload.payment_enabled)) {
+    warnings.push('supports_payment is true but payment defaults are disabled.');
+  }
+  if (supportsDigitCapture === true && !inferScriptSupportsDigitCapture(payload)) {
+    warnings.push('supports_digit_capture is true but digit capture settings are missing.');
+  }
   return { errors, warnings };
+}
+
+function toComparableString(value) {
+  if (value === undefined || value === null || value === '') {
+    return '';
+  }
+  if (typeof value === 'object') {
+    try {
+      return JSON.stringify(value);
+    } catch (_) {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
+function formatDiffValue(value, maxLen = 72) {
+  const raw = toComparableString(value).trim();
+  if (!raw) return '(empty)';
+  return raw.length > maxLen ? `${raw.slice(0, maxLen)}...` : raw;
+}
+
+function buildFieldDiffLines(current = {}, target = {}, fields = []) {
+  const lines = [];
+  fields.forEach(({ key, label }) => {
+    const before = toComparableString(current[key]);
+    const after = toComparableString(target[key]);
+    if (before === after) return;
+    lines.push(`• ${label}: ${formatDiffValue(before)} → ${formatDiffValue(after)}`);
+  });
+  return lines;
+}
+
+function buildCallScriptQualityReport(payload = {}) {
+  const issues = [];
+  let score = 100;
+  const prompt = String(payload.prompt || '').trim();
+  const firstMessage = String(payload.first_message || '').trim();
+  const personaConfig = payload.persona_config && typeof payload.persona_config === 'object'
+    ? payload.persona_config
+    : {};
+
+  if (!prompt) {
+    score -= 25;
+    issues.push('Prompt is empty.');
+  } else if (prompt.length < 90) {
+    score -= 10;
+    issues.push('Prompt is short; include clearer behavior and guardrails.');
+  }
+
+  if (!firstMessage) {
+    score -= 25;
+    issues.push('First message is empty.');
+  } else if (firstMessage.length < 18) {
+    score -= 8;
+    issues.push('First message is very short.');
+  }
+
+  if (!payload.business_id) {
+    score -= 8;
+    issues.push('Persona/business profile is not set.');
+  }
+
+  const personaHints = ['purpose', 'emotion', 'urgency', 'technical_level']
+    .filter((key) => String(personaConfig[key] || '').trim()).length;
+  if (personaHints === 0) {
+    score -= 10;
+    issues.push('Persona guidance (purpose/tone/urgency/technical level) is missing.');
+  } else if (personaHints < 2) {
+    score -= 4;
+    issues.push('Consider adding more persona guidance fields.');
+  }
+
+  if (payload.requires_otp && !payload.default_profile) {
+    score -= 8;
+    issues.push('Digit capture is enabled without a default profile.');
+  }
+
+  if (isPaymentEnabled(payload.payment_enabled) && !String(payload.payment_amount || '').trim()) {
+    score -= 6;
+    issues.push('Payment is enabled but amount is not preset.');
+  }
+
+  const objectiveTags = normalizeObjectiveTagsList(payload.objective_tags);
+  if (!objectiveTags.length) {
+    score -= 4;
+    issues.push('Objective tags are not set; script matching will rely on inference.');
+  }
+  if (objectiveTags.includes('collect_payment') && !inferScriptSupportsPayment(payload)) {
+    score -= 6;
+    issues.push('Tagged for payment objective but payment capability is not enabled.');
+  }
+  if (objectiveTags.includes('verify_identity') && !inferScriptSupportsDigitCapture(payload)) {
+    score -= 6;
+    issues.push('Tagged for identity verification but digit capture is not configured.');
+  }
+
+  score = Math.max(0, Math.min(100, score));
+  return { score, issues };
+}
+
+function formatCallScriptQualityReport(report = { score: 100, issues: [] }) {
+  const lines = [`📊 Script quality score: ${report.score}/100`];
+  if (!Array.isArray(report.issues) || !report.issues.length) {
+    lines.push('✅ Quality checks look good.');
+    return lines.join('\n');
+  }
+  lines.push('Suggested improvements:');
+  report.issues.slice(0, 6).forEach((item) => lines.push(`• ${item}`));
+  return lines.join('\n');
+}
+
+function filterScriptsByQuery(list = [], query = '') {
+  const normalized = String(query || '').trim().toLowerCase();
+  if (!normalized) return list;
+  return list.filter((item) => {
+    const name = String(item?.name || '').toLowerCase();
+    const description = String(item?.description || '').toLowerCase();
+    return name.includes(normalized) || description.includes(normalized);
+  });
+}
+
+function normalizeScriptStatus(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if ([SCRIPT_STATUS_DRAFT, SCRIPT_STATUS_REVIEW, SCRIPT_STATUS_ACTIVE, SCRIPT_STATUS_ARCHIVED].includes(normalized)) {
+    return normalized;
+  }
+  return SCRIPT_STATUS_DRAFT;
+}
+
+function formatScriptStatusBadge(value) {
+  const status = normalizeScriptStatus(value);
+  if (status === SCRIPT_STATUS_ACTIVE) return '🟢 active';
+  if (status === SCRIPT_STATUS_REVIEW) return '🟡 review';
+  if (status === SCRIPT_STATUS_ARCHIVED) return '⚫ archived';
+  return '🟠 draft';
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function getDraftOwnerId(ctx) {
+  return String(ctx?.from?.id || '').trim();
+}
+
+async function loadFlowDraft(ctx, draftKey) {
+  const ownerId = getDraftOwnerId(ctx);
+  if (!ownerId || !draftKey) return null;
+  try {
+    return await getScriptDraft(ownerId, draftKey);
+  } catch (error) {
+    console.warn('Failed to load script draft:', error?.message || error);
+    return null;
+  }
+}
+
+async function saveFlowDraft(ctx, draftKey, scriptType, payload, lastStep) {
+  const ownerId = getDraftOwnerId(ctx);
+  if (!ownerId || !draftKey) return;
+  try {
+    await saveScriptDraft(ownerId, draftKey, scriptType, payload || {}, lastStep || null);
+  } catch (error) {
+    console.warn('Failed to save script draft:', error?.message || error);
+  }
+}
+
+async function clearFlowDraft(ctx, draftKey) {
+  const ownerId = getDraftOwnerId(ctx);
+  if (!ownerId || !draftKey) return;
+  try {
+    await deleteScriptDraft(ownerId, draftKey);
+  } catch (error) {
+    console.warn('Failed to clear script draft:', error?.message || error);
+  }
+}
+
+async function promptDraftResumeMode(conversation, ctx, options = {}) {
+  const draft = await loadFlowDraft(ctx, options.draftKey);
+  if (!draft) return { mode: 'new', draft: null };
+  const ageLabel = draft.updated_at ? new Date(draft.updated_at).toLocaleString() : 'unknown';
+  const lastStep = draft.last_step ? String(draft.last_step) : 'unspecified step';
+  const choice = await askOptionWithButtons(
+    conversation,
+    ctx,
+    `${options.title || 'Draft detected'}\nSaved: ${ageLabel}\nLast step: ${lastStep}`,
+    [
+      { id: 'resume', label: '▶️ Continue draft' },
+      { id: 'review', label: '📝 Review with defaults' },
+      { id: 'discard', label: '🗑️ Discard draft' }
+    ],
+    { prefix: options.prefix || 'script-draft', columns: 1, ensureActive: options.ensureActive }
+  );
+  if (!choice || !choice.id || choice.id === 'discard') {
+    await clearFlowDraft(ctx, options.draftKey);
+    return { mode: 'new', draft: null };
+  }
+  if (choice.id === 'review') {
+    return { mode: 'review', draft };
+  }
+  return { mode: 'resume', draft };
+}
+
+async function getCallScriptLifecycleState(scriptId) {
+  if (!Number.isFinite(Number(scriptId))) return null;
+  try {
+    const lifecycle = await getScriptLifecycle('call', String(scriptId));
+    if (lifecycle) return lifecycle;
+    return await upsertScriptLifecycle('call', String(scriptId), {
+      status: SCRIPT_STATUS_DRAFT
+    });
+  } catch (error) {
+    console.warn('Failed to read script lifecycle:', error?.message || error);
+    return null;
+  }
+}
+
+async function updateCallScriptLifecycleState(scriptId, updates = {}) {
+  if (!Number.isFinite(Number(scriptId))) return null;
+  try {
+    return await upsertScriptLifecycle('call', String(scriptId), updates);
+  } catch (error) {
+    console.warn('Failed to update script lifecycle:', error?.message || error);
+    return null;
+  }
+}
+
+async function listCallScriptLifecycleMap() {
+  try {
+    const rows = await listScriptLifecycle('call');
+    const map = new Map();
+    (rows || []).forEach((row) => {
+      if (!row?.script_id) return;
+      map.set(String(row.script_id), row);
+    });
+    return map;
+  } catch (error) {
+    console.warn('Failed to list script lifecycle rows:', error?.message || error);
+    return new Map();
+  }
+}
+
+function buildCallScriptPreflightReport(script = {}, lifecycle = null) {
+  const quality = buildCallScriptQualityReport(script);
+  const warnings = [];
+  const blockers = [];
+  const prompt = String(script.prompt || '').trim();
+  const firstMessage = String(script.first_message || '').trim();
+  const promptVars = extractScriptVariables(prompt);
+  const firstMessageVars = extractScriptVariables(firstMessage);
+  const combinedVars = Array.from(new Set([...(promptVars || []), ...(firstMessageVars || [])]));
+  const status = normalizeScriptStatus(lifecycle?.status || SCRIPT_STATUS_DRAFT);
+  const objectiveTags = normalizeObjectiveTagsList(script.objective_tags);
+  const supportsPayment = inferScriptSupportsPayment(script);
+  const supportsDigitCapture = inferScriptSupportsDigitCapture(script);
+
+  if (!prompt) blockers.push('Prompt is required.');
+  if (!firstMessage) blockers.push('First message is required.');
+  if (!script.business_id) warnings.push('Persona/business profile is not selected.');
+  if (combinedVars.length > 0) {
+    warnings.push(`Script uses placeholders: ${combinedVars.map((token) => `{${token}}`).join(', ')}`);
+  }
+  if (script.requires_otp && !script.default_profile) {
+    warnings.push('Digit capture enabled without default profile.');
+  }
+  if (isPaymentEnabled(script.payment_enabled) && !String(script.payment_connector || '').trim()) {
+    blockers.push('Payment is enabled but connector is missing.');
+  }
+  if (objectiveTags.includes('collect_payment') && !supportsPayment) {
+    blockers.push('Objective includes Collect Payment but payment capability is not configured.');
+  }
+  if (objectiveTags.includes('verify_identity') && !supportsDigitCapture) {
+    blockers.push('Objective includes Verify Identity but digit capture is not configured.');
+  }
+  if (!objectiveTags.length) {
+    warnings.push('Objective tags are not set; /call objective routing will be inference-based.');
+  }
+  if (status === SCRIPT_STATUS_ACTIVE && !Number.isFinite(Number(lifecycle?.pinned_version))) {
+    warnings.push('No pinned version is set for call execution.');
+  }
+
+  const scorePenalty = blockers.length * 12 + warnings.length * 4;
+  const readinessScore = Math.max(0, Math.min(100, quality.score - scorePenalty));
+  const sampleCallerLine = script.requires_otp
+    ? 'Caller: I received a code. Should I enter it now?'
+    : 'Caller: I need help with my request.';
+  const sampleAgentFollowUp = script.requires_otp
+    ? 'Agent: Please enter the code now so I can verify your account.'
+    : 'Agent: I can help with that. Let me confirm a few details.';
+
+  return {
+    readinessScore,
+    blockers,
+    warnings,
+    status,
+    objectiveTags,
+    supportsPayment,
+    supportsDigitCapture,
+    sampleTranscript: [
+      `Agent: ${firstMessage || '(first message missing)'}`,
+      sampleCallerLine,
+      sampleAgentFollowUp
+    ]
+  };
+}
+
+function formatCallScriptPreflight(report) {
+  const lines = [`🧪 Preflight readiness: ${report.readinessScore}/100`];
+  lines.push(`📌 Lifecycle: ${formatScriptStatusBadge(report.status)}`);
+  lines.push(`🎯 Objectives: ${formatObjectiveTags(report.objectiveTags || [])}`);
+  lines.push(`💳 Supports payment: ${report.supportsPayment ? 'Yes' : 'No'}`);
+  lines.push(`🔢 Supports digit capture: ${report.supportsDigitCapture ? 'Yes' : 'No'}`);
+  if (report.blockers.length) {
+    lines.push('Blockers:');
+    report.blockers.forEach((item) => lines.push(`• ${item}`));
+  } else {
+    lines.push('✅ No blockers detected.');
+  }
+  if (report.warnings.length) {
+    lines.push('Warnings:');
+    report.warnings.slice(0, 6).forEach((item) => lines.push(`• ${item}`));
+  }
+  lines.push('Sample transcript:');
+  report.sampleTranscript.forEach((line) => lines.push(`• ${line}`));
+  return lines.join('\n');
 }
 
 function replacePlaceholders(text = '', values = {}) {
@@ -571,6 +1009,9 @@ function buildCallScriptSnapshot(script = {}) {
     prompt: script.prompt ?? null,
     first_message: script.first_message ?? null,
     voice_model: script.voice_model ?? null,
+    objective_tags: normalizeObjectiveTagsList(script.objective_tags),
+    supports_payment: normalizeOptionalCapabilityFlag(script.supports_payment),
+    supports_digit_capture: normalizeOptionalCapabilityFlag(script.supports_digit_capture),
     requires_otp: !!script.requires_otp,
     default_profile: script.default_profile ?? null,
     expected_length: script.expected_length ?? null,
@@ -1402,6 +1843,148 @@ async function collectPaymentDefaultsConfig(conversation, ctx, defaults = {}, en
   };
 }
 
+async function collectObjectiveMetadataConfig(conversation, ctx, defaults = {}, ensureActive) {
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
+  const currentTags = normalizeObjectiveTagsList(defaults.objective_tags);
+  const tagHint = CALL_OBJECTIVE_DEFINITIONS
+    .map((entry) => `${entry.id} (${entry.label})`)
+    .join(', ');
+  const rawTags = await promptText(
+    conversation,
+    ctx,
+    `🎯 Objective tags (comma-separated ids).\nOptions: ${tagHint}\nType auto to use inferred routing.`,
+    {
+      allowEmpty: true,
+      allowSkip: true,
+      defaultValue: currentTags.length ? currentTags.join(',') : 'auto',
+      parse: (value) => value.trim(),
+      ensureActive: safeEnsureActive
+    }
+  );
+  if (rawTags === null) return null;
+
+  let objectiveTags = currentTags;
+  if (rawTags !== undefined) {
+    const normalizedInput = String(rawTags || '').trim().toLowerCase();
+    if (!normalizedInput || normalizedInput === 'auto') {
+      objectiveTags = [];
+    } else {
+      objectiveTags = normalizeObjectiveTagsList(normalizedInput);
+      if (!objectiveTags.length) {
+        await ctx.reply('⚠️ No valid objective tags parsed. Falling back to auto inference.');
+      }
+    }
+  }
+
+  const supportChoiceToFlag = (id) => {
+    if (id === 'yes') return true;
+    if (id === 'no') return false;
+    return null;
+  };
+
+  const paymentSupportChoice = await askOptionWithButtons(
+    conversation,
+    ctx,
+    '💳 Mark payment objective compatibility?',
+    [
+      { id: 'auto', label: '⚙️ Auto infer' },
+      { id: 'yes', label: '✅ Supports payment' },
+      { id: 'no', label: '🚫 No payment support' }
+    ],
+    { prefix: 'call-script-support-payment', columns: 1, ensureActive: safeEnsureActive }
+  );
+  if (!paymentSupportChoice) return null;
+
+  const digitSupportChoice = await askOptionWithButtons(
+    conversation,
+    ctx,
+    '🔢 Mark digit-capture compatibility?',
+    [
+      { id: 'auto', label: '⚙️ Auto infer' },
+      { id: 'yes', label: '✅ Supports digit capture' },
+      { id: 'no', label: '🚫 No digit capture support' }
+    ],
+    { prefix: 'call-script-support-digit', columns: 1, ensureActive: safeEnsureActive }
+  );
+  if (!digitSupportChoice) return null;
+
+  const supportsPayment = supportChoiceToFlag(paymentSupportChoice.id);
+  const supportsDigitCapture = supportChoiceToFlag(digitSupportChoice.id);
+
+  return {
+    objective_tags: objectiveTags,
+    supports_payment: supportsPayment,
+    supports_digit_capture: supportsDigitCapture
+  };
+}
+
+function normalizeCallScriptItem(item, index = 0) {
+  if (!item || typeof item !== 'object') return null;
+  const idCandidate = item.id ?? item.script_id ?? item.template_id ?? item.call_template_id ?? null;
+  const parsedId = Number(idCandidate);
+  const normalizedId = Number.isFinite(parsedId) ? parsedId : null;
+  const normalizedName = String(
+    item.name ?? item.script_name ?? item.template_name ?? `Script ${index + 1}`
+  ).trim();
+  const parsedVersion = Number(item.version ?? item.script_version ?? 1);
+  if (!normalizedName) return null;
+  return {
+    ...item,
+    id: normalizedId,
+    version: Number.isFinite(parsedVersion) && parsedVersion > 0
+      ? Math.max(1, Math.floor(parsedVersion))
+      : 1,
+    name: normalizedName,
+    description: item.description ?? item.summary ?? item.notes ?? null,
+    prompt: item.prompt ?? item.script_prompt ?? null,
+    first_message: item.first_message ?? item.firstMessage ?? null,
+    objective_tags: normalizeObjectiveTagsList(
+      item.objective_tags ?? item.objectiveTags ?? null
+    ),
+    supports_payment: normalizeOptionalCapabilityFlag(
+      item.supports_payment ?? item.supportsPayment
+    ),
+    supports_digit_capture: normalizeOptionalCapabilityFlag(
+      item.supports_digit_capture ?? item.supportsDigitCapture
+    ),
+    requires_otp: item.requires_otp ?? item.requiresOtp ?? false,
+    default_profile: item.default_profile ?? item.defaultProfile ?? null,
+    expected_length: item.expected_length ?? item.expectedLength ?? null,
+    allow_terminator: item.allow_terminator ?? item.allowTerminator ?? false,
+    terminator_char: item.terminator_char ?? item.terminatorChar ?? null,
+    payment_policy:
+      (item.payment_policy && typeof item.payment_policy === 'object')
+        ? item.payment_policy
+        : (() => {
+          if (!item.payment_policy || typeof item.payment_policy !== 'string') return null;
+          try {
+            const parsed = JSON.parse(item.payment_policy);
+            return parsed && typeof parsed === 'object' ? parsed : null;
+          } catch (_) {
+            return null;
+          }
+        })(),
+    payment_enabled:
+      item.payment_enabled ?? item.paymentEnabled ?? false,
+    payment_connector:
+      item.payment_connector ?? item.paymentConnector ?? null,
+    payment_amount:
+      item.payment_amount ?? item.paymentAmount ?? null,
+    payment_currency:
+      item.payment_currency ?? item.paymentCurrency ?? null,
+    payment_description:
+      item.payment_description ?? item.paymentDescription ?? null,
+    payment_start_message:
+      item.payment_start_message ?? item.paymentStartMessage ?? null,
+    payment_success_message:
+      item.payment_success_message ?? item.paymentSuccessMessage ?? null,
+    payment_failure_message:
+      item.payment_failure_message ?? item.paymentFailureMessage ?? null,
+    payment_retry_message:
+      item.payment_retry_message ?? item.paymentRetryMessage ?? null
+  };
+}
+
 async function fetchCallScripts() {
   const data = await scriptsApiRequest({ method: 'get', url: '/api/call-scripts' });
   const payload = Array.isArray(data)
@@ -1420,64 +2003,14 @@ async function fetchCallScripts() {
             : [];
 
   return sourceList
-    .map((item, index) => {
-      if (!item || typeof item !== 'object') return null;
-      const idCandidate = item.id ?? item.script_id ?? item.template_id ?? item.call_template_id ?? null;
-      const parsedId = Number(idCandidate);
-      const normalizedId = Number.isFinite(parsedId) ? parsedId : null;
-      const normalizedName = String(
-        item.name ?? item.script_name ?? item.template_name ?? `Script ${index + 1}`
-      ).trim();
-      const parsedVersion = Number(item.version ?? item.script_version ?? 1);
-      if (!normalizedName) return null;
-      return {
-        ...item,
-        id: normalizedId,
-        version: Number.isFinite(parsedVersion) && parsedVersion > 0
-          ? Math.max(1, Math.floor(parsedVersion))
-          : 1,
-        name: normalizedName,
-        description: item.description ?? item.summary ?? item.notes ?? null,
-        prompt: item.prompt ?? item.script_prompt ?? null,
-        first_message: item.first_message ?? item.firstMessage ?? null,
-        payment_policy:
-          (item.payment_policy && typeof item.payment_policy === 'object')
-            ? item.payment_policy
-            : (() => {
-              if (!item.payment_policy || typeof item.payment_policy !== 'string') return null;
-              try {
-                const parsed = JSON.parse(item.payment_policy);
-                return parsed && typeof parsed === 'object' ? parsed : null;
-              } catch (_) {
-                return null;
-              }
-            })(),
-        payment_enabled:
-          item.payment_enabled ?? item.paymentEnabled ?? false,
-        payment_connector:
-          item.payment_connector ?? item.paymentConnector ?? null,
-        payment_amount:
-          item.payment_amount ?? item.paymentAmount ?? null,
-        payment_currency:
-          item.payment_currency ?? item.paymentCurrency ?? null,
-        payment_description:
-          item.payment_description ?? item.paymentDescription ?? null,
-        payment_start_message:
-          item.payment_start_message ?? item.paymentStartMessage ?? null,
-        payment_success_message:
-          item.payment_success_message ?? item.paymentSuccessMessage ?? null,
-        payment_failure_message:
-          item.payment_failure_message ?? item.paymentFailureMessage ?? null,
-        payment_retry_message:
-          item.payment_retry_message ?? item.paymentRetryMessage ?? null
-      };
-    })
+    .map((item, index) => normalizeCallScriptItem(item, index))
     .filter(Boolean);
 }
 
 async function fetchCallScriptById(id) {
   const data = await scriptsApiRequest({ method: 'get', url: `/api/call-scripts/${id}` });
-  return data.script;
+  const source = data?.script && typeof data.script === 'object' ? data.script : data;
+  return normalizeCallScriptItem(source, 0);
 }
 
 async function fetchInboundDefaultScript() {
@@ -1558,11 +2091,20 @@ async function cloneCallScript(id, payload, options = {}) {
   return data.script;
 }
 
-function formatCallScriptSummary(script) {
+function formatCallScriptSummary(script, lifecycle = null) {
   const summary = [];
   summary.push(`📛 *${escapeMarkdown(script.name)}*`);
   if (Number.isFinite(Number(script.version)) && Number(script.version) > 0) {
     summary.push(`🧬 Version: v${Math.floor(Number(script.version))}`);
+  }
+  if (lifecycle) {
+    summary.push(`🚦 Lifecycle: ${escapeMarkdown(formatScriptStatusBadge(lifecycle.status))}`);
+    if (Number.isFinite(Number(lifecycle.pinned_version))) {
+      summary.push(`📌 Pinned runtime: v${Math.floor(Number(lifecycle.pinned_version))}`);
+    }
+    if (Number.isFinite(Number(lifecycle.stable_version))) {
+      summary.push(`🛟 Stable rollback: v${Math.floor(Number(lifecycle.stable_version))}`);
+    }
   }
   if (script.description) {
     summary.push(`📝 ${escapeMarkdown(script.description)}`);
@@ -1579,6 +2121,9 @@ function formatCallScriptSummary(script) {
   const captureSummary = buildDigitCaptureSummary(script);
   summary.push(`🔢 Digit capture: ${escapeMarkdown(captureSummary)}`);
   summary.push(`💳 Payment defaults: ${escapeMarkdown(buildPaymentDefaultsSummary(script))}`);
+  summary.push(`🎯 Objectives: ${escapeMarkdown(formatObjectiveTags(script.objective_tags))}`);
+  summary.push(`🧭 Supports payment: ${inferScriptSupportsPayment(script) ? 'Yes' : 'No'}`);
+  summary.push(`🧭 Supports digit capture: ${inferScriptSupportsDigitCapture(script) ? 'Yes' : 'No'}`);
   if (isPaymentEnabled(script.payment_enabled) && script.payment_description) {
     summary.push(`🧾 Payment note: ${escapeMarkdown(String(script.payment_description).slice(0, 160))}`);
   }
@@ -1719,6 +2264,24 @@ async function previewCallScript(conversation, ctx, script, ensureActive) {
     }
   }
 
+  const previewLines = [
+    '🔍 Preview call review',
+    '',
+    `📄 Script: ${script.name || 'Unnamed'}`,
+    `📞 To: ${testNumber}`,
+    `🎤 Voice: ${payload.voice_model || config.defaultVoiceModel}`,
+    `🎭 Persona: ${payload.business_id || 'default'}`,
+    `💳 Payment defaults: ${payload.payment_enabled ? 'Enabled' : 'Disabled'}`,
+    '',
+    `🗣️ First message: ${(payload.first_message || '').slice(0, 160)}${String(payload.first_message || '').length > 160 ? '…' : ''}`
+  ];
+  await ctx.reply(previewLines.join('\n'));
+  const proceed = await confirm(conversation, ctx, 'Launch this preview call now?', safeEnsureActive);
+  if (!proceed) {
+    await ctx.reply('Preview cancelled.');
+    return;
+  }
+
   try {
     await runWithActionWatchdog(
       ctx,
@@ -1739,68 +2302,291 @@ async function previewCallScript(conversation, ctx, script, ensureActive) {
 
 async function createCallScriptFlow(conversation, ctx, ensureActive) {
   const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
-  const name = await promptText(
-    conversation,
-    ctx,
-    '🆕 *Script name*\nEnter a unique name for this call script.',
-    {
-      allowEmpty: false,
-      parse: (value) => value.trim(),
-      ensureActive: safeEnsureActive
-    }
-  );
+  const draftKey = 'call:create';
+  const draftMode = await promptDraftResumeMode(conversation, ctx, {
+    draftKey,
+    title: '📝 Call script draft found',
+    prefix: 'call-script-draft',
+    ensureActive: safeEnsureActive
+  });
+  const draftPayload = draftMode?.draft?.payload && typeof draftMode.draft.payload === 'object'
+    ? { ...draftMode.draft.payload }
+    : {};
+  const resumeMode = String(draftMode?.mode || 'new');
+  const fastResume = resumeMode === 'resume';
+  const reviewResume = resumeMode === 'review';
+  const workingDraft = { ...draftPayload };
+
+  if ((fastResume || reviewResume) && Object.keys(workingDraft).length) {
+    await ctx.reply('↩️ Loaded saved draft values.');
+  }
+
+  let name = null;
+  if (fastResume && String(workingDraft.name || '').trim()) {
+    name = String(workingDraft.name).trim();
+    await ctx.reply(`↩️ Using saved script name: *${escapeMarkdown(name)}*`, { parse_mode: 'Markdown' });
+  } else {
+    name = await promptText(
+      conversation,
+      ctx,
+      '🆕 *Script name*\nEnter a unique name for this call script.',
+      {
+        allowEmpty: false,
+        defaultValue: reviewResume ? String(workingDraft.name || '').trim() : null,
+        parse: (value) => value.trim(),
+        ensureActive: safeEnsureActive
+      }
+    );
+  }
 
   if (!name) {
     await ctx.reply('❌ Script creation cancelled.');
     return;
   }
+  workingDraft.name = name;
+  await saveFlowDraft(ctx, draftKey, 'call', workingDraft, 'name');
 
-  const description = await promptText(
-    conversation,
-    ctx,
-    '📝 Provide an optional description for this script (or type skip).',
-    {
-      allowEmpty: true,
-      allowSkip: true,
-      parse: (value) => value.trim(),
-      ensureActive: safeEnsureActive
-    }
-  );
-  if (description === null) {
-    await ctx.reply('❌ Script creation cancelled.');
-    return;
+  let description = null;
+  const usingSavedDescription =
+    fastResume && Object.prototype.hasOwnProperty.call(workingDraft, 'description');
+  if (usingSavedDescription) {
+    description = workingDraft.description;
+    await ctx.reply('↩️ Using saved description.');
+  } else {
+    description = await promptText(
+      conversation,
+      ctx,
+      '📝 Provide an optional description for this script (or type skip).',
+      {
+        allowEmpty: true,
+        allowSkip: true,
+        defaultValue: reviewResume ? String(workingDraft.description || '') : '',
+        parse: (value) => value.trim(),
+        ensureActive: safeEnsureActive
+      }
+    );
   }
+  if (description === null) {
+    if (usingSavedDescription) {
+      description = undefined;
+    } else {
+      await ctx.reply('❌ Script creation cancelled.');
+      return;
+    }
+  }
+  const normalizedDescription = description === undefined
+    ? null
+    : (String(description || '').trim() || null);
+  workingDraft.description = normalizedDescription;
+  await saveFlowDraft(ctx, draftKey, 'call', workingDraft, 'description');
 
-  const personaResult = await collectPersonaConfig(conversation, ctx, {}, { allowCancel: true, ensureActive: safeEnsureActive });
+  let personaResult = null;
+  const hasPersonaDraft = Object.prototype.hasOwnProperty.call(workingDraft, 'business_id');
+  if (fastResume && hasPersonaDraft) {
+    personaResult = {
+      business_id: workingDraft.business_id || null,
+      persona_config:
+        workingDraft.persona_config && typeof workingDraft.persona_config === 'object'
+          ? workingDraft.persona_config
+          : {}
+    };
+    await ctx.reply('↩️ Using saved persona settings.');
+  } else {
+    personaResult = await collectPersonaConfig(
+      conversation,
+      ctx,
+      {
+        business_id: workingDraft.business_id || null,
+        persona_config:
+          workingDraft.persona_config && typeof workingDraft.persona_config === 'object'
+            ? workingDraft.persona_config
+            : {}
+      },
+      { allowCancel: true, ensureActive: safeEnsureActive }
+    );
+  }
   if (!personaResult) {
     await ctx.reply('❌ Script creation cancelled.');
     return;
   }
+  workingDraft.business_id = personaResult.business_id || null;
+  workingDraft.persona_config = personaResult.persona_config || {};
+  await saveFlowDraft(ctx, draftKey, 'call', workingDraft, 'persona');
 
-  const promptAndVoice = await collectPromptAndVoice(conversation, ctx, {}, safeEnsureActive);
+  let promptAndVoice = null;
+  const hasPromptDraft =
+    Object.prototype.hasOwnProperty.call(workingDraft, 'prompt') &&
+    Object.prototype.hasOwnProperty.call(workingDraft, 'first_message');
+  if (fastResume && hasPromptDraft) {
+    promptAndVoice = {
+      prompt: workingDraft.prompt || '',
+      first_message: workingDraft.first_message || '',
+      voice_model: workingDraft.voice_model || null
+    };
+    await ctx.reply('↩️ Using saved prompt/voice settings.');
+  } else {
+    promptAndVoice = await collectPromptAndVoice(
+      conversation,
+      ctx,
+      {
+        prompt: workingDraft.prompt || '',
+        first_message: workingDraft.first_message || '',
+        voice_model: workingDraft.voice_model || null
+      },
+      safeEnsureActive
+    );
+  }
   if (!promptAndVoice) {
     await ctx.reply('❌ Script creation cancelled.');
     return;
   }
+  workingDraft.prompt = promptAndVoice.prompt;
+  workingDraft.first_message = promptAndVoice.first_message;
+  workingDraft.voice_model = promptAndVoice.voice_model || null;
+  await saveFlowDraft(ctx, draftKey, 'call', workingDraft, 'prompt_voice');
 
-  const captureConfig = await collectDigitCaptureConfig(conversation, ctx, {}, safeEnsureActive);
+  let captureConfig = null;
+  const captureFields = ['requires_otp', 'default_profile', 'expected_length', 'allow_terminator', 'terminator_char', 'capture_group'];
+  const hasCaptureDraft = captureFields.some((field) => Object.prototype.hasOwnProperty.call(workingDraft, field));
+  if (fastResume && hasCaptureDraft) {
+    captureConfig = {
+      requires_otp: !!workingDraft.requires_otp,
+      default_profile: workingDraft.default_profile || null,
+      expected_length: workingDraft.expected_length || null,
+      allow_terminator: !!workingDraft.allow_terminator,
+      terminator_char: workingDraft.terminator_char || null,
+      capture_group: workingDraft.capture_group || null
+    };
+    await ctx.reply('↩️ Using saved digit capture settings.');
+  } else {
+    captureConfig = await collectDigitCaptureConfig(
+      conversation,
+      ctx,
+      {
+        requires_otp: !!workingDraft.requires_otp,
+        default_profile: workingDraft.default_profile || null,
+        expected_length: workingDraft.expected_length || null,
+        allow_terminator: !!workingDraft.allow_terminator,
+        terminator_char: workingDraft.terminator_char || null,
+        capture_group: workingDraft.capture_group || null
+      },
+      safeEnsureActive
+    );
+  }
   if (!captureConfig) {
     await ctx.reply('❌ Script creation cancelled.');
     return;
   }
+  workingDraft.requires_otp = !!captureConfig.requires_otp;
+  workingDraft.default_profile = captureConfig.default_profile || null;
+  workingDraft.expected_length = captureConfig.expected_length || null;
+  workingDraft.allow_terminator = !!captureConfig.allow_terminator;
+  workingDraft.terminator_char = captureConfig.terminator_char || null;
+  workingDraft.capture_group = captureConfig.capture_group || null;
+  await saveFlowDraft(ctx, draftKey, 'call', workingDraft, 'digit_capture');
   if (captureConfig.capture_group) {
     await ctx.reply('ℹ️ Capture groups are guidance-only; the API still infers groups from the prompt text.');
   }
 
-  const paymentConfig = await collectPaymentDefaultsConfig(conversation, ctx, {}, safeEnsureActive);
+  let paymentConfig = null;
+  const paymentFields = [
+    'payment_enabled',
+    'payment_connector',
+    'payment_amount',
+    'payment_currency',
+    'payment_description',
+    'payment_start_message',
+    'payment_success_message',
+    'payment_failure_message',
+    'payment_retry_message'
+  ];
+  const hasPaymentDraft = paymentFields.some((field) => Object.prototype.hasOwnProperty.call(workingDraft, field));
+  if (fastResume && hasPaymentDraft) {
+    paymentConfig = {
+      payment_enabled: workingDraft.payment_enabled === true,
+      payment_connector: workingDraft.payment_connector || null,
+      payment_amount: workingDraft.payment_amount || null,
+      payment_currency: workingDraft.payment_currency || null,
+      payment_description: workingDraft.payment_description || null,
+      payment_start_message: workingDraft.payment_start_message || null,
+      payment_success_message: workingDraft.payment_success_message || null,
+      payment_failure_message: workingDraft.payment_failure_message || null,
+      payment_retry_message: workingDraft.payment_retry_message || null
+    };
+    await ctx.reply('↩️ Using saved payment defaults.');
+  } else {
+    paymentConfig = await collectPaymentDefaultsConfig(
+      conversation,
+      ctx,
+      {
+        payment_enabled: workingDraft.payment_enabled === true,
+        payment_connector: workingDraft.payment_connector || null,
+        payment_amount: workingDraft.payment_amount || null,
+        payment_currency: workingDraft.payment_currency || null,
+        payment_description: workingDraft.payment_description || null,
+        payment_start_message: workingDraft.payment_start_message || null,
+        payment_success_message: workingDraft.payment_success_message || null,
+        payment_failure_message: workingDraft.payment_failure_message || null,
+        payment_retry_message: workingDraft.payment_retry_message || null
+      },
+      safeEnsureActive
+    );
+  }
   if (!paymentConfig) {
     await ctx.reply('❌ Script creation cancelled.');
     return;
   }
+  workingDraft.payment_enabled = paymentConfig.payment_enabled === true;
+  workingDraft.payment_connector = paymentConfig.payment_connector || null;
+  workingDraft.payment_amount = paymentConfig.payment_amount || null;
+  workingDraft.payment_currency = paymentConfig.payment_currency || null;
+  workingDraft.payment_description = paymentConfig.payment_description || null;
+  workingDraft.payment_start_message = paymentConfig.payment_start_message || null;
+  workingDraft.payment_success_message = paymentConfig.payment_success_message || null;
+  workingDraft.payment_failure_message = paymentConfig.payment_failure_message || null;
+  workingDraft.payment_retry_message = paymentConfig.payment_retry_message || null;
+  await saveFlowDraft(ctx, draftKey, 'call', workingDraft, 'payment');
+
+  let objectiveConfig = null;
+  const objectiveFields = ['objective_tags', 'supports_payment', 'supports_digit_capture'];
+  const hasObjectiveDraft = objectiveFields.some((field) => Object.prototype.hasOwnProperty.call(workingDraft, field));
+  if (fastResume && hasObjectiveDraft) {
+    objectiveConfig = {
+      objective_tags: normalizeObjectiveTagsList(workingDraft.objective_tags),
+      supports_payment: normalizeOptionalCapabilityFlag(workingDraft.supports_payment),
+      supports_digit_capture: normalizeOptionalCapabilityFlag(workingDraft.supports_digit_capture)
+    };
+    await ctx.reply('↩️ Using saved objective compatibility settings.');
+  } else {
+    objectiveConfig = await collectObjectiveMetadataConfig(
+      conversation,
+      ctx,
+      {
+        objective_tags: workingDraft.objective_tags || [],
+        supports_payment:
+          Object.prototype.hasOwnProperty.call(workingDraft, 'supports_payment')
+            ? workingDraft.supports_payment
+            : (workingDraft.payment_enabled === true ? true : null),
+        supports_digit_capture:
+          Object.prototype.hasOwnProperty.call(workingDraft, 'supports_digit_capture')
+            ? workingDraft.supports_digit_capture
+            : ((workingDraft.requires_otp || workingDraft.default_profile || workingDraft.expected_length) ? true : null)
+      },
+      safeEnsureActive
+    );
+  }
+  if (!objectiveConfig) {
+    await ctx.reply('❌ Script creation cancelled.');
+    return;
+  }
+  workingDraft.objective_tags = normalizeObjectiveTagsList(objectiveConfig.objective_tags);
+  workingDraft.supports_payment = normalizeOptionalCapabilityFlag(objectiveConfig.supports_payment);
+  workingDraft.supports_digit_capture = normalizeOptionalCapabilityFlag(objectiveConfig.supports_digit_capture);
+  await saveFlowDraft(ctx, draftKey, 'call', workingDraft, 'objective_metadata');
 
   const scriptPayload = {
     name,
-    description: description === undefined ? null : (description.length ? description : null),
+    description: normalizedDescription,
     business_id: personaResult.business_id,
     persona_config: personaResult.persona_config,
     prompt: promptAndVoice.prompt,
@@ -1820,8 +2606,12 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
     payment_success_message: paymentConfig.payment_success_message || null,
     payment_failure_message: paymentConfig.payment_failure_message || null,
     payment_retry_message: paymentConfig.payment_retry_message || null,
+    objective_tags: normalizeObjectiveTagsList(objectiveConfig.objective_tags),
+    supports_payment: normalizeOptionalCapabilityFlag(objectiveConfig.supports_payment),
+    supports_digit_capture: normalizeOptionalCapabilityFlag(objectiveConfig.supports_digit_capture),
     capture_group: captureConfig.capture_group || null
   };
+  await saveFlowDraft(ctx, draftKey, 'call', scriptPayload, 'validate');
 
   const validation = validateCallScriptPayload(scriptPayload);
   if (validation.errors.length) {
@@ -1832,6 +2622,22 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
     await ctx.reply(`⚠️ Warnings:\n• ${validation.warnings.join('\n• ')}`);
     const proceed = await confirm(conversation, ctx, 'Proceed anyway?', safeEnsureActive);
     if (!proceed) {
+      await ctx.reply('❌ Script creation cancelled.');
+      return;
+    }
+  }
+  const qualityReport = buildCallScriptQualityReport(scriptPayload);
+  await ctx.reply(formatCallScriptQualityReport(qualityReport));
+  const preflight = buildCallScriptPreflightReport(scriptPayload);
+  await ctx.reply(formatCallScriptPreflight(preflight));
+  if (qualityReport.score < 60) {
+    const proceedLowQuality = await confirm(
+      conversation,
+      ctx,
+      'This script quality score is low. Create anyway?',
+      safeEnsureActive
+    );
+    if (!proceedLowQuality) {
       await ctx.reply('❌ Script creation cancelled.');
       return;
     }
@@ -1882,6 +2688,15 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
       }
       finishMutationRequest(mutationGate.key, 'done');
       await storeScriptVersionSnapshot({ ...script, ...scriptPayload }, 'call', ctx);
+      const createdVersion = Number.isFinite(Number(script?.version)) && Number(script.version) > 0
+        ? Math.max(1, Math.floor(Number(script.version)))
+        : 1;
+      await updateCallScriptLifecycleState(script.id, {
+        status: SCRIPT_STATUS_DRAFT,
+        pinned_version: null,
+        stable_version: createdVersion
+      });
+      await clearFlowDraft(ctx, draftKey);
       await ctx.reply(`✅ Script *${escapeMarkdown(script.name)}* created successfully!`, { parse_mode: 'Markdown' });
     } catch (error) {
       finishMutationRequest(mutationGate.key, 'failed');
@@ -1895,114 +2710,213 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
 
 async function editCallScriptFlow(conversation, ctx, script, ensureActive) {
   const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
+  const draftKey = `call:edit:${script.id}`;
+  const draftMode = await promptDraftResumeMode(conversation, ctx, {
+    draftKey,
+    title: `✏️ Edit draft found for ${script.name}`,
+    prefix: 'call-script-edit-draft',
+    ensureActive: safeEnsureActive
+  });
+  const draftPayload = draftMode?.draft?.payload && typeof draftMode.draft.payload === 'object'
+    ? draftMode.draft.payload
+    : {};
+  const pendingDraftUpdates =
+    draftPayload?.updates && typeof draftPayload.updates === 'object'
+      ? { ...draftPayload.updates }
+      : {};
+  const resumeMode = String(draftMode?.mode || 'new');
+  const fastResume = resumeMode === 'resume';
+  const reviewResume = resumeMode === 'review';
   const updates = {};
 
-  const name = await promptText(
-    conversation,
-    ctx,
-    '✏️ Update script name (or type skip to keep current).',
-    {
-      allowEmpty: false,
-      allowSkip: true,
-      defaultValue: script.name,
-      parse: (value) => value.trim(),
-      ensureActive: safeEnsureActive
+  if (fastResume && Object.keys(pendingDraftUpdates).length) {
+    await ctx.reply('↩️ Loaded pending edit draft.');
+    const applyPendingNow = await confirm(
+      conversation,
+      ctx,
+      'Apply the saved pending updates now?',
+      safeEnsureActive
+    );
+    if (applyPendingNow) {
+      Object.assign(updates, pendingDraftUpdates);
     }
-  );
-  if (name === null) {
-    await ctx.reply('❌ Update cancelled.');
-    return;
-  }
-  if (name !== undefined) {
-    if (!name.length) {
-      await ctx.reply('❌ Script name cannot be empty.');
-      return;
-    }
-    updates.name = name;
   }
 
-  const description = await promptText(
-    conversation,
-    ctx,
-    '📝 Update description (or type skip).',
-    {
-      allowEmpty: true,
-      allowSkip: true,
-      defaultValue: script.description || '',
-      parse: (value) => value.trim(),
-      ensureActive: safeEnsureActive
-    }
-  );
-  if (description === null) {
-    await ctx.reply('❌ Update cancelled.');
-    return;
-  }
-  if (description !== undefined) {
-    updates.description = description.length ? description : null;
-  }
-
-  const adjustPersona = await confirm(conversation, ctx, 'Would you like to update the persona settings?', safeEnsureActive);
-  if (adjustPersona) {
-    const personaResult = await collectPersonaConfig(conversation, ctx, script, { allowCancel: true, ensureActive: safeEnsureActive });
-    if (!personaResult) {
+  if (!Object.keys(updates).length) {
+    const name = await promptText(
+      conversation,
+      ctx,
+      '✏️ Update script name (or type skip to keep current).',
+      {
+        allowEmpty: false,
+        allowSkip: true,
+        defaultValue: reviewResume
+          ? (pendingDraftUpdates.name || script.name)
+          : script.name,
+        parse: (value) => value.trim(),
+        ensureActive: safeEnsureActive
+      }
+    );
+    if (name === null) {
       await ctx.reply('❌ Update cancelled.');
       return;
     }
-    updates.business_id = personaResult.business_id;
-    updates.persona_config = personaResult.persona_config;
-  }
+    if (name !== undefined) {
+      if (!name.length) {
+        await ctx.reply('❌ Script name cannot be empty.');
+        return;
+      }
+      updates.name = name;
+      await saveFlowDraft(ctx, draftKey, 'call', { updates }, 'name');
+    }
 
-  const adjustPrompt = await confirm(conversation, ctx, 'Update prompt, first message, or voice settings?', safeEnsureActive);
-  if (adjustPrompt) {
-    const promptAndVoice = await collectPromptAndVoice(conversation, ctx, script, safeEnsureActive);
-    if (!promptAndVoice) {
+    const description = await promptText(
+      conversation,
+      ctx,
+      '📝 Update description (or type skip).',
+      {
+        allowEmpty: true,
+        allowSkip: true,
+        defaultValue: reviewResume
+          ? (Object.prototype.hasOwnProperty.call(pendingDraftUpdates, 'description')
+              ? (pendingDraftUpdates.description || '')
+              : (script.description || ''))
+          : (script.description || ''),
+        parse: (value) => value.trim(),
+        ensureActive: safeEnsureActive
+      }
+    );
+    if (description === null) {
       await ctx.reply('❌ Update cancelled.');
       return;
     }
-    updates.prompt = promptAndVoice.prompt;
-    updates.first_message = promptAndVoice.first_message;
-    updates.voice_model = promptAndVoice.voice_model || null;
-  }
-
-  const adjustCapture = await confirm(conversation, ctx, 'Update digit capture settings?', safeEnsureActive);
-  if (adjustCapture) {
-    const captureConfig = await collectDigitCaptureConfig(conversation, ctx, script, safeEnsureActive);
-    if (!captureConfig) {
-      await ctx.reply('❌ Update cancelled.');
-      return;
+    if (description !== undefined) {
+      updates.description = description.length ? description : null;
+      await saveFlowDraft(ctx, draftKey, 'call', { updates }, 'description');
     }
-    updates.requires_otp = captureConfig.requires_otp || false;
-    updates.default_profile = captureConfig.default_profile || null;
-    updates.expected_length = captureConfig.expected_length || null;
-    updates.allow_terminator = captureConfig.allow_terminator || false;
-    updates.terminator_char = captureConfig.terminator_char || null;
-    updates.capture_group = captureConfig.capture_group || null;
-  }
 
-  const adjustPayment = await confirm(conversation, ctx, 'Update payment defaults?', safeEnsureActive);
-  if (adjustPayment) {
-    const paymentConfig = await collectPaymentDefaultsConfig(conversation, ctx, script, safeEnsureActive);
-    if (!paymentConfig) {
-      await ctx.reply('❌ Update cancelled.');
-      return;
+    const adjustPersona = await confirm(conversation, ctx, 'Would you like to update the persona settings?', safeEnsureActive);
+    if (adjustPersona) {
+      const personaDefaults = reviewResume
+        ? { ...script, ...pendingDraftUpdates }
+        : script;
+      const personaResult = await collectPersonaConfig(
+        conversation,
+        ctx,
+        personaDefaults,
+        { allowCancel: true, ensureActive: safeEnsureActive }
+      );
+      if (!personaResult) {
+        await ctx.reply('❌ Update cancelled.');
+        return;
+      }
+      updates.business_id = personaResult.business_id;
+      updates.persona_config = personaResult.persona_config;
+      await saveFlowDraft(ctx, draftKey, 'call', { updates }, 'persona');
     }
-    updates.payment_enabled = paymentConfig.payment_enabled === true;
-    updates.payment_connector = paymentConfig.payment_connector || null;
-    updates.payment_amount = paymentConfig.payment_amount || null;
-    updates.payment_currency = paymentConfig.payment_currency || null;
-    updates.payment_description = paymentConfig.payment_description || null;
-    updates.payment_start_message = paymentConfig.payment_start_message || null;
-    updates.payment_success_message = paymentConfig.payment_success_message || null;
-    updates.payment_failure_message = paymentConfig.payment_failure_message || null;
-    updates.payment_retry_message = paymentConfig.payment_retry_message || null;
+
+    const adjustPrompt = await confirm(conversation, ctx, 'Update prompt, first message, or voice settings?', safeEnsureActive);
+    if (adjustPrompt) {
+      const promptDefaults = reviewResume
+        ? { ...script, ...pendingDraftUpdates }
+        : script;
+      const promptAndVoice = await collectPromptAndVoice(conversation, ctx, promptDefaults, safeEnsureActive);
+      if (!promptAndVoice) {
+        await ctx.reply('❌ Update cancelled.');
+        return;
+      }
+      updates.prompt = promptAndVoice.prompt;
+      updates.first_message = promptAndVoice.first_message;
+      updates.voice_model = promptAndVoice.voice_model || null;
+      await saveFlowDraft(ctx, draftKey, 'call', { updates }, 'prompt_voice');
+    }
+
+    const adjustCapture = await confirm(conversation, ctx, 'Update digit capture settings?', safeEnsureActive);
+    if (adjustCapture) {
+      const captureDefaults = reviewResume
+        ? { ...script, ...pendingDraftUpdates }
+        : script;
+      const captureConfig = await collectDigitCaptureConfig(conversation, ctx, captureDefaults, safeEnsureActive);
+      if (!captureConfig) {
+        await ctx.reply('❌ Update cancelled.');
+        return;
+      }
+      updates.requires_otp = captureConfig.requires_otp || false;
+      updates.default_profile = captureConfig.default_profile || null;
+      updates.expected_length = captureConfig.expected_length || null;
+      updates.allow_terminator = captureConfig.allow_terminator || false;
+      updates.terminator_char = captureConfig.terminator_char || null;
+      updates.capture_group = captureConfig.capture_group || null;
+      await saveFlowDraft(ctx, draftKey, 'call', { updates }, 'digit_capture');
+    }
+
+    const adjustPayment = await confirm(conversation, ctx, 'Update payment defaults?', safeEnsureActive);
+    if (adjustPayment) {
+      const paymentDefaults = reviewResume
+        ? { ...script, ...pendingDraftUpdates }
+        : script;
+      const paymentConfig = await collectPaymentDefaultsConfig(conversation, ctx, paymentDefaults, safeEnsureActive);
+      if (!paymentConfig) {
+        await ctx.reply('❌ Update cancelled.');
+        return;
+      }
+      updates.payment_enabled = paymentConfig.payment_enabled === true;
+      updates.payment_connector = paymentConfig.payment_connector || null;
+      updates.payment_amount = paymentConfig.payment_amount || null;
+      updates.payment_currency = paymentConfig.payment_currency || null;
+      updates.payment_description = paymentConfig.payment_description || null;
+      updates.payment_start_message = paymentConfig.payment_start_message || null;
+      updates.payment_success_message = paymentConfig.payment_success_message || null;
+      updates.payment_failure_message = paymentConfig.payment_failure_message || null;
+      updates.payment_retry_message = paymentConfig.payment_retry_message || null;
+      await saveFlowDraft(ctx, draftKey, 'call', { updates }, 'payment');
+    }
+
+    const adjustObjectiveMetadata = await confirm(
+      conversation,
+      ctx,
+      'Update objective compatibility settings?',
+      safeEnsureActive
+    );
+    if (adjustObjectiveMetadata) {
+      const objectiveDefaults = reviewResume
+        ? { ...script, ...pendingDraftUpdates }
+        : script;
+      const objectiveConfig = await collectObjectiveMetadataConfig(
+        conversation,
+        ctx,
+        {
+          objective_tags: normalizeObjectiveTagsList(objectiveDefaults.objective_tags),
+          supports_payment:
+            Object.prototype.hasOwnProperty.call(objectiveDefaults, 'supports_payment')
+              ? objectiveDefaults.supports_payment
+              : null,
+          supports_digit_capture:
+            Object.prototype.hasOwnProperty.call(objectiveDefaults, 'supports_digit_capture')
+              ? objectiveDefaults.supports_digit_capture
+              : null
+        },
+        safeEnsureActive
+      );
+      if (!objectiveConfig) {
+        await ctx.reply('❌ Update cancelled.');
+        return;
+      }
+      updates.objective_tags = normalizeObjectiveTagsList(objectiveConfig.objective_tags);
+      updates.supports_payment = normalizeOptionalCapabilityFlag(objectiveConfig.supports_payment);
+      updates.supports_digit_capture = normalizeOptionalCapabilityFlag(objectiveConfig.supports_digit_capture);
+      await saveFlowDraft(ctx, draftKey, 'call', { updates }, 'objective_metadata');
+    }
   }
 
   if (Object.keys(updates).length === 0) {
     await ctx.reply('ℹ️ No changes made.');
+    await clearFlowDraft(ctx, draftKey);
     return;
   }
 
   const merged = { ...script, ...updates };
+  await saveFlowDraft(ctx, draftKey, 'call', { updates }, 'validate');
   const validation = validateCallScriptPayload(merged);
   if (validation.errors.length) {
     await ctx.reply(`❌ Fix the following issues:\n• ${validation.errors.join('\n• ')}`);
@@ -2012,6 +2926,22 @@ async function editCallScriptFlow(conversation, ctx, script, ensureActive) {
     await ctx.reply(`⚠️ Warnings:\n• ${validation.warnings.join('\n• ')}`);
     const proceed = await confirm(conversation, ctx, 'Proceed anyway?', safeEnsureActive);
     if (!proceed) {
+      await ctx.reply('❌ Update cancelled.');
+      return;
+    }
+  }
+  const qualityReport = buildCallScriptQualityReport(merged);
+  await ctx.reply(formatCallScriptQualityReport(qualityReport));
+  const preflight = buildCallScriptPreflightReport(merged, await getCallScriptLifecycleState(script.id));
+  await ctx.reply(formatCallScriptPreflight(preflight));
+  if (qualityReport.score < 60) {
+    const proceedLowQuality = await confirm(
+      conversation,
+      ctx,
+      'This script quality score is low. Save changes anyway?',
+      safeEnsureActive
+    );
+    if (!proceedLowQuality) {
       await ctx.reply('❌ Update cancelled.');
       return;
     }
@@ -2036,7 +2966,14 @@ async function editCallScriptFlow(conversation, ctx, script, ensureActive) {
         'call_update',
         () => updateCallScript(script.id, apiUpdates, { idempotencyKey })
       );
+      await storeScriptVersionSnapshot(updated, 'call', ctx);
+      await updateCallScriptLifecycleState(script.id, {
+        status: SCRIPT_STATUS_REVIEW,
+        submitted_by: String(ctx?.from?.id || '') || null,
+        submitted_at: nowIso()
+      });
       finishMutationRequest(mutationGate.key, 'done');
+      await clearFlowDraft(ctx, draftKey);
       await ctx.reply(`✅ Script *${escapeMarkdown(updated.name)}* updated.`, { parse_mode: 'Markdown' });
     } catch (error) {
       finishMutationRequest(mutationGate.key, 'failed');
@@ -2109,6 +3046,15 @@ async function cloneCallScriptFlow(conversation, ctx, script, ensureActive) {
         idempotencyKey
       })
     );
+    await storeScriptVersionSnapshot(cloned, 'call', ctx);
+    const clonedVersion = Number.isFinite(Number(cloned?.version)) && Number(cloned.version) > 0
+      ? Math.max(1, Math.floor(Number(cloned.version)))
+      : 1;
+    await updateCallScriptLifecycleState(cloned.id, {
+      status: SCRIPT_STATUS_DRAFT,
+      stable_version: clonedVersion,
+      pinned_version: null
+    });
     finishCloneRequest(cloneGate.key, 'done');
     await ctx.reply(`✅ Script cloned as *${escapeMarkdown(cloned.name)}*.`, { parse_mode: 'Markdown' });
   } catch (error) {
@@ -2147,6 +3093,7 @@ async function deleteCallScriptFlow(conversation, ctx, script, ensureActive) {
         'call_delete',
         () => deleteCallScript(script.id, { idempotencyKey })
       );
+      await deleteScriptLifecycle('call', String(script.id));
       finishMutationRequest(mutationGate.key, 'done');
       await ctx.reply(`🗑️ Script *${escapeMarkdown(script.name)}* deleted.`, { parse_mode: 'Markdown' });
     } catch (error) {
@@ -2196,6 +3143,32 @@ async function showCallScriptVersions(conversation, ctx, script, ensureActive) {
       await ctx.reply('❌ Version payload not found.');
       return;
     }
+    const callDiffFields = [
+      { key: 'name', label: 'Name' },
+      { key: 'description', label: 'Description' },
+      { key: 'business_id', label: 'Persona' },
+      { key: 'prompt', label: 'Prompt' },
+      { key: 'first_message', label: 'First message' },
+      { key: 'voice_model', label: 'Voice model' },
+      { key: 'objective_tags', label: 'Objective tags' },
+      { key: 'supports_payment', label: 'Supports payment' },
+      { key: 'supports_digit_capture', label: 'Supports digit capture' },
+      { key: 'requires_otp', label: 'Requires OTP' },
+      { key: 'default_profile', label: 'Default profile' },
+      { key: 'expected_length', label: 'Expected length' },
+      { key: 'payment_enabled', label: 'Payment enabled' },
+      { key: 'payment_connector', label: 'Payment connector' },
+      { key: 'payment_amount', label: 'Payment amount' },
+      { key: 'payment_currency', label: 'Payment currency' }
+    ];
+    const currentSnapshot = buildCallScriptSnapshot(script);
+    const targetSnapshot = buildCallScriptSnapshot(version.payload || {});
+    const diffLines = buildFieldDiffLines(currentSnapshot, targetSnapshot, callDiffFields);
+    if (diffLines.length) {
+      await ctx.reply(`🧾 Changes in v${versionNumber}:\n${diffLines.slice(0, 12).join('\n')}`);
+    } else {
+      await ctx.reply(`ℹ️ v${versionNumber} matches the current script content.`);
+    }
     const confirmRestore = await confirm(conversation, ctx, `Restore version v${versionNumber}?`, safeEnsureActive);
     if (!confirmRestore) {
       await ctx.reply('Restore cancelled.');
@@ -2212,6 +3185,12 @@ async function showCallScriptVersions(conversation, ctx, script, ensureActive) {
       'call_restore_version',
       () => updateCallScript(script.id, payload, { idempotencyKey })
     );
+    await storeScriptVersionSnapshot(updated, 'call', ctx);
+    await updateCallScriptLifecycleState(script.id, {
+      status: SCRIPT_STATUS_REVIEW,
+      submitted_by: String(ctx?.from?.id || '') || null,
+      submitted_at: nowIso()
+    });
     await ctx.reply(`✅ Script restored to v${versionNumber} (${escapeMarkdown(updated.name)}).`, { parse_mode: 'Markdown' });
   } catch (error) {
     logScriptsError('Version restore failed', error);
@@ -2219,31 +3198,315 @@ async function showCallScriptVersions(conversation, ctx, script, ensureActive) {
   }
 }
 
+async function showCallScriptPreflight(ctx, script, lifecycle = null) {
+  const resolvedLifecycle = lifecycle || await getCallScriptLifecycleState(script.id);
+  const report = buildCallScriptPreflightReport(script, resolvedLifecycle);
+  await ctx.reply(formatCallScriptPreflight(report));
+  return report;
+}
+
+async function submitCallScriptForReview(ctx, script) {
+  const actor = String(ctx?.from?.id || '');
+  const updated = await updateCallScriptLifecycleState(script.id, {
+    status: SCRIPT_STATUS_REVIEW,
+    submitted_by: actor || null,
+    submitted_at: nowIso()
+  });
+  await ctx.reply(`🟡 Script moved to review: *${escapeMarkdown(script.name)}*`, { parse_mode: 'Markdown' });
+  return updated;
+}
+
+async function publishCallScriptFlow(conversation, ctx, script, ensureActive) {
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
+  const lifecycle = await getCallScriptLifecycleState(script.id);
+  safeEnsureActive();
+  const report = await showCallScriptPreflight(ctx, script, lifecycle);
+  safeEnsureActive();
+
+  if (report.blockers.length > 0) {
+    await ctx.reply('❌ Resolve blockers before publishing this script.');
+    return;
+  }
+
+  const confirmed = await confirm(
+    conversation,
+    ctx,
+    `Publish *${escapeMarkdown(script.name)}* and mark it active for /call?`,
+    safeEnsureActive
+  );
+  if (!confirmed) {
+    await ctx.reply('Publish cancelled.');
+    return;
+  }
+
+  const actor = String(ctx?.from?.id || '');
+  const scriptVersion = Number.isFinite(Number(script.version)) && Number(script.version) > 0
+    ? Math.max(1, Math.floor(Number(script.version)))
+    : 1;
+  const updated = await updateCallScriptLifecycleState(script.id, {
+    status: SCRIPT_STATUS_ACTIVE,
+    submitted_by: lifecycle?.submitted_by || actor || null,
+    submitted_at: lifecycle?.submitted_at || nowIso(),
+    reviewed_by: actor || null,
+    reviewed_at: nowIso(),
+    approved_by: actor || null,
+    approved_at: nowIso(),
+    stable_version: scriptVersion,
+    pinned_version: lifecycle?.pinned_version || scriptVersion
+  });
+  await ctx.reply(
+    `✅ Script *${escapeMarkdown(script.name)}* is now active (runtime v${Math.floor(Number(updated?.pinned_version || scriptVersion))}).`,
+    { parse_mode: 'Markdown' }
+  );
+}
+
+async function updateCallScriptLifecycleStatusFlow(conversation, ctx, script, nextStatus, ensureActive) {
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
+  const targetStatus = normalizeScriptStatus(nextStatus);
+  const confirmed = await confirm(
+    conversation,
+    ctx,
+    `Change lifecycle status to ${targetStatus}?`,
+    safeEnsureActive
+  );
+  if (!confirmed) {
+    await ctx.reply('Status change cancelled.');
+    return;
+  }
+  const actor = String(ctx?.from?.id || '');
+  await updateCallScriptLifecycleState(script.id, {
+    status: targetStatus,
+    reviewed_by: actor || null,
+    reviewed_at: nowIso()
+  });
+  await ctx.reply(`✅ Status updated: ${formatScriptStatusBadge(targetStatus)}`);
+}
+
+async function pinCallScriptVersionFlow(conversation, ctx, script, ensureActive) {
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
+  const versions = await listScriptVersions(script.id, 'call', 12).catch(() => []);
+  safeEnsureActive();
+  const options = [];
+  const seen = new Set();
+  const currentVersion = Number.isFinite(Number(script.version)) && Number(script.version) > 0
+    ? Math.max(1, Math.floor(Number(script.version)))
+    : 1;
+  options.push({ id: `v:${currentVersion}`, label: `📌 Current API version (v${currentVersion})` });
+  seen.add(currentVersion);
+  (versions || []).forEach((versionRow) => {
+    const versionNumber = Number(versionRow?.version_number);
+    if (!Number.isFinite(versionNumber) || seen.has(versionNumber)) return;
+    seen.add(versionNumber);
+    options.push({ id: `v:${versionNumber}`, label: `🗂️ Saved version v${versionNumber}` });
+  });
+  options.push({ id: 'clear', label: '🧹 Clear pin' });
+  options.push({ id: 'back', label: '⬅️ Back' });
+
+  const selection = await askOptionWithButtons(
+    conversation,
+    ctx,
+    'Choose which version /call should run for this script.',
+    options,
+    { prefix: 'call-script-pin', columns: 1, ensureActive: safeEnsureActive }
+  );
+  if (!selection || !selection.id || selection.id === 'back') {
+    return;
+  }
+  if (selection.id === 'clear') {
+    await updateCallScriptLifecycleState(script.id, {
+      pinned_version: null,
+      reviewed_at: nowIso(),
+      reviewed_by: String(ctx?.from?.id || '') || null
+    });
+    await ctx.reply('✅ Runtime pin removed. /call will use current API version.');
+    return;
+  }
+
+  const parsedVersion = Number(String(selection.id).replace(/^v:/, ''));
+  if (!Number.isFinite(parsedVersion) || parsedVersion <= 0) {
+    await ctx.reply('❌ Invalid version selected.');
+    return;
+  }
+  await updateCallScriptLifecycleState(script.id, {
+    pinned_version: Math.floor(parsedVersion),
+    reviewed_at: nowIso(),
+    reviewed_by: String(ctx?.from?.id || '') || null
+  });
+  await ctx.reply(`✅ /call runtime pinned to version v${Math.floor(parsedVersion)}.`);
+}
+
+async function rollbackCallScriptStableFlow(conversation, ctx, script, ensureActive) {
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
+  const lifecycle = await getCallScriptLifecycleState(script.id);
+  safeEnsureActive();
+  const stableVersion = Number(lifecycle?.stable_version);
+  if (!Number.isFinite(stableVersion) || stableVersion <= 0) {
+    await ctx.reply('ℹ️ No stable version is set for this script.');
+    return;
+  }
+  const snapshot = await getScriptVersion(script.id, 'call', stableVersion);
+  safeEnsureActive();
+  if (!snapshot?.payload) {
+    await ctx.reply(`❌ Stable version v${stableVersion} was not found in local version history.`);
+    return;
+  }
+
+  const confirmed = await confirm(
+    conversation,
+    ctx,
+    `Rollback this script to stable v${Math.floor(stableVersion)} now?`,
+    safeEnsureActive
+  );
+  if (!confirmed) {
+    await ctx.reply('Rollback cancelled.');
+    return;
+  }
+
+  await storeScriptVersionSnapshot(script, 'call', ctx);
+  const payload = stripUndefined({ ...snapshot.payload });
+  delete payload.capture_group;
+  const opId = getCurrentOpId(ctx) || `user_${ctx?.from?.id || 'unknown'}`;
+  const idempotencyKey = `rollback_call_script_${script.id}_v${stableVersion}_${opId}`.slice(0, 96);
+  const updated = await runWithActionWatchdog(
+    ctx,
+    'Rolling back script',
+    'call_rollback_stable',
+    () => updateCallScript(script.id, payload, { idempotencyKey })
+  );
+
+  await updateCallScriptLifecycleState(script.id, {
+    status: SCRIPT_STATUS_ACTIVE,
+    pinned_version: Math.floor(stableVersion),
+    reviewed_by: String(ctx?.from?.id || '') || null,
+    reviewed_at: nowIso(),
+    approved_by: String(ctx?.from?.id || '') || null,
+    approved_at: nowIso()
+  });
+  await ctx.reply(`✅ Rolled back to stable v${Math.floor(stableVersion)} (${escapeMarkdown(updated.name)}).`, {
+    parse_mode: 'Markdown'
+  });
+}
+
+async function showCallScriptInsightsFlow(ctx, script) {
+  const lines = [];
+  let calls = [];
+  try {
+    const callsPayload = await scriptsApiRequest({
+      method: 'get',
+      url: '/api/calls/list',
+      params: { limit: 50, offset: 0 }
+    });
+    calls = Array.isArray(callsPayload?.calls) ? callsPayload.calls : [];
+  } catch (error) {
+    console.warn('Failed to load call insights list:', error?.message || error);
+  }
+
+  const scriptId = String(script.id);
+  const scriptCalls = calls.filter((call) => String(call?.script_id || '') === scriptId);
+  const total = scriptCalls.length;
+  const completed = scriptCalls.filter((call) => {
+    const status = String(call?.status_normalized || call?.status || '').toLowerCase();
+    return status === 'completed';
+  }).length;
+  const failed = scriptCalls.filter((call) => {
+    const status = String(call?.status_normalized || call?.status || '').toLowerCase();
+    return ['failed', 'no-answer', 'busy', 'canceled'].includes(status);
+  }).length;
+  const avgDuration = total
+    ? Math.round(
+      scriptCalls.reduce((sum, call) => sum + (Number(call?.duration) || 0), 0) / total
+    )
+    : 0;
+  const completionRate = total ? Number(((completed / total) * 100).toFixed(2)) : 0;
+
+  lines.push(`📈 Calls sampled: ${total} (latest API window)`);
+  lines.push(`✅ Completed: ${completed}`);
+  lines.push(`⚠️ Failed/no-answer/busy/canceled: ${failed}`);
+  lines.push(`📊 Completion rate: ${completionRate}%`);
+  lines.push(`⏱️ Avg duration: ${avgDuration}s`);
+
+  try {
+    const paymentPayload = await scriptsApiRequest({
+      method: 'get',
+      url: '/api/payment/analytics',
+      params: { hours: 24 * 14, limit: 200 }
+    });
+    const items = Array.isArray(paymentPayload?.items) ? paymentPayload.items : [];
+    const matched = items.filter((item) => String(item?.script_id || '') === scriptId);
+    if (matched.length) {
+      const aggregate = matched.reduce(
+        (acc, item) => {
+          acc.offered += Number(item?.offered || 0);
+          acc.requested += Number(item?.requested || 0);
+          acc.completed += Number(item?.completed || 0);
+          return acc;
+        },
+        { offered: 0, requested: 0, completed: 0 }
+      );
+      const offerToRequest = aggregate.offered
+        ? Number(((aggregate.requested / aggregate.offered) * 100).toFixed(2))
+        : 0;
+      const requestToCompleted = aggregate.requested
+        ? Number(((aggregate.completed / aggregate.requested) * 100).toFixed(2))
+        : 0;
+      lines.push(`💳 Payment offered: ${aggregate.offered}`);
+      lines.push(`💳 Payment requested: ${aggregate.requested} (${offerToRequest}%)`);
+      lines.push(`💳 Payment completed: ${aggregate.completed} (${requestToCompleted}%)`);
+    }
+  } catch (error) {
+    console.warn('Failed to load payment insights:', error?.message || error);
+  }
+
+  await ctx.reply(section(`📊 Script Insights: ${script.name}`, lines));
+}
+
 async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
   const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   let viewing = true;
   while (viewing) {
-    const summary = formatCallScriptSummary(script);
+    const lifecycle = await getCallScriptLifecycleState(script.id);
+    const lifecycleStatus = normalizeScriptStatus(lifecycle?.status);
+    const summary = formatCallScriptSummary(script, lifecycle);
     await ctx.reply(summary, { parse_mode: 'Markdown' });
+
+    const actions = [
+      { id: 'preview', label: '📞 Preview' },
+      { id: 'preflight', label: '🧪 Preflight' },
+      { id: 'edit', label: '✏️ Edit' },
+      { id: 'clone', label: '🧬 Clone' },
+      { id: 'versions', label: '🗂️ Versions' },
+      { id: 'pin', label: '📌 Pin version' },
+      { id: 'rollback', label: '🛟 Rollback stable' },
+      { id: 'insights', label: '📊 Insights' }
+    ];
+    if (lifecycleStatus === SCRIPT_STATUS_DRAFT) {
+      actions.push({ id: 'submit_review', label: '🟡 Submit review' });
+    } else if (lifecycleStatus === SCRIPT_STATUS_REVIEW) {
+      actions.push({ id: 'publish', label: '🟢 Publish active' });
+      actions.push({ id: 'move_draft', label: '🟠 Back to draft' });
+    } else if (lifecycleStatus === SCRIPT_STATUS_ACTIVE) {
+      actions.push({ id: 'move_review', label: '🟡 Move to review' });
+      actions.push({ id: 'archive', label: '⚫ Archive' });
+    } else if (lifecycleStatus === SCRIPT_STATUS_ARCHIVED) {
+      actions.push({ id: 'move_review', label: '🟡 Reopen review' });
+    }
+    actions.push({ id: 'delete', label: '🗑️ Delete' });
+    actions.push({ id: 'back', label: '⬅️ Back' });
 
     const action = await askOptionWithButtons(
       conversation,
       ctx,
       'Choose an action for this script.',
-      [
-        { id: 'preview', label: '📞 Preview' },
-        { id: 'edit', label: '✏️ Edit' },
-        { id: 'clone', label: '🧬 Clone' },
-        { id: 'versions', label: '🗂️ Versions' },
-        { id: 'delete', label: '🗑️ Delete' },
-        { id: 'back', label: '⬅️ Back' }
-      ],
+      actions,
       { prefix: 'call-script-action', columns: 2, ensureActive: safeEnsureActive }
     );
 
     switch (action.id) {
       case 'preview':
         await previewCallScript(conversation, ctx, script, safeEnsureActive);
+        break;
+      case 'preflight':
+        await showCallScriptPreflight(ctx, script, lifecycle);
         break;
       case 'edit':
         await editCallScriptFlow(conversation, ctx, script, safeEnsureActive);
@@ -2260,6 +3523,42 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
         break;
       case 'versions':
         await showCallScriptVersions(conversation, ctx, script, safeEnsureActive);
+        try {
+          script = await fetchCallScriptById(script.id);
+        } catch (error) {
+          logScriptsError('Failed to refresh call script after version action', error);
+          viewing = false;
+        }
+        break;
+      case 'submit_review':
+        await submitCallScriptForReview(ctx, script);
+        break;
+      case 'publish':
+        await publishCallScriptFlow(conversation, ctx, script, safeEnsureActive);
+        break;
+      case 'move_draft':
+        await updateCallScriptLifecycleStatusFlow(conversation, ctx, script, SCRIPT_STATUS_DRAFT, safeEnsureActive);
+        break;
+      case 'move_review':
+        await updateCallScriptLifecycleStatusFlow(conversation, ctx, script, SCRIPT_STATUS_REVIEW, safeEnsureActive);
+        break;
+      case 'archive':
+        await updateCallScriptLifecycleStatusFlow(conversation, ctx, script, SCRIPT_STATUS_ARCHIVED, safeEnsureActive);
+        break;
+      case 'pin':
+        await pinCallScriptVersionFlow(conversation, ctx, script, safeEnsureActive);
+        break;
+      case 'rollback':
+        await rollbackCallScriptStableFlow(conversation, ctx, script, safeEnsureActive);
+        try {
+          script = await fetchCallScriptById(script.id);
+        } catch (error) {
+          logScriptsError('Failed to refresh call script after rollback', error);
+          viewing = false;
+        }
+        break;
+      case 'insights':
+        await showCallScriptInsightsFlow(ctx, script);
         break;
       case 'delete':
         await deleteCallScriptFlow(conversation, ctx, script, safeEnsureActive);
@@ -2301,68 +3600,108 @@ async function listCallScriptsFlow(conversation, ctx, ensureActive) {
         count: readOnlyScripts.length
       });
     }
-
-    const summaryLines = manageableScripts.slice(0, 15).map((script, index) => {
-      const parts = [`${index + 1}. ${script.name}`];
-      if (script.description) {
-        parts.push(`– ${script.description}`);
-      }
-      return parts.join(' ');
+    const lifecycleMap = await listCallScriptLifecycleMap();
+    const statusCounts = {
+      [SCRIPT_STATUS_DRAFT]: 0,
+      [SCRIPT_STATUS_REVIEW]: 0,
+      [SCRIPT_STATUS_ACTIVE]: 0,
+      [SCRIPT_STATUS_ARCHIVED]: 0
+    };
+    manageableScripts.forEach((item) => {
+      const row = lifecycleMap.get(String(item.id));
+      const status = normalizeScriptStatus(row?.status || SCRIPT_STATUS_DRAFT);
+      statusCounts[status] += 1;
     });
-
-    let message = '☎️ Call Scripts\n\n';
-    message += summaryLines.join('\n');
-    if (manageableScripts.length > 15) {
-      message += `\n… and ${manageableScripts.length - 15} more.`;
-    }
-    if (readOnlyScripts.length > 0) {
-      message += `\n\n⚠️ ${readOnlyScripts.length} script record(s) were skipped because they are missing IDs.`;
-    }
-    message += '\n\nSelect a script below to view details.';
-
-    await ctx.reply(message);
-
-    const options = manageableScripts.map((script) => ({
-      id: script.id.toString(),
-      label: `📄 ${script.name}`
-    }));
-    options.push({ id: 'back', label: '⬅️ Back' });
-
-    const selection = await askOptionWithButtons(
+    const searchQuery = await promptText(
       conversation,
       ctx,
-      'Choose a call script to manage.',
-      options,
-      { prefix: 'call-script-select', columns: 1, formatLabel: (option) => option.label, ensureActive: safeEnsureActive }
+      '🔎 Search call scripts by name/description (or type skip to browse all).',
+      {
+        allowEmpty: false,
+        allowSkip: true,
+        parse: (value) => value.trim(),
+        ensureActive: safeEnsureActive
+      }
     );
-
-    if (!selection || !selection.id) {
-      await ctx.reply('❌ No selection received. Please try again.');
+    if (searchQuery === null) {
+      await ctx.reply('❌ Script list cancelled.');
       return;
     }
 
-    if (selection.id === 'back') {
+    const normalizedSearch = typeof searchQuery === 'string' ? searchQuery : '';
+    const filteredScripts = filterScriptsByQuery(manageableScripts, normalizedSearch);
+    if (!filteredScripts.length) {
+      await ctx.reply(`ℹ️ No call scripts matched "${normalizedSearch}".`);
       return;
     }
 
-    const scriptId = Number(selection.id);
-    if (Number.isNaN(scriptId)) {
-      await ctx.reply('❌ Invalid script selection.');
-      return;
-    }
+    const totalPages = Math.max(1, Math.ceil(filteredScripts.length / SCRIPT_SELECTION_PAGE_SIZE));
+    let page = 0;
 
-    try {
-      const script = await fetchCallScriptById(scriptId);
+    while (true) {
       safeEnsureActive();
-      if (!script) {
-        await ctx.reply('❌ Script not found.');
+      const start = page * SCRIPT_SELECTION_PAGE_SIZE;
+      const pageScripts = filteredScripts.slice(start, start + SCRIPT_SELECTION_PAGE_SIZE);
+      const options = pageScripts.map((script) => ({
+        id: String(script.id),
+        label: `📄 ${script.name} (${formatScriptStatusBadge(lifecycleMap.get(String(script.id))?.status)})`
+      }));
+
+      if (page > 0) {
+        options.push({ id: PAGE_NAV_PREV, label: '⬅️ Prev page' });
+      }
+      if (page < totalPages - 1) {
+        options.push({ id: PAGE_NAV_NEXT, label: '➡️ Next page' });
+      }
+      options.push({ id: PAGE_NAV_BACK, label: '⬅️ Back' });
+
+      const prompt = [
+        `☎️ Call scripts (${filteredScripts.length} total)`,
+        `Page ${page + 1}/${totalPages}`,
+        `Active ${statusCounts[SCRIPT_STATUS_ACTIVE]} | Review ${statusCounts[SCRIPT_STATUS_REVIEW]} | Draft ${statusCounts[SCRIPT_STATUS_DRAFT]}`,
+        normalizedSearch ? `Filter: "${normalizedSearch}"` : 'Filter: none',
+        '',
+        'Choose a script to manage.'
+      ].join('\n');
+
+      const selection = await askOptionWithButtons(
+        conversation,
+        ctx,
+        prompt,
+        options,
+        { prefix: 'call-script-select', columns: 1, formatLabel: (option) => option.label, ensureActive: safeEnsureActive }
+      );
+
+      if (!selection || !selection.id || selection.id === PAGE_NAV_BACK) {
         return;
       }
+      if (selection.id === PAGE_NAV_PREV) {
+        page = Math.max(0, page - 1);
+        continue;
+      }
+      if (selection.id === PAGE_NAV_NEXT) {
+        page = Math.min(totalPages - 1, page + 1);
+        continue;
+      }
 
-      await showCallScriptDetail(conversation, ctx, script, safeEnsureActive);
-    } catch (error) {
-      logScriptsError('Failed to load call script details', error);
-      await ctx.reply(formatScriptsApiError(error, 'Failed to load script details'));
+      const scriptId = Number(selection.id);
+      if (Number.isNaN(scriptId)) {
+        await ctx.reply('❌ Invalid script selection.');
+        continue;
+      }
+
+      try {
+        const script = await fetchCallScriptById(scriptId);
+        safeEnsureActive();
+        if (!script) {
+          await ctx.reply('❌ Script not found.');
+          continue;
+        }
+        await showCallScriptDetail(conversation, ctx, script, safeEnsureActive);
+      } catch (error) {
+        logScriptsError('Failed to load call script details', error);
+        await ctx.reply(formatScriptsApiError(error, 'Failed to load script details'));
+      }
     }
   } catch (error) {
     logScriptsError('Failed to list scripts', error);
@@ -2717,50 +4056,106 @@ function formatSmsScriptSummary(script) {
 }
 
 async function createSmsScriptFlow(conversation, ctx) {
-  const name = await promptText(
-    conversation,
-    ctx,
-    '🆕 *Script name*\nUse lowercase letters, numbers, dashes, or underscores.',
-    {
-      allowEmpty: false,
-      parse: (value) => {
-        const trimmed = value.trim().toLowerCase();
-        if (!/^[a-z0-9_-]+$/.test(trimmed)) {
-          throw new Error('Use only letters, numbers, underscores, or dashes.');
+  const draftKey = 'sms:create';
+  const draftMode = await promptDraftResumeMode(conversation, ctx, {
+    draftKey,
+    title: '📝 SMS script draft found',
+    prefix: 'sms-script-draft'
+  });
+  const draftPayload = draftMode?.draft?.payload && typeof draftMode.draft.payload === 'object'
+    ? { ...draftMode.draft.payload }
+    : {};
+  const fastResume = String(draftMode?.mode || '') === 'resume';
+  const reviewResume = String(draftMode?.mode || '') === 'review';
+
+  let name = null;
+  if (fastResume && String(draftPayload.name || '').trim()) {
+    name = String(draftPayload.name).trim().toLowerCase();
+    await ctx.reply(`↩️ Using saved script name: ${name}`);
+  } else {
+    name = await promptText(
+      conversation,
+      ctx,
+      '🆕 *Script name*\nUse lowercase letters, numbers, dashes, or underscores.',
+      {
+        allowEmpty: false,
+        defaultValue: reviewResume ? String(draftPayload.name || '') : null,
+        parse: (value) => {
+          const trimmed = value.trim().toLowerCase();
+          if (!/^[a-z0-9_-]+$/.test(trimmed)) {
+            throw new Error('Use only letters, numbers, underscores, or dashes.');
+          }
+          return trimmed;
         }
-        return trimmed;
       }
-    }
-  );
+    );
+  }
   if (!name) {
     await ctx.reply('❌ Script creation cancelled.');
     return;
   }
+  draftPayload.name = name;
+  await saveFlowDraft(ctx, draftKey, 'sms', draftPayload, 'name');
 
-  const description = await promptText(
-    conversation,
-    ctx,
-    '📝 Optional description (or type skip).',
-    { allowEmpty: true, allowSkip: true, parse: (value) => value.trim() }
-  );
-  if (description === null) {
-    await ctx.reply('❌ Script creation cancelled.');
-    return;
+  let description = null;
+  const usingSavedSmsDescription =
+    fastResume && Object.prototype.hasOwnProperty.call(draftPayload, 'description');
+  if (usingSavedSmsDescription) {
+    description = draftPayload.description;
+    await ctx.reply('↩️ Using saved description.');
+  } else {
+    description = await promptText(
+      conversation,
+      ctx,
+      '📝 Optional description (or type skip).',
+      {
+        allowEmpty: true,
+        allowSkip: true,
+        defaultValue: reviewResume ? String(draftPayload.description || '') : '',
+        parse: (value) => value.trim()
+      }
+    );
   }
+  if (description === null) {
+    if (usingSavedSmsDescription) {
+      description = undefined;
+    } else {
+      await ctx.reply('❌ Script creation cancelled.');
+      return;
+    }
+  }
+  draftPayload.description = description === undefined ? null : (description || null);
+  await saveFlowDraft(ctx, draftKey, 'sms', draftPayload, 'description');
 
-  const content = await promptText(
-    conversation,
-    ctx,
-    '💬 Provide the SMS content. You can include placeholders like {code}.',
-    { allowEmpty: false, parse: (value) => value.trim() }
-  );
+  let content = null;
+  if (fastResume && String(draftPayload.content || '').trim()) {
+    content = String(draftPayload.content || '').trim();
+    await ctx.reply('↩️ Using saved SMS content.');
+  } else {
+    content = await promptText(
+      conversation,
+      ctx,
+      '💬 Provide the SMS content. You can include placeholders like {code}.',
+      {
+        allowEmpty: false,
+        defaultValue: reviewResume ? String(draftPayload.content || '') : null,
+        parse: (value) => value.trim()
+      }
+    );
+  }
   if (!content) {
     await ctx.reply('❌ Script creation cancelled.');
     return;
   }
+  draftPayload.content = content;
+  await saveFlowDraft(ctx, draftKey, 'sms', draftPayload, 'content');
 
   const metadata = {};
-  const configurePersona = await confirm(conversation, ctx, 'Add persona guidance for this script?');
+  const configurePersona = await confirm(
+    conversation,
+    ctx,
+    'Add persona guidance for this script?'
+  );
   if (configurePersona) {
     const personaResult = await collectPersonaConfig(conversation, ctx, {}, { allowCancel: true });
     if (!personaResult) {
@@ -2772,6 +4167,8 @@ async function createSmsScriptFlow(conversation, ctx) {
       metadata.persona = overrides;
     }
   }
+  draftPayload.metadata = Object.keys(metadata).length ? metadata : null;
+  await saveFlowDraft(ctx, draftKey, 'sms', draftPayload, 'metadata');
 
   const payload = {
     name,
@@ -2798,6 +4195,7 @@ async function createSmsScriptFlow(conversation, ctx) {
       );
       finishMutationRequest(mutationGate.key, 'done');
       await storeScriptVersionSnapshot(script, 'sms', ctx);
+      await clearFlowDraft(ctx, draftKey);
       await ctx.reply(`✅ SMS script *${escapeMarkdown(script.name)}* created.`, { parse_mode: 'Markdown' });
     } catch (error) {
       finishMutationRequest(mutationGate.key, 'failed');
@@ -2815,64 +4213,103 @@ async function editSmsScriptFlow(conversation, ctx, script) {
     return;
   }
 
+  const draftKey = `sms:edit:${script.name}`;
+  const draftMode = await promptDraftResumeMode(conversation, ctx, {
+    draftKey,
+    title: `✏️ SMS edit draft found for ${script.name}`,
+    prefix: 'sms-script-edit-draft'
+  });
+  const draftPayload = draftMode?.draft?.payload && typeof draftMode.draft.payload === 'object'
+    ? draftMode.draft.payload
+    : {};
+  const savedUpdates =
+    draftPayload?.updates && typeof draftPayload.updates === 'object'
+      ? { ...draftPayload.updates }
+      : {};
+  const fastResume = String(draftMode?.mode || '') === 'resume';
+  const reviewResume = String(draftMode?.mode || '') === 'review';
   const updates = { updated_by: ctx.from.id.toString() };
 
-  const description = await promptText(
-    conversation,
-    ctx,
-    '📝 Update description (or type skip).',
-    { allowEmpty: true, allowSkip: true, defaultValue: script.description || '', parse: (value) => value.trim() }
-  );
-  if (description === null) {
-    await ctx.reply('❌ Update cancelled.');
-    return;
-  }
-  if (description !== undefined) {
-    updates.description = description.length ? description : null;
+  if (fastResume && Object.keys(savedUpdates).length) {
+    await ctx.reply('↩️ Loaded pending SMS edit draft.');
+    const applyPendingNow = await confirm(conversation, ctx, 'Apply pending updates now?');
+    if (applyPendingNow) {
+      Object.assign(updates, savedUpdates);
+    }
   }
 
-  const updateContent = await confirm(conversation, ctx, 'Update the SMS content?');
-  if (updateContent) {
-    const content = await promptText(
+  if (Object.keys(updates).length === 1) {
+    const description = await promptText(
       conversation,
       ctx,
-      '💬 Enter the new SMS content.',
-      { allowEmpty: false, defaultValue: script.content, parse: (value) => value.trim() }
+      '📝 Update description (or type skip).',
+      {
+        allowEmpty: true,
+        allowSkip: true,
+        defaultValue: reviewResume
+          ? (Object.prototype.hasOwnProperty.call(savedUpdates, 'description')
+              ? (savedUpdates.description || '')
+              : (script.description || ''))
+          : (script.description || ''),
+        parse: (value) => value.trim()
+      }
     );
-    if (!content) {
+    if (description === null) {
       await ctx.reply('❌ Update cancelled.');
       return;
     }
-    updates.content = content;
-  }
+    if (description !== undefined) {
+      updates.description = description.length ? description : null;
+      await saveFlowDraft(ctx, draftKey, 'sms', { updates }, 'description');
+    }
 
-  const adjustPersona = await confirm(conversation, ctx, 'Update persona guidance for this script?');
-  if (adjustPersona) {
-    const personaResult = await collectPersonaConfig(conversation, ctx, {}, { allowCancel: true });
-    if (!personaResult) {
-      await ctx.reply('❌ Update cancelled.');
-      return;
+    const updateContent = await confirm(conversation, ctx, 'Update the SMS content?');
+    if (updateContent) {
+      const content = await promptText(
+        conversation,
+        ctx,
+        '💬 Enter the new SMS content.',
+        { allowEmpty: false, defaultValue: reviewResume ? (savedUpdates.content || script.content) : script.content, parse: (value) => value.trim() }
+      );
+      if (!content) {
+        await ctx.reply('❌ Update cancelled.');
+        return;
+      }
+      updates.content = content;
+      await saveFlowDraft(ctx, draftKey, 'sms', { updates }, 'content');
     }
-    const overrides = toPersonaOverrides(personaResult);
-    const metadata = { ...(script.metadata || {}) };
-    if (overrides) {
-      metadata.persona = overrides;
-    } else {
-      delete metadata.persona;
-    }
-    updates.metadata = metadata;
-  } else if (script.metadata?.persona) {
-    const clearPersona = await confirm(conversation, ctx, 'Remove existing persona guidance?');
-    if (clearPersona) {
+
+    const adjustPersona = await confirm(conversation, ctx, 'Update persona guidance for this script?');
+    if (adjustPersona) {
+      const personaResult = await collectPersonaConfig(conversation, ctx, {}, { allowCancel: true });
+      if (!personaResult) {
+        await ctx.reply('❌ Update cancelled.');
+        return;
+      }
+      const overrides = toPersonaOverrides(personaResult);
       const metadata = { ...(script.metadata || {}) };
-      delete metadata.persona;
+      if (overrides) {
+        metadata.persona = overrides;
+      } else {
+        delete metadata.persona;
+      }
       updates.metadata = metadata;
+      await saveFlowDraft(ctx, draftKey, 'sms', { updates }, 'persona');
+    } else if (script.metadata?.persona) {
+      const clearPersona = await confirm(conversation, ctx, 'Remove existing persona guidance?');
+      if (clearPersona) {
+        const metadata = { ...(script.metadata || {}) };
+        delete metadata.persona;
+        updates.metadata = metadata;
+        await saveFlowDraft(ctx, draftKey, 'sms', { updates }, 'clear_persona');
+      }
     }
   }
 
   const updateKeys = Object.keys(updates).filter((key) => key !== 'updated_by');
   if (!updateKeys.length) {
     await ctx.reply('ℹ️ No changes made.');
+    await clearFlowDraft(ctx, draftKey);
     return;
   }
 
@@ -2893,6 +4330,7 @@ async function editSmsScriptFlow(conversation, ctx, script) {
         () => updateSmsScript(script.name, stripUndefined(updates), { idempotencyKey })
       );
       finishMutationRequest(mutationGate.key, 'done');
+      await clearFlowDraft(ctx, draftKey);
       await ctx.reply(`✅ SMS script *${escapeMarkdown(updated.name)}* updated.`, { parse_mode: 'Markdown' });
     } catch (error) {
       finishMutationRequest(mutationGate.key, 'failed');
@@ -3041,6 +4479,20 @@ async function showSmsScriptVersions(conversation, ctx, script) {
     if (!version || !version.payload) {
       await ctx.reply('❌ Version payload not found.');
       return;
+    }
+    const smsDiffFields = [
+      { key: 'name', label: 'Name' },
+      { key: 'description', label: 'Description' },
+      { key: 'content', label: 'Content' },
+      { key: 'metadata', label: 'Metadata' }
+    ];
+    const currentSnapshot = buildSmsScriptSnapshot(script);
+    const targetSnapshot = buildSmsScriptSnapshot(version.payload || {});
+    const diffLines = buildFieldDiffLines(currentSnapshot, targetSnapshot, smsDiffFields);
+    if (diffLines.length) {
+      await ctx.reply(`🧾 Changes in v${versionNumber}:\n${diffLines.slice(0, 12).join('\n')}`);
+    } else {
+      await ctx.reply(`ℹ️ v${versionNumber} matches the current script content.`);
     }
     const confirmRestore = await confirm(conversation, ctx, `Restore version v${versionNumber}?`);
     if (!confirmRestore) {
@@ -3199,59 +4651,96 @@ async function listSmsScriptsFlow(conversation, ctx) {
     const custom = scripts.filter((script) => !script.is_builtin);
     const builtin = scripts.filter((script) => script.is_builtin);
 
-    let message = '💬 SMS Scripts\n\n';
-    if (custom.length) {
-      message += 'Custom scripts:\n';
-      message += custom
-        .slice(0, 15)
-        .map((script) => `• ${script.name}${script.description ? ` – ${script.description}` : ''}`)
-        .join('\n');
-      message += '\n\n';
-    } else {
-      message += 'No custom scripts yet.\n\n';
-    }
-
-    if (builtin.length) {
-      message += 'Built-in scripts:\n';
-      message += builtin
-        .map((script) => `• ${script.name}${script.description ? ` – ${script.description}` : ''}`)
-        .join('\n');
-      message += '\n\n';
-    }
-
-    message += 'Select a script below to view details.';
-    await ctx.reply(message);
-
-    const options = scripts.map((script) => ({
-      id: script.name,
-      label: `${script.is_builtin ? '📦' : '📝'} ${script.name}`,
-      is_builtin: script.is_builtin
-    }));
-    options.push({ id: 'back', label: '⬅️ Back' });
-
-    const selection = await askOptionWithButtons(
+    const searchQuery = await promptText(
       conversation,
       ctx,
-      'Choose an SMS script to manage.',
-      options,
-      { prefix: 'sms-script-select', columns: 1, formatLabel: (option) => option.label }
+      '🔎 Search SMS scripts by name/description (or type skip to browse all).',
+      {
+        allowEmpty: false,
+        allowSkip: true,
+        parse: (value) => value.trim()
+      }
     );
-
-    if (!selection?.id || selection.id === 'back') {
+    if (searchQuery === null) {
+      await ctx.reply('❌ SMS script list cancelled.');
       return;
     }
 
-    try {
-      const script = await fetchSmsScriptByName(selection.id, { detailed: true });
-      if (!script) {
-        await ctx.reply('❌ Script not found.');
+    const normalizedSearch = typeof searchQuery === 'string' ? searchQuery : '';
+    const filteredScripts = filterScriptsByQuery(scripts, normalizedSearch);
+    if (!filteredScripts.length) {
+      await ctx.reply(`ℹ️ No SMS scripts matched "${normalizedSearch}".`);
+      return;
+    }
+
+    const totalPages = Math.max(1, Math.ceil(filteredScripts.length / SCRIPT_SELECTION_PAGE_SIZE));
+    let page = 0;
+
+    while (true) {
+      const start = page * SCRIPT_SELECTION_PAGE_SIZE;
+      const pageScripts = filteredScripts.slice(start, start + SCRIPT_SELECTION_PAGE_SIZE);
+      const options = pageScripts.map((script) => ({
+        id: `script:${script.name}`,
+        label: `${script.is_builtin ? '📦' : '📝'} ${script.name}`,
+        is_builtin: script.is_builtin
+      }));
+
+      if (page > 0) {
+        options.push({ id: PAGE_NAV_PREV, label: '⬅️ Prev page' });
+      }
+      if (page < totalPages - 1) {
+        options.push({ id: PAGE_NAV_NEXT, label: '➡️ Next page' });
+      }
+      options.push({ id: PAGE_NAV_BACK, label: '⬅️ Back' });
+
+      const prompt = [
+        `💬 SMS scripts (${filteredScripts.length} total)`,
+        `Page ${page + 1}/${totalPages}`,
+        `Custom: ${custom.length} | Built-in: ${builtin.length}`,
+        normalizedSearch ? `Filter: "${normalizedSearch}"` : 'Filter: none',
+        '',
+        'Choose a script to manage.'
+      ].join('\n');
+
+      const selection = await askOptionWithButtons(
+        conversation,
+        ctx,
+        prompt,
+        options,
+        { prefix: 'sms-script-select', columns: 1, formatLabel: (option) => option.label }
+      );
+
+      if (!selection?.id || selection.id === PAGE_NAV_BACK) {
         return;
       }
+      if (selection.id === PAGE_NAV_PREV) {
+        page = Math.max(0, page - 1);
+        continue;
+      }
+      if (selection.id === PAGE_NAV_NEXT) {
+        page = Math.min(totalPages - 1, page + 1);
+        continue;
+      }
 
-      await showSmsScriptDetail(conversation, ctx, script);
-    } catch (error) {
-      logScriptsError('Failed to load SMS script details', error);
-      await ctx.reply(formatScriptsApiError(error, 'Failed to load script details'));
+      const scriptName = String(selection.id).startsWith('script:')
+        ? String(selection.id).slice(7)
+        : null;
+      if (!scriptName) {
+        await ctx.reply('❌ Invalid script selection.');
+        continue;
+      }
+
+      try {
+        const script = await fetchSmsScriptByName(scriptName, { detailed: true });
+        if (!script) {
+          await ctx.reply('❌ Script not found.');
+          continue;
+        }
+        await showSmsScriptDetail(conversation, ctx, script);
+      } catch (error) {
+        logScriptsError('Failed to load SMS script details', error);
+        await ctx.reply(formatScriptsApiError(error, 'Failed to load script details'));
+      }
     }
   } catch (error) {
     logScriptsError('Failed to list SMS scripts', error);

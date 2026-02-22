@@ -645,6 +645,146 @@ function parsePaymentPolicy(value) {
   }
 }
 
+const CALL_OBJECTIVE_IDS = Object.freeze([
+  "collect_payment",
+  "verify_identity",
+  "appointment_confirm",
+  "service_recovery",
+  "general_outreach",
+]);
+
+function parseObjectiveTags(value) {
+  if (value === undefined || value === null) return [];
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => String(entry || "").trim().toLowerCase())
+      .filter(Boolean);
+  }
+  const raw = String(value || "").trim();
+  if (!raw) return [];
+  if (raw.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed
+          .map((entry) => String(entry || "").trim().toLowerCase())
+          .filter(Boolean);
+      }
+    } catch (_) {
+      return null;
+    }
+    return null;
+  }
+  return raw
+    .split(",")
+    .map((entry) => String(entry || "").trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function parseOptionalSupportFlag(value) {
+  if (value === undefined) return { provided: false, value: undefined };
+  if (value === null) return { provided: true, value: null };
+  const raw = String(value).trim().toLowerCase();
+  if (!raw || raw === "auto" || raw === "inherit") {
+    return { provided: true, value: null };
+  }
+  if (["true", "1", "yes", "on"].includes(raw)) {
+    return { provided: true, value: true };
+  }
+  if (["false", "0", "no", "off"].includes(raw)) {
+    return { provided: true, value: false };
+  }
+  if (typeof value === "boolean") {
+    return { provided: true, value };
+  }
+  if (typeof value === "number") {
+    if (value === 1) return { provided: true, value: true };
+    if (value === 0) return { provided: true, value: false };
+  }
+  return { provided: true, value: "invalid" };
+}
+
+function normalizeCallScriptObjectiveMetadata(input = {}, options = {}) {
+  const allowPartial = options.allowPartial !== false;
+  const payload = isPlainObject(input) ? input : {};
+  const errors = [];
+  const warnings = [];
+  const normalized = {};
+
+  const rawTags =
+    Object.prototype.hasOwnProperty.call(payload, "objective_tags")
+      ? payload.objective_tags
+      : payload.objectiveTags;
+  if (!allowPartial || rawTags !== undefined) {
+    const parsedTags = parseObjectiveTags(rawTags);
+    if (parsedTags === null) {
+      errors.push(
+        "objective_tags must be an array, comma-separated string, or JSON array.",
+      );
+    } else {
+      const deduped = Array.from(new Set(parsedTags)).slice(0, 12);
+      const invalid = deduped.filter(
+        (entry) => !CALL_OBJECTIVE_IDS.includes(entry),
+      );
+      if (invalid.length) {
+        errors.push(
+          `objective_tags contains unsupported values: ${invalid.join(", ")}`,
+        );
+      } else {
+        normalized.objective_tags = deduped.length ? deduped : null;
+      }
+    }
+  }
+
+  const rawSupportsPayment =
+    Object.prototype.hasOwnProperty.call(payload, "supports_payment")
+      ? payload.supports_payment
+      : payload.supportsPayment;
+  if (!allowPartial || rawSupportsPayment !== undefined) {
+    const parsed = parseOptionalSupportFlag(rawSupportsPayment);
+    if (parsed.value === "invalid") {
+      errors.push("supports_payment must be true, false, or auto.");
+    } else {
+      normalized.supports_payment = parsed.value;
+    }
+  }
+
+  const rawSupportsDigit =
+    Object.prototype.hasOwnProperty.call(payload, "supports_digit_capture")
+      ? payload.supports_digit_capture
+      : payload.supportsDigitCapture;
+  if (!allowPartial || rawSupportsDigit !== undefined) {
+    const parsed = parseOptionalSupportFlag(rawSupportsDigit);
+    if (parsed.value === "invalid") {
+      errors.push("supports_digit_capture must be true, false, or auto.");
+    } else {
+      normalized.supports_digit_capture = parsed.value;
+    }
+  }
+
+  const tags = Array.isArray(normalized.objective_tags)
+    ? normalized.objective_tags
+    : [];
+  if (
+    tags.includes("collect_payment") &&
+    normalized.supports_payment === false
+  ) {
+    warnings.push(
+      "objective_tags includes collect_payment while supports_payment is false.",
+    );
+  }
+  if (
+    tags.includes("verify_identity") &&
+    normalized.supports_digit_capture === false
+  ) {
+    warnings.push(
+      "objective_tags includes verify_identity while supports_digit_capture is false.",
+    );
+  }
+
+  return { normalized, errors, warnings };
+}
+
 function normalizeScriptTemplateRecord(template = null) {
   if (!template || typeof template !== "object") return template;
   const normalized = { ...template };
@@ -653,6 +793,20 @@ function normalizeScriptTemplateRecord(template = null) {
     Number.isFinite(parsedVersion) && parsedVersion > 0
       ? Math.max(1, Math.floor(parsedVersion))
       : 1;
+  const parsedObjectiveTags = parseObjectiveTags(normalized.objective_tags);
+  normalized.objective_tags = Array.isArray(parsedObjectiveTags)
+    ? Array.from(new Set(parsedObjectiveTags)).filter((entry) =>
+        CALL_OBJECTIVE_IDS.includes(entry),
+      )
+    : [];
+  normalized.supports_payment = normalizeBooleanFlag(
+    normalized.supports_payment,
+    null,
+  );
+  normalized.supports_digit_capture = normalizeBooleanFlag(
+    normalized.supports_digit_capture,
+    null,
+  );
   normalized.payment_policy = parsePaymentPolicy(normalized.payment_policy);
   return normalized;
 }
@@ -10973,11 +11127,22 @@ app.post("/api/call-scripts", requireAdminToken, async (req, res) => {
           ? paymentPolicy.normalized
           : null;
     }
+    const objectiveMetadata = normalizeCallScriptObjectiveMetadata(requestBody, {
+      allowPartial: false,
+    });
+    if (objectiveMetadata.errors.length) {
+      failCallScriptMutationIdempotency(idempotency);
+      return res.status(400).json({
+        success: false,
+        error: objectiveMetadata.errors.join(" "),
+      });
+    }
     const id = await db.createCallTemplate({
       ...requestBody,
       name: normalizedName,
       first_message: firstMessage,
       ...paymentSettings.normalized,
+      ...objectiveMetadata.normalized,
       payment_policy: normalizedPaymentPolicy,
     });
     const script = normalizeScriptTemplateRecord(
@@ -10986,7 +11151,11 @@ app.post("/api/call-scripts", requireAdminToken, async (req, res) => {
     const responseBody = {
       success: true,
       script,
-      warnings: [...paymentSettings.warnings, ...paymentPolicyWarnings],
+      warnings: [
+        ...paymentSettings.warnings,
+        ...paymentPolicyWarnings,
+        ...objectiveMetadata.warnings,
+      ],
     };
     completeCallScriptMutationIdempotency(idempotency, 201, responseBody);
     res.status(201).json(responseBody);
@@ -11113,6 +11282,18 @@ app.put("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
           : null;
       paymentWarnings = [...paymentWarnings, ...paymentPolicy.warnings];
     }
+    const objectiveMetadata = normalizeCallScriptObjectiveMetadata(requestBody, {
+      allowPartial: true,
+    });
+    if (objectiveMetadata.errors.length) {
+      failCallScriptMutationIdempotency(idempotency);
+      return res.status(400).json({
+        success: false,
+        error: objectiveMetadata.errors.join(" "),
+      });
+    }
+    Object.assign(updates, objectiveMetadata.normalized);
+    paymentWarnings = [...paymentWarnings, ...objectiveMetadata.warnings];
     const updated = await db.updateCallTemplate(scriptId, updates);
     if (!updated) {
       failCallScriptMutationIdempotency(idempotency);
@@ -11240,6 +11421,21 @@ app.post("/api/call-scripts/:id/clone", requireAdminToken, async (req, res) => {
       first_message: existing.first_message,
       business_id: existing.business_id || null,
       voice_model: existing.voice_model || null,
+      objective_tags: Array.isArray(existing.objective_tags)
+        ? existing.objective_tags
+        : null,
+      supports_payment:
+        existing.supports_payment === true
+          ? true
+          : existing.supports_payment === false
+            ? false
+            : null,
+      supports_digit_capture:
+        existing.supports_digit_capture === true
+          ? true
+          : existing.supports_digit_capture === false
+            ? false
+            : null,
       requires_otp: existing.requires_otp ? 1 : 0,
       default_profile: existing.default_profile || null,
       expected_length:

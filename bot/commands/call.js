@@ -1,6 +1,11 @@
 const config = require('../config');
 const httpClient = require('../utils/httpClient');
-const { getUser } = require('../db/db');
+const {
+  getUser,
+  listScriptLifecycle,
+  getScriptLifecycle,
+  getScriptVersion
+} = require('../db/db');
 const {
   findBusinessOption,
   askOptionWithButtons,
@@ -37,6 +42,371 @@ const { buildCallbackData } = require('../utils/actions');
 
 const scriptsApiBase = config.scriptsApiUrl.replace(/\/+$/, '');
 const DEFAULT_FIRST_MESSAGE = 'Hello! This is an automated call. How can I help you today?';
+const SCRIPT_STATUS_ACTIVE = 'active';
+const DEFAULT_OBJECTIVE_ID = 'general_outreach';
+const OBJECTIVE_OPTIONS = [
+  {
+    id: 'collect_payment',
+    label: 'Collect Payment',
+    emoji: '💳',
+    summary: 'Collect outstanding balance with payment-capable scripts.',
+    defaultPurpose: 'payment',
+    recommendedBusinessId: 'finance',
+    recommendedEmotion: 'neutral',
+    recommendedUrgency: 'high',
+    recommendedTechnicalLevel: 'general',
+    requiresPayment: true,
+    keywords: ['payment', 'invoice', 'billing', 'charge', 'card']
+  },
+  {
+    id: 'verify_identity',
+    label: 'Verify Identity',
+    emoji: '🛡️',
+    summary: 'Guide OTP/security verification flows.',
+    defaultPurpose: 'security',
+    recommendedBusinessId: 'finance',
+    recommendedEmotion: 'urgent',
+    recommendedUrgency: 'high',
+    recommendedTechnicalLevel: 'general',
+    requiresDigitFlow: true,
+    keywords: ['verify', 'verification', 'otp', 'security', 'fraud']
+  },
+  {
+    id: 'appointment_confirm',
+    label: 'Appointment Confirm',
+    emoji: '📅',
+    summary: 'Confirm or remind upcoming appointments.',
+    defaultPurpose: 'appointment',
+    recommendedBusinessId: 'healthcare',
+    recommendedEmotion: 'positive',
+    recommendedUrgency: 'normal',
+    recommendedTechnicalLevel: 'general',
+    keywords: ['appointment', 'schedule', 'visit', 'booking', 'reservation']
+  },
+  {
+    id: 'service_recovery',
+    label: 'Service Recovery',
+    emoji: '🧯',
+    summary: 'Handle complaints and win-back conversations.',
+    defaultPurpose: 'recovery',
+    recommendedBusinessId: 'hospitality',
+    recommendedEmotion: 'empathetic',
+    recommendedUrgency: 'normal',
+    recommendedTechnicalLevel: 'general',
+    keywords: ['recovery', 'follow-up', 'support', 'issue', 'complaint']
+  },
+  {
+    id: DEFAULT_OBJECTIVE_ID,
+    label: 'General Outreach',
+    emoji: '📞',
+    summary: 'Use standard script selection with broad defaults.',
+    defaultPurpose: config.defaultPurpose || 'general',
+    recommendedBusinessId: config.defaultBusinessId || 'general',
+    recommendedEmotion: 'neutral',
+    recommendedUrgency: 'normal',
+    recommendedTechnicalLevel: 'general',
+    keywords: []
+  }
+];
+
+function getObjectiveById(id) {
+  return OBJECTIVE_OPTIONS.find((objective) => objective.id === id) || OBJECTIVE_OPTIONS.find((objective) => objective.id === DEFAULT_OBJECTIVE_ID);
+}
+
+function getScriptContextText(script) {
+  const personaConfig = script?.persona_config && typeof script.persona_config === 'object'
+    ? script.persona_config
+    : {};
+  return [
+    script?.name,
+    script?.description,
+    script?.business_id,
+    script?.purpose,
+    personaConfig.purpose,
+    personaConfig.emotion,
+    personaConfig.urgency,
+    script?.prompt,
+    script?.first_message
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+}
+
+function normalizeObjectiveTags(value) {
+  if (value === undefined || value === null) return [];
+  let list = [];
+  if (Array.isArray(value)) {
+    list = value;
+  } else if (typeof value === 'string') {
+    const raw = String(value || '').trim();
+    if (!raw) return [];
+    if (raw.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          list = parsed;
+        }
+      } catch (_) {
+        return [];
+      }
+    } else {
+      list = raw.split(',');
+    }
+  }
+  const known = new Set(OBJECTIVE_OPTIONS.map((entry) => entry.id));
+  return Array.from(
+    new Set(
+      list
+        .map((entry) => String(entry || '').trim().toLowerCase())
+        .filter((entry) => known.has(entry))
+    )
+  );
+}
+
+function normalizeSupportFlag(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (value === true || value === 1) return true;
+  if (value === false || value === 0) return false;
+  const raw = String(value).trim().toLowerCase();
+  if (!raw || raw === 'auto' || raw === 'inherit') return null;
+  if (['1', 'true', 'yes', 'on'].includes(raw)) return true;
+  if (['0', 'false', 'no', 'off'].includes(raw)) return false;
+  return null;
+}
+
+function hasPaymentCapability(script) {
+  const explicit = normalizeSupportFlag(script?.supports_payment);
+  if (explicit !== null) {
+    return explicit;
+  }
+  const enabled =
+    script?.payment_enabled === true ||
+    script?.payment_enabled === 1 ||
+    String(script?.payment_enabled || '').toLowerCase() === 'true';
+  if (enabled) {
+    return true;
+  }
+  if (script?.payment_policy && typeof script.payment_policy === 'object') {
+    return true;
+  }
+  const text = getScriptContextText(script);
+  return /(payment|billing|invoice|charge|card)/.test(text);
+}
+
+function hasDigitFlowCapability(script) {
+  const explicit = normalizeSupportFlag(script?.supports_digit_capture);
+  if (explicit !== null) {
+    return explicit;
+  }
+  const requiresOtp =
+    script?.requires_otp === true ||
+    script?.requires_otp === 1 ||
+    String(script?.requires_otp || '').toLowerCase() === 'true';
+  if (requiresOtp) {
+    return true;
+  }
+  if (script?.default_profile && String(script.default_profile).trim()) {
+    return true;
+  }
+  if (Number.isFinite(Number(script?.expected_length)) && Number(script.expected_length) > 0) {
+    return true;
+  }
+  const text = getScriptContextText(script);
+  return /(otp|one[ -]?time|verification|verify|code|pin|digits?)/.test(text);
+}
+
+function scoreScriptForObjective(script, objective) {
+  if (!script || !objective) {
+    return 0;
+  }
+  if (objective.id === DEFAULT_OBJECTIVE_ID) {
+    return 0;
+  }
+  const text = getScriptContextText(script);
+  const personaConfig = script.persona_config && typeof script.persona_config === 'object'
+    ? script.persona_config
+    : {};
+  const objectiveTags = normalizeObjectiveTags(script.objective_tags);
+  let score = 0;
+
+  if (objective.requiresPayment && hasPaymentCapability(script)) {
+    score += 100;
+  }
+  if (objective.requiresDigitFlow && hasDigitFlowCapability(script)) {
+    score += 100;
+  }
+  if (objective.defaultPurpose) {
+    const scriptPurpose = String(personaConfig.purpose || script.purpose || '').toLowerCase();
+    if (scriptPurpose && scriptPurpose === String(objective.defaultPurpose).toLowerCase()) {
+      score += 40;
+    }
+  }
+  if (objective.recommendedBusinessId) {
+    const scriptBusiness = String(script.business_id || '').toLowerCase();
+    if (scriptBusiness && scriptBusiness === String(objective.recommendedBusinessId).toLowerCase()) {
+      score += 25;
+    }
+  }
+  if (objectiveTags.length) {
+    if (objectiveTags.includes(objective.id)) {
+      score += 70;
+    } else if (objective.id !== DEFAULT_OBJECTIVE_ID) {
+      score -= 20;
+    }
+  }
+  (objective.keywords || []).forEach((keyword) => {
+    if (text.includes(String(keyword).toLowerCase())) {
+      score += 10;
+    }
+  });
+
+  return score;
+}
+
+async function selectCallObjective(conversation, ctx, ensureActive) {
+  const options = OBJECTIVE_OPTIONS.map((objective) => ({
+    id: objective.id,
+    label: `${objective.emoji || '🎯'} ${objective.label}`
+  }));
+  options.push({ id: 'back', label: '⬅️ Back' });
+
+  const selection = await askOptionWithButtons(
+    conversation,
+    ctx,
+    '🎯 *Call Objective*\nChoose the outcome you want. The bot will optimize script/persona defaults automatically.',
+    options,
+    { prefix: 'call-objective', columns: 1 }
+  );
+  ensureActive();
+
+  if (!selection || selection.id === 'back') {
+    return { status: 'back' };
+  }
+  const objective = getObjectiveById(selection.id);
+  if (!objective) {
+    return { status: 'error' };
+  }
+
+  const objectiveSummary = [
+    buildLine('🎯', 'Objective', escapeMarkdown(objective.label)),
+    buildLine('🧭', 'Plan', escapeMarkdown(objective.summary || 'Guided configuration')),
+    objective.requiresPayment ? buildLine('✅', 'Requirement', 'Payment-ready script') : null,
+    objective.requiresDigitFlow ? buildLine('✅', 'Requirement', 'Digit-flow script') : null
+  ].filter(Boolean);
+  await ctx.reply(section('Objective Selected', objectiveSummary), { parse_mode: 'Markdown' });
+
+  return {
+    status: 'ok',
+    objective
+  };
+}
+
+function buildObjectivePreflightReport(payload = {}, objective = null, configuration = null) {
+  const targetObjective = objective || getObjectiveById(DEFAULT_OBJECTIVE_ID);
+  const blockers = [];
+  const warnings = [];
+  const objectiveTags = normalizeObjectiveTags(
+    configuration?.meta?.objectiveTags
+      || configuration?.payloadUpdates?.objective_tags
+      || payload?.objective_tags
+  );
+  const supportsPayment = hasPaymentCapability({
+    ...configuration?.payloadUpdates,
+    ...payload,
+    supports_payment: configuration?.meta?.supportsPayment
+  });
+  const supportsDigitCapture = hasDigitFlowCapability({
+    ...configuration?.payloadUpdates,
+    ...payload,
+    supports_digit_capture: configuration?.meta?.supportsDigitCapture
+  });
+
+  if (objectiveTags.length && !objectiveTags.includes(targetObjective.id)) {
+    warnings.push(`Script objective tags do not explicitly include ${targetObjective.label}.`);
+  }
+
+  if (targetObjective.requiresPayment) {
+    if (!payload.script_id) {
+      blockers.push('Payment objective requires selecting a saved script.');
+    }
+    if (!supportsPayment || payload.payment_enabled !== true) {
+      blockers.push('Payment objective requires payment-enabled script settings.');
+    }
+    if (!String(payload.payment_connector || '').trim()) {
+      blockers.push('Payment connector is missing.');
+    }
+    if (!String(payload.payment_amount || '').trim()) {
+      warnings.push('Payment amount is not preset; amount must be captured during call.');
+    }
+  }
+
+  if (targetObjective.requiresDigitFlow) {
+    if (!payload.script_id) {
+      blockers.push('Verification objective requires selecting a saved script.');
+    }
+    if (!supportsDigitCapture) {
+      blockers.push('Verification objective requires digit capture capability.');
+    }
+    const expectedLength = Number(payload.expected_length);
+    if (
+      !payload.default_profile
+      && !(Number.isFinite(expectedLength) && expectedLength > 0)
+      && payload.requires_otp !== true
+    ) {
+      warnings.push('No explicit digit profile/length detected; runtime will infer from prompts.');
+    }
+  }
+
+  if (!String(payload.first_message || '').trim()) {
+    blockers.push('First message is missing.');
+  }
+
+  const readinessScore = Math.max(
+    0,
+    Math.min(100, 100 - blockers.length * 20 - warnings.length * 7)
+  );
+
+  return {
+    readinessScore,
+    blockers,
+    warnings,
+    objectiveLabel: targetObjective.label
+  };
+}
+
+function formatObjectivePreflight(report = {}) {
+  const lines = [
+    `🧪 Objective preflight: ${report.readinessScore || 0}/100`,
+    `🎯 Objective: ${report.objectiveLabel || 'General Outreach'}`
+  ];
+  if (Array.isArray(report.blockers) && report.blockers.length) {
+    lines.push('Blockers:');
+    report.blockers.forEach((item) => lines.push(`• ${item}`));
+  } else {
+    lines.push('✅ No blockers detected.');
+  }
+  if (Array.isArray(report.warnings) && report.warnings.length) {
+    lines.push('Warnings:');
+    report.warnings.slice(0, 6).forEach((item) => lines.push(`• ${item}`));
+  }
+  return lines.join('\n');
+}
+
+async function confirmProceedAfterPreflight(conversation, ctx, ensureActive) {
+  const choice = await askOptionWithButtons(
+    conversation,
+    ctx,
+    'Proceed with this call setup?',
+    [
+      { id: 'yes', label: '✅ Proceed' },
+      { id: 'no', label: '⬅️ Review setup' }
+    ],
+    { prefix: 'call-preflight-confirm', columns: 2 }
+  );
+  ensureActive();
+  return Boolean(choice && choice.id === 'yes');
+}
 
 function isValidPhoneNumber(number) {
   const e164Regex = /^\+[1-9]\d{1,14}$/;
@@ -111,7 +481,44 @@ async function fetchCallScriptById(id) {
   return data.script;
 }
 
-async function selectCustomPersonaFallback(conversation, ctx, ensureActive) {
+function normalizeScriptStatus(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (['draft', 'review', 'active', 'archived'].includes(normalized)) {
+    return normalized;
+  }
+  return 'draft';
+}
+
+function formatScriptStatusLabel(status) {
+  const normalized = normalizeScriptStatus(status);
+  if (normalized === 'active') return '🟢 active';
+  if (normalized === 'review') return '🟡 review';
+  if (normalized === 'archived') return '⚫ archived';
+  return '🟠 draft';
+}
+
+async function listCallLifecycleMap() {
+  try {
+    const rows = await listScriptLifecycle('call');
+    const map = new Map();
+    (rows || []).forEach((row) => {
+      if (!row?.script_id) return;
+      map.set(String(row.script_id), row);
+    });
+    return map;
+  } catch (error) {
+    console.warn('Failed to load script lifecycle state:', error?.message || error);
+    return new Map();
+  }
+}
+
+async function selectCustomPersonaFallback(conversation, ctx, ensureActive, objective) {
+  if (objective?.requiresPayment || objective?.requiresDigitFlow) {
+    const requirement = objective?.requiresPayment ? 'payment-capable' : 'digit-flow capable';
+    await ctx.reply(`❌ ${objective?.label || 'This'} objective requires a ${requirement} script. Custom setup is disabled for this objective.`);
+    return { status: 'objective_blocked' };
+  }
+
   let businessOptions = [];
   try {
     businessOptions = await getBusinessOptions();
@@ -121,12 +528,20 @@ async function selectCustomPersonaFallback(conversation, ctx, ensureActive) {
     return { status: 'error' };
   }
 
+  const recommendedBusinessId = String(objective?.recommendedBusinessId || '').toLowerCase();
   const personaChoices = (Array.isArray(businessOptions) ? businessOptions : [])
     .filter((option) => option && option.id)
     .map((option) => ({
       id: option.id,
-      label: option.custom ? '✍️ Custom Persona' : `${option.emoji || '🎭'} ${option.label}`
-    }));
+      label: option.custom
+        ? '✍️ Custom Persona'
+        : `${option.emoji || '🎭'} ${option.label}${recommendedBusinessId && String(option.id).toLowerCase() === recommendedBusinessId ? ' ⭐' : ''}`
+    }))
+    .sort((a, b) => {
+      const aRecommended = recommendedBusinessId && String(a.id).toLowerCase() === recommendedBusinessId ? 1 : 0;
+      const bRecommended = recommendedBusinessId && String(b.id).toLowerCase() === recommendedBusinessId ? 1 : 0;
+      return bRecommended - aRecommended;
+    });
 
   if (!personaChoices.length) {
     personaChoices.push({ id: 'custom', label: '✍️ Custom Persona' });
@@ -136,7 +551,7 @@ async function selectCustomPersonaFallback(conversation, ctx, ensureActive) {
   const personaSelection = await askOptionWithButtons(
     conversation,
     ctx,
-    '🎭 *Custom Call Setup*\nChoose a persona profile or use fully custom mode.',
+    `🎭 *Custom Call Setup*\nObjective: *${escapeMarkdown(objective?.label || 'General Outreach')}*\nChoose a persona profile or use fully custom mode.`,
     personaChoices,
     { prefix: 'call-persona', columns: 1 }
   );
@@ -158,26 +573,30 @@ async function selectCustomPersonaFallback(conversation, ctx, ensureActive) {
   if (!selectedBusiness.custom) {
     payloadUpdates.business_id = selectedBusiness.id;
   } else {
-    payloadUpdates.business_id = config.defaultBusinessId;
+    payloadUpdates.business_id = objective?.recommendedBusinessId || config.defaultBusinessId;
   }
 
   const summary = ['Script: Custom setup'];
+  if (objective?.label) {
+    summary.push(`Objective: ${objective.label}`);
+  }
   summary.push(`Persona: ${selectedBusiness.label || 'Custom Persona'}`);
 
-  let recommendedEmotion = selectedBusiness.defaultEmotion || 'neutral';
-  let recommendedUrgency = selectedBusiness.defaultUrgency || 'normal';
-  let recommendedTech = selectedBusiness.defaultTechnicalLevel || 'general';
+  let recommendedEmotion = selectedBusiness.defaultEmotion || objective?.recommendedEmotion || 'neutral';
+  let recommendedUrgency = selectedBusiness.defaultUrgency || objective?.recommendedUrgency || 'normal';
+  let recommendedTech = selectedBusiness.defaultTechnicalLevel || objective?.recommendedTechnicalLevel || 'general';
 
   const availablePurposes = Array.isArray(selectedBusiness.purposes) ? selectedBusiness.purposes : [];
   if (!selectedBusiness.custom && availablePurposes.length > 0) {
     let selectedPurpose =
+      availablePurposes.find((item) => item.id === objective?.defaultPurpose) ||
       availablePurposes.find((item) => item.id === selectedBusiness.defaultPurpose) ||
       availablePurposes[0];
     if (availablePurposes.length > 1) {
       const selectedPurposeChoice = await askOptionWithButtons(
         conversation,
         ctx,
-        '🎯 *Choose call purpose:*\nThis helps tune the voice behavior.',
+        `🎯 *Choose call purpose:*\nRecommended: *${escapeMarkdown(selectedPurpose?.label || selectedPurpose?.id || objective?.defaultPurpose || 'General')}*`,
         availablePurposes.map((purpose) => ({
           id: purpose.id,
           label: `${purpose.emoji || '•'} ${purpose.label || purpose.id}`
@@ -197,6 +616,9 @@ async function selectCustomPersonaFallback(conversation, ctx, ensureActive) {
       recommendedUrgency = selectedPurpose.defaultUrgency || recommendedUrgency;
       recommendedTech = selectedPurpose.defaultTechnicalLevel || recommendedTech;
     }
+  } else if (selectedBusiness.custom && objective?.defaultPurpose) {
+    payloadUpdates.purpose = objective.defaultPurpose;
+    summary.push(`Purpose: ${objective.defaultPurpose}`);
   }
 
   const toneSelection = await askOptionWithButtons(
@@ -211,6 +633,9 @@ async function selectCustomPersonaFallback(conversation, ctx, ensureActive) {
     payloadUpdates.emotion = toneSelection.id;
     summary.push(`Tone: ${toneSelection.label}`);
   } else if (toneSelection?.label) {
+    if (objective && objective.id !== DEFAULT_OBJECTIVE_ID && recommendedEmotion) {
+      payloadUpdates.emotion = recommendedEmotion;
+    }
     summary.push(`Tone: ${toneSelection.label} (${getOptionLabel(MOOD_OPTIONS, recommendedEmotion)})`);
   }
 
@@ -226,6 +651,9 @@ async function selectCustomPersonaFallback(conversation, ctx, ensureActive) {
     payloadUpdates.urgency = urgencySelection.id;
     summary.push(`Urgency: ${urgencySelection.label}`);
   } else if (urgencySelection?.label) {
+    if (objective && objective.id !== DEFAULT_OBJECTIVE_ID && recommendedUrgency) {
+      payloadUpdates.urgency = recommendedUrgency;
+    }
     summary.push(`Urgency: ${urgencySelection.label} (${getOptionLabel(URGENCY_OPTIONS, recommendedUrgency)})`);
   }
 
@@ -241,6 +669,9 @@ async function selectCustomPersonaFallback(conversation, ctx, ensureActive) {
     payloadUpdates.technical_level = techSelection.id;
     summary.push(`Technical level: ${techSelection.label}`);
   } else if (techSelection?.label) {
+    if (objective && objective.id !== DEFAULT_OBJECTIVE_ID && recommendedTech) {
+      payloadUpdates.technical_level = recommendedTech;
+    }
     summary.push(`Technical level: ${techSelection.label} (${getOptionLabel(TECH_LEVEL_OPTIONS, recommendedTech)})`);
   }
 
@@ -270,29 +701,105 @@ async function selectCustomPersonaFallback(conversation, ctx, ensureActive) {
       scriptName: 'Custom setup',
       scriptDescription: 'Manual persona and prompt configuration',
       personaLabel: selectedBusiness.label || 'Custom Persona',
-      scriptVoiceModel: null
+      scriptVoiceModel: null,
+      objectiveTags: objective?.id ? [objective.id] : [],
+      supportsPayment: false,
+      supportsDigitCapture: false
     }
   };
 }
 
-async function selectCallScript(conversation, ctx, ensureActive) {
+async function selectCallScript(conversation, ctx, ensureActive, objective) {
+  const objectiveTarget = objective || getObjectiveById(DEFAULT_OBJECTIVE_ID);
   let scripts = [];
+  let lifecycleMap = new Map();
   try {
     scripts = await fetchCallScripts();
+    lifecycleMap = await listCallLifecycleMap();
     ensureActive();
   } catch (error) {
-    await ctx.reply(httpClient.getUserMessage(error, 'Unable to load call scripts. You can still continue with custom setup.'));
+    const fallbackMessage = objectiveTarget.requiresPayment
+      ? 'Unable to load call scripts. Payment objective requires script selection, so please retry.'
+      : 'Unable to load call scripts. You can still continue with custom setup.';
+    await ctx.reply(httpClient.getUserMessage(error, fallbackMessage));
     scripts = [];
+    lifecycleMap = new Map();
   }
 
-  const options = scripts.map((script) => ({ id: script.id.toString(), label: `📄 ${script.name}` }));
-  options.push({ id: 'custom', label: '✍️ Custom persona setup' });
+  const scriptsWithLifecycle = (Array.isArray(scripts) ? scripts : [])
+    .filter((script) => script && Number.isFinite(Number(script.id)))
+    .map((script) => {
+      const lifecycle = lifecycleMap.get(String(script.id)) || null;
+      const status = normalizeScriptStatus(lifecycle?.status);
+      return {
+        ...script,
+        _lifecycle: lifecycle,
+        _status: status
+      };
+    });
+  const activeScripts = scriptsWithLifecycle.filter((script) => script._status === SCRIPT_STATUS_ACTIVE);
+  const selectableScripts = activeScripts.length ? activeScripts : scriptsWithLifecycle;
+  if (!activeScripts.length && scriptsWithLifecycle.length) {
+    await ctx.reply('⚠️ No active scripts found. Showing all scripts as fallback.');
+  }
+
+  const scoredScripts = selectableScripts.map((script) => ({
+    ...script,
+    _objectiveScore: scoreScriptForObjective(script, objectiveTarget)
+  }));
+
+  let objectiveScripts = scoredScripts;
+  if (objectiveTarget.id !== DEFAULT_OBJECTIVE_ID) {
+    if (objectiveTarget.requiresPayment) {
+      objectiveScripts = scoredScripts.filter((script) => hasPaymentCapability(script));
+    } else if (objectiveTarget.requiresDigitFlow) {
+      objectiveScripts = scoredScripts.filter((script) => hasDigitFlowCapability(script));
+    } else {
+      const matched = scoredScripts.filter((script) => script._objectiveScore > 0);
+      if (matched.length) {
+        objectiveScripts = matched;
+      }
+    }
+  }
+
+  if (objectiveTarget.requiresPayment && !objectiveScripts.length) {
+    await ctx.reply('❌ No payment-ready scripts were found for this objective. Create/activate one in /scripts and try again.');
+    return { status: 'objective_blocked' };
+  }
+  if (objectiveTarget.requiresDigitFlow && !objectiveScripts.length) {
+    await ctx.reply('❌ No digit-flow scripts were found for this objective. Create/activate one in /scripts and try again.');
+    return { status: 'objective_blocked' };
+  }
+
+  if (!objectiveScripts.length) {
+    objectiveScripts = scoredScripts;
+  } else if (objectiveScripts.length !== scoredScripts.length) {
+    await ctx.reply(`✅ Showing scripts matched to objective: *${escapeMarkdown(objectiveTarget.label)}*`, {
+      parse_mode: 'Markdown'
+    });
+  }
+
+  objectiveScripts.sort((a, b) => {
+    const scoreDelta = Number(b._objectiveScore || 0) - Number(a._objectiveScore || 0);
+    if (scoreDelta !== 0) {
+      return scoreDelta;
+    }
+    return String(a.name || '').localeCompare(String(b.name || ''));
+  });
+
+  const options = objectiveScripts.map((script) => ({
+    id: script.id.toString(),
+    label: `📄 ${script.name}${activeScripts.length ? '' : ` (${formatScriptStatusLabel(script._status)})`}${script._objectiveScore > 0 ? ' ⭐' : ''}`
+  }));
+  if (!objectiveTarget.requiresPayment && !objectiveTarget.requiresDigitFlow) {
+    options.push({ id: 'custom', label: '✍️ Custom persona setup' });
+  }
   options.push({ id: 'back', label: '⬅️ Back' });
 
   const selection = await askOptionWithButtons(
     conversation,
     ctx,
-    '📚 *Call Setup*\nChoose a script or continue with custom persona setup.',
+    `📚 *Call Setup*\nObjective: *${escapeMarkdown(objectiveTarget.label)}*\nChoose a script${objectiveTarget.requiresPayment ? ' (payment-ready only).' : objectiveTarget.requiresDigitFlow ? ' (digit-flow capable only).' : ' or continue with custom persona setup.'}`,
     options,
     { prefix: 'call-script', columns: 1 }
   );
@@ -302,7 +809,7 @@ async function selectCallScript(conversation, ctx, ensureActive) {
     return { status: 'back' };
   }
   if (selection.id === 'custom') {
-    return selectCustomPersonaFallback(conversation, ctx, ensureActive);
+    return selectCustomPersonaFallback(conversation, ctx, ensureActive, objectiveTarget);
   }
 
   const scriptId = Number(selection.id);
@@ -325,14 +832,55 @@ async function selectCallScript(conversation, ctx, ensureActive) {
     return { status: 'error' };
   }
 
-  if (!script.first_message) {
+  let lifecycle = lifecycleMap.get(String(script.id)) || null;
+  if (!lifecycle) {
+    try {
+      lifecycle = await getScriptLifecycle('call', String(script.id));
+    } catch (_) {
+      lifecycle = null;
+    }
+  }
+  const lifecycleStatus = normalizeScriptStatus(lifecycle?.status);
+
+  let runtimeScript = { ...script };
+  let runtimeVersion = Number.isFinite(Number(script.version)) && Number(script.version) > 0
+    ? Math.max(1, Math.floor(Number(script.version)))
+    : 1;
+  const pinnedVersion = Number.isFinite(Number(lifecycle?.pinned_version)) && Number(lifecycle.pinned_version) > 0
+    ? Math.max(1, Math.floor(Number(lifecycle.pinned_version)))
+    : null;
+  if (pinnedVersion) {
+    try {
+      const snapshot = await getScriptVersion(script.id, 'call', pinnedVersion);
+      if (snapshot?.payload && typeof snapshot.payload === 'object') {
+        runtimeScript = {
+          ...script,
+          ...snapshot.payload,
+          id: script.id,
+          name: script.name,
+          description: script.description
+        };
+        runtimeVersion = pinnedVersion;
+        await ctx.reply(`📌 Using pinned runtime version v${pinnedVersion}.`);
+      } else {
+        runtimeVersion = pinnedVersion;
+        await ctx.reply(`⚠️ Pinned version v${pinnedVersion} not found locally. Using current API script.`);
+      }
+    } catch (error) {
+      console.warn('Pinned script lookup failed:', error?.message || error);
+      runtimeVersion = pinnedVersion;
+      await ctx.reply(`⚠️ Failed to load pinned version v${pinnedVersion}. Using current API script.`);
+    }
+  }
+
+  if (!runtimeScript.first_message) {
     await ctx.reply('⚠️ This script does not define a first message. Please edit it before using.');
     return { status: 'error' };
   }
 
   const placeholderSet = new Set();
-  extractScriptVariables(script.prompt || '').forEach((token) => placeholderSet.add(token));
-  extractScriptVariables(script.first_message || '').forEach((token) => placeholderSet.add(token));
+  extractScriptVariables(runtimeScript.prompt || '').forEach((token) => placeholderSet.add(token));
+  extractScriptVariables(runtimeScript.first_message || '').forEach((token) => placeholderSet.add(token));
 
   const placeholderValues = {};
   if (placeholderSet.size > 0) {
@@ -340,80 +888,96 @@ async function selectCallScript(conversation, ctx, ensureActive) {
     Object.assign(placeholderValues, await collectPlaceholderValues(conversation, ctx, Array.from(placeholderSet), ensureActive));
   }
 
-  const filledPrompt = script.prompt ? replacePlaceholders(script.prompt, placeholderValues) : undefined;
-  const filledFirstMessage = replacePlaceholders(script.first_message, placeholderValues);
+  const filledPrompt = runtimeScript.prompt ? replacePlaceholders(runtimeScript.prompt, placeholderValues) : undefined;
+  const filledFirstMessage = replacePlaceholders(runtimeScript.first_message, placeholderValues);
 
   const payloadUpdates = {
     channel: 'voice',
-    business_id: script.business_id || config.defaultBusinessId,
+    business_id: runtimeScript.business_id || config.defaultBusinessId,
     prompt: filledPrompt,
     first_message: filledFirstMessage,
-    voice_model: script.voice_model || config.defaultVoiceModel,
+    voice_model: runtimeScript.voice_model || config.defaultVoiceModel,
     script: script.name,
     script_id: script.id
   };
-  if (Number.isFinite(Number(script.version)) && Number(script.version) > 0) {
-    payloadUpdates.script_version = Math.max(1, Math.floor(Number(script.version)));
+  if (Number.isFinite(Number(runtimeVersion)) && Number(runtimeVersion) > 0) {
+    payloadUpdates.script_version = Math.max(1, Math.floor(Number(runtimeVersion)));
   }
   const summary = [`Script: ${script.name}`];
+  if (objectiveTarget?.label) {
+    summary.push(`Objective: ${objectiveTarget.label}`);
+  }
   if (payloadUpdates.script_version) {
     summary.push(`Version: v${payloadUpdates.script_version}`);
   }
+  summary.push(`Lifecycle: ${formatScriptStatusLabel(lifecycleStatus)}`);
+  if (lifecycleStatus !== SCRIPT_STATUS_ACTIVE) {
+    summary.push('Status note: using fallback non-active script.');
+  }
 
   const scriptPaymentEnabled =
-    script.payment_enabled === true ||
-    script.payment_enabled === 1 ||
-    String(script.payment_enabled || '').toLowerCase() === 'true';
+    runtimeScript.payment_enabled === true ||
+    runtimeScript.payment_enabled === 1 ||
+    String(runtimeScript.payment_enabled || '').toLowerCase() === 'true';
+  const scriptHasPaymentPolicy = runtimeScript.payment_policy && typeof runtimeScript.payment_policy === 'object';
+  if (objectiveTarget?.requiresPayment && !scriptPaymentEnabled && !scriptHasPaymentPolicy) {
+    await ctx.reply('❌ Selected script is not payment-ready for this objective. Choose another script.');
+    return { status: 'objective_blocked' };
+  }
+  if (objectiveTarget?.requiresDigitFlow && !hasDigitFlowCapability(runtimeScript)) {
+    await ctx.reply('❌ Selected script is not digit-flow capable for this objective. Choose another script.');
+    return { status: 'objective_blocked' };
+  }
   if (scriptPaymentEnabled) {
     payloadUpdates.payment_enabled = true;
-    if (script.payment_connector) {
-      payloadUpdates.payment_connector = String(script.payment_connector).trim();
+    if (runtimeScript.payment_connector) {
+      payloadUpdates.payment_connector = String(runtimeScript.payment_connector).trim();
     }
-    if (script.payment_amount) {
-      payloadUpdates.payment_amount = String(script.payment_amount).trim();
+    if (runtimeScript.payment_amount) {
+      payloadUpdates.payment_amount = String(runtimeScript.payment_amount).trim();
     }
-    if (script.payment_currency) {
-      payloadUpdates.payment_currency = String(script.payment_currency).trim().toUpperCase();
+    if (runtimeScript.payment_currency) {
+      payloadUpdates.payment_currency = String(runtimeScript.payment_currency).trim().toUpperCase();
     }
-    if (script.payment_description) {
-      payloadUpdates.payment_description = String(script.payment_description).trim().slice(0, 240);
+    if (runtimeScript.payment_description) {
+      payloadUpdates.payment_description = String(runtimeScript.payment_description).trim().slice(0, 240);
     }
-    if (script.payment_start_message) {
-      payloadUpdates.payment_start_message = String(script.payment_start_message).trim().slice(0, 240);
+    if (runtimeScript.payment_start_message) {
+      payloadUpdates.payment_start_message = String(runtimeScript.payment_start_message).trim().slice(0, 240);
     }
-    if (script.payment_success_message) {
-      payloadUpdates.payment_success_message = String(script.payment_success_message).trim().slice(0, 240);
+    if (runtimeScript.payment_success_message) {
+      payloadUpdates.payment_success_message = String(runtimeScript.payment_success_message).trim().slice(0, 240);
     }
-    if (script.payment_failure_message) {
-      payloadUpdates.payment_failure_message = String(script.payment_failure_message).trim().slice(0, 240);
+    if (runtimeScript.payment_failure_message) {
+      payloadUpdates.payment_failure_message = String(runtimeScript.payment_failure_message).trim().slice(0, 240);
     }
-    if (script.payment_retry_message) {
-      payloadUpdates.payment_retry_message = String(script.payment_retry_message).trim().slice(0, 240);
+    if (runtimeScript.payment_retry_message) {
+      payloadUpdates.payment_retry_message = String(runtimeScript.payment_retry_message).trim().slice(0, 240);
     }
     summary.push(
       `Payment defaults: ${payloadUpdates.payment_currency || 'USD'} ${payloadUpdates.payment_amount || '(amount at runtime)'}`
     );
   }
-  if (script.payment_policy && typeof script.payment_policy === 'object') {
-    payloadUpdates.payment_policy = script.payment_policy;
+  if (scriptHasPaymentPolicy) {
+    payloadUpdates.payment_policy = runtimeScript.payment_policy;
   }
 
   if (script.description) {
     summary.push(`Description: ${script.description}`);
   }
 
-  const businessOption = script.business_id ? findBusinessOption(script.business_id) : null;
+  const businessOption = runtimeScript.business_id ? findBusinessOption(runtimeScript.business_id) : null;
   if (businessOption) {
     summary.push(`Persona: ${businessOption.label}`);
-  } else if (script.business_id) {
-    summary.push(`Persona: ${script.business_id}`);
+  } else if (runtimeScript.business_id) {
+    summary.push(`Persona: ${runtimeScript.business_id}`);
   }
 
   if (!payloadUpdates.purpose && businessOption?.defaultPurpose) {
     payloadUpdates.purpose = businessOption.defaultPurpose;
   }
 
-  const personaConfig = script.persona_config || {};
+  const personaConfig = runtimeScript.persona_config || {};
   if (personaConfig.purpose) {
     summary.push(`Purpose: ${personaConfig.purpose}`);
     payloadUpdates.purpose = personaConfig.purpose;
@@ -436,7 +1000,7 @@ async function selectCallScript(conversation, ctx, ensureActive) {
   }
 
   if (!payloadUpdates.purpose) {
-    payloadUpdates.purpose = config.defaultPurpose;
+    payloadUpdates.purpose = objectiveTarget?.defaultPurpose || config.defaultPurpose;
   }
 
   return {
@@ -446,8 +1010,11 @@ async function selectCallScript(conversation, ctx, ensureActive) {
     meta: {
       scriptName: script.name,
       scriptDescription: script.description || 'No description provided',
-      personaLabel: businessOption?.label || script.business_id || 'Custom',
-      scriptVoiceModel: script.voice_model || null
+      personaLabel: businessOption?.label || runtimeScript.business_id || 'Custom',
+      scriptVoiceModel: runtimeScript.voice_model || null,
+      objectiveTags: normalizeObjectiveTags(runtimeScript.objective_tags),
+      supportsPayment: hasPaymentCapability(runtimeScript),
+      supportsDigitCapture: hasDigitFlowCapability(runtimeScript)
     }
   };
 }
@@ -474,6 +1041,20 @@ async function callFlow(conversation, ctx) {
       return;
     }
     flow.touch('authorized');
+    const objectiveSelection = await selectCallObjective(conversation, ctx, ensureActive);
+    if (objectiveSelection?.status === 'back') {
+      await ctx.reply('❌ Call setup cancelled.');
+      return;
+    }
+    if (objectiveSelection?.status !== 'ok' || !objectiveSelection.objective) {
+      await safeReset(ctx, 'call_objective_error', {
+        message: '⚠️ Unable to set call objective.',
+        menuHint: '📋 Use /call to try again.'
+      });
+      return;
+    }
+    const selectedObjective = objectiveSelection.objective;
+    flow.touch('objective-selected');
 
     const prefill = ctx.session.meta?.prefill || {};
     let number = prefill.phoneNumber || null;
@@ -518,11 +1099,13 @@ async function callFlow(conversation, ctx) {
     }
 
     let configuration = null;
-    const selection = await selectCallScript(conversation, ctx, ensureActive);
+    const selection = await selectCallScript(conversation, ctx, ensureActive, selectedObjective);
     if (selection?.status === 'ok') {
       configuration = selection;
     } else if (selection?.status === 'empty') {
       await ctx.reply('⚠️ No call scripts found. Use /scripts to create one before calling.');
+      return;
+    } else if (selection?.status === 'objective_blocked') {
       return;
     } else if (selection?.status === 'back') {
       await ctx.reply('❌ Call setup cancelled.');
@@ -550,7 +1133,7 @@ async function callFlow(conversation, ctx) {
     };
 
     payload.business_id = payload.business_id || config.defaultBusinessId;
-    payload.purpose = payload.purpose || config.defaultPurpose;
+    payload.purpose = payload.purpose || selectedObjective.defaultPurpose || config.defaultPurpose;
     payload.voice_model = payload.voice_model || config.defaultVoiceModel;
     payload.script = payload.script || 'custom';
     payload.technical_level = payload.technical_level || 'auto';
@@ -613,16 +1196,36 @@ async function callFlow(conversation, ctx) {
       personaLabel
     );
 
+    const objectivePreflight = buildObjectivePreflightReport(
+      payload,
+      selectedObjective,
+      configuration
+    );
+    await ctx.reply(formatObjectivePreflight(objectivePreflight));
+    if (objectivePreflight.blockers.length) {
+      await ctx.reply('❌ Resolve the preflight blockers (script/objective mismatch) before starting this call.');
+      return;
+    }
+    if (objectivePreflight.warnings.length) {
+      const proceedAfterWarning = await confirmProceedAfterPreflight(conversation, ctx, ensureActive);
+      if (!proceedAfterWarning) {
+        await ctx.reply('❌ Call setup paused. Re-run /call when ready.');
+        return;
+      }
+    }
+
     const toneValue = payload.emotion || 'auto';
     const urgencyValue = payload.urgency || 'auto';
     const techValue = payload.technical_level || 'auto';
     const hasAutoFields = [toneValue, urgencyValue, techValue].some((value) => value === 'auto');
 
     const detailLines = [
+      buildLine('🎯', 'Objective', escapeMarkdown(selectedObjective.label || 'General Outreach')),
       buildLine('📋', 'To', number),
       victimName ? buildLine('👤', 'Victim', escapeMarkdown(victimName)) : null,
       buildLine('🧩', 'Script', escapeMarkdown(scriptName)),
       buildLine('🎤', 'Voice', escapeMarkdown(payload.voice_model || defaultVoice)),
+      buildLine('🧪', 'Preflight', `${objectivePreflight.readinessScore}/100`),
       payload.purpose ? buildLine('🎯', 'Purpose', escapeMarkdown(payload.purpose)) : null
     ].filter(Boolean);
 

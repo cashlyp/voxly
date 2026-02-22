@@ -139,6 +139,9 @@ class EnhancedDatabase {
                 version INTEGER DEFAULT 1,
                 business_id TEXT,
                 voice_model TEXT,
+                objective_tags TEXT,
+                supports_payment INTEGER,
+                supports_digit_capture INTEGER,
                 requires_otp INTEGER DEFAULT 0,
                 default_profile TEXT,
                 expected_length INTEGER,
@@ -366,6 +369,9 @@ class EnhancedDatabase {
         await this.ensureCallColumns(['digit_summary', 'digit_count', 'last_otp', 'last_otp_masked', 'direction']);
         await this.ensureTemplateColumns([
             'version',
+            'objective_tags',
+            'supports_payment',
+            'supports_digit_capture',
             'requires_otp',
             'default_profile',
             'expected_length',
@@ -538,6 +544,12 @@ class EnhancedDatabase {
             if (existingNames.has(column)) continue;
             if (column === 'version') {
                 await addColumn('version', 'INTEGER DEFAULT 1');
+            } else if (column === 'objective_tags') {
+                await addColumn('objective_tags', 'TEXT');
+            } else if (column === 'supports_payment') {
+                await addColumn('supports_payment', 'INTEGER');
+            } else if (column === 'supports_digit_capture') {
+                await addColumn('supports_digit_capture', 'INTEGER');
             } else if (column === 'requires_otp') {
                 await addColumn('requires_otp', 'INTEGER DEFAULT 0');
             } else if (column === 'default_profile') {
@@ -1019,6 +1031,7 @@ class EnhancedDatabase {
         return new Promise((resolve, reject) => {
             const sql = `
                 SELECT id, name, description, prompt, first_message, version, business_id, voice_model,
+                       objective_tags, supports_payment, supports_digit_capture,
                        requires_otp, default_profile, expected_length, allow_terminator, terminator_char,
                        payment_enabled, payment_connector, payment_amount, payment_currency, payment_description,
                        payment_policy,
@@ -1041,6 +1054,7 @@ class EnhancedDatabase {
         return new Promise((resolve, reject) => {
             const sql = `
                 SELECT id, name, description, prompt, first_message, version, business_id, voice_model,
+                       objective_tags, supports_payment, supports_digit_capture,
                        requires_otp, default_profile, expected_length, allow_terminator, terminator_char,
                        payment_enabled, payment_connector, payment_amount, payment_currency, payment_description,
                        payment_policy,
@@ -1068,6 +1082,9 @@ class EnhancedDatabase {
             version = 1,
             business_id = null,
             voice_model = null,
+            objective_tags = null,
+            supports_payment = null,
+            supports_digit_capture = null,
             requires_otp = 0,
             default_profile = null,
             expected_length = null,
@@ -1088,6 +1105,42 @@ class EnhancedDatabase {
         const normalizedVersion = Number.isFinite(normalizedVersionParsed) && normalizedVersionParsed > 0
             ? Math.max(1, Math.floor(normalizedVersionParsed))
             : 1;
+        let normalizedObjectiveTags = null;
+        if (objective_tags !== null && objective_tags !== undefined && objective_tags !== '') {
+            if (Array.isArray(objective_tags)) {
+                const cleaned = objective_tags
+                    .map((entry) => String(entry || '').trim())
+                    .filter(Boolean);
+                normalizedObjectiveTags = cleaned.length ? JSON.stringify(Array.from(new Set(cleaned)).slice(0, 12)) : null;
+            } else if (typeof objective_tags === 'string') {
+                const trimmed = String(objective_tags).trim();
+                if (trimmed.startsWith('[')) {
+                    try {
+                        const parsed = JSON.parse(trimmed);
+                        if (Array.isArray(parsed)) {
+                            const cleaned = parsed
+                                .map((entry) => String(entry || '').trim())
+                                .filter(Boolean);
+                            normalizedObjectiveTags = cleaned.length ? JSON.stringify(Array.from(new Set(cleaned)).slice(0, 12)) : null;
+                        }
+                    } catch (_) {
+                        normalizedObjectiveTags = null;
+                    }
+                } else {
+                    const cleaned = trimmed
+                        .split(',')
+                        .map((entry) => String(entry || '').trim())
+                        .filter(Boolean);
+                    normalizedObjectiveTags = cleaned.length ? JSON.stringify(Array.from(new Set(cleaned)).slice(0, 12)) : null;
+                }
+            }
+        }
+        const normalizedSupportsPayment = supports_payment === null || supports_payment === undefined || supports_payment === ''
+            ? null
+            : (supports_payment ? 1 : 0);
+        const normalizedSupportsDigitCapture = supports_digit_capture === null || supports_digit_capture === undefined || supports_digit_capture === ''
+            ? null
+            : (supports_digit_capture ? 1 : 0);
         const normalizedRequiresOtp = requires_otp ? 1 : 0;
         const normalizedAllowTerminator = allow_terminator ? 1 : 0;
         const normalizedExpectedLength =
@@ -1138,13 +1191,14 @@ class EnhancedDatabase {
             const sql = `
                 INSERT INTO call_templates (
                     name, description, prompt, first_message, version, business_id, voice_model,
+                    objective_tags, supports_payment, supports_digit_capture,
                     requires_otp, default_profile, expected_length, allow_terminator, terminator_char,
                     payment_enabled, payment_connector, payment_amount, payment_currency, payment_description,
                     payment_policy,
                     payment_start_message, payment_success_message, payment_failure_message, payment_retry_message,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             `;
             this.db.run(
                 sql,
@@ -1156,6 +1210,9 @@ class EnhancedDatabase {
                     normalizedVersion,
                     business_id,
                     voice_model,
+                    normalizedObjectiveTags,
+                    normalizedSupportsPayment,
+                    normalizedSupportsDigitCapture,
                     normalizedRequiresOtp,
                     default_profile,
                     Number.isFinite(normalizedExpectedLength) ? normalizedExpectedLength : null,
@@ -1193,6 +1250,9 @@ class EnhancedDatabase {
             first_message: 'first_message',
             business_id: 'business_id',
             voice_model: 'voice_model',
+            objective_tags: 'objective_tags',
+            supports_payment: 'supports_payment',
+            supports_digit_capture: 'supports_digit_capture',
             requires_otp: 'requires_otp',
             default_profile: 'default_profile',
             expected_length: 'expected_length',
@@ -1214,6 +1274,44 @@ class EnhancedDatabase {
                 let value = payload[key];
                 if (key === 'payment_enabled') {
                     value = value ? 1 : 0;
+                } else if (key === 'supports_payment' || key === 'supports_digit_capture') {
+                    value = value === null || value === undefined || value === '' ? null : (value ? 1 : 0);
+                } else if (key === 'objective_tags') {
+                    if (value === null || value === undefined || value === '') {
+                        value = null;
+                    } else if (Array.isArray(value)) {
+                        const cleaned = value
+                            .map((entry) => String(entry || '').trim())
+                            .filter(Boolean);
+                        value = cleaned.length ? JSON.stringify(Array.from(new Set(cleaned)).slice(0, 12)) : null;
+                    } else if (typeof value === 'string') {
+                        const trimmed = String(value).trim();
+                        if (!trimmed) {
+                            value = null;
+                        } else if (trimmed.startsWith('[')) {
+                            try {
+                                const parsed = JSON.parse(trimmed);
+                                if (Array.isArray(parsed)) {
+                                    const cleaned = parsed
+                                        .map((entry) => String(entry || '').trim())
+                                        .filter(Boolean);
+                                    value = cleaned.length ? JSON.stringify(Array.from(new Set(cleaned)).slice(0, 12)) : null;
+                                } else {
+                                    value = null;
+                                }
+                            } catch (_) {
+                                value = null;
+                            }
+                        } else {
+                            const cleaned = trimmed
+                                .split(',')
+                                .map((entry) => String(entry || '').trim())
+                                .filter(Boolean);
+                            value = cleaned.length ? JSON.stringify(Array.from(new Set(cleaned)).slice(0, 12)) : null;
+                        }
+                    } else {
+                        value = null;
+                    }
                 } else if (key === 'payment_connector') {
                     value = value ? String(value).trim().slice(0, 120) : null;
                 } else if (key === 'payment_amount') {
