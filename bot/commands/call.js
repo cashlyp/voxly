@@ -375,39 +375,6 @@ function buildObjectivePreflightReport(payload = {}, objective = null, configura
   };
 }
 
-function formatObjectivePreflight(report = {}) {
-  const lines = [
-    `🧪 Objective preflight: ${report.readinessScore || 0}/100`,
-    `🎯 Objective: ${report.objectiveLabel || 'General Outreach'}`
-  ];
-  if (Array.isArray(report.blockers) && report.blockers.length) {
-    lines.push('Blockers:');
-    report.blockers.forEach((item) => lines.push(`• ${item}`));
-  } else {
-    lines.push('✅ No blockers detected.');
-  }
-  if (Array.isArray(report.warnings) && report.warnings.length) {
-    lines.push('Warnings:');
-    report.warnings.slice(0, 6).forEach((item) => lines.push(`• ${item}`));
-  }
-  return lines.join('\n');
-}
-
-async function confirmProceedAfterPreflight(conversation, ctx, ensureActive) {
-  const choice = await askOptionWithButtons(
-    conversation,
-    ctx,
-    'Proceed with this call setup?',
-    [
-      { id: 'yes', label: '✅ Proceed' },
-      { id: 'no', label: '⬅️ Review setup' }
-    ],
-    { prefix: 'call-preflight-confirm', columns: 2 }
-  );
-  ensureActive();
-  return Boolean(choice && choice.id === 'yes');
-}
-
 function isValidPhoneNumber(number) {
   const e164Regex = /^\+[1-9]\d{1,14}$/;
   return e164Regex.test((number || '').trim());
@@ -739,9 +706,6 @@ async function selectCallScript(conversation, ctx, ensureActive, objective) {
     });
   const activeScripts = scriptsWithLifecycle.filter((script) => script._status === SCRIPT_STATUS_ACTIVE);
   const selectableScripts = activeScripts.length ? activeScripts : scriptsWithLifecycle;
-  if (!activeScripts.length && scriptsWithLifecycle.length) {
-    await ctx.reply('⚠️ No active scripts found. Showing all scripts as fallback.');
-  }
 
   const scoredScripts = selectableScripts.map((script) => ({
     ...script,
@@ -773,10 +737,6 @@ async function selectCallScript(conversation, ctx, ensureActive, objective) {
 
   if (!objectiveScripts.length) {
     objectiveScripts = scoredScripts;
-  } else if (objectiveScripts.length !== scoredScripts.length) {
-    await ctx.reply(`✅ Showing scripts matched to objective: *${escapeMarkdown(objectiveTarget.label)}*`, {
-      parse_mode: 'Markdown'
-    });
   }
 
   objectiveScripts.sort((a, b) => {
@@ -1201,17 +1161,15 @@ async function callFlow(conversation, ctx) {
       selectedObjective,
       configuration
     );
-    await ctx.reply(formatObjectivePreflight(objectivePreflight));
     if (objectivePreflight.blockers.length) {
-      await ctx.reply('❌ Resolve the preflight blockers (script/objective mismatch) before starting this call.');
+      const blockerLines = [
+        `🧪 Objective preflight: ${objectivePreflight.readinessScore}/100`,
+        `🎯 Objective: ${objectivePreflight.objectiveLabel || (selectedObjective.label || 'General Outreach')}`,
+        '❌ Blockers:',
+        ...objectivePreflight.blockers.map((item) => `• ${item}`)
+      ];
+      await ctx.reply(blockerLines.join('\n'));
       return;
-    }
-    if (objectivePreflight.warnings.length) {
-      const proceedAfterWarning = await confirmProceedAfterPreflight(conversation, ctx, ensureActive);
-      if (!proceedAfterWarning) {
-        await ctx.reply('❌ Call setup paused. Re-run /call when ready.');
-        return;
-      }
     }
 
     const toneValue = payload.emotion || 'auto';
@@ -1240,6 +1198,9 @@ async function callFlow(conversation, ctx) {
     }
     if (hasAutoFields) {
       detailLines.push(tipLine('⚙️', 'Mode: Auto'));
+    }
+    if (objectivePreflight.warnings.length) {
+      detailLines.push(buildLine('⚠️', 'Warnings', `${objectivePreflight.warnings.length} (use Details)`));
     }
     if (payload.payment_enabled) {
       const connectorLabel = escapeMarkdown(payload.payment_connector || 'configured');
@@ -1278,7 +1239,10 @@ async function callFlow(conversation, ctx) {
         'ℹ️ Call Details:',
         `• Tone: ${toneValue}`,
         `• Urgency: ${urgencyValue}`,
-        `• Technical level: ${techValue}`
+        `• Technical level: ${techValue}`,
+        ...(objectivePreflight.warnings.length
+          ? ['• Preflight warnings:', ...objectivePreflight.warnings.map((item) => `• ${item}`)]
+          : [])
       ].join('\n');
       ctx.session.callDetailsKeys.push(detailsKey);
       if (ctx.session.callDetailsKeys.length > 10) {
