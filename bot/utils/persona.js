@@ -364,13 +364,17 @@ async function askOptionWithButtons(
   ctx,
   prompt,
   options,
-  { prefix, columns = 2, formatLabel, ensureActive } = {}
+  { prefix, columns = 2, formatLabel, ensureActive, bindToOperation } = {}
 ) {
   const keyboard = new InlineKeyboard();
   const opId = getCurrentOpId(ctx);
   const opToken = ctx.session?.currentOp?.token || null;
   const basePrefix = prefix || 'option';
-  const prefixKey = opToken
+  const shouldBindToOperation =
+    typeof bindToOperation === 'boolean'
+      ? bindToOperation
+      : !/^(call-script-|sms-script-|script-|inbound-default|email-template-)/.test(basePrefix);
+  const prefixKey = shouldBindToOperation && opToken
     ? `${basePrefix}:${opToken}`
     : `${basePrefix}`;
   const optionLookupByToken = new Map();

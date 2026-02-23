@@ -632,12 +632,21 @@ async function safeAnswerCallbackQuery(ctx, options = {}) {
 }
 
 function buildCallbackStateSnapshot(ctx) {
+  let activeConversations = null;
+  try {
+    if (ctx?.conversation && typeof ctx.conversation.active === "function") {
+      activeConversations = ctx.conversation.active();
+    }
+  } catch (_) {
+    activeConversations = null;
+  }
   return {
     op_id: ctx.session?.currentOp?.id || null,
     op_token: ctx.session?.currentOp?.token || null,
     op_command: ctx.session?.currentOp?.command || null,
     flow_name: ctx.session?.flow?.name || null,
     flow_step: ctx.session?.flow?.step || null,
+    active_conversations: activeConversations,
   };
 }
 
