@@ -25,12 +25,36 @@ const {
     extractScriptVariables,
     SCRIPT_METADATA
 } = require('../utils/scripts');
-const { section: formatSection, buildLine, tipLine, renderMenu, escapeMarkdown } = require('../utils/ui');
+const {
+    section: formatSection,
+    buildLine,
+    tipLine,
+    renderMenu,
+    escapeMarkdown,
+    isEntityParseError
+} = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 const { getAccessProfile } = require('../utils/capabilities');
 
 async function smsAlert(ctx, text) {
     await ctx.reply(formatSection('⚠️ SMS Alert', [text]));
+}
+
+async function safeReply(ctx, text, options = {}) {
+    try {
+        return await ctx.reply(text, options);
+    } catch (error) {
+        if (!isEntityParseError(error)) {
+            throw error;
+        }
+        const fallbackOptions = { ...options };
+        delete fallbackOptions.parse_mode;
+        return ctx.reply(String(text || ''), fallbackOptions);
+    }
+}
+
+async function safeReplyMarkdown(ctx, text, options = {}) {
+    return safeReply(ctx, text, { parse_mode: 'Markdown', ...options });
 }
 
 function isSessionCancellationError(error) {
@@ -132,19 +156,19 @@ function formatSmsStatusMessage(msg = {}) {
     const aiPreview = msg.ai_response ? summarizeSensitiveText(msg.ai_response) : null;
     let statusText =
         `📱 *SMS Status Report*\n\n` +
-        `🆔 **Message SID:** \`${escapeMarkdown(msg.message_sid || '—')}\`\n` +
-        `📞 **To:** ${escapeMarkdown(maskPhoneForDisplay(msg.to_number))}\n` +
-        `📤 **From:** ${escapeMarkdown(maskPhoneForDisplay(msg.from_number))}\n` +
-        `📊 **Status:** ${escapeMarkdown(msg.status || 'unknown')}\n` +
-        `📅 **Created:** ${escapeMarkdown(new Date(msg.created_at || Date.now()).toLocaleString())}\n` +
-        `🔄 **Updated:** ${escapeMarkdown(new Date(msg.updated_at || Date.now()).toLocaleString())}\n` +
-        `📝 **Message:** ${escapeMarkdown(bodyPreview)}\n`;
+        `🆔 *Message SID:* \`${escapeMarkdown(msg.message_sid || '—')}\`\n` +
+        `📞 *To:* ${escapeMarkdown(maskPhoneForDisplay(msg.to_number))}\n` +
+        `📤 *From:* ${escapeMarkdown(maskPhoneForDisplay(msg.from_number))}\n` +
+        `📊 *Status:* ${escapeMarkdown(msg.status || 'unknown')}\n` +
+        `📅 *Created:* ${escapeMarkdown(new Date(msg.created_at || Date.now()).toLocaleString())}\n` +
+        `🔄 *Updated:* ${escapeMarkdown(new Date(msg.updated_at || Date.now()).toLocaleString())}\n` +
+        `📝 *Message:* ${escapeMarkdown(bodyPreview)}\n`;
 
     if (msg.error_code || msg.error_message) {
-        statusText += `\n❌ **Error:** ${escapeMarkdown(String(msg.error_code || ''))} - ${escapeMarkdown(msg.error_message || '')}`;
+        statusText += `\n❌ *Error:* ${escapeMarkdown(String(msg.error_code || ''))} - ${escapeMarkdown(msg.error_message || '')}`;
     }
     if (aiPreview) {
-        statusText += `\n🤖 **AI Response:** ${escapeMarkdown(aiPreview)}`;
+        statusText += `\n🤖 *AI Response:* ${escapeMarkdown(aiPreview)}`;
     }
     return statusText;
 }
@@ -198,7 +222,7 @@ async function sendSmsStatusBySid(ctx, messageSid) {
         }
         const msg = response.data.message || {};
         const statusText = formatSmsStatusMessage(msg);
-        await ctx.reply(statusText, { parse_mode: 'Markdown' });
+        await safeReplyMarkdown(ctx, statusText);
     } catch (error) {
         await replyApiError(ctx, error, 'Unable to fetch SMS status.');
     }
@@ -281,7 +305,7 @@ async function sendRecentSms(ctx, limit = 10) {
             messagesText += `   To: ${toNumber}\n`;
             messagesText += `   Message: ${preview}\n\n`;
         });
-        await ctx.reply(messagesText, { parse_mode: 'Markdown' });
+        await safeReplyMarkdown(ctx, messagesText);
     } catch (error) {
         await replyApiError(ctx, error, 'Unable to fetch recent SMS messages.');
     }
@@ -365,7 +389,7 @@ async function sendBulkSmsList(ctx, { limit = 10, hours = 24 } = {}) {
             return;
         }
         const blocks = operations.map((op) => formatBulkSmsOperation(op));
-        await ctx.reply(`📦 *Recent Bulk SMS Jobs*\n\n${blocks.join('\n\n')}`, { parse_mode: 'Markdown' });
+        await safeReplyMarkdown(ctx, `📦 *Recent Bulk SMS Jobs*\n\n${blocks.join('\n\n')}`);
     } catch (error) {
         await replyApiError(ctx, error, 'Failed to fetch bulk SMS jobs.');
     }
@@ -386,7 +410,7 @@ async function sendBulkSmsStats(ctx, { hours = 24 } = {}) {
             `Failed: ${summary.totalFailed || 0}`,
             `Success rate: ${summary.successRate || 0}%`
         ];
-        await ctx.reply(`📊 *Bulk SMS Summary (last ${data.time_period_hours || hours}h)*\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
+        await safeReplyMarkdown(ctx, `📊 *Bulk SMS Summary (last ${data.time_period_hours || hours}h)*\n${lines.join('\n')}`);
     } catch (error) {
         await replyApiError(ctx, error, 'Failed to fetch bulk SMS statistics.');
     }
@@ -419,7 +443,7 @@ async function bulkSmsStatusFlow(conversation, ctx) {
             await ctx.reply('ℹ️ Job not found in recent history.');
             return;
         }
-        await ctx.reply(`📦 *Bulk SMS Job*\n\n${formatBulkSmsOperation(match)}`, { parse_mode: 'Markdown' });
+        await safeReplyMarkdown(ctx, `📦 *Bulk SMS Job*\n\n${formatBulkSmsOperation(match)}`);
     } catch (error) {
         logSmsError('Bulk SMS status flow error', error);
         await replyApiError(ctx, error, 'Error fetching bulk SMS status.');
@@ -781,7 +805,7 @@ Tap an option below to continue.`;
                     await ctx.reply('🧩 This script includes placeholders. Provide values or type skip to leave them unchanged.');
 
                     for (const token of placeholders) {
-                        await ctx.reply(`✏️ Enter value for *${token}* (type skip to leave as is):`, { parse_mode: 'Markdown' });
+                        await safeReplyMarkdown(ctx, `✏️ Enter value for *${escapeMarkdown(token)}* (type skip to leave as is):`);
                         const valueMsg = await waitForMessage();
                         const value = valueMsg?.message?.text?.trim();
 
@@ -947,8 +971,7 @@ Tap an option below to continue.`;
                 `📦 Segments: ${segmentInfo.segments} (${segmentInfo.encoding.toUpperCase()} ${segmentInfo.units}/${segmentInfo.per_segment})\n\n` +
                 `🔔 You'll receive delivery notifications`;
 
-            await ctx.reply(successMsg, {
-                parse_mode: 'Markdown',
+            await safeReplyMarkdown(ctx, successMsg, {
                 reply_markup: buildBackToMenuKeyboard(ctx, 'SMS')
             });
         } else {
@@ -1130,8 +1153,7 @@ async function bulkSmsFlow(conversation, ctx) {
                 ? `\n🧾 Request ID: \`${escapeMarkdown(data.request_id)}\``
                 : '';
 
-            await ctx.reply(`${successMsg}${requestLine}`, {
-                parse_mode: 'Markdown',
+            await safeReplyMarkdown(ctx, `${successMsg}${requestLine}`, {
                 reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_SMS', '⬅️ Back to SMS Sender')
             });
 
@@ -1140,9 +1162,9 @@ async function bulkSmsFlow(conversation, ctx) {
                 if (failedResults.length <= 10 && failedResults.length > 0) {
                     let failedMsg = '❌ *Failed Numbers:*\n\n';
                     failedResults.forEach(r => {
-                        failedMsg += `• ${r.recipient}: ${r.error}\n`;
+                        failedMsg += `• ${escapeMarkdown(r.recipient)}: ${escapeMarkdown(r.error)}\n`;
                     });
-                    await ctx.reply(failedMsg, { parse_mode: 'Markdown' });
+                    await safeReplyMarkdown(ctx, failedMsg);
                 }
             }
         } else {
@@ -1246,12 +1268,12 @@ async function scheduleSmsFlow(conversation, ctx) {
 
         const confirmText =
             `⏰ *Schedule SMS*\n\n` +
-            `📱 To: ${number}\n` +
-            `💬 Message: ${message.substring(0, 100)}${message.length > 100 ? '...' : ''}\n` +
-            `📅 Scheduled: ${scheduledTime.toLocaleString()}\n\n` +
+            `📱 To: ${escapeMarkdown(number)}\n` +
+            `💬 Message: ${escapeMarkdown(message.substring(0, 100))}${message.length > 100 ? '...' : ''}\n` +
+            `📅 Scheduled: ${escapeMarkdown(scheduledTime.toLocaleString())}\n\n` +
             `⏳ Scheduling SMS...`;
 
-        await ctx.reply(confirmText, { parse_mode: 'Markdown' });
+        await safeReplyMarkdown(ctx, confirmText);
 
         const payload = {
             to: number,
@@ -1286,8 +1308,7 @@ async function scheduleSmsFlow(conversation, ctx) {
                 successMsg += `\n🧾 Request ID: \`${escapeMarkdown(data.request_id)}\``;
             }
 
-            await ctx.reply(successMsg, {
-                parse_mode: 'Markdown',
+            await safeReplyMarkdown(ctx, successMsg, {
                 reply_markup: buildBackToMenuKeyboard(ctx, 'SMS')
             });
         }
@@ -1355,7 +1376,7 @@ async function viewStoredSmsConversation(ctx, phoneNumber) {
                 conversationText += `\n_... and ${messages.length - 15} earlier messages_`;
             }
 
-            await ctx.reply(conversationText, { parse_mode: 'Markdown' });
+            await safeReplyMarkdown(ctx, conversationText);
         } else {
             await ctx.reply('❌ No conversation found with this phone number');
         }
@@ -1383,7 +1404,7 @@ async function getSmsStats(ctx) {
             const conversations = serviceResponse.data.active_conversations || [];
 
             statsText += 
-                `**Active Service Data:**\n` +
+                `*Active Service Data:*\n` +
                 `💬 Active Conversations: ${stats.active_conversations || 0}\n` +
                 `⏰ Scheduled Messages: ${stats.scheduled_messages || 0}\n` +
                 `📋 Queue Size: ${stats.message_queue_size || 0}\n\n`;
@@ -1401,7 +1422,7 @@ async function getSmsStats(ctx) {
         if (dbStatsResponse.data.success) {
             const dbStats = dbStatsResponse.data;
             statsText += 
-                `**Database Statistics:**\n` +
+                `*Database Statistics:*\n` +
                 `📱 Total SMS Messages: ${dbStats.total_messages || 0}\n` +
                 `📤 Sent Messages: ${dbStats.sent_messages || 0}\n` +
                 `📨 Received Messages: ${dbStats.received_messages || 0}\n` +
@@ -1421,7 +1442,7 @@ async function getSmsStats(ctx) {
             }
         }
 
-        await ctx.reply(statsText, { parse_mode: 'Markdown' });
+        await safeReplyMarkdown(ctx, statsText);
         
     } catch (error) {
         logSmsError('SMS stats error', error);
@@ -1440,7 +1461,7 @@ async function getSmsStats(ctx) {
                     `❌ Failed: ${stats.failed_count || 0}\n\n` +
                     `_Note: Some detailed statistics are temporarily unavailable_`;
                     
-                await ctx.reply(basicStatsText, { parse_mode: 'Markdown' });
+                await safeReplyMarkdown(ctx, basicStatsText);
             } else {
                 await ctx.reply('Error fetching SMS statistics. Service may be down.');
             }

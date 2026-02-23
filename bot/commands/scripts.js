@@ -446,7 +446,7 @@ function isCancelInput(text) {
 }
 
 function escapeMarkdown(text = '') {
-  return text.replace(/([_*[\]`])/g, '\\$1');
+  return String(text).replace(/([\\_*[\]`])/g, '\\$1');
 }
 
 function normalizeScriptName(name = '') {
@@ -1189,14 +1189,15 @@ async function promptText(
   const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   const hints = [];
   if (defaultValue !== null && defaultValue !== undefined && defaultValue !== '') {
-    hints.push(`Current: ${defaultValue}`);
+    hints.push(`Current: ${escapeMarkdown(String(defaultValue))}`);
   }
   if (allowSkip) {
     hints.push('Type skip to keep current value');
   }
   hints.push('Type cancel to abort');
 
-  const promptMessage = hints.length > 0 ? `${message}\n_${hints.join(' | ')}_` : message;
+  const safeMessage = escapeMarkdown(String(message || ''));
+  const promptMessage = hints.length > 0 ? `${safeMessage}\n_${hints.join(' | ')}_` : safeMessage;
   await ctx.reply(promptMessage, { parse_mode: 'Markdown' });
   while (true) {
     const { text } = await waitForConversationText(conversation, ctx, {
@@ -3892,6 +3893,7 @@ async function callScriptsMenu(conversation, ctx, ensureActive) {
       }
       logScriptsError('Call scripts menu step failed', error);
       await ctx.reply(formatScriptsApiError(error, 'Call script menu failed'));
+      open = false;
     }
   }
 }
@@ -4821,6 +4823,7 @@ async function smsScriptsMenu(conversation, ctx) {
       }
       logScriptsError('SMS scripts menu step failed', error);
       await ctx.reply(formatScriptsApiError(error, 'SMS script menu failed'));
+      open = false;
     }
   }
 }

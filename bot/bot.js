@@ -39,7 +39,12 @@ const {
 const {
   getConversationRecoveryTarget,
 } = require("./utils/conversationRecovery");
-const { normalizeReply, logCommandError, escapeMarkdown } = require("./utils/ui");
+const {
+  normalizeReply,
+  logCommandError,
+  escapeMarkdown,
+  isEntityParseError,
+} = require("./utils/ui");
 const {
   hasActiveConversation,
   isSafeCallIdentifier,
@@ -190,9 +195,18 @@ bot.use(async (ctx, next) => {
     return next();
   }
   const originalReply = ctx.reply.bind(ctx);
-  ctx.reply = (text, options = {}) => {
+  ctx.reply = async (text, options = {}) => {
     const normalized = normalizeReply(text, options);
-    return originalReply(normalized.text, normalized.options);
+    try {
+      return await originalReply(normalized.text, normalized.options);
+    } catch (error) {
+      if (!isEntityParseError(error)) {
+        throw error;
+      }
+      const fallbackOptions = { ...normalized.options };
+      delete fallbackOptions.parse_mode;
+      return originalReply(String(normalized.text || ""), fallbackOptions);
+    }
   };
   return next();
 });

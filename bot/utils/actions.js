@@ -5,6 +5,9 @@ const { ensureSession } = require('./sessionState');
 const DEFAULT_CALLBACK_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_DEDUPE_TTL_MS = 8000;
 const SIGN_PREFIX = 'cb';
+const SHORT_SIGN_PREFIX = 'cbk';
+const MAX_CALLBACK_DATA_LENGTH = 64;
+const CALLBACK_ALIAS_MAX_ENTRIES = 4000;
 const MENU_ACTION_LOG_INTERVAL = 25;
 const MENU_ACTIONS = new Set([
   'CALL',
@@ -49,6 +52,7 @@ const MENU_ACTIONS = new Set([
 ]);
 const menuActionStats = {};
 let menuActionCount = 0;
+const callbackAliasStore = new Map();
 
 function getCallbackSecret() {
   return config.botToken || config.apiAuth?.hmacSecret || 'callback-secret';
@@ -57,6 +61,40 @@ function getCallbackSecret() {
 function signPayload(payload) {
   const secret = getCallbackSecret();
   return crypto.createHmac('sha256', secret).update(payload).digest('hex').slice(0, 8);
+}
+
+function pruneCallbackAliasStore(now = Date.now()) {
+  for (const [key, entry] of callbackAliasStore.entries()) {
+    if (!entry || (entry.expiresAt && now >= entry.expiresAt)) {
+      callbackAliasStore.delete(key);
+    }
+  }
+  if (callbackAliasStore.size <= CALLBACK_ALIAS_MAX_ENTRIES) {
+    return;
+  }
+  const overflow = callbackAliasStore.size - CALLBACK_ALIAS_MAX_ENTRIES;
+  const keys = Array.from(callbackAliasStore.keys()).slice(0, overflow);
+  keys.forEach((key) => callbackAliasStore.delete(key));
+}
+
+function createCallbackAlias(action, token, timestamp, ttlMs) {
+  const now = Date.now();
+  pruneCallbackAliasStore(now);
+  const effectiveTtl = Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : DEFAULT_CALLBACK_TTL_MS;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const key = crypto.randomBytes(4).toString('hex');
+    if (callbackAliasStore.has(key)) {
+      continue;
+    }
+    callbackAliasStore.set(key, {
+      action,
+      token: token || '',
+      timestamp,
+      expiresAt: timestamp + effectiveTtl
+    });
+    return key;
+  }
+  return null;
 }
 
 function buildCallbackData(ctx, action, options = {}) {
@@ -71,20 +109,92 @@ function buildCallbackData(ctx, action, options = {}) {
   const payload = `${safeAction}|${token}|${ts}`;
   const sig = signPayload(payload);
   const data = `${SIGN_PREFIX}|${safeAction}|${token}|${ts}|${sig}`;
-  if (data.length > 64) {
-    return safeAction;
+  if (data.length <= MAX_CALLBACK_DATA_LENGTH && ttlMs > 0) {
+    return data;
   }
   if (ttlMs <= 0) {
     return safeAction;
   }
-  return data;
+  const alias = createCallbackAlias(safeAction, token, ts, ttlMs);
+  if (!alias) {
+    return safeAction;
+  }
+  const aliasPayload = `${alias}|${token}|${ts}`;
+  const aliasSig = signPayload(aliasPayload);
+  const shortData = `${SHORT_SIGN_PREFIX}|${alias}|${token}|${ts}|${aliasSig}`;
+  if (shortData.length > MAX_CALLBACK_DATA_LENGTH) {
+    return safeAction;
+  }
+  return shortData;
 }
 
 function parseCallbackData(rawAction) {
   const text = String(rawAction || '');
-  if (!text.startsWith(`${SIGN_PREFIX}|`)) {
+  if (!text.startsWith(`${SIGN_PREFIX}|`) && !text.startsWith(`${SHORT_SIGN_PREFIX}|`)) {
     return { action: text, signed: false };
   }
+  if (text.startsWith(`${SHORT_SIGN_PREFIX}|`)) {
+    const parts = text.split('|');
+    if (parts.length < 5) {
+      return { action: text, signed: true, valid: false, reason: 'format' };
+    }
+    const [, alias, token, ts, sig] = parts;
+    const payload = `${alias}|${token}|${ts}`;
+    const expected = signPayload(payload);
+    const timestamp = Number(ts);
+    if (sig !== expected) {
+      return {
+        action: '',
+        signed: true,
+        token,
+        timestamp,
+        valid: false,
+        reason: 'signature'
+      };
+    }
+    pruneCallbackAliasStore();
+    const aliasEntry = callbackAliasStore.get(alias);
+    if (!aliasEntry) {
+      return {
+        action: '',
+        signed: true,
+        token,
+        timestamp,
+        valid: false,
+        reason: 'alias_missing'
+      };
+    }
+    if (aliasEntry.expiresAt && Date.now() > aliasEntry.expiresAt) {
+      callbackAliasStore.delete(alias);
+      return {
+        action: '',
+        signed: true,
+        token,
+        timestamp,
+        valid: false,
+        reason: 'alias_expired'
+      };
+    }
+    if (aliasEntry.token && token && aliasEntry.token !== token) {
+      return {
+        action: '',
+        signed: true,
+        token,
+        timestamp,
+        valid: false,
+        reason: 'token_mismatch'
+      };
+    }
+    return {
+      action: aliasEntry.action,
+      signed: true,
+      token,
+      timestamp,
+      valid: true,
+      reason: null
+    };
+  }
+
   const parts = text.split('|');
   if (parts.length < 5) {
     return { action: text, signed: true, valid: false, reason: 'format' };

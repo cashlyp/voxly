@@ -2,6 +2,15 @@ const { ensureSession } = require('./sessionState');
 
 const DEFAULT_MENU_TTL_MS = 24 * 60 * 60 * 1000;
 
+function hasLikelyMarkdownFormatting(text = '') {
+    const source = String(text || '');
+    return (
+        /(^|\s)\*[^*\n]+\*(?=\s|$)/.test(source) ||
+        /(^|\s)_[^_\n]+_(?=\s|$)/.test(source) ||
+        /`[^`\n]+`/.test(source)
+    );
+}
+
 function normalizeReply(text, options = {}) {
     const normalizedText = text === undefined || text === null ? '' : String(text);
     const normalizedOptions = { ...options };
@@ -9,7 +18,7 @@ function normalizeReply(text, options = {}) {
     if (!normalizedOptions.parse_mode) {
         if (/<[^>]+>/.test(normalizedText)) {
             normalizedOptions.parse_mode = 'HTML';
-        } else if (/[`*_]/.test(normalizedText)) {
+        } else if (hasLikelyMarkdownFormatting(normalizedText)) {
             normalizedOptions.parse_mode = 'Markdown';
         }
     }
@@ -111,6 +120,35 @@ function isLatestMenuExpired(ctx, chatId = null, ttlMs = DEFAULT_MENU_TTL_MS) {
     return isMenuEntryExpired(entry, ttlMs);
 }
 
+function isEntityParseError(error) {
+    const message = String(error?.description || error?.message || '');
+    return /can't parse entities/i.test(message);
+}
+
+function isMenuMutationPermanentError(error) {
+    const message = String(error?.description || error?.message || '').toLowerCase();
+    if (!message) return false;
+    return (
+        /message to delete not found/.test(message) ||
+        /message to edit not found/.test(message) ||
+        /message identifier is not specified/.test(message) ||
+        /message can't be deleted/.test(message) ||
+        /message can't be edited/.test(message) ||
+        /chat not found/.test(message) ||
+        /message is not modified/.test(message) ||
+        /message_id_invalid/.test(message)
+    );
+}
+
+function toHtmlSafeMenuText(text = '') {
+    const source = String(text || '');
+    const withoutLinks = source.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)');
+    const plain = withoutLinks
+        .replace(/\\([*`\[\]])/g, '$1')
+        .replace(/[*`]/g, '');
+    return escapeHtml(plain);
+}
+
 function registerMenuMessage(ctx, message) {
     const messageId = message?.message_id;
     const chatId = message?.chat?.id || ctx.chat?.id;
@@ -139,16 +177,31 @@ async function clearMenuMessages(ctx, { keepMessageId = null } = {}) {
         if (!entry.chatId || !entry.messageId) {
             continue;
         }
+        let deleteError = null;
         try {
             await ctx.api.deleteMessage(entry.chatId, entry.messageId);
             continue;
-        } catch (_) {
+        } catch (error) {
+            deleteError = error;
+            if (isMenuMutationPermanentError(error)) {
+                continue;
+            }
             // Fallback: remove buttons if deletion is not allowed (e.g., older messages).
         }
+        let editError = null;
         try {
             await ctx.api.editMessageReplyMarkup(entry.chatId, entry.messageId);
-        } catch (_) {
-            // Ignore if we can't edit or delete.
+            continue;
+        } catch (error) {
+            editError = error;
+            if (isMenuMutationPermanentError(error)) {
+                continue;
+            }
+            // Keep tracking only for transient failures so a later cleanup can retry.
+            nextEntries.push(entry);
+        }
+        if (!editError && !deleteError) {
+            nextEntries.push(entry);
         }
     }
 
@@ -157,9 +210,24 @@ async function clearMenuMessages(ctx, { keepMessageId = null } = {}) {
 
 async function sendMenu(ctx, text, options = {}) {
     await clearMenuMessages(ctx);
-    const message = await ctx.reply(text, options);
-    registerMenuMessage(ctx, message);
-    return message;
+    try {
+        const message = await ctx.reply(text, options);
+        registerMenuMessage(ctx, message);
+        return message;
+    } catch (error) {
+        if (!isEntityParseError(error)) {
+            throw error;
+        }
+        console.warn('Menu markdown parse failed; retrying with safe HTML text.');
+        const fallbackOptions = {
+            ...options,
+            parse_mode: 'HTML'
+        };
+        const fallbackText = toHtmlSafeMenuText(text);
+        const message = await ctx.reply(fallbackText, fallbackOptions);
+        registerMenuMessage(ctx, message);
+        return message;
+    }
 }
 
 async function activateMenuMessage(ctx, messageId, chatId = null) {
@@ -201,5 +269,11 @@ module.exports = {
     activateMenuMessage,
     getLatestMenuMessageId,
     isLatestMenuExpired,
-    renderMenu
+    renderMenu,
+    isEntityParseError,
+    __testables: {
+        isEntityParseError,
+        isMenuMutationPermanentError,
+        toHtmlSafeMenuText
+    }
 };

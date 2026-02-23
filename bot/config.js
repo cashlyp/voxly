@@ -4,7 +4,11 @@
  * Configuration for the Telegram bot
  */
 
-require('dotenv').config();
+try {
+  require('dotenv').config();
+} catch (_) {
+  // Allow runtime/test environments that already inject env variables.
+}
 const required = ['ADMIN_TELEGRAM_ID', 'ADMIN_TELEGRAM_USERNAME', 'API_URL', 'BOT_TOKEN'];
 const missing = required.filter((key) => !process.env[key]);
 if (missing.length > 0) {
