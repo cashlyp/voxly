@@ -1271,6 +1271,21 @@ bot.on("callback_query:data", async (ctx) => {
         return;
       }
 
+      // For menu-exempt conversation actions (script designer, persona, etc.) without
+      // operation tokens, let the active conversation handle the callback even if the
+      // operation token doesn't match. This preserves restart-safe callback behavior where
+      // callbacks intentionally don't bind to operation tokens.
+      if (
+        isMenuExemptAction &&
+        hasActiveRecoveryConversation &&
+        !hasMatchingOpToken
+      ) {
+        finishMetric("ignored", {
+          reason: "menu_exempt_conversation_listener",
+        });
+        return;
+      }
+
       // No active op: route back to a fresh menu instead of trying to resurrect stale flow state.
       if (!hasActiveOp) {
         if (hasActiveRecoveryConversation) {
