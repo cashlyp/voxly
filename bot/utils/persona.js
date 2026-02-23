@@ -359,6 +359,11 @@ const CALLBACK_REPLAY_TTL_MS = 2 * 60 * 1000;
 const CALLBACK_REPLAY_MAX_ACTIONS = 8;
 const MENU_TAP_LOCK_TTL_MS = 8 * 1000;
 const MENU_SELECTION_TIMEOUT_MS = 20 * 60 * 1000;
+const SCRIPT_MENU_SELECTION_TIMEOUT_MS = 30 * 60 * 1000;
+const SCRIPT_MENU_PREFIX_PATTERN =
+  /^(call-script-|sms-script-|script-|inbound-default|email-template-)/;
+const SCRIPT_MENU_NO_TIMEOUT_PREFIX_PATTERN =
+  /^(script-channel|call-script-main|sms-script-main|email-template-main|inbound-default)$/;
 
 function formatOptionLabel(option) {
   if (option.emoji) {
@@ -486,7 +491,9 @@ async function askOptionWithButtons(
   ctx,
   prompt,
   options,
-  {
+  settings = {}
+) {
+  const {
     prefix,
     columns = 2,
     formatLabel,
@@ -494,16 +501,30 @@ async function askOptionWithButtons(
     bindToOperation,
     timeoutMs = MENU_SELECTION_TIMEOUT_MS,
     timeoutMessage = '⏱️ Menu timed out. Please reopen this command.'
-  } = {}
-) {
+  } = settings;
   const keyboard = new InlineKeyboard();
   const opId = getCurrentOpId(ctx);
   const opToken = ctx.session?.currentOp?.token || null;
   const basePrefix = prefix || 'option';
+  const isScriptDesignerMenu = SCRIPT_MENU_PREFIX_PATTERN.test(basePrefix);
+  const hasExplicitTimeoutMs = Object.prototype.hasOwnProperty.call(settings, 'timeoutMs');
+  const shouldDisableTimeout =
+    isScriptDesignerMenu &&
+    SCRIPT_MENU_NO_TIMEOUT_PREFIX_PATTERN.test(basePrefix) &&
+    !hasExplicitTimeoutMs;
   const shouldBindToOperation =
     typeof bindToOperation === 'boolean'
       ? bindToOperation
-      : !/^(call-script-|sms-script-|script-|inbound-default|email-template-)/.test(basePrefix);
+      : !isScriptDesignerMenu;
+  const resolvedTimeoutMs = shouldDisableTimeout
+    ? 0
+    : (Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? (isScriptDesignerMenu ? Math.max(timeoutMs, SCRIPT_MENU_SELECTION_TIMEOUT_MS) : timeoutMs)
+      : timeoutMs);
+  const resolvedTimeoutMessage = isScriptDesignerMenu
+    && timeoutMessage === '⏱️ Menu timed out. Please reopen this command.'
+    ? '⏱️ Script Designer step timed out. Reopen /scripts to continue.'
+    : timeoutMessage;
   const prefixKey = shouldBindToOperation && opToken
     ? `${basePrefix}:${opToken}`
     : `${basePrefix}`;
@@ -613,13 +634,13 @@ async function askOptionWithButtons(
       const data = callbackCtx?.callbackQuery?.data;
       return matchesCallbackPrefix(data, prefixKey);
     };
-    const useTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0;
+    const useTimeout = Number.isFinite(resolvedTimeoutMs) && resolvedTimeoutMs > 0;
     if (!useTimeout) {
       return conversation.waitFor('callback_query:data', callbackMatcher);
     }
-    const remainingMs = Math.max(0, timeoutMs - (Date.now() - waitStartedAt));
+    const remainingMs = Math.max(0, resolvedTimeoutMs - (Date.now() - waitStartedAt));
     if (remainingMs <= 0) {
-      throw new OperationCancelledError(`Menu callback timeout after ${timeoutMs}ms`);
+      throw new OperationCancelledError(`Menu callback timeout after ${resolvedTimeoutMs}ms`);
     }
     let timeoutHandle = null;
     try {
@@ -627,7 +648,7 @@ async function askOptionWithButtons(
         conversation.waitFor('callback_query:data', callbackMatcher),
         new Promise((_, reject) => {
           timeoutHandle = setTimeout(
-            () => reject(new OperationCancelledError(`Menu callback timeout after ${timeoutMs}ms`)),
+            () => reject(new OperationCancelledError(`Menu callback timeout after ${resolvedTimeoutMs}ms`)),
             remainingMs
           );
         })
@@ -648,12 +669,13 @@ async function askOptionWithButtons(
         error instanceof OperationCancelledError ||
         /timeout/i.test(String(error?.message || ''));
       if (timeoutError) {
+        writePendingCallbackReplay(ctx, [], null);
         try {
           await clearMenuMessages(ctx);
         } catch (_) {}
-        if (timeoutMessage) {
+        if (resolvedTimeoutMessage) {
           try {
-            await ctx.reply(timeoutMessage);
+            await ctx.reply(resolvedTimeoutMessage);
           } catch (_) {}
         }
       }

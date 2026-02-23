@@ -50,6 +50,7 @@ const {
   normalizeReply,
   logCommandError,
   escapeMarkdown,
+  toHtmlSafeText,
   isEntityParseError,
 } = require("./utils/ui");
 const {
@@ -210,9 +211,14 @@ bot.use(async (ctx, next) => {
       if (!isEntityParseError(error)) {
         throw error;
       }
-      const fallbackOptions = { ...normalized.options };
-      delete fallbackOptions.parse_mode;
-      return originalReply(String(normalized.text || ""), fallbackOptions);
+      const fallbackOptions = {
+        ...normalized.options,
+        parse_mode: "HTML",
+      };
+      return originalReply(
+        toHtmlSafeText(String(normalized.text || "")),
+        fallbackOptions,
+      );
     }
   };
   return next();
@@ -729,6 +735,57 @@ function isScriptDesignerRecoveryPrefix(prefix) {
   );
 }
 
+const SCRIPT_RECOVERY_GUARD_WINDOW_MS = 30 * 1000;
+const SCRIPT_RECOVERY_GUARD_MAX_ATTEMPTS = 2;
+
+function reserveScriptRecoveryAttempt(ctx, action, messageId = null) {
+  ensureSession(ctx);
+  ctx.session.meta = ctx.session.meta || {};
+  const key = `${String(action || "")}|${String(messageId || "")}`;
+  const now = Date.now();
+  const attempts =
+    ctx.session.meta.scriptRecoveryAttempts &&
+    typeof ctx.session.meta.scriptRecoveryAttempts === "object"
+      ? ctx.session.meta.scriptRecoveryAttempts
+      : {};
+
+  Object.entries(attempts).forEach(([attemptKey, value]) => {
+    const lastAt = Number(value?.lastAt || 0);
+    if (!lastAt || now - lastAt > SCRIPT_RECOVERY_GUARD_WINDOW_MS) {
+      delete attempts[attemptKey];
+    }
+  });
+
+  const previous = attempts[key];
+  if (
+    !previous ||
+    !Number.isFinite(Number(previous.firstAt)) ||
+    now - Number(previous.firstAt) > SCRIPT_RECOVERY_GUARD_WINDOW_MS
+  ) {
+    attempts[key] = { count: 1, firstAt: now, lastAt: now };
+  } else {
+    attempts[key] = {
+      count: Number(previous.count || 0) + 1,
+      firstAt: Number(previous.firstAt),
+      lastAt: now,
+    };
+  }
+  ctx.session.meta.scriptRecoveryAttempts = attempts;
+  const count = Number(attempts[key]?.count || 0);
+  return {
+    key,
+    count,
+    allowed: count <= SCRIPT_RECOVERY_GUARD_MAX_ATTEMPTS,
+  };
+}
+
+function clearScriptRecoveryAttempt(ctx, key) {
+  if (!key || !ctx?.session?.meta?.scriptRecoveryAttempts) {
+    return;
+  }
+  delete ctx.session.meta.scriptRecoveryAttempts[key];
+}
+
 async function handleScriptDesignerCallbackRouting(
   ctx,
   action,
@@ -772,15 +829,36 @@ async function handleScriptDesignerCallbackRouting(
     const recoveryPrefix = String(recoveryTarget?.parsed?.prefix || "");
     if (isScriptDesignerRecoveryPrefix(recoveryPrefix)) {
       const replayQueue = buildCallbackReplayQueue(action);
+      const expiredMessage = recoveryPrefix.startsWith("email-template-")
+        ? "⚠️ Template menu is stale. Reopen with /email."
+        : "⚠️ Script Designer menu is stale. Reopen with /scripts.";
+      if (!replayQueue.length) {
+        await ctx.reply(expiredMessage).catch(() => {});
+        finishMetric?.("stale", { reason: "replay_not_supported" });
+        return true;
+      }
+      const recoveryAttempt = reserveScriptRecoveryAttempt(
+        ctx,
+        action,
+        ctx.callbackQuery?.message?.message_id || null,
+      );
+      if (!recoveryAttempt.allowed) {
+        await ctx.reply(expiredMessage).catch(() => {});
+        finishMetric?.("stale", {
+          reason: "recovery_loop_guard",
+          attempts: recoveryAttempt.count,
+        });
+        return true;
+      }
       const replayState =
         replayQueue.length > 0
           ? {
-            pendingCallbackReplay: {
-              actions: replayQueue,
-              createdAt: Date.now(),
-              sourceAction: action,
-            },
-          }
+              pendingCallbackReplay: {
+                actions: replayQueue,
+                createdAt: Date.now(),
+                sourceAction: action,
+              },
+            }
           : null;
       const lastCommand = String(ctx.session?.lastCommand || "").toLowerCase();
       const recoveryTargets = [recoveryTarget.conversationTarget];
@@ -808,6 +886,7 @@ async function handleScriptDesignerCallbackRouting(
               callback_data: action,
               conversation_target: conversationTarget,
               replay_count: replayQueue.length,
+              recovery_attempt: recoveryAttempt.count,
               user_id: ctx.from?.id || null,
               chat_id: ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id || null,
             }),
@@ -827,6 +906,7 @@ async function handleScriptDesignerCallbackRouting(
             },
           );
           if (recovered) {
+            clearScriptRecoveryAttempt(ctx, recoveryAttempt.key);
             finishMetric?.("ok", {
               reason: "recovered_missing_active_op",
               replay_count: replayQueue.length,
@@ -847,9 +927,6 @@ async function handleScriptDesignerCallbackRouting(
         });
         return true;
       }
-      const expiredMessage = recoveryPrefix.startsWith("email-template-")
-        ? "⚠️ Template menu is stale. Reopen with /email."
-        : "⚠️ Script Designer menu is stale. Reopen with /scripts.";
       await ctx.reply(expiredMessage).catch(() => {});
       finishMetric?.("stale", { reason: "missing_active_op" });
       return true;
@@ -1171,13 +1248,19 @@ bot.on("callback_query:data", async (ctx) => {
       "email-template-", // Email template menus (covers all email sub-menus)
       "persona-", // Persona selection menus
     ];
-    const isMenuExempt = menuExemptPrefixes.some((prefix) =>
-      rawAction.startsWith(prefix),
-    );
+    const parsedRawCallback = parseCallbackData(rawAction);
+    const parsedRawAction = parsedRawCallback.action || rawAction;
+    const matchesMenuExemptPrefix = (candidate) =>
+      menuExemptPrefixes.some((prefix) =>
+        String(candidate || "").startsWith(prefix),
+      );
+    const isMenuExempt =
+      matchesMenuExemptPrefix(rawAction) ||
+      matchesMenuExemptPrefix(parsedRawAction);
     const validation = isMenuExempt
       ? {
           status: "ok",
-          action: parseCallbackData(rawAction).action || rawAction,
+          action: parsedRawAction,
         }
       : validateCallback(ctx, rawAction);
 
@@ -1186,6 +1269,7 @@ bot.on("callback_query:data", async (ctx) => {
         JSON.stringify({
           type: "callback_query_exempt",
           callback_data: rawAction,
+          action: validation.action || parsedRawAction,
           reason: "conversation_menu",
           ...callbackMeta,
         }),
@@ -1296,9 +1380,7 @@ bot.on("callback_query:data", async (ctx) => {
       }
     }
 
-    const isMenuExemptAction = menuExemptPrefixes.some((prefix) =>
-      action.startsWith(prefix),
-    );
+    const isMenuExemptAction = matchesMenuExemptPrefix(action);
     const isSessionBoundAction = /^[A-Za-z0-9_-]+:[0-9a-fA-F-]{8,}(?::|$)/.test(
       action,
     );

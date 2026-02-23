@@ -286,6 +286,7 @@ module.exports = {
   logCommandError,
   escapeHtml,
   escapeMarkdown,
+  toHtmlSafeText: toHtmlSafeMenuText,
   emphasize,
   buildLine,
   tipLine,

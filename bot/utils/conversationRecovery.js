@@ -4,6 +4,19 @@ const {
   parseScriptDesignerCallbackAction,
 } = require('./scriptDesignerCallbacks');
 
+const SCRIPT_CHANNEL_SELECTIONS = ['call', 'sms', 'email', 'exit'];
+const CALL_SCRIPT_MAIN_SELECTIONS = ['list', 'create', 'incoming', 'back'];
+const SMS_SCRIPT_MAIN_SELECTIONS = ['list', 'create', 'back'];
+const EMAIL_TEMPLATE_MAIN_SELECTIONS = ['list', 'create', 'search', 'import', 'back'];
+const INBOUND_DEFAULT_SELECTIONS = ['set', 'clear', 'back'];
+
+function mapSelectionToken(selections, selectionToken) {
+  const parsedIndex = Number(selectionToken);
+  if (!Number.isFinite(parsedIndex)) return null;
+  if (parsedIndex < 0 || parsedIndex >= selections.length) return null;
+  return selections[parsedIndex] || null;
+}
+
 function parseCallbackAction(action) {
   if (!action || !action.includes(':')) {
     return null;
@@ -77,25 +90,44 @@ function buildCallbackReplayQueue(action) {
   const normalizedAction = `${parsed.prefix}:${normalizedSelection}`;
 
   if (parsed.prefix === 'script-channel') {
-    return [normalizedAction];
+    const selectionId = mapSelectionToken(SCRIPT_CHANNEL_SELECTIONS, selectionToken);
+    return selectionId ? [`script-channel:${selectionId}`] : [normalizedAction];
   }
   if (parsed.prefix === 'call-script-main') {
-    return ['script-channel:0', normalizedAction];
+    const selectionId = mapSelectionToken(CALL_SCRIPT_MAIN_SELECTIONS, selectionToken);
+    return selectionId
+      ? ['script-channel:call', `call-script-main:${selectionId}`]
+      : ['script-channel:call', normalizedAction];
   }
   if (parsed.prefix === 'sms-script-main') {
-    return ['script-channel:1', normalizedAction];
+    const selectionId = mapSelectionToken(SMS_SCRIPT_MAIN_SELECTIONS, selectionToken);
+    return selectionId
+      ? ['script-channel:sms', `sms-script-main:${selectionId}`]
+      : ['script-channel:sms', normalizedAction];
   }
   if (parsed.prefix === 'email-template-main') {
-    return ['script-channel:2', normalizedAction];
+    const selectionId = mapSelectionToken(
+      EMAIL_TEMPLATE_MAIN_SELECTIONS,
+      selectionToken,
+    );
+    return selectionId
+      ? ['script-channel:email', `email-template-main:${selectionId}`]
+      : ['script-channel:email', normalizedAction];
   }
+  // Do not replay dynamic selections after recovery. Reopen the parent menu so
+  // users can intentionally reselect current data without index mismatch risk.
   if (parsed.prefix === 'inbound-default-select') {
-    return ['script-channel:0', 'call-script-main:2', 'inbound-default:0', normalizedAction];
+    return ['script-channel:call', 'call-script-main:incoming', 'inbound-default:set'];
   }
-  if (parsed.prefix.startsWith('inbound-default')) {
-    return ['script-channel:0', 'call-script-main:2', normalizedAction];
+  if (parsed.prefix === 'inbound-default') {
+    const selectionId = mapSelectionToken(INBOUND_DEFAULT_SELECTIONS, selectionToken);
+    return selectionId
+      ? ['script-channel:call', 'call-script-main:incoming', `inbound-default:${selectionId}`]
+      : ['script-channel:call', 'call-script-main:incoming', normalizedAction];
   }
 
-  return [normalizedAction];
+  // Only static Script Designer navigation menus are replayable.
+  return [];
 }
 
 async function recoverConversationFromCallback(

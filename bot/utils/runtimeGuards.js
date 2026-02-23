@@ -1,8 +1,30 @@
 "use strict";
 
+function hasConversationSessionState(ctx) {
+  const conversationState = ctx?.session?.conversation;
+  if (!conversationState || typeof conversationState !== "object") {
+    return false;
+  }
+  const entries = Object.values(conversationState);
+  if (entries.length === 0) {
+    return false;
+  }
+  return entries.some((entry) => {
+    if (Array.isArray(entry)) {
+      return entry.length > 0;
+    }
+    if (entry && typeof entry === "object") {
+      return Object.keys(entry).length > 0;
+    }
+    return Boolean(entry);
+  });
+}
+
 function hasActiveConversation(ctx) {
   const hasInteractiveSession = Boolean(
-    ctx?.session?.currentOp?.id || ctx?.session?.flow?.name,
+    ctx?.session?.currentOp?.id ||
+      ctx?.session?.flow?.name ||
+      hasConversationSessionState(ctx),
   );
   try {
     if (!ctx?.conversation || typeof ctx.conversation.active !== "function") {
@@ -40,4 +62,7 @@ function isSafeCallIdentifier(value) {
 module.exports = {
   hasActiveConversation,
   isSafeCallIdentifier,
+  __testables: {
+    hasConversationSessionState,
+  },
 };
