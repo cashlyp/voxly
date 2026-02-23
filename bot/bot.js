@@ -685,6 +685,11 @@ function isConversationTargetActive(ctx, conversationTarget) {
       return false;
     }
     const scoped = ctx.conversation.active(conversationTarget);
+    if (scoped && typeof scoped.then === "function") {
+      // If active-state probing is async in this runtime, avoid stale routing by
+      // treating the conversation as active.
+      return true;
+    }
     if (typeof scoped === "number") {
       return scoped > 0;
     }
@@ -692,10 +697,16 @@ function isConversationTargetActive(ctx, conversationTarget) {
       return scoped;
     }
     const active = ctx.conversation.active();
+    if (active && typeof active.then === "function") {
+      return true;
+    }
     if (Array.isArray(active)) {
       return active.includes(conversationTarget);
     }
     if (active && typeof active === "object") {
+      if (Object.keys(active).length === 0) {
+        return Boolean(ctx.session?.currentOp?.id);
+      }
       return Number(active[conversationTarget] || 0) > 0;
     }
     if (typeof active === "number") {
@@ -760,43 +771,88 @@ async function handleScriptDesignerCallbackRouting(
 
     const recoveryPrefix = String(recoveryTarget?.parsed?.prefix || "");
     if (isScriptDesignerRecoveryPrefix(recoveryPrefix)) {
-      try {
-        const replayQueue = buildCallbackReplayQueue(action);
-        const recovered = await recoverConversationFromCallback(
-          ctx,
-          action,
-          recoveryTarget.conversationTarget,
-          {
-            cancelActiveFlow,
-            resetSession,
-            clearMenuMessages,
-          },
-          {
-            notify: false,
-            sessionMeta: replayQueue.length > 0
-              ? {
-                pendingCallbackReplay: {
-                  actions: replayQueue,
-                  createdAt: Date.now(),
-                  sourceAction: action,
-                },
-              }
-              : null,
-          },
-        );
-        if (recovered) {
-          finishMetric?.("ok", {
-            reason: "recovered_missing_active_op",
-            replay_count: replayQueue.length,
-          });
-          return true;
-        }
-      } catch (recoveryError) {
-        console.warn(
-          `Conversation recovery failed for ${action}:`,
-          recoveryError?.message || recoveryError,
-        );
+      const replayQueue = buildCallbackReplayQueue(action);
+      const replayState =
+        replayQueue.length > 0
+          ? {
+            pendingCallbackReplay: {
+              actions: replayQueue,
+              createdAt: Date.now(),
+              sourceAction: action,
+            },
+          }
+          : null;
+      const lastCommand = String(ctx.session?.lastCommand || "").toLowerCase();
+      const recoveryTargets = [recoveryTarget.conversationTarget];
+      if (
+        recoveryPrefix.startsWith("email-template-") &&
+        lastCommand === "scripts"
+      ) {
+        recoveryTargets.unshift("scripts-conversation");
+      } else if (
+        recoveryPrefix.startsWith("call-script-") ||
+        recoveryPrefix.startsWith("sms-script-") ||
+        recoveryPrefix.startsWith("script-") ||
+        recoveryPrefix.startsWith("inbound-default")
+      ) {
+        recoveryTargets.push("scripts-conversation");
       }
+      const uniqueRecoveryTargets = Array.from(
+        new Set(recoveryTargets.filter(Boolean)),
+      );
+      for (const conversationTarget of uniqueRecoveryTargets) {
+        try {
+          console.log(
+            JSON.stringify({
+              type: "callback_query_recovery_attempt",
+              callback_data: action,
+              conversation_target: conversationTarget,
+              replay_count: replayQueue.length,
+              user_id: ctx.from?.id || null,
+              chat_id: ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id || null,
+            }),
+          );
+          const recovered = await recoverConversationFromCallback(
+            ctx,
+            action,
+            conversationTarget,
+            {
+              cancelActiveFlow,
+              resetSession,
+              clearMenuMessages,
+            },
+            {
+              notify: false,
+              sessionMeta: replayState,
+            },
+          );
+          if (recovered) {
+            finishMetric?.("ok", {
+              reason: "recovered_missing_active_op",
+              replay_count: replayQueue.length,
+              recovery_target: conversationTarget,
+            });
+            return true;
+          }
+        } catch (recoveryError) {
+          console.warn(
+            `Conversation recovery failed for ${action} -> ${conversationTarget}:`,
+            recoveryError?.message || recoveryError,
+          );
+        }
+      }
+      if (hasActiveConversation(ctx)) {
+        finishMetric?.("ignored", {
+          reason: "active_conversation_recovery_failed",
+        });
+        return true;
+      }
+      const expiredMessage = recoveryPrefix.startsWith("email-template-")
+        ? "⚠️ Template menu is stale. Reopen with /email."
+        : "⚠️ Script Designer menu is stale. Reopen with /scripts.";
+      await ctx.reply(expiredMessage).catch(() => {});
+      finishMetric?.("stale", { reason: "missing_active_op" });
+      return true;
     }
 
     await clearMenuMessages(ctx);
@@ -1110,6 +1166,7 @@ bot.on("callback_query:data", async (ctx) => {
       "rca:",
       "call-script-", // Call Script Designer menus
       "sms-script-", // SMS Script Designer menus
+      "inbound-default", // Inbound default submenus
       "script-", // General script menus (business, persona, draft, etc.)
       "email-template-", // Email template menus (covers all email sub-menus)
       "persona-", // Persona selection menus
@@ -1151,6 +1208,9 @@ bot.on("callback_query:data", async (ctx) => {
           ? "⌛ This menu expired. Opening the latest view…"
           : "⚠️ This menu is no longer active.";
       const staleTarget = getConversationRecoveryTarget(validation.action);
+      const rejectedScriptAction = parseScriptDesignerCallbackAction(
+        validation.action || rawAction,
+      );
       const hasActiveConversationOp = Boolean(
         staleTarget &&
         (ctx.session?.currentOp?.id ||
@@ -1161,8 +1221,14 @@ bot.on("callback_query:data", async (ctx) => {
       // Falling back to the global admin menu here can unexpectedly
       // kick users out of Script Designer/SMS/Email template flows.
       if (!hasActiveConversationOp && !staleTarget) {
-        await clearMenuMessages(ctx);
-        await handleMenu(ctx);
+        if (rejectedScriptAction.isScriptDesigner) {
+          await ctx
+            .reply("⚠️ Script Designer menu is stale. Reopen with /scripts.")
+            .catch(() => {});
+        } else {
+          await clearMenuMessages(ctx);
+          await handleMenu(ctx);
+        }
       }
       finishMetric(validation.status, { reason: validation.reason });
       return;
@@ -1842,6 +1908,22 @@ bot.on("message:text", async (ctx) => {
 
   // Let active conversation flows control their own prompts/replies.
   if (hasActiveConversation(ctx)) {
+    return;
+  }
+  // Ignore ad-hoc text while an operation is still live to prevent
+  // command fallback messages from interrupting in-flight conversations.
+  if (ctx.session?.currentOp?.id || ctx.session?.flow?.name) {
+    console.log(
+      JSON.stringify({
+        type: "message_text_deferred",
+        reason: "active_operation_or_flow",
+        user_id: ctx.from?.id || null,
+        chat_id: ctx.chat?.id || null,
+        op_id: ctx.session?.currentOp?.id || null,
+        op_command: ctx.session?.currentOp?.command || null,
+        flow_name: ctx.session?.flow?.name || null,
+      }),
+    );
     return;
   }
 

@@ -79,6 +79,15 @@ function testScriptReplayQueueBuilder() {
     buildCallbackReplayQueue("inbound-default:1234abcd:9z9z:1"),
     ["script-channel:0", "call-script-main:2", "inbound-default:1"],
   );
+  assert.deepStrictEqual(
+    buildCallbackReplayQueue("inbound-default-select:1234abcd:9z9z:4"),
+    [
+      "script-channel:0",
+      "call-script-main:2",
+      "inbound-default:0",
+      "inbound-default-select:4",
+    ],
+  );
 }
 
 testParseSignedConversationAction();

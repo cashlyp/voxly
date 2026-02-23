@@ -35,6 +35,21 @@ function testHasActiveConversation() {
   );
   assert.strictEqual(
     hasActiveConversation({
+      session: {
+        currentOp: { id: "op-123" },
+      },
+      conversation: { active: () => ({}) },
+    }),
+    true,
+  );
+  assert.strictEqual(
+    hasActiveConversation({
+      conversation: { active: () => Promise.resolve(["scripts-conversation"]) },
+    }),
+    true,
+  );
+  assert.strictEqual(
+    hasActiveConversation({
       conversation: { active: () => 1 },
     }),
     true,

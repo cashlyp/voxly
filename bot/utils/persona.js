@@ -1,7 +1,11 @@
 const { InlineKeyboard } = require('grammy');
 const config = require('../config');
 const httpClient = require('./httpClient');
-const { ensureOperationActive, getCurrentOpId } = require('./sessionState');
+const {
+  ensureOperationActive,
+  getCurrentOpId,
+  OperationCancelledError
+} = require('./sessionState');
 const { sendMenu, clearMenuMessages } = require('./ui');
 const { buildCallbackData, matchesCallbackPrefix, parseCallbackData } = require('./actions');
 
@@ -354,6 +358,7 @@ const TECH_LEVEL_OPTIONS = [
 const CALLBACK_REPLAY_TTL_MS = 2 * 60 * 1000;
 const CALLBACK_REPLAY_MAX_ACTIONS = 8;
 const MENU_TAP_LOCK_TTL_MS = 8 * 1000;
+const MENU_SELECTION_TIMEOUT_MS = 20 * 60 * 1000;
 
 function formatOptionLabel(option) {
   if (option.emoji) {
@@ -481,7 +486,15 @@ async function askOptionWithButtons(
   ctx,
   prompt,
   options,
-  { prefix, columns = 2, formatLabel, ensureActive, bindToOperation } = {}
+  {
+    prefix,
+    columns = 2,
+    formatLabel,
+    ensureActive,
+    bindToOperation,
+    timeoutMs = MENU_SELECTION_TIMEOUT_MS,
+    timeoutMessage = '⏱️ Menu timed out. Please reopen this command.'
+  } = {}
 ) {
   const keyboard = new InlineKeyboard();
   const opId = getCurrentOpId(ctx);
@@ -526,7 +539,23 @@ async function askOptionWithButtons(
     let dropped = 0;
     while (pendingReplayQueue.length > 0) {
       const pendingActionRaw = String(pendingReplayQueue[0] || '');
-      if (!pendingActionRaw || !matchesCallbackPrefix(pendingActionRaw, prefixKey)) {
+      if (!pendingActionRaw) {
+        break;
+      }
+      if (!matchesCallbackPrefix(pendingActionRaw, prefixKey)) {
+        writePendingCallbackReplay(
+          ctx,
+          [],
+          ctx.session?.meta?.pendingCallbackReplay?.sourceAction || null
+        );
+        console.log(JSON.stringify({
+          type: 'conversation_callback_replay_cleared',
+          prefix_key: prefixKey,
+          reason: 'prefix_mismatch',
+          pending_action: pendingActionRaw,
+          user_id: ctx?.from?.id || null,
+          chat_id: ctx?.chat?.id || null
+        }));
         break;
       }
       const pendingAction = parseCallbackData(pendingActionRaw).action || pendingActionRaw;
@@ -578,12 +607,58 @@ async function askOptionWithButtons(
   const tapLockKey = expectedChatId && expectedMessageId
     ? `${expectedChatId}:${expectedMessageId}`
     : null;
-  let selected = null;
-  while (!selected) {
-    const selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {
+  const waitStartedAt = Date.now();
+  const waitSelectionUpdate = async () => {
+    const callbackMatcher = (callbackCtx) => {
       const data = callbackCtx?.callbackQuery?.data;
       return matchesCallbackPrefix(data, prefixKey);
-    });
+    };
+    const useTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0;
+    if (!useTimeout) {
+      return conversation.waitFor('callback_query:data', callbackMatcher);
+    }
+    const remainingMs = Math.max(0, timeoutMs - (Date.now() - waitStartedAt));
+    if (remainingMs <= 0) {
+      throw new OperationCancelledError(`Menu callback timeout after ${timeoutMs}ms`);
+    }
+    let timeoutHandle = null;
+    try {
+      return await Promise.race([
+        conversation.waitFor('callback_query:data', callbackMatcher),
+        new Promise((_, reject) => {
+          timeoutHandle = setTimeout(
+            () => reject(new OperationCancelledError(`Menu callback timeout after ${timeoutMs}ms`)),
+            remainingMs
+          );
+        })
+      ]);
+    } finally {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+    }
+  };
+  let selected = null;
+  while (!selected) {
+    let selectionCtx;
+    try {
+      selectionCtx = await waitSelectionUpdate();
+    } catch (error) {
+      const timeoutError =
+        error instanceof OperationCancelledError ||
+        /timeout/i.test(String(error?.message || ''));
+      if (timeoutError) {
+        try {
+          await clearMenuMessages(ctx);
+        } catch (_) {}
+        if (timeoutMessage) {
+          try {
+            await ctx.reply(timeoutMessage);
+          } catch (_) {}
+        }
+      }
+      throw error;
+    }
     const callbackRawData = String(selectionCtx?.callbackQuery?.data || '');
     const selectionAction = parseCallbackData(callbackRawData).action || callbackRawData;
     const callbackChatId = selectionCtx?.callbackQuery?.message?.chat?.id || null;
@@ -663,6 +738,9 @@ async function askOptionWithButtons(
       }
       await selectionCtx.answerCallbackQuery();
       await disableMessageButtons(selectionCtx, expectedChatId, expectedMessageId);
+      // Keep the lock for a short window after successful selection so
+      // near-simultaneous duplicate taps cannot race into the next step.
+      lockHeld = false;
       selected = matchedOption;
     } catch (_) {
       releaseTapLock(ctx, tapLockKey);

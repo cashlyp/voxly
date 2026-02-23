@@ -389,16 +389,23 @@ async function waitForConversationText(conversation, ctx, options = {}) {
 
       try {
         if (timeoutMs > 0) {
-          // Use Promise.race with a timeout
-          update = await Promise.race([
-            conversation.wait(),
-            new Promise((_, reject) =>
-              setTimeout(
-                () => reject(new OperationCancelledError("wait() timeout")),
-                remainingMs,
-              ),
-            ),
-          ]);
+          // Use Promise.race with a timeout and clear timer eagerly.
+          let timeoutHandle = null;
+          try {
+            update = await Promise.race([
+              conversation.wait(),
+              new Promise((_, reject) => {
+                timeoutHandle = setTimeout(
+                  () => reject(new OperationCancelledError("wait() timeout")),
+                  remainingMs,
+                );
+              }),
+            ]);
+          } finally {
+            if (timeoutHandle) {
+              clearTimeout(timeoutHandle);
+            }
+          }
         } else {
           update = await conversation.wait();
         }

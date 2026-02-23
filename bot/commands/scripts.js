@@ -1183,7 +1183,8 @@ async function promptText(
     allowSkip = false,
     defaultValue = null,
     parse = (value) => value,
-    ensureActive
+    ensureActive,
+    escapeMessage = false
   } = {}
 ) {
   const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
@@ -1196,7 +1197,9 @@ async function promptText(
   }
   hints.push('Type cancel to abort');
 
-  const safeMessage = escapeMarkdown(String(message || ''));
+  const safeMessage = escapeMessage
+    ? escapeMarkdown(String(message || ''))
+    : String(message || '');
   const promptMessage = hints.length > 0 ? `${safeMessage}\n_${hints.join(' | ')}_` : safeMessage;
   await ctx.reply(promptMessage, { parse_mode: 'Markdown' });
   while (true) {

@@ -88,6 +88,9 @@ function buildCallbackReplayQueue(action) {
   if (parsed.prefix === 'email-template-main') {
     return ['script-channel:2', normalizedAction];
   }
+  if (parsed.prefix === 'inbound-default-select') {
+    return ['script-channel:0', 'call-script-main:2', 'inbound-default:0', normalizedAction];
+  }
   if (parsed.prefix.startsWith('inbound-default')) {
     return ['script-channel:0', 'call-script-main:2', normalizedAction];
   }

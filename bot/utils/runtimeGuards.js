@@ -1,11 +1,19 @@
 "use strict";
 
 function hasActiveConversation(ctx) {
+  const hasInteractiveSession = Boolean(
+    ctx?.session?.currentOp?.id || ctx?.session?.flow?.name,
+  );
   try {
     if (!ctx?.conversation || typeof ctx.conversation.active !== "function") {
-      return false;
+      return hasInteractiveSession;
     }
     const active = ctx.conversation.active();
+    if (active && typeof active.then === "function") {
+      // Conservatively treat unresolved conversation state as active to avoid
+      // misrouting free-text input while a conversation is resuming.
+      return true;
+    }
     if (Array.isArray(active)) {
       return active.length > 0;
     }
@@ -13,11 +21,15 @@ function hasActiveConversation(ctx) {
       return active > 0;
     }
     if (active && typeof active === "object") {
-      return Object.values(active).some((count) => Number(count) > 0);
+      const values = Object.values(active);
+      if (values.length === 0) {
+        return hasInteractiveSession;
+      }
+      return values.some((count) => Number(count) > 0);
     }
-    return Boolean(active);
+    return Boolean(active || hasInteractiveSession);
   } catch (_) {
-    return false;
+    return hasInteractiveSession;
   }
 }
 
