@@ -96,16 +96,33 @@ function generateOpId() {
 
 function startOperation(ctx, command, metadata = {}) {
   ensureSession(ctx);
+  const safeCommand = String(command || "").trim();
+  const currentOp = ctx.session?.currentOp;
+  if (
+    currentOp &&
+    currentOp.id &&
+    safeCommand &&
+    String(currentOp.command || "") === safeCommand
+  ) {
+    currentOp.startedAt = Date.now();
+    if (metadata && Object.keys(metadata).length > 0) {
+      currentOp.metadata = { ...(currentOp.metadata || {}), ...metadata };
+    }
+    ctx.session.currentOp = currentOp;
+    ctx.session.lastCommand = safeCommand;
+    return currentOp.id;
+  }
+
   const opId = generateOpId();
   const opToken = opId.replace(/-/g, "").slice(0, 8);
   ctx.session.currentOp = {
     id: opId,
     token: opToken,
-    command,
+    command: safeCommand,
     metadata,
     startedAt: Date.now(),
   };
-  ctx.session.lastCommand = command;
+  ctx.session.lastCommand = safeCommand;
   return opId;
 }
 

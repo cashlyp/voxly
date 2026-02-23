@@ -104,7 +104,7 @@ function wrapConversation(handler, name) {
       await ctx.reply(message);
     } finally {
       // Prevent stale operations from trapping later callbacks in "in-progress" state.
-      if (ctx.session?.currentOp?.id) {
+      if (ctx.session?.currentOp?.id && !hasActiveConversation(ctx)) {
         ctx.session.currentOp = null;
       }
     }
@@ -665,6 +665,21 @@ function hasMatchingConversationOpToken(ctx, recoveryTarget) {
   );
 }
 
+function isConversationTargetActive(ctx, conversationTarget) {
+  if (!conversationTarget) {
+    return false;
+  }
+  try {
+    if (!ctx?.conversation || typeof ctx.conversation.active !== "function") {
+      return false;
+    }
+    const active = ctx.conversation.active();
+    return Array.isArray(active) && active.includes(conversationTarget);
+  } catch (_) {
+    return false;
+  }
+}
+
 function splitTelegramMessage(text, maxLength = 3900) {
   const source = String(text || "");
   if (source.length <= maxLength) return [source];
@@ -1005,7 +1020,12 @@ bot.on("callback_query:data", async (ctx) => {
           : "⚠️ This menu is no longer active.";
       const staleTarget = getConversationRecoveryTarget(validation.action);
       const hasActiveConversationOp = Boolean(
-        staleTarget && ctx.session?.currentOp?.id,
+        staleTarget &&
+          (ctx.session?.currentOp?.id ||
+            isConversationTargetActive(
+              ctx,
+              staleTarget.conversationTarget,
+            )),
       );
       await safeAnswerCallbackQuery(ctx, { text: message, show_alert: false });
       if (!hasActiveConversationOp) {
@@ -1207,6 +1227,10 @@ bot.on("callback_query:data", async (ctx) => {
         ctx,
         recoveryTarget,
       );
+      const hasActiveRecoveryConversation = isConversationTargetActive(
+        ctx,
+        recoveryTarget.conversationTarget,
+      );
 
       // Conversation-scoped callback reached the global router while the same op is active.
       // Keep current flow state and avoid noisy forced restarts.
@@ -1217,6 +1241,12 @@ bot.on("callback_query:data", async (ctx) => {
 
       // No active op: route back to a fresh menu instead of trying to resurrect stale flow state.
       if (!hasActiveOp) {
+        if (hasActiveRecoveryConversation) {
+          finishMetric("ignored", {
+            reason: "active_conversation_router_leak",
+          });
+          return;
+        }
         await clearMenuMessages(ctx);
         await handleMenu(ctx);
         finishMetric("stale", { reason: "missing_active_op" });

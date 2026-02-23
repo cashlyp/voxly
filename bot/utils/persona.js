@@ -370,10 +370,9 @@ async function askOptionWithButtons(
   const opId = getCurrentOpId(ctx);
   const opToken = ctx.session?.currentOp?.token || null;
   const basePrefix = prefix || 'option';
-  const promptNonce = Math.random().toString(36).slice(2, 6);
   const prefixKey = opToken
-    ? `${basePrefix}:${opToken}:${promptNonce}`
-    : `${basePrefix}:${promptNonce}`;
+    ? `${basePrefix}:${opToken}`
+    : `${basePrefix}`;
   const optionLookupByToken = new Map();
   const labels = options.map((option) => (formatLabel ? formatLabel(option) : formatOptionLabel(option)));
   const hasLongLabel = labels.some((label) => String(label).length > 22);
@@ -399,6 +398,7 @@ async function askOptionWithButtons(
 
   const message = await sendMenu(ctx, prompt, { parse_mode: 'Markdown', reply_markup: keyboard });
   const expectedChatId = message?.chat?.id || ctx.chat?.id || null;
+  const expectedMessageId = message?.message_id || null;
   const fallbackOpId = opId;
   const activeChecker = typeof ensureActive === 'function'
     ? ensureActive
@@ -412,6 +412,7 @@ async function askOptionWithButtons(
     const callbackRawData = String(selectionCtx?.callbackQuery?.data || '');
     const selectionAction = parseCallbackData(callbackRawData).action || callbackRawData;
     const callbackChatId = selectionCtx?.callbackQuery?.message?.chat?.id || null;
+    const callbackMessageId = selectionCtx?.callbackQuery?.message?.message_id || null;
     console.log(JSON.stringify({
       type: 'conversation_callback_matched',
       callback_data: callbackRawData,
@@ -443,6 +444,19 @@ async function askOptionWithButtons(
       try {
         await selectionCtx.answerCallbackQuery({
           text: 'That option is unavailable in this chat.',
+          show_alert: false
+        });
+      } catch (_) {}
+      continue;
+    }
+    if (
+      expectedMessageId &&
+      callbackMessageId &&
+      callbackMessageId !== expectedMessageId
+    ) {
+      try {
+        await selectionCtx.answerCallbackQuery({
+          text: '⚠️ This menu is no longer active.',
           show_alert: false
         });
       } catch (_) {}

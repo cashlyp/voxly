@@ -2312,6 +2312,7 @@ async function previewCallScript(conversation, ctx, script, ensureActive) {
         timeout: 30000
       })
     );
+    safeEnsureActive();
 
     await ctx.reply('✅ Preview call launched! You should receive a call shortly.');
   } catch (error) {
@@ -2677,6 +2678,7 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
         'call_create',
         () => createCallScript(apiPayload, { idempotencyKey: createIdempotencyKey })
       );
+      safeEnsureActive();
       const needsCaptureUpdate = scriptPayload.requires_otp
         || scriptPayload.default_profile
         || scriptPayload.expected_length
@@ -2698,6 +2700,7 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
               idempotencyKey: `update_call_script_capture_${script.id}_${opId}`.slice(0, 96)
             })
           );
+          safeEnsureActive();
         } catch (updateError) {
           console.warn('Capture settings update failed:', updateError.message);
         }
@@ -2982,6 +2985,7 @@ async function editCallScriptFlow(conversation, ctx, script, ensureActive) {
         'call_update',
         () => updateCallScript(script.id, apiUpdates, { idempotencyKey })
       );
+      safeEnsureActive();
       await storeScriptVersionSnapshot(updated, 'call', ctx);
       await updateCallScriptLifecycleState(script.id, {
         status: SCRIPT_STATUS_REVIEW,
@@ -3062,6 +3066,7 @@ async function cloneCallScriptFlow(conversation, ctx, script, ensureActive) {
         idempotencyKey
       })
     );
+    safeEnsureActive();
     await storeScriptVersionSnapshot(cloned, 'call', ctx);
     const clonedVersion = Number.isFinite(Number(cloned?.version)) && Number(cloned.version) > 0
       ? Math.max(1, Math.floor(Number(cloned.version)))
@@ -3109,6 +3114,7 @@ async function deleteCallScriptFlow(conversation, ctx, script, ensureActive) {
         'call_delete',
         () => deleteCallScript(script.id, { idempotencyKey })
       );
+      safeEnsureActive();
       await deleteScriptLifecycle('call', String(script.id));
       finishMutationRequest(mutationGate.key, 'done');
       await ctx.reply(`🗑️ Script *${escapeMarkdown(script.name)}* deleted.`, { parse_mode: 'Markdown' });
@@ -3206,6 +3212,7 @@ async function showCallScriptVersions(conversation, ctx, script, ensureActive) {
       'call_restore_version',
       () => updateCallScript(script.id, payload, { idempotencyKey })
     );
+    safeEnsureActive();
     await storeScriptVersionSnapshot(updated, 'call', ctx);
     await updateCallScriptLifecycleState(script.id, {
       status: SCRIPT_STATUS_REVIEW,
@@ -3275,6 +3282,7 @@ async function publishCallScriptFlow(conversation, ctx, script, ensureActive) {
     stable_version: scriptVersion,
     pinned_version: lifecycle?.pinned_version || scriptVersion
   });
+  safeEnsureActive();
   await ctx.reply(
     `✅ Script *${escapeMarkdown(script.name)}* is now active (runtime v${Math.floor(Number(updated?.pinned_version || scriptVersion))}).`,
     { parse_mode: 'Markdown' }
@@ -3300,6 +3308,7 @@ async function updateCallScriptLifecycleStatusFlow(conversation, ctx, script, ne
     reviewed_by: actor || null,
     reviewed_at: nowIso()
   });
+  safeEnsureActive();
   await ctx.reply(`✅ Status updated: ${formatScriptStatusBadge(targetStatus)}`);
 }
 
@@ -3339,6 +3348,7 @@ async function pinCallScriptVersionFlow(conversation, ctx, script, ensureActive)
       reviewed_at: nowIso(),
       reviewed_by: String(ctx?.from?.id || '') || null
     });
+    safeEnsureActive();
     await ctx.reply('✅ Runtime pin removed. /call will use current API version.');
     return;
   }
@@ -3353,6 +3363,7 @@ async function pinCallScriptVersionFlow(conversation, ctx, script, ensureActive)
     reviewed_at: nowIso(),
     reviewed_by: String(ctx?.from?.id || '') || null
   });
+  safeEnsureActive();
   await ctx.reply(`✅ /call runtime pinned to version v${Math.floor(parsedVersion)}.`);
 }
 
@@ -3394,6 +3405,7 @@ async function rollbackCallScriptStableFlow(conversation, ctx, script, ensureAct
     'call_rollback_stable',
     () => updateCallScript(script.id, payload, { idempotencyKey })
   );
+  safeEnsureActive();
 
   await updateCallScriptLifecycleState(script.id, {
     status: SCRIPT_STATUS_ACTIVE,
@@ -3485,7 +3497,9 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
   const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   let viewing = true;
   while (viewing) {
+    safeEnsureActive();
     const lifecycle = await getCallScriptLifecycleState(script.id);
+    safeEnsureActive();
     const lifecycleStatus = normalizeScriptStatus(lifecycle?.status);
     const summary = formatCallScriptSummary(script, lifecycle);
     const summaryMessage = await ctx.reply(summary, { parse_mode: 'Markdown' });
@@ -3533,11 +3547,13 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
         break;
       case 'preflight':
         await showCallScriptPreflight(ctx, script, lifecycle);
+        safeEnsureActive();
         break;
       case 'edit':
         await editCallScriptFlow(conversation, ctx, script, safeEnsureActive);
         try {
           script = await fetchCallScriptById(script.id);
+          safeEnsureActive();
         } catch (error) {
           logScriptsError('Failed to refresh call script after edit', error);
           await ctx.reply(formatScriptsApiError(error, 'Failed to refresh script details'));
@@ -3551,6 +3567,7 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
         await showCallScriptVersions(conversation, ctx, script, safeEnsureActive);
         try {
           script = await fetchCallScriptById(script.id);
+          safeEnsureActive();
         } catch (error) {
           logScriptsError('Failed to refresh call script after version action', error);
           viewing = false;
@@ -3578,6 +3595,7 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
         await rollbackCallScriptStableFlow(conversation, ctx, script, safeEnsureActive);
         try {
           script = await fetchCallScriptById(script.id);
+          safeEnsureActive();
         } catch (error) {
           logScriptsError('Failed to refresh call script after rollback', error);
           viewing = false;
@@ -4082,12 +4100,14 @@ function formatSmsScriptSummary(script) {
   return summary.join('\n');
 }
 
-async function createSmsScriptFlow(conversation, ctx) {
+async function createSmsScriptFlow(conversation, ctx, ensureActive) {
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   const draftKey = 'sms:create';
   const draftMode = await promptDraftResumeMode(conversation, ctx, {
     draftKey,
     title: '📝 SMS script draft found',
-    prefix: 'sms-script-draft'
+    prefix: 'sms-script-draft',
+    ensureActive: safeEnsureActive
   });
   const draftPayload = draftMode?.draft?.payload && typeof draftMode.draft.payload === 'object'
     ? { ...draftMode.draft.payload }
@@ -4112,6 +4132,7 @@ async function createSmsScriptFlow(conversation, ctx) {
       {
         allowEmpty: false,
         defaultValue: reviewResume ? String(draftPayload.name || '') : null,
+        ensureActive: safeEnsureActive,
         parse: (value) => {
           const trimmed = value.trim().toLowerCase();
           if (!/^[a-z0-9_-]+$/.test(trimmed)) {
@@ -4143,6 +4164,7 @@ async function createSmsScriptFlow(conversation, ctx) {
         allowEmpty: true,
         allowSkip: true,
         defaultValue: reviewResume ? String(draftPayload.description || '') : '',
+        ensureActive: safeEnsureActive,
         parse: (value) => value.trim()
       }
     );
@@ -4169,6 +4191,7 @@ async function createSmsScriptFlow(conversation, ctx) {
       {
         allowEmpty: false,
         defaultValue: reviewResume ? String(draftPayload.content || '') : null,
+        ensureActive: safeEnsureActive,
         parse: (value) => value.trim()
       }
     );
@@ -4184,10 +4207,11 @@ async function createSmsScriptFlow(conversation, ctx) {
   const configurePersona = await confirm(
     conversation,
     ctx,
-    'Add persona guidance for this script?'
+    'Add persona guidance for this script?',
+    safeEnsureActive
   );
   if (configurePersona) {
-    const personaResult = await collectPersonaConfig(conversation, ctx, {}, { allowCancel: true });
+    const personaResult = await collectPersonaConfig(conversation, ctx, {}, { allowCancel: true, ensureActive: safeEnsureActive });
     if (!personaResult) {
       await ctx.reply('❌ Script creation cancelled.');
       return;
@@ -4223,6 +4247,7 @@ async function createSmsScriptFlow(conversation, ctx) {
         'sms_create',
         () => createSmsScript(payload, { idempotencyKey })
       );
+      safeEnsureActive();
       finishMutationRequest(mutationGate.key, 'done');
       await storeScriptVersionSnapshot(script, 'sms', ctx);
       await clearFlowDraft(ctx, draftKey);
@@ -4237,7 +4262,8 @@ async function createSmsScriptFlow(conversation, ctx) {
   }
 }
 
-async function editSmsScriptFlow(conversation, ctx, script) {
+async function editSmsScriptFlow(conversation, ctx, script, ensureActive) {
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   if (script.is_builtin) {
     await ctx.reply('ℹ️ Built-in scripts are read-only. Clone the script to modify it.');
     return;
@@ -4247,7 +4273,8 @@ async function editSmsScriptFlow(conversation, ctx, script) {
   const draftMode = await promptDraftResumeMode(conversation, ctx, {
     draftKey,
     title: `✏️ SMS edit draft found for ${script.name}`,
-    prefix: 'sms-script-edit-draft'
+    prefix: 'sms-script-edit-draft',
+    ensureActive: safeEnsureActive
   });
   const draftPayload = draftMode?.draft?.payload && typeof draftMode.draft.payload === 'object'
     ? draftMode.draft.payload
@@ -4262,7 +4289,7 @@ async function editSmsScriptFlow(conversation, ctx, script) {
 
   if (fastResume && Object.keys(savedUpdates).length) {
     await ctx.reply('↩️ Loaded pending SMS edit draft.');
-    const applyPendingNow = await confirm(conversation, ctx, 'Apply pending updates now?');
+    const applyPendingNow = await confirm(conversation, ctx, 'Apply pending updates now?', safeEnsureActive);
     if (applyPendingNow) {
       Object.assign(updates, savedUpdates);
     }
@@ -4281,6 +4308,7 @@ async function editSmsScriptFlow(conversation, ctx, script) {
               ? (savedUpdates.description || '')
               : (script.description || ''))
           : (script.description || ''),
+        ensureActive: safeEnsureActive,
         parse: (value) => value.trim()
       }
     );
@@ -4293,13 +4321,18 @@ async function editSmsScriptFlow(conversation, ctx, script) {
       await saveFlowDraft(ctx, draftKey, 'sms', { updates }, 'description');
     }
 
-    const updateContent = await confirm(conversation, ctx, 'Update the SMS content?');
+    const updateContent = await confirm(conversation, ctx, 'Update the SMS content?', safeEnsureActive);
     if (updateContent) {
       const content = await promptText(
         conversation,
         ctx,
         '💬 Enter the new SMS content.',
-        { allowEmpty: false, defaultValue: reviewResume ? (savedUpdates.content || script.content) : script.content, parse: (value) => value.trim() }
+        {
+          allowEmpty: false,
+          defaultValue: reviewResume ? (savedUpdates.content || script.content) : script.content,
+          ensureActive: safeEnsureActive,
+          parse: (value) => value.trim()
+        }
       );
       if (!content) {
         await ctx.reply('❌ Update cancelled.');
@@ -4309,9 +4342,14 @@ async function editSmsScriptFlow(conversation, ctx, script) {
       await saveFlowDraft(ctx, draftKey, 'sms', { updates }, 'content');
     }
 
-    const adjustPersona = await confirm(conversation, ctx, 'Update persona guidance for this script?');
+    const adjustPersona = await confirm(conversation, ctx, 'Update persona guidance for this script?', safeEnsureActive);
     if (adjustPersona) {
-      const personaResult = await collectPersonaConfig(conversation, ctx, {}, { allowCancel: true });
+      const personaResult = await collectPersonaConfig(
+        conversation,
+        ctx,
+        {},
+        { allowCancel: true, ensureActive: safeEnsureActive }
+      );
       if (!personaResult) {
         await ctx.reply('❌ Update cancelled.');
         return;
@@ -4326,7 +4364,7 @@ async function editSmsScriptFlow(conversation, ctx, script) {
       updates.metadata = metadata;
       await saveFlowDraft(ctx, draftKey, 'sms', { updates }, 'persona');
     } else if (script.metadata?.persona) {
-      const clearPersona = await confirm(conversation, ctx, 'Remove existing persona guidance?');
+      const clearPersona = await confirm(conversation, ctx, 'Remove existing persona guidance?', safeEnsureActive);
       if (clearPersona) {
         const metadata = { ...(script.metadata || {}) };
         delete metadata.persona;
@@ -4359,6 +4397,7 @@ async function editSmsScriptFlow(conversation, ctx, script) {
         'sms_update',
         () => updateSmsScript(script.name, stripUndefined(updates), { idempotencyKey })
       );
+      safeEnsureActive();
       finishMutationRequest(mutationGate.key, 'done');
       await clearFlowDraft(ctx, draftKey);
       await ctx.reply(`✅ SMS script *${escapeMarkdown(updated.name)}* updated.`, { parse_mode: 'Markdown' });
@@ -4372,13 +4411,15 @@ async function editSmsScriptFlow(conversation, ctx, script) {
   }
 }
 
-async function cloneSmsScriptFlow(conversation, ctx, script) {
+async function cloneSmsScriptFlow(conversation, ctx, script, ensureActive) {
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   const name = await promptText(
     conversation,
     ctx,
     `🆕 Enter a name for the clone of *${escapeMarkdown(script.name)}*.`,
     {
       allowEmpty: false,
+      ensureActive: safeEnsureActive,
       parse: (value) => {
         const trimmed = value.trim().toLowerCase();
         if (!/^[a-z0-9_-]+$/.test(trimmed)) {
@@ -4397,7 +4438,13 @@ async function cloneSmsScriptFlow(conversation, ctx, script) {
     conversation,
     ctx,
     '📝 Optional description for the cloned script (or type skip).',
-    { allowEmpty: true, allowSkip: true, defaultValue: script.description || '', parse: (value) => value.trim() }
+    {
+      allowEmpty: true,
+      allowSkip: true,
+      defaultValue: script.description || '',
+      ensureActive: safeEnsureActive,
+      parse: (value) => value.trim()
+    }
   );
   if (description === null) {
     await ctx.reply('❌ Clone cancelled.');
@@ -4427,6 +4474,7 @@ async function cloneSmsScriptFlow(conversation, ctx, script) {
       'sms_clone',
       () => createSmsScript(payload, { idempotencyKey })
     );
+    safeEnsureActive();
     finishCloneRequest(cloneGate.key, 'done');
     await ctx.reply(`✅ Script cloned as *${escapeMarkdown(cloned.name)}*.`, { parse_mode: 'Markdown' });
   } catch (error) {
@@ -4436,13 +4484,19 @@ async function cloneSmsScriptFlow(conversation, ctx, script) {
   }
 }
 
-async function deleteSmsScriptFlow(conversation, ctx, script) {
+async function deleteSmsScriptFlow(conversation, ctx, script, ensureActive) {
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   if (script.is_builtin) {
     await ctx.reply('ℹ️ Built-in scripts cannot be deleted.');
     return;
   }
 
-  const confirmed = await confirm(conversation, ctx, `Delete SMS script *${escapeMarkdown(script.name)}*?`);
+  const confirmed = await confirm(
+    conversation,
+    ctx,
+    `Delete SMS script *${escapeMarkdown(script.name)}*?`,
+    safeEnsureActive
+  );
   if (!confirmed) {
     await ctx.reply('Deletion cancelled.');
     return;
@@ -4464,6 +4518,7 @@ async function deleteSmsScriptFlow(conversation, ctx, script) {
         'sms_delete',
         () => deleteSmsScript(script.name, { idempotencyKey })
       );
+      safeEnsureActive();
       finishMutationRequest(mutationGate.key, 'done');
       await ctx.reply(`🗑️ Script *${escapeMarkdown(script.name)}* deleted.`, { parse_mode: 'Markdown' });
     } catch (error) {
@@ -4476,9 +4531,11 @@ async function deleteSmsScriptFlow(conversation, ctx, script) {
   }
 }
 
-async function showSmsScriptVersions(conversation, ctx, script) {
+async function showSmsScriptVersions(conversation, ctx, script, ensureActive) {
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   try {
     const versions = await listScriptVersions(script.name, 'sms', 8);
+    safeEnsureActive();
     if (!versions.length) {
       await ctx.reply('ℹ️ No saved versions yet. Versions are stored on edit/delete.');
       return;
@@ -4499,7 +4556,7 @@ async function showSmsScriptVersions(conversation, ctx, script) {
         ctx,
         'Select a version to restore.',
         options,
-        { prefix: 'sms-script-version', columns: 2 }
+        { prefix: 'sms-script-version', columns: 2, ensureActive: safeEnsureActive }
       );
     } finally {
       await deleteMessageSafely(ctx, versionsMessage);
@@ -4511,6 +4568,7 @@ async function showSmsScriptVersions(conversation, ctx, script) {
       return;
     }
     const version = await getScriptVersion(script.name, 'sms', versionNumber);
+    safeEnsureActive();
     if (!version || !version.payload) {
       await ctx.reply('❌ Version payload not found.');
       return;
@@ -4529,7 +4587,7 @@ async function showSmsScriptVersions(conversation, ctx, script) {
     } else {
       await ctx.reply(`ℹ️ v${versionNumber} matches the current script content.`);
     }
-    const confirmRestore = await confirm(conversation, ctx, `Restore version v${versionNumber}?`);
+    const confirmRestore = await confirm(conversation, ctx, `Restore version v${versionNumber}?`, safeEnsureActive);
     if (!confirmRestore) {
       await ctx.reply('Restore cancelled.');
       return;
@@ -4541,6 +4599,7 @@ async function showSmsScriptVersions(conversation, ctx, script) {
       'sms_restore_version',
       () => updateSmsScript(script.name, stripUndefined(version.payload))
     );
+    safeEnsureActive();
     await ctx.reply(`✅ SMS script restored to v${versionNumber}.`, { parse_mode: 'Markdown' });
     try {
       script = await fetchSmsScriptByName(script.name, { detailed: true });
@@ -4551,12 +4610,13 @@ async function showSmsScriptVersions(conversation, ctx, script) {
   }
 }
 
-async function previewSmsScript(conversation, ctx, script) {
+async function previewSmsScript(conversation, ctx, script, ensureActive) {
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   const to = await promptText(
     conversation,
     ctx,
     '📱 Enter the destination number (E.164 format, e.g., +1234567890).',
-    { allowEmpty: false, parse: (value) => value.trim() }
+    { allowEmpty: false, ensureActive: safeEnsureActive, parse: (value) => value.trim() }
   );
   if (!to) {
     await ctx.reply('❌ Preview cancelled.');
@@ -4572,7 +4632,7 @@ async function previewSmsScript(conversation, ctx, script) {
   let variables = {};
   if (placeholders.length > 0) {
     await ctx.reply('🧩 This script includes placeholders. Provide values or type skip to leave unchanged.');
-    const values = await collectPlaceholderValues(conversation, ctx, placeholders);
+    const values = await collectPlaceholderValues(conversation, ctx, placeholders, safeEnsureActive);
     if (values === null) {
       await ctx.reply('❌ Preview cancelled.');
       return;
@@ -4601,6 +4661,7 @@ async function previewSmsScript(conversation, ctx, script) {
       'sms_preview',
       () => requestSmsScriptPreview(script.name, payload)
     );
+    safeEnsureActive();
     const previewContent = String(preview?.content || '');
     const snippet = previewContent.substring(0, 200);
     const messageSid = preview?.message_sid || preview?.messageSid || 'n/a';
@@ -4615,9 +4676,11 @@ async function previewSmsScript(conversation, ctx, script) {
   }
 }
 
-async function showSmsScriptDetail(conversation, ctx, script) {
+async function showSmsScriptDetail(conversation, ctx, script, ensureActive) {
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   let viewing = true;
   while (viewing) {
+    safeEnsureActive();
     const summary = formatSmsScriptSummary(script);
     const summaryMessage = await ctx.reply(summary, { parse_mode: 'Markdown' });
 
@@ -4641,7 +4704,7 @@ async function showSmsScriptDetail(conversation, ctx, script) {
         ctx,
         'Choose an action for this SMS script.',
         actions,
-        { prefix: 'sms-script-action', columns: 2 }
+        { prefix: 'sms-script-action', columns: 2, ensureActive: safeEnsureActive }
       );
     } finally {
       await deleteMessageSafely(ctx, summaryMessage);
@@ -4649,12 +4712,13 @@ async function showSmsScriptDetail(conversation, ctx, script) {
 
     switch (action.id) {
       case 'preview':
-        await previewSmsScript(conversation, ctx, script);
+        await previewSmsScript(conversation, ctx, script, safeEnsureActive);
         break;
       case 'edit':
-        await editSmsScriptFlow(conversation, ctx, script);
+        await editSmsScriptFlow(conversation, ctx, script, safeEnsureActive);
         try {
           script = await fetchSmsScriptByName(script.name, { detailed: true });
+          safeEnsureActive();
         } catch (error) {
           logScriptsError('Failed to refresh SMS script after edit', error);
           await ctx.reply(formatScriptsApiError(error, 'Failed to refresh script details'));
@@ -4662,13 +4726,13 @@ async function showSmsScriptDetail(conversation, ctx, script) {
         }
         break;
       case 'clone':
-        await cloneSmsScriptFlow(conversation, ctx, script);
+        await cloneSmsScriptFlow(conversation, ctx, script, safeEnsureActive);
         break;
       case 'versions':
-        await showSmsScriptVersions(conversation, ctx, script);
+        await showSmsScriptVersions(conversation, ctx, script, safeEnsureActive);
         break;
       case 'delete':
-        await deleteSmsScriptFlow(conversation, ctx, script);
+        await deleteSmsScriptFlow(conversation, ctx, script, safeEnsureActive);
         viewing = false;
         break;
       case 'back':
@@ -4680,9 +4744,11 @@ async function showSmsScriptDetail(conversation, ctx, script) {
   }
 }
 
-async function listSmsScriptsFlow(conversation, ctx) {
+async function listSmsScriptsFlow(conversation, ctx, ensureActive) {
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   try {
     const scripts = await fetchSmsScripts();
+    safeEnsureActive();
     if (!scripts.length) {
       await ctx.reply('ℹ️ No SMS scripts found. Use the create action to add one.');
       return;
@@ -4698,6 +4764,7 @@ async function listSmsScriptsFlow(conversation, ctx) {
       {
         allowEmpty: false,
         allowSkip: true,
+        ensureActive: safeEnsureActive,
         parse: (value) => value.trim()
       }
     );
@@ -4717,6 +4784,7 @@ async function listSmsScriptsFlow(conversation, ctx) {
     let page = 0;
 
     while (true) {
+      safeEnsureActive();
       const start = page * SCRIPT_SELECTION_PAGE_SIZE;
       const pageScripts = filteredScripts.slice(start, start + SCRIPT_SELECTION_PAGE_SIZE);
       const options = pageScripts.map((script) => ({
@@ -4747,7 +4815,12 @@ async function listSmsScriptsFlow(conversation, ctx) {
         ctx,
         prompt,
         options,
-        { prefix: 'sms-script-select', columns: 1, formatLabel: (option) => option.label }
+        {
+          prefix: 'sms-script-select',
+          columns: 1,
+          formatLabel: (option) => option.label,
+          ensureActive: safeEnsureActive
+        }
       );
 
       if (!selection?.id || selection.id === PAGE_NAV_BACK) {
@@ -4772,11 +4845,12 @@ async function listSmsScriptsFlow(conversation, ctx) {
 
       try {
         const script = await fetchSmsScriptByName(scriptName, { detailed: true });
+        safeEnsureActive();
         if (!script) {
           await ctx.reply('❌ Script not found.');
           continue;
         }
-        await showSmsScriptDetail(conversation, ctx, script);
+        await showSmsScriptDetail(conversation, ctx, script, safeEnsureActive);
       } catch (error) {
         logScriptsError('Failed to load SMS script details', error);
         await ctx.reply(formatScriptsApiError(error, 'Failed to load script details'));
@@ -4788,7 +4862,8 @@ async function listSmsScriptsFlow(conversation, ctx) {
   }
 }
 
-async function smsScriptsMenu(conversation, ctx) {
+async function smsScriptsMenu(conversation, ctx, ensureActive) {
+  const safeEnsureActive = resolveEnsureActive(ensureActive, ctx);
   let open = true;
   while (open) {
     try {
@@ -4801,15 +4876,15 @@ async function smsScriptsMenu(conversation, ctx) {
           { id: 'create', label: '➕ Create script' },
           { id: 'back', label: '⬅️ Back' }
         ],
-        { prefix: 'sms-script-main', columns: 1 }
+        { prefix: 'sms-script-main', columns: 1, ensureActive: safeEnsureActive }
       );
 
       switch (action.id) {
         case 'list':
-          await listSmsScriptsFlow(conversation, ctx);
+          await listSmsScriptsFlow(conversation, ctx, safeEnsureActive);
           break;
         case 'create':
-          await createSmsScriptFlow(conversation, ctx);
+          await createSmsScriptFlow(conversation, ctx, safeEnsureActive);
           break;
         case 'back':
           open = false;
