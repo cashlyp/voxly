@@ -351,12 +351,69 @@ const TECH_LEVEL_OPTIONS = [
   { id: 'novice', label: 'Beginner-friendly' },
   { id: 'advanced', label: 'Advanced / technical specialist' },
 ];
+const CALLBACK_REPLAY_TTL_MS = 2 * 60 * 1000;
+const CALLBACK_REPLAY_MAX_ACTIONS = 8;
 
 function formatOptionLabel(option) {
   if (option.emoji) {
     return `${option.emoji} ${option.label}`;
   }
   return option.label;
+}
+
+function readPendingCallbackReplay(ctx) {
+  const meta = ctx.session?.meta;
+  if (!meta || !meta.pendingCallbackReplay) {
+    return [];
+  }
+  const replayMeta = meta.pendingCallbackReplay;
+  let actions = [];
+  let createdAt = 0;
+  if (Array.isArray(replayMeta)) {
+    actions = replayMeta;
+  } else if (replayMeta && typeof replayMeta === 'object') {
+    actions = Array.isArray(replayMeta.actions) ? replayMeta.actions : [];
+    createdAt = Number(replayMeta.createdAt || 0);
+  }
+  if (!actions.length) {
+    delete meta.pendingCallbackReplay;
+    return [];
+  }
+  if (createdAt > 0 && Date.now() - createdAt > CALLBACK_REPLAY_TTL_MS) {
+    delete meta.pendingCallbackReplay;
+    console.log(JSON.stringify({
+      type: 'conversation_callback_replay_expired',
+      user_id: ctx?.from?.id || null,
+      chat_id: ctx?.chat?.id || null
+    }));
+    return [];
+  }
+  return actions
+    .map((action) => String(action || '').trim())
+    .filter(Boolean)
+    .slice(0, CALLBACK_REPLAY_MAX_ACTIONS);
+}
+
+function writePendingCallbackReplay(ctx, actions, sourceAction = null) {
+  if (!ctx.session) {
+    return;
+  }
+  ctx.session.meta = ctx.session.meta || {};
+  const normalized = Array.isArray(actions)
+    ? actions
+      .map((action) => String(action || '').trim())
+      .filter(Boolean)
+      .slice(0, CALLBACK_REPLAY_MAX_ACTIONS)
+    : [];
+  if (normalized.length === 0) {
+    delete ctx.session.meta.pendingCallbackReplay;
+    return;
+  }
+  ctx.session.meta.pendingCallbackReplay = {
+    actions: normalized,
+    createdAt: Date.now(),
+    sourceAction: sourceAction || null
+  };
 }
 
 async function askOptionWithButtons(
@@ -380,6 +437,10 @@ async function askOptionWithButtons(
   const optionLookupByToken = new Map();
   const labels = options.map((option) => (formatLabel ? formatLabel(option) : formatOptionLabel(option)));
   const hasLongLabel = labels.some((label) => String(label).length > 22);
+  const fallbackOpId = opId;
+  const activeChecker = typeof ensureActive === 'function'
+    ? ensureActive
+    : () => ensureOperationActive(ctx, fallbackOpId);
   let resolvedColumns = Number.isFinite(columns) ? columns : (labels.length > 6 || hasLongLabel ? 1 : 2);
   if (resolvedColumns < 1) {
     resolvedColumns = 1;
@@ -400,13 +461,60 @@ async function askOptionWithButtons(
     }
   });
 
+  const pendingReplayQueue = readPendingCallbackReplay(ctx);
+  if (pendingReplayQueue.length > 0) {
+    let dropped = 0;
+    while (pendingReplayQueue.length > 0) {
+      const pendingActionRaw = String(pendingReplayQueue[0] || '');
+      if (!pendingActionRaw || !matchesCallbackPrefix(pendingActionRaw, prefixKey)) {
+        break;
+      }
+      const pendingAction = parseCallbackData(pendingActionRaw).action || pendingActionRaw;
+      const pendingParts = pendingAction.split(':');
+      const pendingToken = pendingParts.length ? pendingParts[pendingParts.length - 1] : '';
+      const replaySelection = optionLookupByToken.get(pendingToken)
+        || options.find((option) => String(option.id) === pendingToken);
+      pendingReplayQueue.shift();
+      if (replaySelection) {
+        activeChecker();
+        writePendingCallbackReplay(
+          ctx,
+          pendingReplayQueue,
+          ctx.session?.meta?.pendingCallbackReplay?.sourceAction || null
+        );
+        console.log(JSON.stringify({
+          type: 'conversation_callback_replayed',
+          pending_action: pendingActionRaw,
+          resolved_action: pendingAction,
+          prefix_key: prefixKey,
+          selected_id: replaySelection?.id || null,
+          user_id: ctx?.from?.id || null,
+          chat_id: ctx?.chat?.id || null
+        }));
+        return replaySelection;
+      }
+      dropped += 1;
+    }
+    if (dropped > 0) {
+      writePendingCallbackReplay(
+        ctx,
+        pendingReplayQueue,
+        ctx.session?.meta?.pendingCallbackReplay?.sourceAction || null
+      );
+      console.log(JSON.stringify({
+        type: 'conversation_callback_replay_dropped',
+        prefix_key: prefixKey,
+        dropped,
+        remaining: pendingReplayQueue.length,
+        user_id: ctx?.from?.id || null,
+        chat_id: ctx?.chat?.id || null
+      }));
+    }
+  }
+
   const message = await sendMenu(ctx, prompt, { parse_mode: 'Markdown', reply_markup: keyboard });
   const expectedChatId = message?.chat?.id || ctx.chat?.id || null;
   const expectedMessageId = message?.message_id || null;
-  const fallbackOpId = opId;
-  const activeChecker = typeof ensureActive === 'function'
-    ? ensureActive
-    : () => ensureOperationActive(ctx, fallbackOpId);
   let selected = null;
   while (!selected) {
     const selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {

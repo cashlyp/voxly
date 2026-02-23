@@ -46,11 +46,62 @@ function getConversationRecoveryTarget(action) {
   return { parsed, conversationTarget };
 }
 
-async function recoverConversationFromCallback(ctx, action, conversationTarget, adapters) {
+function getSelectionTokenFromAction(action) {
+  const parsed = parseCallbackAction(action);
+  if (!parsed || !parsed.value) {
+    return null;
+  }
+  const parts = String(parsed.value).split(':').filter(Boolean);
+  if (parts.length === 0) {
+    return null;
+  }
+  return parts[parts.length - 1];
+}
+
+function buildCallbackReplayQueue(action) {
+  const parsed = parseCallbackAction(action);
+  if (!parsed) {
+    return [];
+  }
+  const selectionToken = getSelectionTokenFromAction(action);
+  if (!selectionToken) {
+    return [];
+  }
+
+  const normalizedSelection = String(selectionToken);
+  const normalizedAction = `${parsed.prefix}:${normalizedSelection}`;
+
+  if (parsed.prefix === 'script-channel') {
+    return [normalizedAction];
+  }
+  if (parsed.prefix === 'call-script-main') {
+    return ['script-channel:0', normalizedAction];
+  }
+  if (parsed.prefix === 'sms-script-main') {
+    return ['script-channel:1', normalizedAction];
+  }
+  if (parsed.prefix === 'email-template-main') {
+    return ['script-channel:2', normalizedAction];
+  }
+  if (parsed.prefix.startsWith('inbound-default')) {
+    return ['script-channel:0', 'call-script-main:2', normalizedAction];
+  }
+
+  return [normalizedAction];
+}
+
+async function recoverConversationFromCallback(
+  ctx,
+  action,
+  conversationTarget,
+  adapters,
+  options = {},
+) {
   if (!ctx || !action || !conversationTarget) {
     return false;
   }
   const { cancelActiveFlow, resetSession, clearMenuMessages } = adapters || {};
+  const { notify = true, message = '↩️ Reopening that flow so you can continue.', sessionMeta = null } = options;
   if (
     typeof cancelActiveFlow !== 'function' ||
     typeof resetSession !== 'function' ||
@@ -61,8 +112,16 @@ async function recoverConversationFromCallback(ctx, action, conversationTarget, 
 
   await cancelActiveFlow(ctx, `desynced_callback:${action}`);
   resetSession(ctx);
+  if (sessionMeta && typeof sessionMeta === 'object') {
+    ctx.session.meta = {
+      ...(ctx.session.meta || {}),
+      ...sessionMeta
+    };
+  }
   await clearMenuMessages(ctx);
-  await ctx.reply('↩️ Reopening that flow so you can continue.');
+  if (notify) {
+    await ctx.reply(message);
+  }
   await ctx.conversation.enter(conversationTarget);
   return true;
 }
@@ -71,5 +130,7 @@ module.exports = {
   parseCallbackAction,
   resolveConversationFromPrefix,
   getConversationRecoveryTarget,
+  getSelectionTokenFromAction,
+  buildCallbackReplayQueue,
   recoverConversationFromCallback
 };

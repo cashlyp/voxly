@@ -5,6 +5,8 @@ const {
   parseCallbackAction,
   resolveConversationFromPrefix,
   getConversationRecoveryTarget,
+  getSelectionTokenFromAction,
+  buildCallbackReplayQueue,
 } = require("../utils/conversationRecovery");
 
 function testParseSignedConversationAction() {
@@ -48,8 +50,41 @@ function testPrefixResolverCoverage() {
   assert.strictEqual(resolveConversationFromPrefix("persona-choose"), "persona-conversation");
 }
 
+function testSelectionTokenExtraction() {
+  assert.strictEqual(
+    getSelectionTokenFromAction("sms-script-main:bd0c9bd3:3fg7:0"),
+    "0",
+  );
+  assert.strictEqual(
+    getSelectionTokenFromAction("call-script-main:1234abcd:2"),
+    "2",
+  );
+  assert.strictEqual(getSelectionTokenFromAction("script-channel"), null);
+}
+
+function testScriptReplayQueueBuilder() {
+  assert.deepStrictEqual(
+    buildCallbackReplayQueue("sms-script-main:bd0c9bd3:3fg7:0"),
+    ["script-channel:1", "sms-script-main:0"],
+  );
+  assert.deepStrictEqual(
+    buildCallbackReplayQueue("call-script-main:abcd1234:2"),
+    ["script-channel:0", "call-script-main:2"],
+  );
+  assert.deepStrictEqual(
+    buildCallbackReplayQueue("email-template-main:deadbeef:4"),
+    ["script-channel:2", "email-template-main:4"],
+  );
+  assert.deepStrictEqual(
+    buildCallbackReplayQueue("inbound-default:1234abcd:9z9z:1"),
+    ["script-channel:0", "call-script-main:2", "inbound-default:1"],
+  );
+}
+
 testParseSignedConversationAction();
 testParseActionWithoutOperationToken();
 testRecoveryTargetMapping();
 testUnknownPrefixHasNoRecoveryTarget();
 testPrefixResolverCoverage();
+testSelectionTokenExtraction();
+testScriptReplayQueueBuilder();

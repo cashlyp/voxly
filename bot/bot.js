@@ -39,6 +39,7 @@ const {
 } = require("./utils/actions");
 const {
   getConversationRecoveryTarget,
+  buildCallbackReplayQueue,
   recoverConversationFromCallback,
 } = require("./utils/conversationRecovery");
 const {
@@ -1296,6 +1297,7 @@ bot.on("callback_query:data", async (ctx) => {
         }
         if (shouldRecoverMissingScriptOp) {
           try {
+            const replayQueue = buildCallbackReplayQueue(action);
             const recovered = await recoverConversationFromCallback(
               ctx,
               action,
@@ -1305,9 +1307,24 @@ bot.on("callback_query:data", async (ctx) => {
                 resetSession,
                 clearMenuMessages,
               },
+              {
+                notify: false,
+                sessionMeta: replayQueue.length > 0
+                  ? {
+                    pendingCallbackReplay: {
+                      actions: replayQueue,
+                      createdAt: Date.now(),
+                      sourceAction: action,
+                    },
+                  }
+                  : null,
+              },
             );
             if (recovered) {
-              finishMetric("ok", { reason: "recovered_missing_active_op" });
+              finishMetric("ok", {
+                reason: "recovered_missing_active_op",
+                replay_count: replayQueue.length,
+              });
               return;
             }
           } catch (recoveryError) {
