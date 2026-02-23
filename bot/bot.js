@@ -1164,6 +1164,18 @@ bot.on("callback_query:data", async (ctx) => {
       return;
     }
 
+    // Guard against future conversation callback prefixes that are not yet in
+    // the explicit recovery map. If the callback is session-bound and token-matched,
+    // let the active conversation own it and keep the global router side-effect free.
+    if (isSessionBoundAction) {
+      const callbackOpToken = normalizeOpToken(action.split(":")[1]);
+      const currentOpToken = ctx.session?.currentOp?.token || null;
+      if (callbackOpToken && currentOpToken && callbackOpToken === currentOpToken) {
+        finishMetric("ignored", { reason: "session_bound_router_leak" });
+        return;
+      }
+    }
+
     // Handle conversation actions
     const conversations = {
       CALL: "call-conversation",

@@ -18,6 +18,7 @@ function resolveConversationFromPrefix(prefix) {
   if (prefix === 'call-voice') return 'call-conversation';
   if (prefix === 'call-script') return 'call-conversation';
   if (prefix.startsWith('call-script-')) return 'scripts-conversation';
+  if (prefix.startsWith('inbound-default')) return 'scripts-conversation';
   if (prefix.startsWith('sms-script-')) return 'scripts-conversation';
   if (prefix === 'sms-script') return 'sms-conversation';
   if (prefix.startsWith('script-') || prefix === 'confirm') return 'scripts-conversation';
