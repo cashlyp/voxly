@@ -1417,6 +1417,8 @@ const TELEGRAM_COMMANDS_USER = [
   { command: "email", description: "Open Email center" },
 ];
 const COMMAND_SYNC_DEBOUNCE_MS = 60 * 1000;
+const COMMAND_SYNC_RETENTION_MS = 10 * 60 * 1000;
+const COMMAND_SYNC_MAX_CHATS = 5000;
 const commandSyncState = new Map();
 
 function buildCommandsFingerprint(commands = []) {
@@ -1425,10 +1427,30 @@ function buildCommandsFingerprint(commands = []) {
     .join("|");
 }
 
+function pruneCommandSyncState(now = Date.now()) {
+  for (const [chatId, state] of commandSyncState.entries()) {
+    if (!state || now - Number(state.updatedAt || 0) > COMMAND_SYNC_RETENTION_MS) {
+      commandSyncState.delete(chatId);
+    }
+  }
+  if (commandSyncState.size <= COMMAND_SYNC_MAX_CHATS) {
+    return;
+  }
+  const overflow = commandSyncState.size - COMMAND_SYNC_MAX_CHATS;
+  const oldest = Array.from(commandSyncState.entries())
+    .sort((a, b) => Number(a[1]?.updatedAt || 0) - Number(b[1]?.updatedAt || 0))
+    .slice(0, overflow);
+  for (const [chatId] of oldest) {
+    commandSyncState.delete(chatId);
+  }
+}
+
 async function syncChatCommands(ctx, access) {
   if (!ctx.chat || ctx.chat.type !== "private") {
     return;
   }
+  const now = Date.now();
+  pruneCommandSyncState(now);
   const chatId = String(ctx.chat.id);
   const commands = access.user
     ? access.isAdmin
@@ -1436,7 +1458,6 @@ async function syncChatCommands(ctx, access) {
       : TELEGRAM_COMMANDS_USER
     : TELEGRAM_COMMANDS_GUEST;
   const fingerprint = buildCommandsFingerprint(commands);
-  const now = Date.now();
   const cached = commandSyncState.get(chatId);
   if (
     cached &&
