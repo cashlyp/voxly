@@ -39,6 +39,10 @@ function testUnknownPrefixHasNoRecoveryTarget() {
 function testPrefixResolverCoverage() {
   assert.strictEqual(resolveConversationFromPrefix("sms-foo"), "sms-conversation");
   assert.strictEqual(resolveConversationFromPrefix("bulk-email-x"), "bulk-email-conversation");
+  assert.strictEqual(resolveConversationFromPrefix("call-script-main"), "scripts-conversation");
+  assert.strictEqual(resolveConversationFromPrefix("sms-script-main"), "scripts-conversation");
+  assert.strictEqual(resolveConversationFromPrefix("script-channel"), "scripts-conversation");
+  assert.strictEqual(resolveConversationFromPrefix("email-template-main"), "email-templates-conversation");
   assert.strictEqual(resolveConversationFromPrefix("inbound-default"), "scripts-conversation");
   assert.strictEqual(resolveConversationFromPrefix("inbound-default-select"), "scripts-conversation");
   assert.strictEqual(resolveConversationFromPrefix("persona-choose"), "persona-conversation");

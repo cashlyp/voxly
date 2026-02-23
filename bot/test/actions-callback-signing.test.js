@@ -75,7 +75,20 @@ function testSessionBoundPayloadRespectsOperationToken() {
   assert.strictEqual(validation.status, "stale");
 }
 
+function testSignedScriptDesignerPayloadValidatesWithMatchingToken() {
+  const ctx = createCtx("1234abcd");
+  const action = "call-script-main:1234abcd:0";
+  const payload = buildCallbackData(ctx, action);
+  const parsed = parseCallbackData(payload);
+  assert.strictEqual(parsed.action, action);
+
+  const validation = validateCallback(ctx, payload);
+  assert.strictEqual(validation.status, "ok");
+  assert.strictEqual(validation.action, action);
+}
+
 testShortActionUsesRegularSignedPayload();
 testLongSessionBoundActionUsesPortableRawPayload();
 testLongNonSessionActionUsesAliasSignedPayload();
 testSessionBoundPayloadRespectsOperationToken();
+testSignedScriptDesignerPayloadValidatesWithMatchingToken();

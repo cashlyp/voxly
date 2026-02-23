@@ -102,11 +102,6 @@ function wrapConversation(handler, name) {
         "❌ An error occurred during the conversation. Please try again.";
       const message = error?.userMessage || fallback;
       await ctx.reply(message);
-    } finally {
-      // Prevent stale operations from trapping later callbacks in "in-progress" state.
-      if (ctx.session?.currentOp?.id && !hasActiveConversation(ctx)) {
-        ctx.session.currentOp = null;
-      }
     }
   }, name);
 }
@@ -1028,7 +1023,10 @@ bot.on("callback_query:data", async (ctx) => {
             )),
       );
       await safeAnswerCallbackQuery(ctx, { text: message, show_alert: false });
-      if (!hasActiveConversationOp) {
+      // Keep stale conversation-scoped callbacks side-effect free.
+      // Falling back to the global admin menu here can unexpectedly
+      // kick users out of Script Designer/SMS/Email template flows.
+      if (!hasActiveConversationOp && !staleTarget) {
         await clearMenuMessages(ctx);
         await handleMenu(ctx);
       }
