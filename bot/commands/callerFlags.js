@@ -3,7 +3,7 @@ const config = require('../config');
 const httpClient = require('../utils/httpClient');
 const { getUser, isAdmin } = require('../db/db');
 const { buildCallbackData } = require('../utils/actions');
-const { OperationCancelledError, startOperation, waitForConversationText } = require('../utils/sessionState');
+const { guardAgainstCommandInterrupt, OperationCancelledError, startOperation } = require('../utils/sessionState');
 const { escapeMarkdown, renderMenu } = require('../utils/ui');
 
 const ADMIN_HEADER_NAME = 'x-admin-token';
@@ -54,10 +54,7 @@ function buildCallerFlagsKeyboard(ctx) {
     .text('✅ Allow', buildCallbackData(ctx, 'CALLER_FLAGS_ALLOW'))
     .text('🚫 Block', buildCallbackData(ctx, 'CALLER_FLAGS_BLOCK'))
     .row()
-    .text('⚠️ Spam', buildCallbackData(ctx, 'CALLER_FLAGS_SPAM'))
-    .row()
-    .text('⬅️ Back', buildCallbackData(ctx, 'MENU'))
-    .text('🚪 Exit', buildCallbackData(ctx, 'MENU_EXIT'));
+    .text('⚠️ Spam', buildCallbackData(ctx, 'CALLER_FLAGS_SPAM'));
 }
 
 async function renderCallerFlagsMenu(ctx, note = '') {
@@ -228,9 +225,11 @@ function createCallerFlagFlow(status) {
       if (!isAdminUser) return;
 
       await ctx.reply('📞 Enter the caller phone number:');
-      const { text: phoneText } = await waitForConversationText(conversation, ctx, {
-        invalidMessage: '⚠️ Please send the phone number as text.'
-      });
+      const phoneMsg = await conversation.wait();
+      const phoneText = phoneMsg?.message?.text?.trim();
+      if (phoneText) {
+        await guardAgainstCommandInterrupt(ctx, phoneText);
+      }
       const normalizedPhone = normalizePhoneInput(phoneText);
       if (!normalizedPhone) {
         await ctx.reply('❌ Please provide a valid phone number.');
@@ -238,9 +237,11 @@ function createCallerFlagFlow(status) {
       }
 
       await ctx.reply('📝 Optional note (or type skip):');
-      const { text: noteText } = await waitForConversationText(conversation, ctx, {
-        invalidMessage: '⚠️ Please send the note as text (or type skip).'
-      });
+      const noteMsg = await conversation.wait();
+      const noteText = noteMsg?.message?.text?.trim();
+      if (noteText) {
+        await guardAgainstCommandInterrupt(ctx, noteText);
+      }
       const note = noteText && noteText.toLowerCase() !== 'skip'
         ? noteText
         : null;

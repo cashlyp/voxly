@@ -1,62 +1,7 @@
-'use strict';
-
-/**
- * persona.js
- *
- * Utility for fetching/caching business persona profiles and providing the
- * askOptionWithButtons helper used throughout every conversation flow.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * BUG FIX — "⚠️ This menu is no longer active." on Script Designer buttons
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * PROBLEM:
- *   Inside the `while (!selected)` callback-waiting loop in `askOptionWithButtons`,
- *   there is a guard:
- *
- *       if (expectedMessageId && callbackMessageId !== expectedMessageId) {
- *         await selectionCtx.answerCallbackQuery({ text: '⚠️ This menu is no longer active.' });
- *         continue;  // ← silently drops the tap and loops forever
- *       }
- *
- *   This guard fires when the message ID of the button the user tapped differs
- *   from the message ID of the menu the conversation most recently rendered.
- *
- *   For non-Script-Designer menus this is correct — a stale button from an old
- *   prompt should be rejected.
- *
- *   For SCRIPT DESIGNER menus (script-channel, call-script-main, sms-script-main,
- *   email-template-main, inbound-default) the guard caused a permanent loop
- *   because after a bot restart or recovery the conversation re-enters,
- *   re-renders the menu (new message_id), but the user's tap references the
- *   freshly-rendered menu — and due to a grammY conversation-replay timing issue,
- *   the `expectedMessageId` captured inside `askOptionWithButtons` sometimes
- *   still pointed to the message from the PREVIOUS session.
- *
- *   Result: every single button tap was rejected with the "no longer active" alert.
- *
- * FIX:
- *   For Script Designer menus (`isScriptDesignerMenu = true`) the message-ID
- *   guard is RELAXED:
- *     • Mismatches are LOGGED as diagnostic JSON (type: conversation_msg_id_mismatch)
- *       so they remain observable in production logs.
- *     • The callback is NOT rejected — execution falls through to the normal
- *       option-matching and tap-lock logic.
- *     • Non-Script-Designer menus are UNCHANGED — the guard remains strict.
- *
- *   This is safe because Script Designer menus use prefix-based matching
- *   (matchesCallbackPrefix) which already ensures only callbacks for the correct
- *   prefix are accepted, and the tap-lock prevents duplicate processing.
- */
-
 const { InlineKeyboard } = require('grammy');
 const config = require('../config');
 const httpClient = require('./httpClient');
-const {
-  ensureOperationActive,
-  getCurrentOpId,
-  OperationCancelledError
-} = require('./sessionState');
+const { ensureOperationActive, getCurrentOpId } = require('./sessionState');
 const { sendMenu, clearMenuMessages } = require('./ui');
 const { buildCallbackData, matchesCallbackPrefix, parseCallbackData } = require('./actions');
 
@@ -330,7 +275,7 @@ let personaCache = {
 
 async function fetchRemotePersonas() {
   try {
-    const response = await httpClient.get(null, `${config.apiUrl}/api/personas`, { timeout: 10000 });
+  const response = await httpClient.get(null, `${config.apiUrl}/api/personas`, { timeout: 10000 });
     const data = response.data || {};
     const builtin = Array.isArray(data.builtin) ? data.builtin : [];
     const custom = Array.isArray(data.custom) ? data.custom : [];
@@ -407,16 +352,6 @@ const TECH_LEVEL_OPTIONS = [
   { id: 'advanced', label: 'Advanced / technical specialist' },
 ];
 
-const CALLBACK_REPLAY_TTL_MS = 2 * 60 * 1000;
-const CALLBACK_REPLAY_MAX_ACTIONS = 8;
-const MENU_TAP_LOCK_TTL_MS = 8 * 1000;
-const MENU_SELECTION_TIMEOUT_MS = 20 * 60 * 1000;
-const SCRIPT_MENU_SELECTION_TIMEOUT_MS = 30 * 60 * 1000;
-const SCRIPT_MENU_PREFIX_PATTERN =
-  /^(call-script-|sms-script-|script-|inbound-default|email-template-)/;
-const SCRIPT_MENU_NO_TIMEOUT_PREFIX_PATTERN =
-  /^(script-channel|call-script-main|sms-script-main|email-template-main|inbound-default)$/;
-
 function formatOptionLabel(option) {
   if (option.emoji) {
     return `${option.emoji} ${option.label}`;
@@ -424,169 +359,19 @@ function formatOptionLabel(option) {
   return option.label;
 }
 
-function readPendingCallbackReplay(ctx) {
-  const meta = ctx.session?.meta;
-  if (!meta || !meta.pendingCallbackReplay) {
-    return [];
-  }
-  const replayMeta = meta.pendingCallbackReplay;
-  let actions = [];
-  let createdAt = 0;
-  if (Array.isArray(replayMeta)) {
-    actions = replayMeta;
-  } else if (replayMeta && typeof replayMeta === 'object') {
-    actions = Array.isArray(replayMeta.actions) ? replayMeta.actions : [];
-    createdAt = Number(replayMeta.createdAt || 0);
-  }
-  if (!actions.length) {
-    delete meta.pendingCallbackReplay;
-    return [];
-  }
-  if (createdAt > 0 && Date.now() - createdAt > CALLBACK_REPLAY_TTL_MS) {
-    delete meta.pendingCallbackReplay;
-    console.log(JSON.stringify({
-      type: 'conversation_callback_replay_expired',
-      user_id: ctx?.from?.id || null,
-      chat_id: ctx?.chat?.id || null
-    }));
-    return [];
-  }
-  return actions
-    .map((action) => String(action || '').trim())
-    .filter(Boolean)
-    .slice(0, CALLBACK_REPLAY_MAX_ACTIONS);
-}
-
-function writePendingCallbackReplay(ctx, actions, sourceAction = null) {
-  if (!ctx.session) {
-    return;
-  }
-  ctx.session.meta = ctx.session.meta || {};
-  const normalized = Array.isArray(actions)
-    ? actions
-      .map((action) => String(action || '').trim())
-      .filter(Boolean)
-      .slice(0, CALLBACK_REPLAY_MAX_ACTIONS)
-    : [];
-  if (normalized.length === 0) {
-    delete ctx.session.meta.pendingCallbackReplay;
-    return;
-  }
-  ctx.session.meta.pendingCallbackReplay = {
-    actions: normalized,
-    createdAt: Date.now(),
-    sourceAction: sourceAction || null
-  };
-}
-
-function readTapLocks(ctx) {
-  if (!ctx.session) {
-    return {};
-  }
-  ctx.session.meta = ctx.session.meta || {};
-  const locks = ctx.session.meta.menuTapLocks;
-  if (!locks || typeof locks !== 'object') {
-    ctx.session.meta.menuTapLocks = {};
-    return ctx.session.meta.menuTapLocks;
-  }
-  return locks;
-}
-
-function pruneTapLocks(ctx, now = Date.now()) {
-  const locks = readTapLocks(ctx);
-  Object.entries(locks).forEach(([key, expiresAt]) => {
-    if (!Number.isFinite(expiresAt) || expiresAt <= now) {
-      delete locks[key];
-    }
-  });
-  return locks;
-}
-
-function acquireTapLock(ctx, lockKey) {
-  if (!lockKey) {
-    return true;
-  }
-  const now = Date.now();
-  const locks = pruneTapLocks(ctx, now);
-  const expiresAt = Number(locks[lockKey] || 0);
-  if (expiresAt > now) {
-    return false;
-  }
-  locks[lockKey] = now + MENU_TAP_LOCK_TTL_MS;
-  return true;
-}
-
-function releaseTapLock(ctx, lockKey) {
-  if (!ctx?.session?.meta?.menuTapLocks || !lockKey) {
-    return;
-  }
-  delete ctx.session.meta.menuTapLocks[lockKey];
-}
-
-async function disableMessageButtons(apiCtx, chatId, messageId) {
-  if (!apiCtx || !chatId || !messageId) {
-    return;
-  }
-  try {
-    await apiCtx.api.editMessageReplyMarkup(chatId, messageId, {
-      reply_markup: { inline_keyboard: [] }
-    });
-  } catch (_) {
-    try {
-      await apiCtx.api.editMessageReplyMarkup(chatId, messageId);
-    } catch (_) {}
-  }
-}
-
 async function askOptionWithButtons(
   conversation,
   ctx,
   prompt,
   options,
-  settings = {}
+  { prefix, columns = 2, formatLabel, ensureActive } = {}
 ) {
-  const {
-    prefix,
-    columns = 2,
-    formatLabel,
-    ensureActive,
-    bindToOperation,
-    timeoutMs = MENU_SELECTION_TIMEOUT_MS,
-    timeoutMessage = '⏱️ Menu timed out. Please reopen this command.'
-  } = settings;
   const keyboard = new InlineKeyboard();
   const opId = getCurrentOpId(ctx);
-  const opToken = ctx.session?.currentOp?.token || null;
   const basePrefix = prefix || 'option';
-  const isScriptDesignerMenu = SCRIPT_MENU_PREFIX_PATTERN.test(basePrefix);
-  const hasExplicitTimeoutMs = Object.prototype.hasOwnProperty.call(settings, 'timeoutMs');
-  const shouldDisableTimeout =
-    isScriptDesignerMenu &&
-    SCRIPT_MENU_NO_TIMEOUT_PREFIX_PATTERN.test(basePrefix) &&
-    !hasExplicitTimeoutMs;
-  const shouldBindToOperation =
-    typeof bindToOperation === 'boolean'
-      ? bindToOperation
-      : !isScriptDesignerMenu;
-  const resolvedTimeoutMs = shouldDisableTimeout
-    ? 0
-    : (Number.isFinite(timeoutMs) && timeoutMs > 0
-      ? (isScriptDesignerMenu ? Math.max(timeoutMs, SCRIPT_MENU_SELECTION_TIMEOUT_MS) : timeoutMs)
-      : timeoutMs);
-  const resolvedTimeoutMessage = isScriptDesignerMenu
-    && timeoutMessage === '⏱️ Menu timed out. Please reopen this command.'
-    ? '⏱️ Script Designer step timed out. Reopen /scripts to continue.'
-    : timeoutMessage;
-  const prefixKey = shouldBindToOperation && opToken
-    ? `${basePrefix}:${opToken}`
-    : `${basePrefix}`;
-  const optionLookupByToken = new Map();
+  const prefixKey = opId ? `${basePrefix}:${opId}` : basePrefix;
   const labels = options.map((option) => (formatLabel ? formatLabel(option) : formatOptionLabel(option)));
   const hasLongLabel = labels.some((label) => String(label).length > 22);
-  const fallbackOpId = opId;
-  const activeChecker = typeof ensureActive === 'function'
-    ? ensureActive
-    : () => ensureOperationActive(ctx, fallbackOpId);
   let resolvedColumns = Number.isFinite(columns) ? columns : (labels.length > 6 || hasLongLabel ? 1 : 2);
   if (resolvedColumns < 1) {
     resolvedColumns = 1;
@@ -597,278 +382,23 @@ async function askOptionWithButtons(
 
   labels.forEach((label, index) => {
     const option = options[index];
-    const optionToken = String(index);
-    optionLookupByToken.set(optionToken, option);
-    const action = `${prefixKey}:${optionToken}`;
-    // Keep conversation menu callback_data restart-safe and worker-safe.
-    keyboard.text(label, buildCallbackData(ctx, action, { ttlMs: 0 }));
+    const action = `${prefixKey}:${option.id}`;
+    keyboard.text(label, buildCallbackData(ctx, action));
     if ((index + 1) % resolvedColumns === 0) {
       keyboard.row();
     }
   });
 
-  const pendingReplayQueue = readPendingCallbackReplay(ctx);
-  if (pendingReplayQueue.length > 0) {
-    let dropped = 0;
-    while (pendingReplayQueue.length > 0) {
-      const pendingActionRaw = String(pendingReplayQueue[0] || '');
-      if (!pendingActionRaw) {
-        break;
-      }
-      if (!matchesCallbackPrefix(pendingActionRaw, prefixKey)) {
-        writePendingCallbackReplay(
-          ctx,
-          [],
-          ctx.session?.meta?.pendingCallbackReplay?.sourceAction || null
-        );
-        console.log(JSON.stringify({
-          type: 'conversation_callback_replay_cleared',
-          prefix_key: prefixKey,
-          reason: 'prefix_mismatch',
-          pending_action: pendingActionRaw,
-          user_id: ctx?.from?.id || null,
-          chat_id: ctx?.chat?.id || null
-        }));
-        break;
-      }
-      const pendingAction = parseCallbackData(pendingActionRaw).action || pendingActionRaw;
-      const pendingParts = pendingAction.split(':');
-      const pendingToken = pendingParts.length ? pendingParts[pendingParts.length - 1] : '';
-      const replaySelection = optionLookupByToken.get(pendingToken)
-        || options.find((option) => String(option.id) === pendingToken);
-      pendingReplayQueue.shift();
-      if (replaySelection) {
-        activeChecker();
-        writePendingCallbackReplay(
-          ctx,
-          pendingReplayQueue,
-          ctx.session?.meta?.pendingCallbackReplay?.sourceAction || null
-        );
-        console.log(JSON.stringify({
-          type: 'conversation_callback_replayed',
-          pending_action: pendingActionRaw,
-          resolved_action: pendingAction,
-          prefix_key: prefixKey,
-          selected_id: replaySelection?.id || null,
-          user_id: ctx?.from?.id || null,
-          chat_id: ctx?.chat?.id || null
-        }));
-        return replaySelection;
-      }
-      dropped += 1;
-    }
-    if (dropped > 0) {
-      writePendingCallbackReplay(
-        ctx,
-        pendingReplayQueue,
-        ctx.session?.meta?.pendingCallbackReplay?.sourceAction || null
-      );
-      console.log(JSON.stringify({
-        type: 'conversation_callback_replay_dropped',
-        prefix_key: prefixKey,
-        dropped,
-        remaining: pendingReplayQueue.length,
-        user_id: ctx?.from?.id || null,
-        chat_id: ctx?.chat?.id || null
-      }));
-    }
-  }
-
   const message = await sendMenu(ctx, prompt, { parse_mode: 'Markdown', reply_markup: keyboard });
-  const expectedChatId = message?.chat?.id || ctx.chat?.id || null;
-  const expectedMessageId = message?.message_id || null;
-  const tapLockKey = expectedChatId && expectedMessageId
-    ? `${expectedChatId}:${expectedMessageId}`
-    : null;
-  const waitStartedAt = Date.now();
-  const waitSelectionUpdate = async () => {
-    const callbackMatcher = (callbackCtx) => {
-      const data = callbackCtx?.callbackQuery?.data;
-      return matchesCallbackPrefix(data, prefixKey);
-    };
-    const useTimeout = Number.isFinite(resolvedTimeoutMs) && resolvedTimeoutMs > 0;
-    if (!useTimeout) {
-      return conversation.waitFor('callback_query:data', callbackMatcher);
-    }
-    const remainingMs = Math.max(0, resolvedTimeoutMs - (Date.now() - waitStartedAt));
-    if (remainingMs <= 0) {
-      throw new OperationCancelledError(`Menu callback timeout after ${resolvedTimeoutMs}ms`);
-    }
-    let timeoutHandle = null;
-    try {
-      return await Promise.race([
-        conversation.waitFor('callback_query:data', callbackMatcher),
-        new Promise((_, reject) => {
-          timeoutHandle = setTimeout(
-            () => reject(new OperationCancelledError(`Menu callback timeout after ${resolvedTimeoutMs}ms`)),
-            remainingMs
-          );
-        })
-      ]);
-    } finally {
-      if (timeoutHandle) {
-        clearTimeout(timeoutHandle);
-      }
-    }
-  };
-  let selected = null;
-  while (!selected) {
-    let selectionCtx;
-    try {
-      selectionCtx = await waitSelectionUpdate();
-    } catch (error) {
-      const timeoutError =
-        error instanceof OperationCancelledError ||
-        /timeout/i.test(String(error?.message || ''));
-      if (timeoutError) {
-        writePendingCallbackReplay(ctx, [], null);
-        try {
-          await clearMenuMessages(ctx);
-        } catch (_) {}
-        if (resolvedTimeoutMessage) {
-          try {
-            await ctx.reply(resolvedTimeoutMessage);
-          } catch (_) {}
-        }
-      }
-      throw error;
-    }
-    const callbackRawData = String(selectionCtx?.callbackQuery?.data || '');
-    const selectionAction = parseCallbackData(callbackRawData).action || callbackRawData;
-    const callbackChatId = selectionCtx?.callbackQuery?.message?.chat?.id || null;
-    const callbackMessageId = selectionCtx?.callbackQuery?.message?.message_id || null;
-    console.log(JSON.stringify({
-      type: 'conversation_callback_matched',
-      callback_data: callbackRawData,
-      action: selectionAction,
-      prefix_key: prefixKey,
-      matched: true,
-      user_id: selectionCtx?.from?.id || ctx.from?.id || null,
-      chat_id: callbackChatId || ctx.chat?.id || null,
-      state: {
-        op_id: ctx.session?.currentOp?.id || null,
-        op_token: ctx.session?.currentOp?.token || null,
-        op_command: ctx.session?.currentOp?.command || null,
-        flow_name: ctx.session?.flow?.name || null,
-        flow_step: ctx.session?.flow?.step || null
-      }
-    }));
-    try {
-      activeChecker();
-    } catch (error) {
-      try {
-        await selectionCtx.answerCallbackQuery({
-          text: '⚠️ This menu is no longer active.',
-          show_alert: false
-        });
-      } catch (_) {}
-      throw error;
-    }
-    if (expectedChatId && callbackChatId && callbackChatId !== expectedChatId) {
-      try {
-        await selectionCtx.answerCallbackQuery({
-          text: 'That option is unavailable in this chat.',
-          show_alert: false
-        });
-      } catch (_) {}
-      continue;
-    }
+  const selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {
+    return matchesCallbackPrefix(callbackCtx.callbackQuery.data, prefixKey);
+  });
+  const activeChecker = typeof ensureActive === 'function'
+    ? ensureActive
+    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  activeChecker();
 
-    // ── Message-ID stale-guard ────────────────────────────────────────────────
-    // FIX: For Script Designer menus, relax the strict message-ID check.
-    //
-    // Background: after a bot restart or conversation recovery, the conversation
-    // re-enters and re-renders the menu.  Due to grammY's conversation-replay
-    // mechanism, the `expectedMessageId` captured here can briefly refer to the
-    // PREVIOUS session's message.  The user's tap arrives for the freshly-
-    // rendered menu, so `callbackMessageId !== expectedMessageId` fires and the
-    // tap is silently dropped — causing the "no longer active" loop forever.
-    //
-    // For Script Designer menus we instead: log the mismatch for observability
-    // and then ALLOW the callback to proceed to option-matching.  This is safe
-    // because prefix-matching already filters only correct-prefix callbacks, and
-    // the tap-lock prevents duplicate processing.
-    //
-    // Non-Script-Designer menus retain the original strict rejection behaviour.
-    if (
-      expectedMessageId &&
-      callbackMessageId &&
-      callbackMessageId !== expectedMessageId
-    ) {
-      if (isScriptDesignerMenu) {
-        // FIX: Log mismatch but DO NOT reject — allow the tap through.
-        console.log(JSON.stringify({
-          type: 'conversation_msg_id_mismatch',
-          prefix_key: prefixKey,
-          expected_message_id: expectedMessageId,
-          callback_message_id: callbackMessageId,
-          action: selectionAction,
-          note: 'script_designer_relaxed_guard_accepted',
-          user_id: selectionCtx?.from?.id || ctx?.from?.id || null,
-          chat_id: callbackChatId || ctx?.chat?.id || null
-        }));
-        // Fall through — do NOT `continue` — let the option-matching proceed.
-      } else {
-        // Non-script-designer menus: reject the stale tap as before.
-        try {
-          await selectionCtx.answerCallbackQuery({
-            text: '⚠️ This menu is no longer active.',
-            show_alert: false
-          });
-        } catch (_) {}
-        continue;
-      }
-    }
-    // ─────────────────────────────────────────────────────────────────────────
-
-    if (!acquireTapLock(ctx, tapLockKey)) {
-      try {
-        await selectionCtx.answerCallbackQuery({
-          text: '⏳ Processing previous tap…',
-          show_alert: false
-        });
-      } catch (_) {}
-      continue;
-    }
-    let lockHeld = Boolean(tapLockKey);
-    const parts = selectionAction.split(':');
-    const selectedToken = parts.length ? parts[parts.length - 1] : '';
-    const matchedOption = optionLookupByToken.get(selectedToken)
-      || options.find((option) => String(option.id) === selectedToken);
-    try {
-      if (!matchedOption) {
-        releaseTapLock(ctx, tapLockKey);
-        lockHeld = false;
-        await selectionCtx.answerCallbackQuery({
-          text: 'That option is no longer available. Please choose again.',
-          show_alert: false
-        });
-        continue;
-      }
-      await selectionCtx.answerCallbackQuery();
-      await disableMessageButtons(selectionCtx, expectedChatId, expectedMessageId);
-      // Keep the lock for a short window after successful selection so
-      // near-simultaneous duplicate taps cannot race into the next step.
-      lockHeld = false;
-      selected = matchedOption;
-    } catch (_) {
-      releaseTapLock(ctx, tapLockKey);
-      lockHeld = false;
-    } finally {
-      if (lockHeld) {
-        releaseTapLock(ctx, tapLockKey);
-      }
-    }
-  }
-
-  console.log(JSON.stringify({
-    type: 'conversation_callback_completed',
-    prefix_key: prefixKey,
-    selected_id: selected?.id || null,
-    user_id: ctx?.from?.id || null,
-    chat_id: ctx?.chat?.id || null
-  }));
-
+  await selectionCtx.answerCallbackQuery();
   try {
     await ctx.api.deleteMessage(message.chat.id, message.message_id);
   } catch (_) {
@@ -876,7 +406,10 @@ async function askOptionWithButtons(
   }
   await clearMenuMessages(ctx);
 
-  return selected;
+  const selectionAction = parseCallbackData(selectionCtx.callbackQuery.data).action || selectionCtx.callbackQuery.data;
+  const parts = selectionAction.split(':');
+  const selectedId = opId ? parts.slice(2).join(':') : parts.slice(1).join(':');
+  return options.find((option) => option.id === selectedId);
 }
 
 function getOptionLabel(options, id) {

@@ -2,25 +2,10 @@ const config = require('../config');
 const httpClient = require('../utils/httpClient');
 const { InlineKeyboard } = require('grammy');
 const { getUser } = require('../db/db');
-const { startOperation, ensureOperationActive, OperationCancelledError, waitForConversationText } = require('../utils/sessionState');
+const { startOperation, ensureOperationActive } = require('../utils/sessionState');
 const { renderMenu, escapeMarkdown, buildLine, section } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 const { getAccessProfile } = require('../utils/capabilities');
-
-function maskPhoneForDisplay(value = '') {
-    const text = String(value || '').trim();
-    if (!text) return 'N/A';
-    const digits = text.replace(/\D/g, '');
-    if (digits.length < 4) return '***';
-    const prefix = text.startsWith('+') ? '+' : '';
-    return `${prefix}***${digits.slice(-4)}`;
-}
-
-function summarizeSensitiveText(value = '') {
-    const text = String(value || '').trim();
-    if (!text) return '';
-    return `🔒 redacted (${text.length} chars)`;
-}
 
 function parseRecentFilter(input = '') {
     const trimmed = String(input || '').trim();
@@ -30,13 +15,6 @@ function parseRecentFilter(input = '') {
         return { phone: trimmed };
     }
     return { status: trimmed };
-}
-
-function isSessionCancellationError(error) {
-    if (!error) return false;
-    if (error instanceof OperationCancelledError) return true;
-    const name = String(error.name || '');
-    return name === 'AbortError' || name === 'CanceledError';
 }
 
 async function fetchRecentCalls({ limit = 10, filter } = {}) {
@@ -82,10 +60,7 @@ function buildCalllogMenuKeyboard(ctx) {
         .text('🔍 Search', buildCallbackData(ctx, 'CALLLOG_SEARCH'))
         .row()
         .text('📄 Call Details', buildCallbackData(ctx, 'CALLLOG_DETAILS'))
-        .text('🧾 Recent Events', buildCallbackData(ctx, 'CALLLOG_EVENTS'))
-        .row()
-        .text('⬅️ Back', buildCallbackData(ctx, 'MENU'))
-        .text('🚪 Exit', buildCallbackData(ctx, 'MENU_EXIT'));
+        .text('🧾 Recent Events', buildCallbackData(ctx, 'CALLLOG_EVENTS'));
 }
 
 function buildMainMenuKeyboard(ctx) {
@@ -120,12 +95,9 @@ async function calllogRecentFlow(conversation, ctx) {
         await ctx.reply('🕒 Enter limit (max 30) and optional filter (status or phone).\nExample: `15 completed` or `20 +1234567890`', {
             parse_mode: 'Markdown'
         });
-        const { text: rawText } = await waitForConversationText(conversation, ctx, {
-            ensureActive,
-            allowEmpty: true,
-            invalidMessage: '⚠️ Please send the limit/filter as text.'
-        });
-        const raw = rawText || '';
+        const update = await conversation.wait();
+        ensureActive();
+        const raw = update?.message?.text?.trim() || '';
         const parts = raw.split(/\s+/).filter(Boolean);
         const limit = Math.min(parseInt(parts[0], 10) || 10, 30);
         const filter = parts.slice(1).join(' ');
@@ -144,7 +116,7 @@ async function calllogRecentFlow(conversation, ctx) {
             const duration = call.duration ? `${Math.floor(call.duration / 60)}:${String(call.duration % 60).padStart(2, '0')}` : 'N/A';
             return [
                 `• ${escapeMarkdown(call.call_sid || 'unknown')} (${escapeMarkdown(status)})`,
-                `📞 ${escapeMarkdown(maskPhoneForDisplay(call.phone_number))}`,
+                `📞 ${escapeMarkdown(call.phone_number || 'N/A')}`,
                 `⏱️ ${duration} | 🕒 ${escapeMarkdown(when)}`
             ].join('\n');
         });
@@ -157,9 +129,6 @@ async function calllogRecentFlow(conversation, ctx) {
             reply_markup: buildMainMenuKeyboard(ctx)
         });
     } catch (error) {
-        if (isSessionCancellationError(error)) {
-            return;
-        }
         await ctx.reply(httpClient.getUserMessage(error, 'Failed to fetch recent calls.'), {
             reply_markup: buildMainMenuKeyboard(ctx)
         });
@@ -177,10 +146,9 @@ async function calllogSearchFlow(conversation, ctx) {
             return;
         }
         await ctx.reply('🔍 Enter a search term (phone, call ID, or status).');
-        const { text: query } = await waitForConversationText(conversation, ctx, {
-            ensureActive,
-            invalidMessage: '⚠️ Please send the search term as text.'
-        });
+        const update = await conversation.wait();
+        ensureActive();
+        const query = update?.message?.text?.trim();
         if (!query || query.length < 2) {
             await ctx.reply('❌ Please provide at least 2 characters.');
             return;
@@ -202,17 +170,14 @@ async function calllogSearchFlow(conversation, ctx) {
         const lines = results.slice(0, 5).map((c) => {
             const status = c.status || 'unknown';
             const when = new Date(c.created_at).toLocaleString();
-            const summary = c.call_summary ? `\n📝 ${escapeMarkdown(summarizeSensitiveText(c.call_summary))}` : '';
-            return `• ${escapeMarkdown(c.call_sid || 'unknown')} (${escapeMarkdown(status)})\n📞 ${escapeMarkdown(maskPhoneForDisplay(c.phone_number))}\n🕒 ${escapeMarkdown(when)}${summary}`;
+            const summary = c.call_summary ? `\n📝 ${escapeMarkdown(c.call_summary.slice(0, 120))}${c.call_summary.length > 120 ? '…' : ''}` : '';
+            return `• ${escapeMarkdown(c.call_sid || 'unknown')} (${escapeMarkdown(status)})\n📞 ${escapeMarkdown(c.phone_number || 'N/A')}\n🕒 ${escapeMarkdown(when)}${summary}`;
         });
         await ctx.reply(lines.join('\n\n'), {
             parse_mode: 'Markdown',
             reply_markup: buildMainMenuKeyboard(ctx)
         });
     } catch (error) {
-        if (isSessionCancellationError(error)) {
-            return;
-        }
         await ctx.reply(httpClient.getUserMessage(error, 'Search failed. Please try again later.'), {
             reply_markup: buildMainMenuKeyboard(ctx)
         });
@@ -230,10 +195,9 @@ async function calllogDetailsFlow(conversation, ctx) {
             return;
         }
         await ctx.reply('📄 Enter the call SID to view details.');
-        const { text: callSid } = await waitForConversationText(conversation, ctx, {
-            ensureActive,
-            invalidMessage: '⚠️ Please send the call SID as text.'
-        });
+        const update = await conversation.wait();
+        ensureActive();
+        const callSid = update?.message?.text?.trim();
         if (!callSid) {
             await ctx.reply('❌ Call SID is required.');
             return;
@@ -253,22 +217,19 @@ async function calllogDetailsFlow(conversation, ctx) {
         const duration = call.duration ? `${Math.floor(call.duration / 60)}:${String(call.duration % 60).padStart(2, '0')}` : 'N/A';
         const lines = [
             buildLine('🆔', 'Call', escapeMarkdown(call.call_sid || callSid)),
-            buildLine('📞', 'Phone', escapeMarkdown(maskPhoneForDisplay(call.phone_number))),
+            buildLine('📞', 'Phone', escapeMarkdown(call.phone_number || 'N/A')),
             buildLine('📊', 'Status', escapeMarkdown(call.status || 'unknown')),
             buildLine('⏱️', 'Duration', escapeMarkdown(duration)),
             buildLine('🕒', 'Started', escapeMarkdown(call.created_at ? new Date(call.created_at).toLocaleString() : 'N/A'))
         ];
         if (call.call_summary) {
-            lines.push(`📝 ${escapeMarkdown(summarizeSensitiveText(call.call_summary))}`);
+            lines.push(`📝 ${escapeMarkdown(call.call_summary.slice(0, 300))}${call.call_summary.length > 300 ? '…' : ''}`);
         }
         await ctx.reply(section('📄 Call Details', lines), {
             parse_mode: 'Markdown',
             reply_markup: buildMainMenuKeyboard(ctx)
         });
     } catch (error) {
-        if (isSessionCancellationError(error)) {
-            return;
-        }
         await ctx.reply(httpClient.getUserMessage(error, 'Failed to fetch call details.'), {
             reply_markup: buildMainMenuKeyboard(ctx)
         });
@@ -286,10 +247,9 @@ async function calllogEventsFlow(conversation, ctx) {
             return;
         }
         await ctx.reply('🧾 Enter the call SID to view recent events.');
-        const { text: callSid } = await waitForConversationText(conversation, ctx, {
-            ensureActive,
-            invalidMessage: '⚠️ Please send the call SID as text.'
-        });
+        const update = await conversation.wait();
+        ensureActive();
+        const callSid = update?.message?.text?.trim();
         if (!callSid) {
             await ctx.reply('❌ Call SID is required.');
             return;
@@ -315,9 +275,6 @@ async function calllogEventsFlow(conversation, ctx) {
             reply_markup: buildMainMenuKeyboard(ctx)
         });
     } catch (error) {
-        if (isSessionCancellationError(error)) {
-            return;
-        }
         await ctx.reply(httpClient.getUserMessage(error, 'Failed to fetch recent events.'), {
             reply_markup: buildMainMenuKeyboard(ctx)
         });

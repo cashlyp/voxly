@@ -69,7 +69,6 @@ const ACTION_CAPABILITIES = [
   { match: (action) => action === 'HELP', cap: 'view_help' },
   { match: (action) => action === 'GUIDE', cap: 'view_guide' },
   { match: (action) => action === 'MENU', cap: 'view_menu' },
-  { match: (action) => action === 'MENU_EXIT', cap: 'view_menu' },
   { match: (action) => action === 'HEALTH', cap: 'health' },
   { match: (action) => action === 'STATUS', cap: 'status_admin' },
   { match: (action) => action === 'CALL', cap: 'call' },
@@ -90,10 +89,7 @@ const ACTION_CAPABILITIES = [
   { match: (action) => action.startsWith('BULK_EMAIL_'), cap: 'bulk_email' },
   { match: (action) => action === 'SCRIPTS', cap: 'scripts_manage' },
   { match: (action) => action === 'PERSONA', cap: 'persona_manage' },
-  { match: (action) => action === 'PROVIDER:HOME', cap: 'provider_manage' },
   { match: (action) => action === 'PROVIDER_STATUS', cap: 'provider_manage' },
-  { match: (action) => action.startsWith('PROVIDER_STATUS:'), cap: 'provider_manage' },
-  { match: (action) => action.startsWith('PROVIDER_CHANNEL:'), cap: 'provider_manage' },
   { match: (action) => action.startsWith('PROVIDER_SET:'), cap: 'provider_manage' },
   { match: (action) => ['USERS', 'USERS_LIST', 'ADDUSER', 'PROMOTE', 'REMOVE'].includes(action), cap: 'users_manage' },
   { match: (action) => ['CALLER_FLAGS', 'CALLER_FLAGS_LIST', 'CALLER_FLAGS_ALLOW', 'CALLER_FLAGS_BLOCK', 'CALLER_FLAGS_SPAM'].includes(action), cap: 'caller_flags_manage' },
@@ -237,11 +233,10 @@ function getDeniedAuditSummary() {
 
 async function sendAccessDenied(ctx, capability, options = {}) {
   const actionLabel = options.actionLabel ? `\n\nAction: ${options.actionLabel}` : '';
-  const message = capability === 'provider_manage'
-    ? `❌ Admins only: provider controls are restricted to administrators.${actionLabel}`
-    : `🔒 Access required to use this action.` +
-      `\n\nYou can explore menus, but execution is disabled without approval.` +
-      `${actionLabel}`;
+  const message =
+    `🔒 Access required to use this action.` +
+    `\n\nYou can explore menus, but execution is disabled without approval.` +
+    `${actionLabel}`;
   await ctx.reply(message, { reply_markup: buildAccessKeyboard(ctx) });
 }
 

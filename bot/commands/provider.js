@@ -6,227 +6,79 @@ const { buildLine, section, escapeMarkdown, renderMenu } = require('../utils/ui'
 const { buildCallbackData } = require('../utils/actions');
 
 const ADMIN_HEADER_NAME = 'x-admin-token';
-const PROVIDER_CHANNELS = Object.freeze({
-    CALL: 'call',
-    SMS: 'sms',
-    EMAIL: 'email'
-});
-const CHANNEL_ORDER = [
-    PROVIDER_CHANNELS.CALL,
-    PROVIDER_CHANNELS.SMS,
-    PROVIDER_CHANNELS.EMAIL
-];
-const CHANNEL_META = Object.freeze({
-    [PROVIDER_CHANNELS.CALL]: {
-        label: 'Call',
-        emoji: '☎️',
-        envKey: 'CALL_PROVIDER',
-        fallbackProviders: ['twilio', 'aws', 'vonage']
-    },
-    [PROVIDER_CHANNELS.SMS]: {
-        label: 'SMS',
-        emoji: '💬',
-        envKey: 'SMS_PROVIDER',
-        fallbackProviders: ['twilio', 'aws', 'vonage']
-    },
-    [PROVIDER_CHANNELS.EMAIL]: {
-        label: 'Email',
-        emoji: '📧',
-        envKey: 'EMAIL_PROVIDER',
-        fallbackProviders: ['sendgrid', 'mailgun', 'ses']
-    }
-});
+const SUPPORTED_PROVIDERS = ['twilio', 'aws', 'vonage'];
 const STATUS_CACHE_TTL_MS = 8000;
 const statusCache = {
-    [PROVIDER_CHANNELS.CALL]: { value: null, fetchedAt: 0 },
-    [PROVIDER_CHANNELS.SMS]: { value: null, fetchedAt: 0 },
-    [PROVIDER_CHANNELS.EMAIL]: { value: null, fetchedAt: 0 }
+    value: null,
+    fetchedAt: 0
 };
 
-function normalizeProviderChannel(value, { allowNull = false } = {}) {
-    const normalized = String(value || '')
-        .trim()
-        .toLowerCase();
-    if (CHANNEL_META[normalized]) {
-        return normalized;
-    }
-    return allowNull ? null : PROVIDER_CHANNELS.CALL;
-}
-
-function resetProviderStatusCache() {
-    CHANNEL_ORDER.forEach((channel) => {
-        statusCache[channel] = { value: null, fetchedAt: 0 };
-    });
-}
-
-function normalizeProviders(status = {}, channel = PROVIDER_CHANNELS.CALL) {
-    const fallbackProviders = CHANNEL_META[channel]?.fallbackProviders || CHANNEL_META[PROVIDER_CHANNELS.CALL].fallbackProviders;
+function normalizeProviders(status = {}) {
     const supportedValues = Array.isArray(status.supported_providers) && status.supported_providers.length > 0
         ? status.supported_providers
-        : fallbackProviders;
+        : SUPPORTED_PROVIDERS;
     const supported = Array.from(new Set(supportedValues.map((item) => String(item).toLowerCase()))).filter(Boolean);
     const active = typeof status.provider === 'string' ? status.provider.toLowerCase() : '';
-    const stored = typeof status.stored_provider === 'string' && status.stored_provider.trim()
-        ? status.stored_provider.toLowerCase()
-        : active;
-    const readiness = status.readiness && typeof status.readiness === 'object' ? status.readiness : {};
-    return { supported, active, stored, readiness };
+    return { supported, active };
 }
 
-function extractChannelState(status = {}, channel = PROVIDER_CHANNELS.CALL) {
-    const providersBlock = status?.providers;
-    if (providersBlock && typeof providersBlock === 'object' && providersBlock[channel]) {
-        return providersBlock[channel];
-    }
-
-    if (status?.channel === channel) {
-        return {
-            provider: status.provider,
-            stored_provider: status.stored_provider,
-            supported_providers: status.supported_providers,
-            readiness: status.readiness || {}
-        };
-    }
-
-    if (channel === PROVIDER_CHANNELS.SMS) {
-        return {
-            provider: status.sms_provider,
-            stored_provider: status.sms_stored_provider,
-            supported_providers: status.sms_supported_providers,
-            readiness: status.sms_readiness || {}
-        };
-    }
-
-    if (channel === PROVIDER_CHANNELS.EMAIL) {
-        return {
-            provider: status.email_provider,
-            stored_provider: status.email_stored_provider,
-            supported_providers: status.email_supported_providers,
-            readiness: status.email_readiness || {}
-        };
-    }
-
-    return {
-        provider: status.provider,
-        stored_provider: status.stored_provider,
-        supported_providers: status.supported_providers,
-        readiness: {
-            twilio: Boolean(status.twilio_ready),
-            aws: Boolean(status.aws_ready),
-            vonage: Boolean(status.vonage_ready)
-        }
-    };
-}
-
-function formatReadinessSummary(supported, readiness = {}) {
-    if (!Array.isArray(supported) || !supported.length) {
-        return 'N/A';
-    }
-    return supported
-        .map((provider) => `${provider.toUpperCase()}:${readiness[provider] ? '✅' : '⚠️'}`)
-        .join(' • ');
-}
-
-function formatProviderHubStatus(status = {}) {
-    const lines = CHANNEL_ORDER.map((channel) => {
-        const state = normalizeProviders(extractChannelState(status, channel), channel);
-        const label = CHANNEL_META[channel].label;
-        const emoji = CHANNEL_META[channel].emoji;
-        const active = state.active ? state.active.toUpperCase() : 'UNKNOWN';
-        const readiness = formatReadinessSummary(state.supported, state.readiness);
-        return `${emoji} *${label}:* ${active}\n• Ready: ${readiness}`;
-    });
-
-    return section('⚙️ Provider Center', [
-        ...lines,
-        '',
-        'Choose a feature to configure providers.'
-    ]);
-}
-
-function formatProviderStatus(status, channel = PROVIDER_CHANNELS.CALL) {
-    const channelMeta = CHANNEL_META[channel] || CHANNEL_META[PROVIDER_CHANNELS.CALL];
+function formatProviderStatus(status) {
     if (!status) {
-        return section(`⚙️ ${channelMeta.label} Provider Settings`, ['No status data available.']);
+        return section('⚙️ Call Provider Settings', ['No status data available.']);
     }
 
-    const state = normalizeProviders(extractChannelState(status, channel), channel);
-    const current = state.active || 'unknown';
-    const stored = state.stored || current;
+    const current = typeof status.provider === 'string' ? status.provider : 'unknown';
+    const stored = typeof status.stored_provider === 'string' && status.stored_provider.length > 0
+        ? status.stored_provider
+        : current;
+    const supportedValues = Array.isArray(status.supported_providers) && status.supported_providers.length > 0
+        ? status.supported_providers
+        : SUPPORTED_PROVIDERS;
+    const vonageReady = status.vonage_ready ? '✅ Ready' : '⚠️ Missing keys';
 
     const details = [
-        buildLine('•', channelMeta.envKey, `*${current.toUpperCase()}*`),
-        buildLine('•', 'Stored Default', stored.toUpperCase()),
-        buildLine('•', 'Supported', state.supported.map((item) => item.toUpperCase()).join(', ') || 'N/A'),
-        buildLine('•', 'Ready', formatReadinessSummary(state.supported, state.readiness))
+        buildLine('•', `Current Provider`, `*${current.toUpperCase()}*`),
+        buildLine('•', `Stored Default`, stored.toUpperCase()),
+        buildLine('•', `AWS Ready`, status.aws_ready ? '✅' : '⚠️'),
+        buildLine('•', `Twilio Ready`, status.twilio_ready ? '✅' : '⚠️'),
+        buildLine('•', `Vonage Ready`, vonageReady),
+        buildLine('•', `Supported Backbones`, supportedValues.join(', ').toUpperCase())
     ];
 
-    if (channel === PROVIDER_CHANNELS.CALL) {
-        details.push(
-            buildLine('•', 'Vonage DTMF Webhook', status.vonage_dtmf_ready ? '✅ Enabled' : '⚠️ Disabled'),
-            buildLine('•', 'Keypad Guard', status.keypad_guard_enabled ? '✅ Enabled' : '⚠️ Disabled')
-        );
-    }
-
-    return section(`⚙️ ${channelMeta.label} Provider Settings`, details);
+    return section('⚙️ Call Provider Settings', details);
 }
 
-function buildProviderHubKeyboard(ctx) {
-    const keyboard = new InlineKeyboard()
-        .text('☎️ Call', buildCallbackData(ctx, `PROVIDER_CHANNEL:${PROVIDER_CHANNELS.CALL}`))
-        .text('💬 SMS', buildCallbackData(ctx, `PROVIDER_CHANNEL:${PROVIDER_CHANNELS.SMS}`))
-        .row()
-        .text('📧 Email', buildCallbackData(ctx, `PROVIDER_CHANNEL:${PROVIDER_CHANNELS.EMAIL}`))
-        .row()
-        .text('🔄 Refresh', buildCallbackData(ctx, 'PROVIDER_STATUS'))
-        .row()
-        .text('⬅️ Back', buildCallbackData(ctx, 'MENU'))
-        .text('🚪 Exit', buildCallbackData(ctx, 'MENU_EXIT'));
-    return keyboard;
-}
-
-function buildProviderKeyboard(ctx, channel, activeProvider = '', supportedProviders = []) {
+function buildProviderKeyboard(ctx, activeProvider = '', supportedProviders = []) {
     const keyboard = new InlineKeyboard();
-    const fallbackProviders = CHANNEL_META[channel]?.fallbackProviders || CHANNEL_META[PROVIDER_CHANNELS.CALL].fallbackProviders;
-    const providers = supportedProviders.length ? supportedProviders : fallbackProviders;
+    const providers = supportedProviders.length ? supportedProviders : SUPPORTED_PROVIDERS;
     providers.forEach((provider, index) => {
         const normalized = provider.toLowerCase();
         const isActive = normalized === activeProvider;
         const label = isActive ? `✅ ${normalized.toUpperCase()}` : normalized.toUpperCase();
-        keyboard.text(label, buildCallbackData(ctx, `PROVIDER_SET:${channel}:${normalized}`));
+        keyboard.text(label, buildCallbackData(ctx, `PROVIDER_SET:${normalized}`));
 
         const shouldInsertRow = index % 2 === 1 && index < providers.length - 1;
         if (shouldInsertRow) {
             keyboard.row();
         }
     });
-    keyboard
-        .row()
-        .text('🔄 Refresh', buildCallbackData(ctx, `PROVIDER_STATUS:${channel}`))
-        .text('⬅️ Back', buildCallbackData(ctx, 'PROVIDER:HOME'))
-        .row()
-        .text('🚪 Exit', buildCallbackData(ctx, 'MENU_EXIT'));
+    keyboard.row().text('🔄 Refresh', buildCallbackData(ctx, 'PROVIDER_STATUS'));
     return keyboard;
 }
 
-async function fetchProviderStatus({ channel = PROVIDER_CHANNELS.CALL, force = false } = {}) {
-    const resolvedChannel = normalizeProviderChannel(channel);
-    const cacheEntry = statusCache[resolvedChannel];
-    if (!force && cacheEntry?.value && Date.now() - cacheEntry.fetchedAt < STATUS_CACHE_TTL_MS) {
-        return cacheEntry.value;
+async function fetchProviderStatus({ force = false } = {}) {
+    if (!force && statusCache.value && Date.now() - statusCache.fetchedAt < STATUS_CACHE_TTL_MS) {
+        return statusCache.value;
     }
     const response = await httpClient.get(null, `${config.apiUrl}/admin/provider`, {
         timeout: 10000,
-        params: { channel: resolvedChannel },
         headers: {
             [ADMIN_HEADER_NAME]: config.admin.apiToken,
             'Content-Type': 'application/json',
         },
     });
-    statusCache[resolvedChannel] = {
-        value: response.data,
-        fetchedAt: Date.now()
-    };
+    statusCache.value = response.data;
+    statusCache.fetchedAt = Date.now();
     return response.data;
 }
 
@@ -245,12 +97,11 @@ function formatProviderError(error, actionLabel) {
     return `❌ Error: ${escapeMarkdown(error.message || 'Unknown error')}`;
 }
 
-async function updateProvider({ channel, provider }) {
-    const resolvedChannel = normalizeProviderChannel(channel);
+async function updateProvider(provider) {
     const response = await httpClient.post(
         null,
         `${config.apiUrl}/admin/provider`,
-        { provider, channel: resolvedChannel },
+        { provider },
         {
             timeout: 15000,
             headers: {
@@ -259,92 +110,34 @@ async function updateProvider({ channel, provider }) {
             },
         }
     );
-    resetProviderStatusCache();
     return response.data;
 }
 
-async function renderProviderHub(ctx, { status, notice, forceRefresh = false } = {}) {
-    let resolvedStatus = status;
-    let cachedNotice = null;
-    if (!resolvedStatus) {
-        try {
-            resolvedStatus = await fetchProviderStatus({ channel: PROVIDER_CHANNELS.CALL, force: forceRefresh });
-        } catch (error) {
-            if (statusCache[PROVIDER_CHANNELS.CALL]?.value) {
-                resolvedStatus = statusCache[PROVIDER_CHANNELS.CALL].value;
-                cachedNotice = '⚠️ Showing cached provider status (API unavailable).';
-            } else {
-                throw error;
-            }
-        }
-    }
-
-    const keyboard = buildProviderHubKeyboard(ctx);
-    let message = formatProviderHubStatus(resolvedStatus);
-    const notices = [notice, cachedNotice].filter(Boolean);
-    if (notices.length) {
-        message = `${notices.join('\n')}\n\n${message}`;
-    }
-    await renderMenu(ctx, message, keyboard, { parseMode: 'Markdown' });
-}
-
-async function renderProviderChannelMenu(ctx, {
-    channel = PROVIDER_CHANNELS.CALL,
-    status,
-    notice,
-    forceRefresh = false
-} = {}) {
-    const resolvedChannel = normalizeProviderChannel(channel);
-    let resolvedStatus = status;
-    let cachedNotice = null;
-    if (!resolvedStatus) {
-        try {
-            resolvedStatus = await fetchProviderStatus({ channel: resolvedChannel, force: forceRefresh });
-        } catch (error) {
-            if (statusCache[resolvedChannel]?.value) {
-                resolvedStatus = statusCache[resolvedChannel].value;
-                cachedNotice = '⚠️ Showing cached provider status (API unavailable).';
-            } else {
-                throw error;
-            }
-        }
-    }
-
-    const normalized = normalizeProviders(extractChannelState(resolvedStatus, resolvedChannel), resolvedChannel);
-    const keyboard = buildProviderKeyboard(ctx, resolvedChannel, normalized.active, normalized.supported);
-
-    let message = formatProviderStatus(resolvedStatus, resolvedChannel);
-    const notices = [notice, cachedNotice].filter(Boolean);
-    if (notices.length) {
-        message = `${notices.join('\n')}\n\n${message}`;
-    }
-    message += '\n\nTap a provider below to switch.';
-    await renderMenu(ctx, message, keyboard, { parseMode: 'Markdown' });
-}
-
-async function renderProviderMenu(ctx, { status, notice, forceRefresh = false, channel = null } = {}) {
+async function renderProviderMenu(ctx, { status, notice, forceRefresh = false } = {}) {
     try {
-        const { isAdminUser } = await ensureAuthorizedAdmin(ctx);
-        if (!isAdminUser) {
-            return;
+        let resolvedStatus = status;
+        let cachedNotice = null;
+        if (!resolvedStatus) {
+            try {
+                resolvedStatus = await fetchProviderStatus({ force: forceRefresh });
+            } catch (error) {
+                if (statusCache.value) {
+                    resolvedStatus = statusCache.value;
+                    cachedNotice = '⚠️ Showing cached provider status (API unavailable).';
+                } else {
+                    throw error;
+                }
+            }
         }
-
-        const normalizedChannel = normalizeProviderChannel(channel, { allowNull: true });
-        if (normalizedChannel) {
-            await renderProviderChannelMenu(ctx, {
-                channel: normalizedChannel,
-                status,
-                notice,
-                forceRefresh
-            });
-            return;
+        const { supported, active } = normalizeProviders(resolvedStatus);
+        const keyboard = buildProviderKeyboard(ctx, active, supported);
+        let message = formatProviderStatus(resolvedStatus);
+        const notices = [notice, cachedNotice].filter(Boolean);
+        if (notices.length) {
+            message = `${notices.join('\n')}\n\n${message}`;
         }
-
-        await renderProviderHub(ctx, {
-            status,
-            notice,
-            forceRefresh
-        });
+        message += '\n\nTap a provider below to switch.';
+        await renderMenu(ctx, message, keyboard, { parseMode: 'Markdown' });
     } catch (error) {
         console.error('Provider status command error:', error);
         await ctx.reply(formatProviderError(error, 'fetch provider status'));
@@ -373,50 +166,26 @@ async function ensureAuthorizedAdmin(ctx) {
     return { user, isAdminUser: true };
 }
 
-async function handleProviderSwitch(ctx, requestedProvider, requestedChannel = PROVIDER_CHANNELS.CALL) {
+async function handleProviderSwitch(ctx, requestedProvider) {
     try {
-        const channel = normalizeProviderChannel(requestedChannel);
+        const status = await fetchProviderStatus();
+        const { supported } = normalizeProviders(status);
         const normalized = String(requestedProvider || '').toLowerCase();
-        if (!normalized) {
-            await renderProviderMenu(ctx, { forceRefresh: true, channel });
-            return;
-        }
-
-        const { isAdminUser } = await ensureAuthorizedAdmin(ctx);
-        if (!isAdminUser) {
-            return;
-        }
-
-        const status = await fetchProviderStatus({ channel }).catch(() => null);
-        const currentState = normalizeProviders(extractChannelState(status || {}, channel), channel);
-        if (!normalized || !currentState.supported.includes(normalized)) {
-            const usage = [
-                `• /provider ${channel}`,
-                ...currentState.supported.map((item) => `• /provider ${channel} ${item}`)
-            ].join('\n');
+        if (!normalized || !supported.includes(normalized)) {
+            const options = supported.map((item) => `• /provider ${item}`).join('\n');
             await ctx.reply(
-                `❌ Unsupported ${CHANNEL_META[channel].label} provider "${escapeMarkdown(requestedProvider || '')}".\n\nUsage:\n${usage}`
+                `❌ Unsupported provider "${escapeMarkdown(requestedProvider || '')}".\n\nUsage:\n• /provider status\n${options}`
             );
             return;
         }
 
-        if (currentState.active && currentState.active === normalized) {
-            await renderProviderMenu(ctx, {
-                status: status || null,
-                channel,
-                notice: `ℹ️ ${CHANNEL_META[channel].label} provider already set to *${normalized.toUpperCase()}*.`,
-            });
-            return;
-        }
-
-        const result = await updateProvider({ channel, provider: normalized });
-        const refreshed = await fetchProviderStatus({ channel, force: true }).catch(() => result || status || null);
-        const refreshedState = normalizeProviders(extractChannelState(refreshed || {}, channel), channel);
-        const activeLabel = (refreshedState.active || result?.provider || normalized).toUpperCase();
+        const result = await updateProvider(normalized);
+        const refreshed = await fetchProviderStatus({ force: true });
+        const activeLabel = (refreshed.provider || normalized).toUpperCase();
         const notice = result.changed === false
-            ? `ℹ️ ${CHANNEL_META[channel].label} provider already set to *${activeLabel}*.`
-            : `✅ ${CHANNEL_META[channel].label} provider set to *${activeLabel}*.`;
-        await renderProviderMenu(ctx, { status: refreshed, channel, notice });
+            ? `ℹ️ Provider already set to *${activeLabel}*.`
+            : `✅ Call provider set to *${activeLabel}*.`;
+        await renderProviderMenu(ctx, { status: refreshed, notice });
     } catch (error) {
         console.error('Provider switch command error:', error);
         await ctx.reply(formatProviderError(error, 'update provider'));
@@ -426,9 +195,8 @@ async function handleProviderSwitch(ctx, requestedProvider, requestedChannel = P
 function registerProviderCommand(bot) {
     bot.command('provider', async (ctx) => {
         const text = ctx.message?.text || '';
-        const args = text.split(/\s+/).slice(1).map((item) => item.toLowerCase());
-        const requestedAction = args[0] || '';
-        const requestedTarget = args[1] || '';
+        const args = text.split(/\s+/).slice(1);
+        const requestedAction = (args[0] || '').toLowerCase();
 
         const { isAdminUser } = await ensureAuthorizedAdmin(ctx);
         if (!isAdminUser) {
@@ -436,26 +204,12 @@ function registerProviderCommand(bot) {
         }
 
         try {
-            if (!requestedAction || requestedAction === 'status' || requestedAction === 'home') {
+            if (!requestedAction || requestedAction === 'status') {
                 await renderProviderMenu(ctx, { forceRefresh: true });
                 return;
             }
 
-            const requestedChannel = normalizeProviderChannel(requestedAction, { allowNull: true });
-            if (requestedChannel) {
-                if (!requestedTarget || requestedTarget === 'status' || requestedTarget === 'refresh') {
-                    await renderProviderMenu(ctx, {
-                        forceRefresh: true,
-                        channel: requestedChannel
-                    });
-                    return;
-                }
-                await handleProviderSwitch(ctx, requestedTarget, requestedChannel);
-                return;
-            }
-
-            // Backward-compatible shortcut: /provider twilio (defaults to call channel)
-            await handleProviderSwitch(ctx, requestedAction, PROVIDER_CHANNELS.CALL);
+            await handleProviderSwitch(ctx, requestedAction);
         } catch (error) {
             console.error('Failed to manage provider via Telegram command:', error);
             await ctx.reply(formatProviderError(error, 'update provider'));
@@ -471,7 +225,9 @@ module.exports = initializeProviderCommand;
 module.exports.registerProviderCommand = registerProviderCommand;
 module.exports.fetchProviderStatus = fetchProviderStatus;
 module.exports.updateProvider = updateProvider;
-module.exports.renderProviderMenu = renderProviderMenu;
+module.exports.formatProviderStatus = formatProviderStatus;
 module.exports.handleProviderSwitch = handleProviderSwitch;
-module.exports.normalizeProviderChannel = normalizeProviderChannel;
-module.exports.PROVIDER_CHANNELS = PROVIDER_CHANNELS;
+module.exports.renderProviderMenu = renderProviderMenu;
+module.exports.buildProviderKeyboard = buildProviderKeyboard;
+module.exports.SUPPORTED_PROVIDERS = SUPPORTED_PROVIDERS;
+module.exports.ADMIN_HEADER_NAME = ADMIN_HEADER_NAME;

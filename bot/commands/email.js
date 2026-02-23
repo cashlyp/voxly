@@ -1,7 +1,6 @@
 const httpClient = require('../utils/httpClient');
 const { InlineKeyboard } = require('grammy');
 const config = require('../config');
-const crypto = require('crypto');
 const {
   getUser,
   isAdmin,
@@ -13,9 +12,7 @@ const {
   startOperation,
   ensureOperationActive,
   registerAbortController,
-  guardAgainstCommandInterrupt,
-  OperationCancelledError,
-  waitForConversationText
+  guardAgainstCommandInterrupt
 } = require('../utils/sessionState');
 const { section, buildLine, tipLine, escapeMarkdown, emphasize, activateMenuMessage, renderMenu } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
@@ -48,62 +45,9 @@ async function safeReplyMarkdown(ctx, text, options = {}) {
   return safeReply(ctx, text, { parse_mode: 'Markdown', ...options });
 }
 
-async function deleteMessageSafely(ctx, message) {
-  const chatId = message?.chat?.id;
-  const messageId = message?.message_id;
-  if (!chatId || !messageId) {
-    return;
-  }
-  try {
-    await ctx.api.deleteMessage(chatId, messageId);
-    return;
-  } catch (_) {
-    // Ignore and fall back to clearing reply markup when deletion is blocked.
-  }
-  try {
-    await ctx.api.editMessageReplyMarkup(chatId, messageId);
-  } catch (_) {
-    // Ignore if message is missing or cannot be edited.
-  }
-}
-
-async function waitForTextInput(conversation, ctx, ensureActive, options = {}) {
-  const { update, text } = await waitForConversationText(conversation, ctx, {
-    ensureActive,
-    allowEmpty: Boolean(options.allowEmpty),
-    invalidMessage: options.invalidMessage || '⚠️ Please send a text response to continue.',
-    emptyMessage: options.emptyMessage || '⚠️ Please send a non-empty response to continue.'
-  });
-  return { update, text };
-}
-
 async function replyApiError(ctx, error, fallback) {
-  if (
-    error instanceof OperationCancelledError ||
-    String(error?.name || '') === 'AbortError' ||
-    String(error?.name || '') === 'CanceledError'
-  ) {
-    return;
-  }
   const message = httpClient.getUserMessage(error, fallback);
   return safeReply(ctx, message);
-}
-
-function summarizeEmailError(error) {
-  if (!error) return 'unknown_error';
-  if (error.response) {
-    const detail = error.response?.data?.error || error.response?.data?.message || error.response?.statusText || 'http_error';
-    const safeDetail = String(detail)
-      .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[redacted-email]')
-      .replace(/\+?\d[\d\s().-]{6,}\d/g, '[redacted-phone]');
-    return `http_${error.response.status}:${safeDetail.slice(0, 140)}`;
-  }
-  if (error.request) return 'upstream_no_response';
-  return String(error.message || 'unknown_error').slice(0, 140);
-}
-
-function logEmailError(label, error) {
-  console.error(`${label}: ${summarizeEmailError(error)}`);
 }
 
 function buildBackToMenuKeyboard(ctx, action = 'EMAIL', label = '⬅️ Back to Email Menu') {
@@ -166,16 +110,6 @@ function isValidEmail(value) {
   if (parts.length !== 2) return false;
   if (!parts[0] || !parts[1]) return false;
   return true;
-}
-
-function buildIdempotencyKey(scope, actorId, payload = {}) {
-  const digest = crypto
-    .createHash('sha256')
-    .update(JSON.stringify(payload))
-    .digest('hex')
-    .slice(0, 16);
-  const actor = String(actorId || 'anon');
-  return `${scope}:${actor}:${Date.now().toString(36)}:${digest}`;
 }
 
 function parseJsonInput(text) {
@@ -292,18 +226,13 @@ async function promptHtmlBody(conversation, ctx, ensureActive) {
   }
   if (choice.id === 'paste') {
     await safeReplyMarkdown(ctx, section('🧩 HTML Body', ['Paste HTML content.']));
-    const { text } = await waitForTextInput(conversation, ctx, ensureActive, {
-      invalidMessage: '⚠️ Please paste HTML text to continue.'
-    });
-    return text || null;
+    const update = await conversation.wait();
+    ensureActive();
+    return update?.message?.text?.trim() || null;
   }
   await safeReplyMarkdown(ctx, section('📎 Upload HTML', ['Send the .html file now.']));
   const upload = await conversation.wait();
   ensureActive();
-  const uploadText = upload?.message?.text?.trim();
-  if (uploadText) {
-    await guardAgainstCommandInterrupt(ctx, uploadText);
-  }
   const doc = upload?.message?.document;
   if (!doc?.file_id) {
     await safeReply(ctx, '❌ No document received.');
@@ -378,28 +307,27 @@ async function createEmailTemplateFlow(conversation, ctx, ensureActive) {
   await safeReplyMarkdown(ctx, section('🆕 Create Email Template', [
     'Provide a template ID (e.g., welcome_email).'
   ]));
-  const { text: templateId } = await waitForTextInput(conversation, ctx, ensureActive, {
-    invalidMessage: '⚠️ Please send the template ID as text.'
-  });
+  const idMsg = await conversation.wait();
+  ensureActive();
+  const templateId = idMsg?.message?.text?.trim();
   if (!templateId) {
     await safeReply(ctx, '❌ Template ID is required.');
     return;
   }
 
   await safeReplyMarkdown(ctx, section('🧾 Subject', ['Enter the email subject line.']));
-  const { text: subject } = await waitForTextInput(conversation, ctx, ensureActive, {
-    invalidMessage: '⚠️ Please send the subject as text.'
-  });
+  const subjectMsg = await conversation.wait();
+  ensureActive();
+  const subject = subjectMsg?.message?.text?.trim();
   if (!subject) {
     await safeReply(ctx, '❌ Subject is required.');
     return;
   }
 
   await safeReplyMarkdown(ctx, section('📝 Text Body', ['Enter the plain text body (or type skip).']));
-  const { text: textInput } = await waitForTextInput(conversation, ctx, ensureActive, {
-    invalidMessage: '⚠️ Please send the text body as text.'
-  });
-  let textBody = textInput;
+  const textMsg = await conversation.wait();
+  ensureActive();
+  let textBody = textMsg?.message?.text?.trim();
   if (textBody && textBody.toLowerCase() === 'skip') {
     textBody = null;
   }
@@ -446,17 +374,15 @@ async function editEmailTemplateFlow(conversation, ctx, template, ensureActive) 
   ]));
 
   await safeReplyMarkdown(ctx, section('🧾 Subject', [`Current: ${template.subject || '—'}`]));
-  const { text: subjectInput } = await waitForTextInput(conversation, ctx, ensureActive, {
-    invalidMessage: '⚠️ Please send the subject as text.'
-  });
-  let subject = subjectInput;
+  const subjectMsg = await conversation.wait();
+  ensureActive();
+  let subject = subjectMsg?.message?.text?.trim();
   if (subject && subject.toLowerCase() === 'skip') subject = undefined;
 
   await safeReplyMarkdown(ctx, section('📝 Text Body', ['Paste new text or type skip.']));
-  const { text: textBodyInput } = await waitForTextInput(conversation, ctx, ensureActive, {
-    invalidMessage: '⚠️ Please send the text body as text.'
-  });
-  let textBody = textBodyInput;
+  const textMsg = await conversation.wait();
+  ensureActive();
+  let textBody = textMsg?.message?.text?.trim();
   if (textBody && textBody.toLowerCase() === 'skip') textBody = undefined;
 
   const htmlBody = await promptHtmlBody(conversation, ctx, ensureActive);
@@ -630,9 +556,9 @@ async function cloneEmailTemplateFlow(conversation, ctx, template, ensureActive)
   await safeReplyMarkdown(ctx, section('🧬 Clone Template', [
     `Enter a new template ID for the clone of ${escapeMarkdown(template.template_id)}.`
   ]));
-  const { text: newId } = await waitForTextInput(conversation, ctx, ensureActive, {
-    invalidMessage: '⚠️ Please send the new template ID as text.'
-  });
+  const update = await conversation.wait();
+  ensureActive();
+  const newId = update?.message?.text?.trim();
   if (!newId) {
     await safeReply(ctx, '❌ Template ID is required.');
     return;
@@ -685,9 +611,9 @@ async function importEmailTemplateFlow(conversation, ctx, ensureActive) {
     'Paste JSON with template_id, subject, and text/html.',
     'Example: {"template_id":"welcome","subject":"Hi {{name}}","text":"Hello {{name}}"}'
   ]));
-  const { text: raw } = await waitForTextInput(conversation, ctx, ensureActive, {
-    invalidMessage: '⚠️ Please paste template JSON as text.'
-  });
+  const update = await conversation.wait();
+  ensureActive();
+  const raw = update?.message?.text?.trim();
   if (!raw) {
     await safeReply(ctx, '❌ Import cancelled.');
     return;
@@ -730,9 +656,9 @@ async function importEmailTemplateFlow(conversation, ctx, ensureActive) {
 
 async function searchEmailTemplatesFlow(conversation, ctx, ensureActive) {
   await safeReplyMarkdown(ctx, section('🔎 Search Templates', ['Enter a keyword to search.']));
-  const { text: term } = await waitForTextInput(conversation, ctx, ensureActive, {
-    invalidMessage: '⚠️ Please send a search keyword as text.'
-  });
+  const update = await conversation.wait();
+  ensureActive();
+  const term = update?.message?.text?.trim();
   if (!term) {
     await safeReply(ctx, '❌ Search cancelled.');
     return;
@@ -772,27 +698,22 @@ async function searchEmailTemplatesFlow(conversation, ctx, ensureActive) {
 async function showEmailTemplateDetail(conversation, ctx, template, ensureActive) {
   let viewing = true;
   while (viewing) {
-    const summaryMessage = await safeReplyMarkdown(ctx, formatEmailTemplateSummary(template));
-    let action;
-    try {
-      action = await askOptionWithButtons(
-        conversation,
-        ctx,
-        'Choose an action.',
-        [
-          { id: 'preview', label: '🔍 Preview' },
-          { id: 'edit', label: '✏️ Edit' },
-          { id: 'clone', label: '🧬 Clone' },
-          { id: 'export', label: '📤 Export' },
-          { id: 'versions', label: '🗂️ Versions' },
-          { id: 'delete', label: '🗑️ Delete' },
-          { id: 'back', label: '⬅️ Back' }
-        ],
-        { prefix: 'email-template-action', columns: 2, ensureActive }
-      );
-    } finally {
-      await deleteMessageSafely(ctx, summaryMessage);
-    }
+    await safeReplyMarkdown(ctx, formatEmailTemplateSummary(template));
+    const action = await askOptionWithButtons(
+      conversation,
+      ctx,
+      'Choose an action.',
+      [
+        { id: 'preview', label: '🔍 Preview' },
+        { id: 'edit', label: '✏️ Edit' },
+        { id: 'clone', label: '🧬 Clone' },
+        { id: 'export', label: '📤 Export' },
+        { id: 'versions', label: '🗂️ Versions' },
+        { id: 'delete', label: '🗑️ Delete' },
+        { id: 'back', label: '⬅️ Back' }
+      ],
+      { prefix: 'email-template-action', columns: 2, ensureActive }
+    );
     switch (action.id) {
       case 'preview':
         await previewEmailTemplate(conversation, ctx, template, ensureActive);
@@ -898,7 +819,7 @@ async function emailTemplatesFlow(conversation, ctx, options = {}) {
       }
     }
   } catch (error) {
-    logEmailError('Email template flow error', error);
+    console.error('Email template flow error:', error);
     await replyApiError(ctx, error, 'Failed to manage templates.');
   }
 }
@@ -909,10 +830,7 @@ function buildEmailMenuKeyboard(ctx) {
     .text('📬 Delivery Status', buildCallbackData(ctx, 'EMAIL_STATUS'))
     .row()
     .text('🧩 Templates', buildCallbackData(ctx, 'EMAIL_TEMPLATES'))
-    .text('🕒 History', buildCallbackData(ctx, 'EMAIL_HISTORY'))
-    .row()
-    .text('⬅️ Back', buildCallbackData(ctx, 'MENU'))
-    .text('🚪 Exit', buildCallbackData(ctx, 'MENU_EXIT'));
+    .text('🕒 History', buildCallbackData(ctx, 'EMAIL_HISTORY'));
   return keyboard;
 }
 
@@ -940,16 +858,16 @@ async function emailStatusFlow(conversation, ctx) {
       return;
     }
     await ctx.reply('📬 Enter the email message ID:');
-    const { text: messageId } = await waitForTextInput(conversation, ctx, ensureActive, {
-      invalidMessage: '⚠️ Please send the message ID as text.'
-    });
+    const update = await conversation.wait();
+    ensureActive();
+    const messageId = update?.message?.text?.trim();
     if (!messageId) {
       await ctx.reply('❌ Message ID is required.');
       return;
     }
     await sendEmailStatusCard(ctx, messageId, { forceReply: true });
   } catch (error) {
-    logEmailError('Email status flow error', error);
+    console.error('Email status flow error:', error);
     await replyApiError(ctx, error, 'Failed to fetch email status.');
   }
 }
@@ -964,10 +882,7 @@ function buildBulkEmailMenuKeyboard(ctx) {
     .text('🧾 Job Status', buildCallbackData(ctx, 'BULK_EMAIL_STATUS'))
     .row()
     .text('🕒 History', buildCallbackData(ctx, 'BULK_EMAIL_LIST'))
-    .text('📊 Stats', buildCallbackData(ctx, 'BULK_EMAIL_STATS'))
-    .row()
-    .text('⬅️ Back', buildCallbackData(ctx, 'EMAIL'))
-    .text('🚪 Exit', buildCallbackData(ctx, 'MENU_EXIT'));
+    .text('📊 Stats', buildCallbackData(ctx, 'BULK_EMAIL_STATS'));
 }
 
 async function renderBulkEmailMenu(ctx) {
@@ -1030,11 +945,9 @@ async function bulkEmailHistoryFlow(conversation, ctx) {
       return;
     }
     await ctx.reply('🕒 Enter page and limit (e.g., `1 10`). Limit max 50.', { parse_mode: 'Markdown' });
-    const { text: rawInput } = await waitForTextInput(conversation, ctx, ensureActive, {
-      allowEmpty: true,
-      invalidMessage: '⚠️ Please send page and limit as text.'
-    });
-    const raw = rawInput || '';
+    const update = await conversation.wait();
+    ensureActive();
+    const raw = update?.message?.text?.trim() || '';
     const parts = raw.split(/\s+/).filter(Boolean);
     const page = Math.max(parseInt(parts[0], 10) || 1, 1);
     const limit = Math.min(Math.max(parseInt(parts[1], 10) || 10, 1), 50);
@@ -1092,11 +1005,9 @@ async function bulkEmailStatsFlow(conversation, ctx) {
       return;
     }
     await ctx.reply('📊 Enter timeframe in hours (e.g., 24 or 72).');
-    const { text: hoursInput } = await waitForTextInput(conversation, ctx, ensureActive, {
-      allowEmpty: true,
-      invalidMessage: '⚠️ Please send the timeframe as text.'
-    });
-    const hours = Math.min(Math.max(parseInt(hoursInput, 10) || 24, 1), 720);
+    const update = await conversation.wait();
+    ensureActive();
+    const hours = Math.min(Math.max(parseInt(update?.message?.text?.trim(), 10) || 24, 1), 720);
     await sendBulkEmailStats(ctx, { hours });
   } catch (error) {
     await replyApiError(ctx, error, 'Failed to fetch bulk email stats.');
@@ -1115,16 +1026,16 @@ async function bulkEmailStatusFlow(conversation, ctx) {
       return;
     }
     await ctx.reply('🆔 Enter the bulk email job ID:');
-    const { text: jobId } = await waitForTextInput(conversation, ctx, ensureActive, {
-      invalidMessage: '⚠️ Please send the job ID as text.'
-    });
+    const update = await conversation.wait();
+    ensureActive();
+    const jobId = update?.message?.text?.trim();
     if (!jobId) {
       await ctx.reply('❌ Job ID is required.');
       return;
     }
     await sendBulkStatusCard(ctx, jobId, { forceReply: true });
   } catch (error) {
-    logEmailError('Bulk email status flow error', error);
+    console.error('Bulk email status flow error:', error);
     await replyApiError(ctx, error, 'Failed to fetch bulk email status.');
   }
 }
@@ -1346,10 +1257,9 @@ async function askSchedule(conversation, ctx, ensureActive) {
     'Send an ISO timestamp (e.g., 2024-12-25T09:30:00Z).',
     'Type "now" to send immediately.'
   ]), { parse_mode: 'Markdown' });
-  const { text: input } = await waitForTextInput(conversation, ctx, ensureActive, {
-    allowEmpty: true,
-    invalidMessage: '⚠️ Please send the schedule time as text.'
-  });
+  const update = await conversation.wait();
+  ensureActive();
+  const input = update?.message?.text?.trim();
   if (!input || input.toLowerCase() === 'now') {
     return { sendAt: null };
   }
@@ -1381,10 +1291,9 @@ async function promptVariables(conversation, ctx, ensureActive) {
     'Paste JSON (e.g., {"name":"Jamie","code":"123456"})',
     'Type "skip" for none.'
   ]), { parse_mode: 'Markdown' });
-  const { text } = await waitForTextInput(conversation, ctx, ensureActive, {
-    allowEmpty: true,
-    invalidMessage: '⚠️ Please send variables JSON as text.'
-  });
+  const update = await conversation.wait();
+  ensureActive();
+  const text = update?.message?.text?.trim();
   if (!text || text.toLowerCase() === 'skip') {
     return {};
   }
@@ -1400,9 +1309,12 @@ async function emailFlow(conversation, ctx) {
   const opId = startOperation(ctx, 'email');
   const ensureActive = () => ensureOperationActive(ctx, opId);
   const waitForMessage = async () => {
-    const { update } = await waitForTextInput(conversation, ctx, ensureActive, {
-      invalidMessage: '⚠️ Please send a text response to continue email setup.'
-    });
+    const update = await conversation.wait();
+    ensureActive();
+    const text = update?.message?.text?.trim();
+    if (text) {
+      await guardAgainstCommandInterrupt(ctx, text);
+    }
     return update;
   };
 
@@ -1538,30 +1450,25 @@ async function emailFlow(conversation, ctx) {
       payload.send_at = schedule.sendAt;
     }
 
-    const idempotencyKey = buildIdempotencyKey('email_send', ctx.from?.id, payload);
-    const response = await guardedPost(ctx, `${config.apiUrl}/email/send`, payload, {
-      headers: { 'Idempotency-Key': idempotencyKey }
-    });
+    const response = await guardedPost(ctx, `${config.apiUrl}/email/send`, payload);
     const messageId = response.data?.message_id;
-    const requestId = response.data?.request_id;
     if (!messageId) {
       await ctx.reply('❌ Email enqueue failed.');
       return;
     }
-    const confirmationLines = [
+    await ctx.reply(section('✅ Email queued', [
       buildLine('🆔', 'Message', escapeMarkdown(messageId))
-    ];
-    if (requestId) {
-      confirmationLines.push(buildLine('🧾', 'Request', escapeMarkdown(requestId)));
-    }
-    await ctx.reply(section('✅ Email queued', confirmationLines), {
+    ]), {
       parse_mode: 'Markdown',
       reply_markup: buildBackToMenuKeyboard(ctx, 'EMAIL')
     });
     await sendEmailStatusCard(ctx, messageId, { forceReply: true });
   } catch (error) {
-    logEmailError('Email flow error', error);
-    await replyApiError(ctx, error, 'Failed to send email.');
+    console.error('Email flow error:', error);
+    await ctx.reply(section('❌ Email Error', [error.message || 'Failed to send email.']), {
+      parse_mode: 'Markdown',
+      reply_markup: buildBackToMenuKeyboard(ctx, 'EMAIL')
+    });
   }
 }
 
@@ -1569,9 +1476,12 @@ async function bulkEmailFlow(conversation, ctx) {
   const opId = startOperation(ctx, 'bulk-email');
   const ensureActive = () => ensureOperationActive(ctx, opId);
   const waitForMessage = async () => {
-    const { update } = await waitForTextInput(conversation, ctx, ensureActive, {
-      invalidMessage: '⚠️ Please send a text response to continue bulk email setup.'
-    });
+    const update = await conversation.wait();
+    ensureActive();
+    const text = update?.message?.text?.trim();
+    if (text) {
+      await guardAgainstCommandInterrupt(ctx, text);
+    }
     return update;
   };
 
@@ -1692,30 +1602,22 @@ async function bulkEmailFlow(conversation, ctx) {
       payload.send_at = schedule.sendAt;
     }
 
-    const idempotencyKey = buildIdempotencyKey('email_bulk', ctx.from?.id, payload);
-    const response = await guardedPost(ctx, `${config.apiUrl}/email/bulk`, payload, {
-      headers: { 'Idempotency-Key': idempotencyKey }
-    });
+    const response = await guardedPost(ctx, `${config.apiUrl}/email/bulk`, payload);
     const jobId = response.data?.bulk_job_id;
-    const requestId = response.data?.request_id;
     if (!jobId) {
       await ctx.reply('❌ Bulk job enqueue failed.');
       return;
     }
-    const confirmationLines = [
+    await ctx.reply(section('✅ Bulk job queued', [
       buildLine('🆔', 'Job', escapeMarkdown(jobId)),
       buildLine('📨', 'Recipients', escapeMarkdown(String(recipients.length)))
-    ];
-    if (requestId) {
-      confirmationLines.push(buildLine('🧾', 'Request', escapeMarkdown(requestId)));
-    }
-    await ctx.reply(section('✅ Bulk job queued', confirmationLines), {
+    ]), {
       parse_mode: 'Markdown',
       reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_EMAIL', '⬅️ Back to Bulk Email')
     });
     await sendBulkStatusCard(ctx, jobId, { forceReply: true });
   } catch (error) {
-    logEmailError('Bulk email flow error', error);
+    console.error('Bulk email flow error:', error);
     await replyApiError(ctx, error, 'Failed to send bulk email.');
   }
 }
@@ -1725,7 +1627,7 @@ function registerEmailCommands(bot) {
     try {
       await renderEmailMenu(ctx);
     } catch (error) {
-      logEmailError('Email command error', error);
+      console.error('Email command error:', error);
       await ctx.reply('❌ Could not open email menu.');
     }
   });
@@ -1734,7 +1636,7 @@ function registerEmailCommands(bot) {
     try {
       await renderBulkEmailMenu(ctx);
     } catch (error) {
-      logEmailError('Bulk email command error', error);
+      console.error('Bulk email command error:', error);
       await ctx.reply('❌ Could not open bulk email menu.');
     }
   });
@@ -1755,7 +1657,7 @@ function registerEmailCommands(bot) {
       const messageId = args[1].trim();
       await sendEmailStatusCard(ctx, messageId, { forceReply: true });
     } catch (error) {
-      logEmailError('Email status command error', error);
+      console.error('Email status command error:', error);
       await replyApiError(ctx, error, 'Failed to fetch email status.');
     }
   });

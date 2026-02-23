@@ -9,7 +9,7 @@ const {
   registerAbortController,
   OperationCancelledError,
   getCurrentOpId,
-  waitForConversationText
+  guardAgainstCommandInterrupt
 } = require('../utils/sessionState');
 const {
   askOptionWithButtons,
@@ -32,10 +32,7 @@ const {
 const personaApi = axios.create({
   baseURL: config.apiUrl.replace(/\/+$/, ''),
   timeout: 15000,
-  headers: {
-    'Content-Type': 'application/json',
-    ...(config.admin?.apiToken ? { 'x-admin-token': config.admin.apiToken } : {})
-  }
+  headers: { 'Content-Type': 'application/json' }
 });
 
 let apiOrigin;
@@ -58,8 +55,7 @@ function safeEnsureActiveFactory(ctx, ensureActive) {
   if (typeof ensureActive === 'function') {
     return ensureActive;
   }
-  const opIdSnapshot = getCurrentOpId(ctx);
-  return () => ensureOperationActive(ctx, opIdSnapshot);
+  return () => ensureOperationActive(ctx, getCurrentOpId(ctx));
 }
 
 async function personaApiRequest(ctx, ensureActive, options) {
@@ -111,11 +107,7 @@ async function fetchSmsScriptsSummary(ctx, ensureActive) {
       params: { include_builtins: true }
     });
     const custom = Array.isArray(data.scripts) ? data.scripts : [];
-    const builtin = Array.isArray(data.builtin)
-      ? data.builtin
-      : Array.isArray(data.available_scripts)
-        ? data.available_scripts.map((name) => ({ name, is_builtin: true }))
-        : [];
+    const builtin = Array.isArray(data.builtin) ? data.builtin : [];
     return [...custom, ...builtin];
   } catch (error) {
     console.error('Failed to fetch SMS scripts for persona command:', error?.message);
@@ -152,37 +144,37 @@ async function promptForText(conversation, ctx, message, options = {}) {
   hints.push('Type cancel to abort');
 
   const promptText = hints.length ? `${message} (${hints.join(' | ')})` : message;
+  await styledSection(ctx, '📝 Provide Input', [promptText]);
 
-  while (true) {
-    await styledSection(ctx, '📝 Provide Input', [promptText]);
+  const update = await conversation.wait();
+  safeEnsureActive();
 
-    const { text } = await waitForConversationText(conversation, ctx, {
-      ensureActive: safeEnsureActive,
-      allowEmpty: !required,
-      invalidMessage: '⚠️ Please send a text response to continue.'
-    });
+  const text = update?.message?.text?.trim();
+  if (text) {
+    await guardAgainstCommandInterrupt(ctx, text);
+  }
     if (!text) {
       if (required) {
         await styledAlert(ctx, 'Please provide a response or type cancel.');
-        continue;
+        return promptForText(conversation, ctx, message, options);
       }
       return '';
     }
 
-    const lower = text.toLowerCase();
-    if (CANCEL_KEYWORDS.has(lower)) {
-      throw new OperationCancelledError('Persona flow cancelled by user');
-    }
+  const lower = text.toLowerCase();
+  if (CANCEL_KEYWORDS.has(lower)) {
+    throw new OperationCancelledError('Persona flow cancelled by user');
+  }
 
-    if (allowSkip && lower === 'skip') {
-      return undefined;
-    }
+  if (allowSkip && lower === 'skip') {
+    return undefined;
+  }
 
-    try {
-      return parser(text);
-    } catch (error) {
-      await styledAlert(ctx, error.message || 'Invalid value supplied.');
-    }
+  try {
+    return parser(text);
+  } catch (error) {
+    await styledAlert(ctx, error.message || 'Invalid value supplied.');
+    return promptForText(conversation, ctx, message, options);
   }
 }
 

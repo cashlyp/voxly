@@ -69,7 +69,7 @@ async function handleHelp(ctx) {
                 '🧪 /status — deep system status',
                 '🧰 /scripts — manage reusable prompts',
                 '🍃 /persona — sculpt adaptive agents',
-                '🔀 /provider — view/switch provider and manage keypad overrides'
+                '🔀 /provider — view or switch voice providers'
             ];
             helpSections.push(`<b>Admin Toolkit</b>\n${formatLines(adminList)}`);
         }
@@ -101,6 +101,8 @@ async function handleHelp(ctx) {
 
         const helpText = isAuthorized ? helpSections.join('\n\n') : unauthSections.join('\n\n');
 
+        const adminUsername = (config.admin.username || '').replace(/^@/, '');
+
         const kb = isAuthorized
             ? (() => {
                 const keyboard = new InlineKeyboard()
@@ -127,7 +129,9 @@ async function handleHelp(ctx) {
                 const keyboard = new InlineKeyboard()
                     .text('📚 Guide', buildCallbackData(ctx, 'GUIDE'))
                     .text('📋 Menu', buildCallbackData(ctx, 'MENU'));
-                keyboard.row().text('📩 Request Access', buildCallbackData(ctx, 'REQUEST_ACCESS'));
+                if (adminUsername) {
+                    keyboard.row().url('🔓 Request Access', `https://t.me/${adminUsername}`);
+                }
                 return keyboard;
             })();
 
