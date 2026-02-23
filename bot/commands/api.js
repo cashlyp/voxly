@@ -1,7 +1,7 @@
 const config = require('../config');
 const httpClient = require('../utils/httpClient');
 const { getUser, isAdmin } = require('../db/db');
-const { escapeMarkdown, buildLine } = require('../utils/ui');
+const { escapeMarkdown, buildLine, sendEphemeral } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 const { getDeniedAuditSummary } = require('../utils/capabilities');
 
@@ -25,7 +25,7 @@ async function handleStatusCommand(ctx) {
             return ctx.reply('❌ This command is for administrators only.');
         }
 
-        await ctx.reply('🔍 Checking system status...');
+        await sendEphemeral(ctx, '🔍 Checking system status...');
 
         const startTime = Date.now();
         const healthHeaders = {

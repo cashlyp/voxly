@@ -146,6 +146,33 @@ function formatScriptsApiError(error, action) {
 }
 
 const CANCEL_KEYWORDS = new Set(['cancel', 'exit', 'quit']);
+const CALL_SCRIPT_FLOW_LABELS = Object.freeze({
+  payment_collection: 'Payment collection',
+  identity_verification: 'Identity verification',
+  appointment_confirmation: 'Appointment confirmation',
+  service_recovery: 'Service recovery',
+  general_outreach: 'General outreach',
+  general: 'General'
+});
+
+const CALL_SCRIPT_FLOW_BADGES = Object.freeze({
+  payment_collection: '💳 Payment',
+  identity_verification: '🔐 Verification',
+  appointment_confirmation: '📅 Appointment',
+  service_recovery: '🛠️ Recovery',
+  general_outreach: '📣 Outreach',
+  general: '🧩 General'
+});
+
+const CALL_SCRIPT_FLOW_FILTER_OPTIONS = Object.freeze([
+  { id: 'all', label: '📚 All flows' },
+  { id: 'payment_collection', label: '💳 Payment collection' },
+  { id: 'identity_verification', label: '🔐 Identity verification' },
+  { id: 'appointment_confirmation', label: '📅 Appointment confirmation' },
+  { id: 'service_recovery', label: '🛠️ Service recovery' },
+  { id: 'general_outreach', label: '📣 General outreach' },
+  { id: 'general', label: '🧩 General' }
+]);
 
 function isCancelInput(text) {
   return typeof text === 'string' && CANCEL_KEYWORDS.has(text.trim().toLowerCase());
@@ -157,6 +184,93 @@ function escapeMarkdown(text = '') {
 
 function normalizeScriptName(name = '') {
   return String(name || '').trim().slice(0, 80);
+}
+
+function normalizeCallScriptFlowType(rawType) {
+  const value = String(rawType || '').trim().toLowerCase();
+  if (!value) return null;
+  const aliases = {
+    payment: 'payment_collection',
+    payment_flow: 'payment_collection',
+    collect_payment: 'payment_collection',
+    identity: 'identity_verification',
+    verify_identity: 'identity_verification',
+    otp: 'identity_verification',
+    digit_capture: 'identity_verification',
+    appointment: 'appointment_confirmation',
+    appointment_confirm: 'appointment_confirmation',
+    recovery: 'service_recovery',
+    outreach: 'general_outreach',
+    default: 'general'
+  };
+  if (CALL_SCRIPT_FLOW_LABELS[value]) return value;
+  return aliases[value] || null;
+}
+
+function getCallScriptFlowTypes(script = {}) {
+  const rawFlowTypes = Array.isArray(script.flow_types)
+    ? script.flow_types
+    : script.flow_type
+      ? [script.flow_type]
+      : [];
+  const normalized = [];
+  rawFlowTypes.forEach((entry) => {
+    const flowType = normalizeCallScriptFlowType(entry);
+    if (flowType && !normalized.includes(flowType)) {
+      normalized.push(flowType);
+    }
+  });
+  if (normalized.length) {
+    return normalized;
+  }
+
+  const objectiveTags = Array.isArray(script.objective_tags)
+    ? script.objective_tags.map((entry) => String(entry || '').trim().toLowerCase())
+    : [];
+  const fallback = [];
+  const add = (flowType) => {
+    if (!fallback.includes(flowType)) {
+      fallback.push(flowType);
+    }
+  };
+  if (script.supports_payment === true || objectiveTags.includes('collect_payment')) {
+    add('payment_collection');
+  }
+  if (
+    script.supports_digit_capture === true ||
+    script.requires_otp === true ||
+    (script.default_profile && String(script.default_profile).trim()) ||
+    objectiveTags.includes('verify_identity')
+  ) {
+    add('identity_verification');
+  }
+  if (objectiveTags.includes('appointment_confirm')) {
+    add('appointment_confirmation');
+  }
+  if (objectiveTags.includes('service_recovery')) {
+    add('service_recovery');
+  }
+  if (objectiveTags.includes('general_outreach')) {
+    add('general_outreach');
+  }
+  if (!fallback.length) {
+    add('general');
+  }
+  return fallback;
+}
+
+function getCallScriptPrimaryFlowType(script = {}) {
+  const flowTypes = getCallScriptFlowTypes(script);
+  return flowTypes[0] || 'general';
+}
+
+function getCallScriptFlowLabel(flowType) {
+  return CALL_SCRIPT_FLOW_LABELS[flowType] || CALL_SCRIPT_FLOW_LABELS.general;
+}
+
+function getCallScriptFlowBadge(script = {}) {
+  const flowType = getCallScriptPrimaryFlowType(script);
+  return CALL_SCRIPT_FLOW_BADGES[flowType] || CALL_SCRIPT_FLOW_BADGES.general;
 }
 
 function buildDigitCaptureSummary(script = {}) {
@@ -745,8 +859,16 @@ async function collectDigitCaptureConfig(conversation, ctx, defaults = {}, ensur
   return capture;
 }
 
-async function fetchCallScripts() {
-  const data = await scriptsApiRequest({ method: 'get', url: '/api/call-scripts' });
+async function fetchCallScripts({ flowType = null } = {}) {
+  const params = {};
+  if (flowType && flowType !== 'all') {
+    params.flow_type = flowType;
+  }
+  const data = await scriptsApiRequest({
+    method: 'get',
+    url: '/api/call-scripts',
+    params: Object.keys(params).length ? params : undefined
+  });
   return data.scripts || [];
 }
 
@@ -795,7 +917,12 @@ async function cloneCallScript(id, payload) {
 
 function formatCallScriptSummary(script) {
   const summary = [];
+  const flowTypes = getCallScriptFlowTypes(script);
   summary.push(`📛 *${escapeMarkdown(script.name)}*`);
+  summary.push(`🧭 Flow type: ${escapeMarkdown(getCallScriptFlowLabel(flowTypes[0] || 'general'))}`);
+  if (flowTypes.length > 1) {
+    summary.push(`🗂️ Flow coverage: ${flowTypes.slice(1).map((flow) => escapeMarkdown(getCallScriptFlowLabel(flow))).join(', ')}`);
+  }
   if (script.description) {
     summary.push(`📝 ${escapeMarkdown(script.description)}`);
   }
@@ -1346,12 +1473,13 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
   }
 }
 
-async function listCallScriptsFlow(conversation, ctx, ensureActive) {
+async function listCallScriptsFlow(conversation, ctx, ensureActive, options = {}) {
   const safeEnsureActive = typeof ensureActive === 'function'
     ? ensureActive
     : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  const selectedFlow = normalizeCallScriptFlowType(options.flowType);
   try {
-    const scripts = await fetchCallScripts();
+    const scripts = await fetchCallScripts({ flowType: selectedFlow });
     safeEnsureActive();
     const list = Array.isArray(scripts) ? scripts : [];
     const validScripts = list.filter((script) => script && typeof script.id !== 'undefined' && script.id !== null);
@@ -1360,19 +1488,26 @@ async function listCallScriptsFlow(conversation, ctx, ensureActive) {
       if (scripts && scripts.length && scripts.some((t) => !t || typeof t.id === 'undefined')) {
         console.warn('Script list contained invalid entries, ignoring malformed records.');
       }
-      await ctx.reply('ℹ️ No call scripts found. Use the create action to add one.');
+      if (selectedFlow) {
+        await ctx.reply(`ℹ️ No call scripts found for flow: ${getCallScriptFlowLabel(selectedFlow)}.`);
+      } else {
+        await ctx.reply('ℹ️ No call scripts found. Use the create action to add one.');
+      }
       return;
     }
 
     const summaryLines = validScripts.slice(0, 15).map((script, index) => {
-      const parts = [`${index + 1}. ${script.name}`];
+      const parts = [`${index + 1}. ${getCallScriptFlowBadge(script)} ${script.name}`];
       if (script.description) {
         parts.push(`– ${script.description}`);
       }
       return parts.join(' ');
     });
 
-    let message = '☎️ Call Scripts\n\n';
+    const header = selectedFlow
+      ? `☎️ Call Scripts (${getCallScriptFlowLabel(selectedFlow)})`
+      : '☎️ Call Scripts';
+    let message = `${header}\n\n`;
     message += summaryLines.join('\n');
     if (validScripts.length > 15) {
       message += `\n… and ${validScripts.length - 15} more.`;
@@ -1381,17 +1516,17 @@ async function listCallScriptsFlow(conversation, ctx, ensureActive) {
 
     await ctx.reply(message);
 
-    const options = validScripts.map((script) => ({
+    const selectableOptions = validScripts.map((script) => ({
       id: script.id.toString(),
-      label: `📄 ${script.name}`
+      label: `${getCallScriptFlowBadge(script)} ${script.name}`
     }));
-    options.push({ id: 'back', label: '⬅️ Back' });
+    selectableOptions.push({ id: 'back', label: '⬅️ Back' });
 
     const selection = await askOptionWithButtons(
       conversation,
       ctx,
       'Choose a call script to manage.',
-      options,
+      selectableOptions,
       { prefix: 'call-script-select', columns: 1, formatLabel: (option) => option.label, ensureActive: safeEnsureActive }
     );
 
@@ -1547,6 +1682,7 @@ async function callScriptsMenu(conversation, ctx, ensureActive) {
       [
         { id: 'list', label: '📄 List scripts' },
         { id: 'create', label: '➕ Create script' },
+        { id: 'flow', label: '🧭 List by flow type' },
         { id: 'incoming', label: '📥 Incoming default' },
         { id: 'back', label: '⬅️ Back' }
       ],
@@ -1560,6 +1696,22 @@ async function callScriptsMenu(conversation, ctx, ensureActive) {
       case 'create':
         await createCallScriptFlow(conversation, ctx, safeEnsureActive);
         break;
+      case 'flow': {
+        const flowSelection = await askOptionWithButtons(
+          conversation,
+          ctx,
+          'Select the flow type to list.',
+          [
+            ...CALL_SCRIPT_FLOW_FILTER_OPTIONS,
+            { id: 'back', label: '⬅️ Back' }
+          ],
+          { prefix: 'call-script-flow', columns: 1, ensureActive: safeEnsureActive }
+        );
+        if (flowSelection?.id && flowSelection.id !== 'back') {
+          await listCallScriptsFlow(conversation, ctx, safeEnsureActive, { flowType: flowSelection.id });
+        }
+        break;
+      }
       case 'incoming':
         await inboundDefaultScriptMenu(conversation, ctx, safeEnsureActive);
         break;

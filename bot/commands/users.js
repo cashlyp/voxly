@@ -4,6 +4,12 @@ const { buildCallbackData } = require('../utils/actions');
 const { guardAgainstCommandInterrupt, OperationCancelledError } = require('../utils/sessionState');
 const { renderMenu } = require('../utils/ui');
 
+const CANCEL_KEYWORDS = new Set(['cancel', 'exit', 'quit']);
+
+function isCancelInput(value) {
+  return CANCEL_KEYWORDS.has(String(value || '').trim().toLowerCase());
+}
+
 async function ensureAdminAccess(ctx) {
   const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
   if (!user) {
@@ -27,7 +33,16 @@ function buildUsersKeyboard(ctx) {
     .text('➕ Add User', buildCallbackData(ctx, 'ADDUSER'))
     .text('⬆️ Promote User', buildCallbackData(ctx, 'PROMOTE'))
     .row()
-    .text('❌ Remove User', buildCallbackData(ctx, 'REMOVE'));
+    .text('❌ Remove User', buildCallbackData(ctx, 'REMOVE'))
+    .row()
+    .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+}
+
+function buildUsersResultKeyboard(ctx) {
+  return new InlineKeyboard()
+    .text('⬅️ Back to Users', buildCallbackData(ctx, 'USERS'))
+    .row()
+    .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
 }
 
 async function renderUsersMenu(ctx, note = '') {
@@ -51,7 +66,9 @@ async function sendUsersList(ctx) {
     });
 
     if (!users || users.length === 0) {
-      await ctx.reply('📋 No users found in the system.');
+      await ctx.reply('📋 No users found in the system.', {
+        reply_markup: buildUsersResultKeyboard(ctx)
+      });
       return;
     }
 
@@ -67,21 +84,31 @@ async function sendUsersList(ctx) {
       message += `   Joined: ${joinDate}\n\n`;
     });
 
-    await ctx.reply(message);
+    await ctx.reply(message, {
+      reply_markup: buildUsersResultKeyboard(ctx)
+    });
   } catch (error) {
     console.error('Users list error:', error);
-    await ctx.reply('❌ Error fetching users list. Please try again.');
+    await ctx.reply('❌ Error fetching users list. Please try again.', {
+      reply_markup: buildUsersResultKeyboard(ctx)
+    });
   }
 }
 
 // ------------------------- Add User Flow -------------------------
 async function addUserFlow(conversation, ctx) {
   try {
-    await ctx.reply('🆔 Enter Telegram ID:');
+    await ctx.reply('🆔 Enter Telegram ID (or type cancel):');
     const idMsg = await conversation.wait();
     const idText = idMsg?.message?.text?.trim();
     if (idText) {
       await guardAgainstCommandInterrupt(ctx, idText);
+    }
+    if (isCancelInput(idText)) {
+      await ctx.reply('🛑 Add user cancelled.', {
+        reply_markup: buildUsersResultKeyboard(ctx)
+      });
+      return;
     }
     if (!idText) {
       await ctx.reply('❌ Please send a valid text message.');
@@ -94,11 +121,17 @@ async function addUserFlow(conversation, ctx) {
       return;
     }
 
-    await ctx.reply('🔠 Enter username:');
+    await ctx.reply('🔠 Enter username (or type cancel):');
     const usernameMsg = await conversation.wait();
     const usernameText = usernameMsg?.message?.text?.trim();
     if (usernameText) {
       await guardAgainstCommandInterrupt(ctx, usernameText);
+    }
+    if (isCancelInput(usernameText)) {
+      await ctx.reply('🛑 Add user cancelled.', {
+        reply_markup: buildUsersResultKeyboard(ctx)
+      });
+      return;
     }
     if (!usernameText) {
       await ctx.reply('❌ Please send a valid username.');
@@ -122,14 +155,18 @@ async function addUserFlow(conversation, ctx) {
       });
     });
 
-    await ctx.reply(`✅ @${username} (${id}) added as USER.`);
+    await ctx.reply(`✅ @${username} (${id}) added as USER.`, {
+      reply_markup: buildUsersResultKeyboard(ctx)
+    });
   } catch (error) {
     if (error instanceof OperationCancelledError) {
       console.log('Add user flow cancelled');
       return;
     }
     console.error('Add user flow error:', error);
-    await ctx.reply('❌ An error occurred while adding user. Please try again.');
+    await ctx.reply('❌ An error occurred while adding user. Please try again.', {
+      reply_markup: buildUsersResultKeyboard(ctx)
+    });
   }
 }
 
@@ -137,11 +174,17 @@ async function addUserFlow(conversation, ctx) {
 // ------------------------- Promote User Flow -------------------------
 async function promoteFlow(conversation, ctx) {
   try {
-    await ctx.reply('🆔 Enter Telegram ID to promote:');
+    await ctx.reply('🆔 Enter Telegram ID to promote (or type cancel):');
     const idMsg = await conversation.wait();
     const idText = idMsg?.message?.text?.trim();
     if (idText) {
       await guardAgainstCommandInterrupt(ctx, idText);
+    }
+    if (isCancelInput(idText)) {
+      await ctx.reply('🛑 Promote user cancelled.', {
+        reply_markup: buildUsersResultKeyboard(ctx)
+      });
+      return;
     }
     if (!idText) {
       await ctx.reply('❌ Please send a valid Telegram ID.');
@@ -165,14 +208,18 @@ async function promoteFlow(conversation, ctx) {
       });
     });
 
-    await ctx.reply(`✅ User ${id} promoted to ADMIN.`);
+    await ctx.reply(`✅ User ${id} promoted to ADMIN.`, {
+      reply_markup: buildUsersResultKeyboard(ctx)
+    });
   } catch (error) {
     if (error instanceof OperationCancelledError) {
       console.log('Promote flow cancelled');
       return;
     }
     console.error('Promote flow error:', error);
-    await ctx.reply('❌ An error occurred while promoting user. Please try again.');
+    await ctx.reply('❌ An error occurred while promoting user. Please try again.', {
+      reply_markup: buildUsersResultKeyboard(ctx)
+    });
   }
 }
 
@@ -180,11 +227,17 @@ async function promoteFlow(conversation, ctx) {
 // ------------------------- Remove User Flow -------------------------
 async function removeUserFlow(conversation, ctx) {
   try {
-    await ctx.reply('🆔 Enter Telegram ID to remove:');
+    await ctx.reply('🆔 Enter Telegram ID to remove (or type cancel):');
     const idMsg = await conversation.wait();
     const idText = idMsg?.message?.text?.trim();
     if (idText) {
       await guardAgainstCommandInterrupt(ctx, idText);
+    }
+    if (isCancelInput(idText)) {
+      await ctx.reply('🛑 Remove user cancelled.', {
+        reply_markup: buildUsersResultKeyboard(ctx)
+      });
+      return;
     }
     if (!idText) {
       await ctx.reply('❌ Please send a valid Telegram ID.');
@@ -208,14 +261,18 @@ async function removeUserFlow(conversation, ctx) {
       });
     });
 
-    await ctx.reply(`✅ User ${id} removed.`);
+    await ctx.reply(`✅ User ${id} removed.`, {
+      reply_markup: buildUsersResultKeyboard(ctx)
+    });
   } catch (error) {
     if (error instanceof OperationCancelledError) {
       console.log('Remove user flow cancelled');
       return;
     }
     console.error('Remove user flow error:', error);
-    await ctx.reply('❌ An error occurred while removing user. Please try again.');
+    await ctx.reply('❌ An error occurred while removing user. Please try again.', {
+      reply_markup: buildUsersResultKeyboard(ctx)
+    });
   }
 }
 

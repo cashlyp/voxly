@@ -32,15 +32,120 @@ async function notifyCallError(ctx, lines = []) {
     reply_markup: buildMainMenuReplyMarkup(ctx)
   });
 }
-const { section, escapeMarkdown, tipLine, buildLine, renderMenu } = require('../utils/ui');
+const { section, escapeMarkdown, tipLine, buildLine, renderMenu, sendEphemeral } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 
 const scriptsApiBase = config.scriptsApiUrl.replace(/\/+$/, '');
 const DEFAULT_FIRST_MESSAGE = 'Hello! This is an automated call. How can I help you today?';
+const CALL_SCRIPT_FLOW_LABELS = Object.freeze({
+  payment_collection: 'Payment collection',
+  identity_verification: 'Identity verification',
+  appointment_confirmation: 'Appointment confirmation',
+  service_recovery: 'Service recovery',
+  general_outreach: 'General outreach',
+  general: 'General'
+});
+
+const CALL_SCRIPT_FLOW_BADGES = Object.freeze({
+  payment_collection: '💳',
+  identity_verification: '🔐',
+  appointment_confirmation: '📅',
+  service_recovery: '🛠️',
+  general_outreach: '📣',
+  general: '🧩'
+});
 
 function isValidPhoneNumber(number) {
   const e164Regex = /^\+[1-9]\d{1,14}$/;
   return e164Regex.test((number || '').trim());
+}
+
+function normalizeCallScriptFlowType(rawType) {
+  const value = String(rawType || '').trim().toLowerCase();
+  if (!value) return null;
+  const aliases = {
+    payment: 'payment_collection',
+    payment_flow: 'payment_collection',
+    collect_payment: 'payment_collection',
+    identity: 'identity_verification',
+    verify_identity: 'identity_verification',
+    otp: 'identity_verification',
+    digit_capture: 'identity_verification',
+    appointment: 'appointment_confirmation',
+    appointment_confirm: 'appointment_confirmation',
+    recovery: 'service_recovery',
+    outreach: 'general_outreach',
+    default: 'general'
+  };
+  if (CALL_SCRIPT_FLOW_LABELS[value]) return value;
+  return aliases[value] || null;
+}
+
+function getCallScriptFlowTypes(script = {}) {
+  const rawFlowTypes = Array.isArray(script.flow_types)
+    ? script.flow_types
+    : script.flow_type
+      ? [script.flow_type]
+      : [];
+  const normalized = [];
+  rawFlowTypes.forEach((entry) => {
+    const flowType = normalizeCallScriptFlowType(entry);
+    if (flowType && !normalized.includes(flowType)) {
+      normalized.push(flowType);
+    }
+  });
+  if (normalized.length) {
+    return normalized;
+  }
+
+  const objectiveTags = Array.isArray(script.objective_tags)
+    ? script.objective_tags.map((entry) => String(entry || '').trim().toLowerCase())
+    : [];
+  const fallback = [];
+  const add = (flowType) => {
+    if (!fallback.includes(flowType)) {
+      fallback.push(flowType);
+    }
+  };
+  if (script.supports_payment === true || objectiveTags.includes('collect_payment')) {
+    add('payment_collection');
+  }
+  if (
+    script.supports_digit_capture === true ||
+    script.requires_otp === true ||
+    (script.default_profile && String(script.default_profile).trim()) ||
+    objectiveTags.includes('verify_identity')
+  ) {
+    add('identity_verification');
+  }
+  if (objectiveTags.includes('appointment_confirm')) {
+    add('appointment_confirmation');
+  }
+  if (objectiveTags.includes('service_recovery')) {
+    add('service_recovery');
+  }
+  if (objectiveTags.includes('general_outreach')) {
+    add('general_outreach');
+  }
+  if (!fallback.length) {
+    add('general');
+  }
+  return fallback;
+}
+
+function getPrimaryCallScriptFlowType(script = {}) {
+  const flowTypes = getCallScriptFlowTypes(script);
+  return flowTypes[0] || 'general';
+}
+
+function getCallScriptFlowLabel(script = {}) {
+  const flowType = getPrimaryCallScriptFlowType(script);
+  return CALL_SCRIPT_FLOW_LABELS[flowType] || CALL_SCRIPT_FLOW_LABELS.general;
+}
+
+function getCallScriptFlowBadge(script = {}) {
+  const flowType = getPrimaryCallScriptFlowType(script);
+  return CALL_SCRIPT_FLOW_BADGES[flowType] || CALL_SCRIPT_FLOW_BADGES.general;
 }
 
 function replacePlaceholders(text = '', values = {}) {
@@ -83,6 +188,19 @@ async function getCallScriptById(scriptId) {
 async function getCallScripts() {
   const response = await httpClient.get(null, `${scriptsApiBase}/api/call-scripts`, { timeout: 12000 });
   return response.data;
+}
+
+async function getActiveCallProvider() {
+  const response = await httpClient.get(null, `${scriptsApiBase}/admin/provider`, {
+    timeout: 10000,
+    headers: {
+      'x-admin-token': config.admin.apiToken
+    },
+    params: {
+      channel: 'call'
+    }
+  });
+  return String(response?.data?.provider || '').trim().toLowerCase() || null;
 }
 
 async function collectPlaceholderValues(conversation, ctx, placeholders, ensureActive) {
@@ -128,8 +246,12 @@ async function selectCallScript(conversation, ctx, ensureActive) {
     return { status: 'empty' };
   }
 
-  const options = scripts.map((script) => ({ id: script.id.toString(), label: `📄 ${script.name}` }));
+  const options = scripts.map((script) => ({
+    id: script.id.toString(),
+    label: `${getCallScriptFlowBadge(script)} ${script.name}`
+  }));
   options.push({ id: 'back', label: '⬅️ Back' });
+  options.push({ id: 'cancel', label: '❌ Cancel' });
 
   const selection = await askOptionWithButtons(
     conversation,
@@ -139,9 +261,16 @@ async function selectCallScript(conversation, ctx, ensureActive) {
     { prefix: 'call-script', columns: 1 }
   );
   ensureActive();
+  if (!selection || !selection.id) {
+    await ctx.reply('❌ No script selected.');
+    return { status: 'back' };
+  }
 
   if (selection.id === 'back') {
     return { status: 'back' };
+  }
+  if (selection.id === 'cancel') {
+    return { status: 'cancel' };
   }
 
   const scriptId = Number(selection.id);
@@ -169,6 +298,38 @@ async function selectCallScript(conversation, ctx, ensureActive) {
     return { status: 'error' };
   }
 
+  const scriptFlowTypes = getCallScriptFlowTypes(script);
+  if (scriptFlowTypes.includes('payment_collection')) {
+    let activeProvider = null;
+    try {
+      activeProvider = await getActiveCallProvider();
+      ensureActive();
+    } catch (error) {
+      console.warn('Failed to fetch active provider for payment flow guard:', error?.message || error);
+    }
+
+    if (activeProvider && activeProvider !== 'twilio') {
+      const providerGuard = await askOptionWithButtons(
+        conversation,
+        ctx,
+        `⚠️ *Payment flow selected*\nActive provider is *${activeProvider}*.\nPayment capture is most reliable on *twilio*.`,
+        [
+          { id: 'continue', label: '✅ Continue anyway' },
+          { id: 'reselect', label: '↩️ Choose another script' },
+          { id: 'cancel', label: '❌ Cancel' }
+        ],
+        { prefix: 'call-script-provider-guard', columns: 1 }
+      );
+      ensureActive();
+      if (!providerGuard || providerGuard.id === 'cancel') {
+        return { status: 'cancel' };
+      }
+      if (providerGuard.id === 'reselect') {
+        return { status: 'back' };
+      }
+    }
+  }
+
   const placeholderSet = new Set();
   extractScriptVariables(script.prompt || '').forEach((token) => placeholderSet.add(token));
   extractScriptVariables(script.first_message || '').forEach((token) => placeholderSet.add(token));
@@ -192,7 +353,7 @@ async function selectCallScript(conversation, ctx, ensureActive) {
     script_id: script.id
   };
 
-  const summary = [`Script: ${script.name}`];
+  const summary = [`Script: ${script.name}`, `Flow: ${getCallScriptFlowLabel(script)}`];
   if (script.description) {
     summary.push(`Description: ${script.description}`);
   }
@@ -242,7 +403,8 @@ async function selectCallScript(conversation, ctx, ensureActive) {
       scriptName: script.name,
       scriptDescription: script.description || 'No description provided',
       personaLabel: businessOption?.label || script.business_id || 'Custom',
-      scriptVoiceModel: script.voice_model || null
+      scriptVoiceModel: script.voice_model || null,
+      scriptFlowLabel: getCallScriptFlowLabel(script)
     }
   };
 }
@@ -435,7 +597,7 @@ async function callFlow(conversation, ctx) {
   };
 
   try {
-    await ctx.reply('Starting call process…');
+    await sendEphemeral(ctx, 'Starting call process…');
     const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
     ensureActive();
     if (!user) {
@@ -496,17 +658,29 @@ async function callFlow(conversation, ctx) {
       '⚙️ How would you like to configure this call?',
       [
         { id: 'script', label: '📁 Use call script' },
-        { id: 'custom', label: '🛠️ Build custom persona' }
+        { id: 'custom', label: '🛠️ Build custom persona' },
+        { id: 'cancel', label: '❌ Cancel' }
       ],
       { prefix: 'call-config', columns: 1 }
     );
     ensureActive();
+    if (!configurationMode || configurationMode.id === 'cancel') {
+      await ctx.reply('❌ Call setup cancelled.', {
+        reply_markup: buildMainMenuReplyMarkup(ctx)
+      });
+      return;
+    }
 
     let configuration = null;
     if (configurationMode.id === 'script') {
       const selection = await selectCallScript(conversation, ctx, ensureActive);
       if (selection?.status === 'ok') {
         configuration = selection;
+      } else if (selection?.status === 'cancel') {
+        await ctx.reply('❌ Call setup cancelled.', {
+          reply_markup: buildMainMenuReplyMarkup(ctx)
+        });
+        return;
       } else if (selection?.status === 'empty' || selection?.status === 'back') {
         const fallbackChoice = await promptScriptFallback(
           conversation,
@@ -564,6 +738,7 @@ async function callFlow(conversation, ctx) {
       configuration.payloadUpdates?.persona_label ||
       'Custom';
     const scriptVoiceModel = configuration.meta?.scriptVoiceModel || null;
+    const scriptFlowLabel = configuration.meta?.scriptFlowLabel || null;
 
     const defaultVoice = config.defaultVoiceModel;
     const voiceOptions = [];
@@ -574,6 +749,7 @@ async function callFlow(conversation, ctx) {
       voiceOptions.push({ id: 'default', label: `🎧 Default voice (${defaultVoice})` });
     }
     voiceOptions.push({ id: 'custom', label: '✍️ Custom voice id' });
+    voiceOptions.push({ id: 'cancel', label: '❌ Cancel' });
 
     const voiceSelection = await askOptionWithButtons(
       conversation,
@@ -583,6 +759,12 @@ async function callFlow(conversation, ctx) {
       { prefix: 'call-voice', columns: 1 }
     );
     ensureActive();
+    if (!voiceSelection || voiceSelection.id === 'cancel') {
+      await ctx.reply('❌ Call setup cancelled.', {
+        reply_markup: buildMainMenuReplyMarkup(ctx)
+      });
+      return;
+    }
 
     if (voiceSelection?.id === 'script' && scriptVoiceModel) {
       payload.voice_model = scriptVoiceModel;
@@ -618,6 +800,7 @@ async function callFlow(conversation, ctx) {
       buildLine('📋', 'To', number),
       victimName ? buildLine('👤', 'Victim', escapeMarkdown(victimName)) : null,
       buildLine('🧩', 'Script', escapeMarkdown(scriptName)),
+      scriptFlowLabel ? buildLine('🧭', 'Flow', escapeMarkdown(scriptFlowLabel)) : null,
       buildLine('🎤', 'Voice', escapeMarkdown(payload.voice_model || defaultVoice)),
       payload.purpose ? buildLine('🎯', 'Purpose', escapeMarkdown(payload.purpose)) : null
     ].filter(Boolean);
@@ -635,7 +818,7 @@ async function callFlow(conversation, ctx) {
       detailLines.push(tipLine('⚙️', 'Mode: Auto'));
     }
 
-    const replyOptions = { parse_mode: 'Markdown' };
+    let callBriefKeyboard = null;
     if (hasAutoFields) {
       const detailsKey = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
       if (!ctx.session.callDetailsCache) {
@@ -657,24 +840,15 @@ async function callFlow(conversation, ctx) {
           delete ctx.session.callDetailsCache[oldestKey];
         }
       }
-      replyOptions.reply_markup = {
+      callBriefKeyboard = {
         inline_keyboard: [[{ text: 'ℹ️ Details', callback_data: buildCallbackData(ctx, `CALL_DETAILS:${detailsKey}`) }]]
       };
     }
-    if (!replyOptions.reply_markup) {
-      replyOptions.reply_markup = buildMainMenuReplyMarkup(ctx);
-    } else if (replyOptions.reply_markup.inline_keyboard) {
-      replyOptions.reply_markup.inline_keyboard.push([
-        { text: '⬅️ Main Menu', callback_data: buildCallbackData(ctx, 'MENU') }
-      ]);
-    }
 
-    await renderMenu(ctx, section('🔍 Call Brief', detailLines), replyOptions.reply_markup, {
+    await renderMenu(ctx, section('🔍 Call Brief', detailLines), callBriefKeyboard, {
       payload: { parse_mode: 'Markdown' }
     });
-    await ctx.reply('⏳ Making the call…', {
-      reply_markup: buildMainMenuReplyMarkup(ctx)
-    });
+    await sendEphemeral(ctx, '⏳ Making the call…');
 
     const payloadForLog = { ...payload };
     if (payloadForLog.prompt) {

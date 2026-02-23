@@ -1,6 +1,26 @@
 const { ensureSession } = require('./sessionState');
+const config = require('../config');
 
 const DEFAULT_MENU_TTL_MS = 15 * 60 * 1000;
+const DEFAULT_EPHEMERAL_TTL_MS = Number.isFinite(config.ui?.ephemeralTtlMs)
+    ? config.ui.ephemeralTtlMs
+    : 8 * 1000;
+const MIN_EPHEMERAL_TTL_MS = 1000;
+const MAX_EPHEMERAL_TTL_MS = 60 * 1000;
+
+function clampEphemeralTtl(ttlMs) {
+    const parsed = Number(ttlMs);
+    if (!Number.isFinite(parsed)) {
+        return DEFAULT_EPHEMERAL_TTL_MS;
+    }
+    if (parsed < MIN_EPHEMERAL_TTL_MS) {
+        return MIN_EPHEMERAL_TTL_MS;
+    }
+    if (parsed > MAX_EPHEMERAL_TTL_MS) {
+        return MAX_EPHEMERAL_TTL_MS;
+    }
+    return parsed;
+}
 
 function normalizeReply(text, options = {}) {
     const normalizedText = text === undefined || text === null ? '' : String(text);
@@ -162,6 +182,48 @@ async function sendMenu(ctx, text, options = {}) {
     return message;
 }
 
+async function sendEphemeral(ctx, text, options = {}) {
+    const {
+        ttlMs = DEFAULT_EPHEMERAL_TTL_MS,
+        parseMode = null,
+        replyMarkup = null,
+        payload = {}
+    } = options;
+
+    const normalized = normalizeReply(text, {
+        ...payload,
+        ...(parseMode ? { parse_mode: parseMode } : {}),
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+    });
+    const message = await ctx.reply(normalized.text, normalized.options);
+
+    const chatId = message?.chat?.id || ctx.chat?.id;
+    const messageId = message?.message_id;
+    if (!chatId || !messageId) {
+        return message;
+    }
+
+    const delay = clampEphemeralTtl(ttlMs);
+    const timer = setTimeout(async () => {
+        try {
+            await ctx.api.deleteMessage(chatId, messageId);
+            return;
+        } catch (_) {
+            // Ignore and try fallback below.
+        }
+        try {
+            await ctx.api.editMessageReplyMarkup(chatId, messageId);
+        } catch (_) {
+            // Ignore if neither delete nor edit is possible.
+        }
+    }, delay);
+
+    if (typeof timer.unref === 'function') {
+        timer.unref();
+    }
+    return message;
+}
+
 async function activateMenuMessage(ctx, messageId, chatId = null) {
     const resolvedChatId = chatId || ctx.chat?.id;
     if (!messageId || !resolvedChatId) {
@@ -196,6 +258,7 @@ module.exports = {
     section,
     styledAlert,
     sendMenu,
+    sendEphemeral,
     clearMenuMessages,
     registerMenuMessage,
     activateMenuMessage,

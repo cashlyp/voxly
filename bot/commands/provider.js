@@ -63,6 +63,7 @@ function buildProviderKeyboard(ctx, activeProvider = '', supportedProviders = []
         }
     });
     keyboard.row().text('🔄 Refresh', buildCallbackData(ctx, 'PROVIDER_STATUS'));
+    keyboard.row().text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
     return keyboard;
 }
 

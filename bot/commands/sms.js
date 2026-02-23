@@ -24,7 +24,7 @@ const {
     extractScriptVariables,
     SCRIPT_METADATA
 } = require('../utils/scripts');
-const { section: formatSection, buildLine, tipLine, renderMenu, escapeMarkdown } = require('../utils/ui');
+const { section: formatSection, buildLine, tipLine, renderMenu, escapeMarkdown, sendEphemeral } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 const { getAccessProfile } = require('../utils/capabilities');
 
@@ -46,7 +46,7 @@ async function maybeSendSmsAliasTip(ctx) {
     ctx.session.hints = ctx.session.hints || {};
     if (ctx.session.hints.smsMenuTipSent) return;
     ctx.session.hints.smsMenuTipSent = true;
-    await ctx.reply('ℹ️ Tip: /sms is now the single entry point for all SMS actions.');
+    await sendEphemeral(ctx, 'ℹ️ Tip: /sms is now the single entry point for all SMS actions.');
 }
 
 function formatSmsStatusMessage(msg = {}) {
@@ -85,6 +85,8 @@ function buildSmsMenuKeyboard(ctx, isAdminUser) {
             .text('🕒 Recent SMS', buildCallbackData(ctx, 'SMS_RECENT'))
             .text('📊 SMS Stats', buildCallbackData(ctx, 'SMS_STATS'));
     }
+
+    keyboard.row().text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
 
     return keyboard;
 }
@@ -165,7 +167,7 @@ async function smsConversationFlow(conversation, ctx) {
             await ctx.reply('❌ Invalid phone number format. Use E.164 format: +1234567890');
             return;
         }
-        await ctx.reply(`🔍 Fetching conversation for ${phoneNumber}...`);
+        await sendEphemeral(ctx, `🔍 Fetching conversation for ${phoneNumber}...`);
         await viewSmsConversation(ctx, phoneNumber);
     } catch (error) {
         console.error('SMS conversation flow error:', error);
@@ -218,7 +220,7 @@ async function recentSmsFlow(conversation, ctx) {
         ensureActive();
         const raw = update?.message?.text?.trim();
         const limit = Math.min(Number(raw) || 10, 20);
-        await ctx.reply(`📱 Fetching last ${limit} SMS messages...`);
+        await sendEphemeral(ctx, `📱 Fetching last ${limit} SMS messages...`);
         await sendRecentSms(ctx, limit);
     } catch (error) {
         console.error('Recent SMS flow error:', error);
@@ -237,7 +239,7 @@ async function smsStatsFlow(conversation, ctx) {
             await ctx.reply('❌ SMS statistics are for administrators only.');
             return;
         }
-        await ctx.reply('📊 Fetching SMS statistics...');
+        await sendEphemeral(ctx, '📊 Fetching SMS statistics...');
         await getSmsStats(ctx);
     } catch (error) {
         console.error('SMS stats flow error:', error);
@@ -344,7 +346,9 @@ function buildBulkSmsMenuKeyboard(ctx) {
         .text('🕒 Recent Jobs', buildCallbackData(ctx, 'BULK_SMS_LIST'))
         .row()
         .text('🧾 Job Status', buildCallbackData(ctx, 'BULK_SMS_STATUS'))
-        .text('📊 Bulk Stats', buildCallbackData(ctx, 'BULK_SMS_STATS'));
+        .text('📊 Bulk Stats', buildCallbackData(ctx, 'BULK_SMS_STATS'))
+        .row()
+        .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
 }
 
 async function renderBulkSmsMenu(ctx) {
@@ -487,22 +491,31 @@ async function smsFlow(conversation, ctx) {
 
         const businessOptions = await getBusinessOptions();
         ensureActive();
+        const personaChoices = [
+            ...businessOptions,
+            { id: 'cancel', label: '🛑 Cancel', custom: true }
+        ];
 
         const selectedBusiness = await askWithGuard(
             conversation,
             ctx,
             `🎭 *Select SMS persona:*
 Choose the business profile for this message.`,
-            businessOptions,
+            personaChoices,
             {
                 prefix: 'sms-persona',
                 columns: 2,
-                formatLabel: (option) => option.custom ? '✍️ Custom Message' : option.label
+                formatLabel: (option) => {
+                    if (option.id === 'cancel') return option.label;
+                    return option.custom ? '✍️ Custom Message' : option.label;
+                }
             }
         );
 
-        if (!selectedBusiness) {
-            await ctx.reply('❌ Invalid persona selection. Please try again.');
+        if (!selectedBusiness || selectedBusiness.id === 'cancel') {
+            await ctx.reply('🛑 SMS cancelled.', {
+                reply_markup: buildBackToMenuKeyboard(ctx, 'SMS')
+            });
             return;
         }
 
@@ -635,6 +648,7 @@ How comfortable is the recipient with technical details?`,
         }
 
         scriptChoices.push(CUSTOM_SCRIPT_OPTION);
+        scriptChoices.push({ id: 'cancel', label: '🛑 Cancel', description: 'Exit SMS flow' });
 
         const scriptListText = scriptChoices
             .map((option) => `• ${option.label}${option.description ? ` - ${option.description}` : ''}`)
@@ -652,6 +666,13 @@ Tap an option below to continue.`;
             scriptChoices,
             { prefix: 'sms-script', columns: 1, formatLabel: (option) => option.label }
         );
+
+        if (!scriptSelection || scriptSelection.id === 'cancel') {
+            await ctx.reply('🛑 SMS cancelled.', {
+                reply_markup: buildBackToMenuKeyboard(ctx, 'SMS')
+            });
+            return;
+        }
 
         if (scriptSelection.id === 'custom') {
             await ctx.reply('💬 Enter the SMS message (max 1600 characters):');
@@ -786,7 +807,7 @@ Tap an option below to continue.`;
             }
         }
 
-        await ctx.reply('⏳ Sending SMS...');
+        await sendEphemeral(ctx, '⏳ Sending SMS...');
 
         const response = await guardedPost(`${config.apiUrl}/api/sms/send`, {
             ...payload,
@@ -946,7 +967,7 @@ async function bulkSmsFlow(conversation, ctx) {
             }
         }
 
-        await ctx.reply('⏳ Sending bulk SMS...');
+        await sendEphemeral(ctx, '⏳ Sending bulk SMS...');
 
         const payload = {
             recipients: numbers,
@@ -1354,7 +1375,7 @@ function registerSmsCommands(bot) {
 
     bot.command('schedulesms', async ctx => {
         try {
-            await ctx.reply('ℹ️ /schedulesms is now under /sms. Opening SMS menu…');
+            await sendEphemeral(ctx, 'ℹ️ /schedulesms is now under /sms. Opening SMS menu…');
             await maybeSendSmsAliasTip(ctx);
             await renderSmsMenu(ctx);
         } catch (error) {
@@ -1365,7 +1386,7 @@ function registerSmsCommands(bot) {
 
     bot.command('smsconversation', async ctx => {
         try {
-            await ctx.reply('ℹ️ /smsconversation is now under /sms. Opening SMS menu…');
+            await sendEphemeral(ctx, 'ℹ️ /smsconversation is now under /sms. Opening SMS menu…');
             await maybeSendSmsAliasTip(ctx);
             await renderSmsMenu(ctx);
         } catch (error) {
@@ -1376,7 +1397,7 @@ function registerSmsCommands(bot) {
 
     bot.command('smsstats', async ctx => {
         try {
-            await ctx.reply('ℹ️ /smsstats is now under /sms. Opening SMS menu…');
+            await sendEphemeral(ctx, 'ℹ️ /smsstats is now under /sms. Opening SMS menu…');
             await maybeSendSmsAliasTip(ctx);
             await renderSmsMenu(ctx);
         } catch (error) {
@@ -1390,7 +1411,7 @@ function registerSmsCommands(bot) {
             const args = ctx.message.text.split(' ');
             const messageSid = args.length > 1 ? args[1].trim() : '';
             if (!messageSid) {
-                await ctx.reply('ℹ️ /smsstatus is now under /sms. Opening SMS menu…');
+                await sendEphemeral(ctx, 'ℹ️ /smsstatus is now under /sms. Opening SMS menu…');
                 await maybeSendSmsAliasTip(ctx);
                 await renderSmsMenu(ctx);
                 return;
@@ -1407,7 +1428,7 @@ function registerSmsCommands(bot) {
             const args = ctx.message.text.split(' ');
             const limit = args.length > 1 ? Math.min(parseInt(args[1]) || 10, 20) : null;
             if (!limit) {
-                await ctx.reply('ℹ️ /recentsms is now under /sms. Opening SMS menu…');
+                await sendEphemeral(ctx, 'ℹ️ /recentsms is now under /sms. Opening SMS menu…');
                 await maybeSendSmsAliasTip(ctx);
                 await renderSmsMenu(ctx);
                 return;

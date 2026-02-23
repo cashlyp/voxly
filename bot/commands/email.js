@@ -14,7 +14,7 @@ const {
   registerAbortController,
   guardAgainstCommandInterrupt
 } = require('../utils/sessionState');
-const { section, buildLine, tipLine, escapeMarkdown, emphasize, activateMenuMessage, renderMenu } = require('../utils/ui');
+const { section, buildLine, tipLine, escapeMarkdown, emphasize, activateMenuMessage, renderMenu, sendEphemeral } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 const { getAccessProfile } = require('../utils/capabilities');
 const { askOptionWithButtons } = require('../utils/persona');
@@ -59,7 +59,7 @@ async function maybeSendEmailAliasTip(ctx) {
   ctx.session.hints = ctx.session.hints || {};
   if (ctx.session.hints.emailMenuTipSent) return;
   ctx.session.hints.emailMenuTipSent = true;
-  await ctx.reply('ℹ️ Tip: /email is now the single entry point for all Email actions.');
+  await sendEphemeral(ctx, 'ℹ️ Tip: /email is now the single entry point for all Email actions.');
 }
 
 function extractEmailTemplateVariables(text = '') {
@@ -830,7 +830,9 @@ function buildEmailMenuKeyboard(ctx) {
     .text('📬 Delivery Status', buildCallbackData(ctx, 'EMAIL_STATUS'))
     .row()
     .text('🧩 Templates', buildCallbackData(ctx, 'EMAIL_TEMPLATES'))
-    .text('🕒 History', buildCallbackData(ctx, 'EMAIL_HISTORY'));
+    .text('🕒 History', buildCallbackData(ctx, 'EMAIL_HISTORY'))
+    .row()
+    .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
   return keyboard;
 }
 
@@ -882,7 +884,9 @@ function buildBulkEmailMenuKeyboard(ctx) {
     .text('🧾 Job Status', buildCallbackData(ctx, 'BULK_EMAIL_STATUS'))
     .row()
     .text('🕒 History', buildCallbackData(ctx, 'BULK_EMAIL_LIST'))
-    .text('📊 Stats', buildCallbackData(ctx, 'BULK_EMAIL_STATS'));
+    .text('📊 Stats', buildCallbackData(ctx, 'BULK_EMAIL_STATS'))
+    .row()
+    .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
 }
 
 async function renderBulkEmailMenu(ctx) {
@@ -1649,7 +1653,7 @@ function registerEmailCommands(bot) {
       }
       const args = ctx.message?.text?.split(' ') || [];
       if (args.length < 2) {
-        await ctx.reply('ℹ️ /emailstatus is now under /email. Opening Email menu…');
+        await sendEphemeral(ctx, 'ℹ️ /emailstatus is now under /email. Opening Email menu…');
         await maybeSendEmailAliasTip(ctx);
         await renderEmailMenu(ctx);
         return;

@@ -5,6 +5,7 @@
  */
 
 require('dotenv').config();
+const DEFAULT_BOT_EPHEMERAL_TTL_MS = 8000;
 const required = ['ADMIN_TELEGRAM_ID', 'ADMIN_TELEGRAM_USERNAME', 'API_URL', 'BOT_TOKEN'];
 const missing = required.filter((key) => !process.env[key]);
 if (missing.length > 0) {
@@ -23,6 +24,11 @@ if (!adminApiToken || !apiHmacSecret) {
 }
 
 const scriptsApiUrl = process.env.SCRIPTS_API_URL || process.env.TEMPLATES_API_URL || process.env.API_URL;
+
+function parsePositiveInt(value, fallback) {
+  const parsed = Number.parseInt(String(value || ''), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 try {
   // eslint-disable-next-line no-new
@@ -46,6 +52,9 @@ module.exports = {
   defaultVoiceModel: process.env.DEFAULT_VOICE_MODEL || 'aura-asteria-en',
   defaultBusinessId: process.env.DEFAULT_BUSINESS_ID || 'general',
   defaultPurpose: process.env.DEFAULT_CALL_PURPOSE || 'general',
+  ui: {
+    ephemeralTtlMs: parsePositiveInt(process.env.BOT_EPHEMERAL_TTL_MS, DEFAULT_BOT_EPHEMERAL_TTL_MS),
+  },
   apiAuth: {
     hmacSecret: apiHmacSecret,
   },

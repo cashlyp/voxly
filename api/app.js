@@ -653,6 +653,85 @@ const CALL_OBJECTIVE_IDS = Object.freeze([
   "general_outreach",
 ]);
 
+const CALL_SCRIPT_FLOW_TYPES = Object.freeze([
+  "payment_collection",
+  "identity_verification",
+  "appointment_confirmation",
+  "service_recovery",
+  "general_outreach",
+  "general",
+]);
+
+const CALL_SCRIPT_FLOW_TYPE_ALIASES = Object.freeze({
+  payment_collection: "payment_collection",
+  "payment-collection": "payment_collection",
+  payment_flow: "payment_collection",
+  payment: "payment_collection",
+  collect_payment: "payment_collection",
+  "collect-payment": "payment_collection",
+  identity_verification: "identity_verification",
+  "identity-verification": "identity_verification",
+  identity: "identity_verification",
+  verify_identity: "identity_verification",
+  "verify-identity": "identity_verification",
+  otp: "identity_verification",
+  digit_capture: "identity_verification",
+  "digit-capture": "identity_verification",
+  appointment_confirmation: "appointment_confirmation",
+  "appointment-confirmation": "appointment_confirmation",
+  appointment_confirm: "appointment_confirmation",
+  "appointment-confirm": "appointment_confirmation",
+  appointment: "appointment_confirmation",
+  service_recovery: "service_recovery",
+  "service-recovery": "service_recovery",
+  recovery: "service_recovery",
+  general_outreach: "general_outreach",
+  "general-outreach": "general_outreach",
+  outreach: "general_outreach",
+  general: "general",
+  default: "general",
+});
+
+function normalizeCallScriptFlowType(value) {
+  if (value === undefined || value === null) return null;
+  const raw = String(value).trim().toLowerCase();
+  if (!raw) return null;
+  return CALL_SCRIPT_FLOW_TYPE_ALIASES[raw] || null;
+}
+
+function parseCallScriptFlowFilter(value) {
+  if (value === undefined || value === null) {
+    return { values: [], invalid: [] };
+  }
+  const rawValues = [];
+  if (Array.isArray(value)) {
+    value.forEach((entry) => {
+      String(entry || "")
+        .split(",")
+        .forEach((token) => rawValues.push(token));
+    });
+  } else {
+    String(value || "")
+      .split(",")
+      .forEach((token) => rawValues.push(token));
+  }
+  const values = [];
+  const invalid = [];
+  rawValues.forEach((token) => {
+    const trimmed = String(token || "").trim().toLowerCase();
+    if (!trimmed) return;
+    const normalized = normalizeCallScriptFlowType(trimmed);
+    if (!normalized) {
+      invalid.push(trimmed);
+      return;
+    }
+    if (!values.includes(normalized)) {
+      values.push(normalized);
+    }
+  });
+  return { values, invalid };
+}
+
 function parseObjectiveTags(value) {
   if (value === undefined || value === null) return [];
   if (Array.isArray(value)) {
@@ -808,6 +887,46 @@ function normalizeScriptTemplateRecord(template = null) {
     null,
   );
   normalized.payment_policy = parsePaymentPolicy(normalized.payment_policy);
+  const flowTypes = (() => {
+    const tags = new Set(
+      Array.isArray(normalized.objective_tags) ? normalized.objective_tags : [],
+    );
+    const flows = [];
+    const add = (flow) => {
+      if (!flows.includes(flow)) {
+        flows.push(flow);
+      }
+    };
+    if (
+      normalized.supports_payment === true ||
+      tags.has("collect_payment")
+    ) {
+      add("payment_collection");
+    }
+    if (
+      normalized.supports_digit_capture === true ||
+      normalizeBooleanFlag(normalized.requires_otp, false) === true ||
+      Boolean(String(normalized.default_profile || "").trim()) ||
+      tags.has("verify_identity")
+    ) {
+      add("identity_verification");
+    }
+    if (tags.has("appointment_confirm")) {
+      add("appointment_confirmation");
+    }
+    if (tags.has("service_recovery")) {
+      add("service_recovery");
+    }
+    if (tags.has("general_outreach")) {
+      add("general_outreach");
+    }
+    if (!flows.length) {
+      add("general");
+    }
+    return flows;
+  })();
+  normalized.flow_types = flowTypes;
+  normalized.flow_type = flowTypes[0] || "general";
   return normalized;
 }
 
@@ -11021,9 +11140,28 @@ async function suggestCallTemplateName(baseName, excludeId = null) {
 // Call script endpoints for bot script management
 app.get("/api/call-scripts", requireAdminToken, async (req, res) => {
   try {
-    const scripts = (await db.getCallTemplates()).map((item) =>
+    const flowFilter = parseCallScriptFlowFilter(
+      req.query?.flow_type ?? req.query?.flowType,
+    );
+    if (flowFilter.invalid.length) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid flow_type value(s): ${flowFilter.invalid.join(
+          ", ",
+        )}. Allowed values: ${CALL_SCRIPT_FLOW_TYPES.join(", ")}`,
+      });
+    }
+
+    let scripts = (await db.getCallTemplates()).map((item) =>
       normalizeScriptTemplateRecord(item),
     );
+    if (flowFilter.values.length) {
+      scripts = scripts.filter((script) =>
+        Array.isArray(script?.flow_types)
+          ? script.flow_types.some((flow) => flowFilter.values.includes(flow))
+          : flowFilter.values.includes(script?.flow_type),
+      );
+    }
     res.json({ success: true, scripts });
   } catch (error) {
     res

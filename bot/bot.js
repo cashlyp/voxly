@@ -28,6 +28,7 @@ const {
   getLatestMenuMessageId,
   isLatestMenuExpired,
   renderMenu,
+  sendEphemeral,
 } = require("./utils/ui");
 const {
   buildCallbackData,
@@ -647,9 +648,23 @@ bot.on("callback_query:data", async (ctx) => {
     await getAccessProfile(ctx);
     const requiredCapability = getCapabilityForAction(action);
     if (requiredCapability) {
-      const allowed = await requireCapability(ctx, requiredCapability, {
-        actionLabel: action,
-      });
+      let allowed = false;
+      try {
+        allowed = await requireCapability(ctx, requiredCapability, {
+          actionLabel: action,
+        });
+      } catch (capabilityError) {
+        console.error("Capability check error:", capabilityError);
+        await sendEphemeral(
+          ctx,
+          "⚠️ Access check failed. Please use /menu and try again.",
+        );
+        finishMetric("error", {
+          stage: "capability_check",
+          error: capabilityError?.message || String(capabilityError),
+        });
+        return;
+      }
       if (!allowed) {
         finishMetric("forbidden");
         return;
@@ -758,7 +773,7 @@ bot.on("callback_query:data", async (ctx) => {
         ) {
           await cancelActiveFlow(ctx, `stale_callback:${action}`);
           resetSession(ctx);
-          await ctx.reply("↩️ Reopening the menu so you can continue.");
+          await sendEphemeral(ctx, "↩️ Reopening the menu so you can continue.");
           await ctx.conversation.enter(conversationTarget);
           finishMetric("stale");
         }
@@ -821,7 +836,7 @@ bot.on("callback_query:data", async (ctx) => {
       };
       const label =
         conversationLabels[action] || action.toLowerCase().replace(/_/g, " ");
-      await ctx.reply(`Starting ${label}...`);
+      await sendEphemeral(ctx, `Starting ${label}...`);
       await ctx.conversation.enter(conversations[action]);
       finishMetric("ok");
       return;
@@ -970,22 +985,23 @@ bot.on("callback_query:data", async (ctx) => {
       default:
         if (action.includes(":")) {
           console.log(`Stale callback action: ${action}`);
-          await ctx.reply(
+          await sendEphemeral(
+            ctx,
             "⚠️ That menu is no longer active. Use /menu to start again.",
           );
           finishMetric("stale");
         } else {
           console.log(`Unknown callback action: ${action}`);
-          await ctx.reply("❌ Unknown action. Please try again.");
+          await sendEphemeral(ctx, "❌ Unknown action. Please try again.");
           finishMetric("unknown");
         }
     }
   } catch (error) {
     console.error("Callback query error:", error);
-    const fallback =
-      "❌ An error occurred processing your request. Please try again.";
-    const message = error?.userMessage || fallback;
-    await ctx.reply(message);
+    await sendEphemeral(
+      ctx,
+      "❌ Could not process that action. Please use /menu and try again.",
+    );
     finishMetric("error", { error: error?.message || String(error) });
   }
 });

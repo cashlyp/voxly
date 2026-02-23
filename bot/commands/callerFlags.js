@@ -4,11 +4,16 @@ const httpClient = require('../utils/httpClient');
 const { getUser, isAdmin } = require('../db/db');
 const { buildCallbackData } = require('../utils/actions');
 const { guardAgainstCommandInterrupt, OperationCancelledError, startOperation } = require('../utils/sessionState');
-const { escapeMarkdown, renderMenu } = require('../utils/ui');
+const { escapeMarkdown, renderMenu, sendEphemeral } = require('../utils/ui');
 
 const ADMIN_HEADER_NAME = 'x-admin-token';
 const DEFAULT_LIMIT = 20;
 const STATUS_OPTIONS = ['blocked', 'allowed', 'spam'];
+const CANCEL_KEYWORDS = new Set(['cancel', 'exit', 'quit']);
+
+function isCancelInput(value) {
+  return CANCEL_KEYWORDS.has(String(value || '').trim().toLowerCase());
+}
 
 function normalizePhoneInput(raw) {
   const digits = String(raw || '').replace(/\D/g, '');
@@ -54,7 +59,16 @@ function buildCallerFlagsKeyboard(ctx) {
     .text('✅ Allow', buildCallbackData(ctx, 'CALLER_FLAGS_ALLOW'))
     .text('🚫 Block', buildCallbackData(ctx, 'CALLER_FLAGS_BLOCK'))
     .row()
-    .text('⚠️ Spam', buildCallbackData(ctx, 'CALLER_FLAGS_SPAM'));
+    .text('⚠️ Spam', buildCallbackData(ctx, 'CALLER_FLAGS_SPAM'))
+    .row()
+    .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+}
+
+function buildCallerFlagsResultKeyboard(ctx) {
+  return new InlineKeyboard()
+    .text('⬅️ Back to Caller Flags', buildCallbackData(ctx, 'CALLER_FLAGS'))
+    .row()
+    .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
 }
 
 async function renderCallerFlagsMenu(ctx, note = '') {
@@ -106,7 +120,10 @@ async function sendCallerFlagsList(ctx, { status = null, limit = DEFAULT_LIMIT }
     limit: safeLimit
   });
   const message = formatFlagsList(flags, safeStatus);
-  await ctx.reply(message, { parse_mode: 'Markdown' });
+  await ctx.reply(message, {
+    parse_mode: 'Markdown',
+    reply_markup: buildCallerFlagsResultKeyboard(ctx)
+  });
 }
 
 async function upsertCallerFlag(ctx, { phone, status, note } = {}) {
@@ -172,7 +189,9 @@ async function handleCallerFlagsCommand(ctx) {
         statusCandidate = null;
       }
       if (statusCandidate && !normalizeStatusInput(statusCandidate)) {
-        await ctx.reply('❌ Status must be blocked, allowed, or spam.');
+        await ctx.reply('❌ Status must be blocked, allowed, or spam.', {
+          reply_markup: buildCallerFlagsResultKeyboard(ctx)
+        });
         return;
       }
       await sendCallerFlagsList(ctx, {
@@ -190,7 +209,10 @@ async function handleCallerFlagsCommand(ctx) {
         const flag = await upsertCallerFlag(ctx, { phone, status, note });
         await ctx.reply(
           `✅ Updated ${escapeMarkdown(flag.phone_number)} as ${formatStatusLabel(flag.status)}.`,
-          { parse_mode: 'Markdown' }
+          {
+            parse_mode: 'Markdown',
+            reply_markup: buildCallerFlagsResultKeyboard(ctx)
+          }
         );
         return;
       }
@@ -199,7 +221,7 @@ async function handleCallerFlagsCommand(ctx) {
         : action === 'block' ? 'callerflag-block-conversation'
         : 'callerflag-spam-conversation';
       startOperation(ctx, `callerflags_${action}`);
-      await ctx.reply(`Starting ${action} flow...`);
+      await sendEphemeral(ctx, `Starting ${action} flow...`);
       await ctx.conversation.enter(flowName);
       return;
     }
@@ -210,11 +232,16 @@ async function handleCallerFlagsCommand(ctx) {
       '• /callerflags allow <phone> [note]\n' +
       '• /callerflags block <phone> [note]\n' +
       '• /callerflags spam <phone> [note]',
-      { parse_mode: 'Markdown' }
+      {
+        parse_mode: 'Markdown',
+        reply_markup: buildCallerFlagsResultKeyboard(ctx)
+      }
     );
   } catch (error) {
     console.error('Caller flags command error:', error);
-    await ctx.reply(httpClient.getUserMessage(error, 'Unable to manage caller flags. Please try again.'));
+    await ctx.reply(httpClient.getUserMessage(error, 'Unable to manage caller flags. Please try again.'), {
+      reply_markup: buildCallerFlagsResultKeyboard(ctx)
+    });
   }
 }
 
@@ -224,11 +251,17 @@ function createCallerFlagFlow(status) {
       const { isAdminUser } = await ensureAuthorizedAdmin(ctx);
       if (!isAdminUser) return;
 
-      await ctx.reply('📞 Enter the caller phone number:');
+      await ctx.reply('📞 Enter the caller phone number (or type cancel):');
       const phoneMsg = await conversation.wait();
       const phoneText = phoneMsg?.message?.text?.trim();
       if (phoneText) {
         await guardAgainstCommandInterrupt(ctx, phoneText);
+      }
+      if (isCancelInput(phoneText)) {
+        await ctx.reply('🛑 Caller flag update cancelled.', {
+          reply_markup: buildCallerFlagsResultKeyboard(ctx)
+        });
+        return;
       }
       const normalizedPhone = normalizePhoneInput(phoneText);
       if (!normalizedPhone) {
@@ -236,11 +269,17 @@ function createCallerFlagFlow(status) {
         return;
       }
 
-      await ctx.reply('📝 Optional note (or type skip):');
+      await ctx.reply('📝 Optional note (type skip to ignore or cancel to abort):');
       const noteMsg = await conversation.wait();
       const noteText = noteMsg?.message?.text?.trim();
       if (noteText) {
         await guardAgainstCommandInterrupt(ctx, noteText);
+      }
+      if (isCancelInput(noteText)) {
+        await ctx.reply('🛑 Caller flag update cancelled.', {
+          reply_markup: buildCallerFlagsResultKeyboard(ctx)
+        });
+        return;
       }
       const note = noteText && noteText.toLowerCase() !== 'skip'
         ? noteText
@@ -249,7 +288,10 @@ function createCallerFlagFlow(status) {
       const flag = await upsertCallerFlag(ctx, { phone: normalizedPhone, status, note });
       await ctx.reply(
         `✅ Updated ${escapeMarkdown(flag.phone_number)} as ${formatStatusLabel(flag.status)}.`,
-        { parse_mode: 'Markdown' }
+        {
+          parse_mode: 'Markdown',
+          reply_markup: buildCallerFlagsResultKeyboard(ctx)
+        }
       );
     } catch (error) {
       if (error instanceof OperationCancelledError) {
@@ -257,7 +299,9 @@ function createCallerFlagFlow(status) {
         return;
       }
       console.error('Caller flag flow error:', error);
-      await ctx.reply('❌ Failed to update caller flag. Please try again.');
+      await ctx.reply('❌ Failed to update caller flag. Please try again.', {
+        reply_markup: buildCallerFlagsResultKeyboard(ctx)
+      });
     }
   };
 }

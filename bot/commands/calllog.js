@@ -3,9 +3,15 @@ const httpClient = require('../utils/httpClient');
 const { InlineKeyboard } = require('grammy');
 const { getUser } = require('../db/db');
 const { startOperation, ensureOperationActive } = require('../utils/sessionState');
-const { renderMenu, escapeMarkdown, buildLine, section } = require('../utils/ui');
+const { renderMenu, escapeMarkdown, buildLine, section, sendEphemeral } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 const { getAccessProfile } = require('../utils/capabilities');
+
+const CANCEL_KEYWORDS = new Set(['cancel', 'exit', 'quit']);
+
+function isCancelInput(value) {
+    return CANCEL_KEYWORDS.has(String(value || '').trim().toLowerCase());
+}
 
 function parseRecentFilter(input = '') {
     const trimmed = String(input || '').trim();
@@ -60,11 +66,16 @@ function buildCalllogMenuKeyboard(ctx) {
         .text('🔍 Search', buildCallbackData(ctx, 'CALLLOG_SEARCH'))
         .row()
         .text('📄 Call Details', buildCallbackData(ctx, 'CALLLOG_DETAILS'))
-        .text('🧾 Recent Events', buildCallbackData(ctx, 'CALLLOG_EVENTS'));
+        .text('🧾 Recent Events', buildCallbackData(ctx, 'CALLLOG_EVENTS'))
+        .row()
+        .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
 }
 
-function buildMainMenuKeyboard(ctx) {
-    return new InlineKeyboard().text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+function buildCalllogResultKeyboard(ctx) {
+    return new InlineKeyboard()
+        .text('⬅️ Back to Call Log', buildCallbackData(ctx, 'CALLLOG'))
+        .row()
+        .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
 }
 
 async function renderCalllogMenu(ctx) {
@@ -92,12 +103,18 @@ async function calllogRecentFlow(conversation, ctx) {
             return;
         }
 
-        await ctx.reply('🕒 Enter limit (max 30) and optional filter (status or phone).\nExample: `15 completed` or `20 +1234567890`', {
+        await ctx.reply('🕒 Enter limit (max 30) and optional filter (status or phone).\nExample: `15 completed` or `20 +1234567890`\nType `cancel` to stop.', {
             parse_mode: 'Markdown'
         });
         const update = await conversation.wait();
         ensureActive();
         const raw = update?.message?.text?.trim() || '';
+        if (isCancelInput(raw)) {
+            await ctx.reply('🛑 Call log lookup cancelled.', {
+                reply_markup: buildCalllogResultKeyboard(ctx)
+            });
+            return;
+        }
         const parts = raw.split(/\s+/).filter(Boolean);
         const limit = Math.min(parseInt(parts[0], 10) || 10, 30);
         const filter = parts.slice(1).join(' ');
@@ -105,7 +122,7 @@ async function calllogRecentFlow(conversation, ctx) {
         const { calls, filtered } = await fetchRecentCalls({ limit, filter });
         if (!calls.length) {
             await ctx.reply('ℹ️ No recent calls found.', {
-                reply_markup: buildMainMenuKeyboard(ctx)
+                reply_markup: buildCalllogResultKeyboard(ctx)
             });
             return;
         }
@@ -126,11 +143,11 @@ async function calllogRecentFlow(conversation, ctx) {
             : '';
         await ctx.reply(`${header}${lines.join('\n\n')}`, {
             parse_mode: 'Markdown',
-            reply_markup: buildMainMenuKeyboard(ctx)
+            reply_markup: buildCalllogResultKeyboard(ctx)
         });
     } catch (error) {
         await ctx.reply(httpClient.getUserMessage(error, 'Failed to fetch recent calls.'), {
-            reply_markup: buildMainMenuKeyboard(ctx)
+            reply_markup: buildCalllogResultKeyboard(ctx)
         });
     }
 }
@@ -145,16 +162,24 @@ async function calllogSearchFlow(conversation, ctx) {
             await ctx.reply('❌ You are not authorized to use this bot.');
             return;
         }
-        await ctx.reply('🔍 Enter a search term (phone, call ID, or status).');
+        await ctx.reply('🔍 Enter a search term (phone, call ID, or status), or type `cancel`.', {
+            parse_mode: 'Markdown'
+        });
         const update = await conversation.wait();
         ensureActive();
         const query = update?.message?.text?.trim();
+        if (isCancelInput(query)) {
+            await ctx.reply('🛑 Call log search cancelled.', {
+                reply_markup: buildCalllogResultKeyboard(ctx)
+            });
+            return;
+        }
         if (!query || query.length < 2) {
             await ctx.reply('❌ Please provide at least 2 characters.');
             return;
         }
 
-        await ctx.reply('🔍 Searching call log…');
+        await sendEphemeral(ctx, '🔍 Searching call log…');
         const res = await httpClient.get(null, `${config.apiUrl}/api/calls/search`, {
             params: { q: query, limit: 10 },
             timeout: 12000
@@ -162,7 +187,7 @@ async function calllogSearchFlow(conversation, ctx) {
         const results = res.data?.results || [];
         if (!results.length) {
             await ctx.reply('ℹ️ No matches found.', {
-                reply_markup: buildMainMenuKeyboard(ctx)
+                reply_markup: buildCalllogResultKeyboard(ctx)
             });
             return;
         }
@@ -175,11 +200,11 @@ async function calllogSearchFlow(conversation, ctx) {
         });
         await ctx.reply(lines.join('\n\n'), {
             parse_mode: 'Markdown',
-            reply_markup: buildMainMenuKeyboard(ctx)
+            reply_markup: buildCalllogResultKeyboard(ctx)
         });
     } catch (error) {
         await ctx.reply(httpClient.getUserMessage(error, 'Search failed. Please try again later.'), {
-            reply_markup: buildMainMenuKeyboard(ctx)
+            reply_markup: buildCalllogResultKeyboard(ctx)
         });
     }
 }
@@ -194,10 +219,18 @@ async function calllogDetailsFlow(conversation, ctx) {
             await ctx.reply('❌ You are not authorized to use this bot.');
             return;
         }
-        await ctx.reply('📄 Enter the call SID to view details.');
+        await ctx.reply('📄 Enter the call SID to view details, or type `cancel`.', {
+            parse_mode: 'Markdown'
+        });
         const update = await conversation.wait();
         ensureActive();
         const callSid = update?.message?.text?.trim();
+        if (isCancelInput(callSid)) {
+            await ctx.reply('🛑 Call details lookup cancelled.', {
+                reply_markup: buildCalllogResultKeyboard(ctx)
+            });
+            return;
+        }
         if (!callSid) {
             await ctx.reply('❌ Call SID is required.');
             return;
@@ -209,7 +242,7 @@ async function calllogDetailsFlow(conversation, ctx) {
         const call = res.data?.call || res.data;
         if (!call) {
             await ctx.reply('❌ Call not found.', {
-                reply_markup: buildMainMenuKeyboard(ctx)
+                reply_markup: buildCalllogResultKeyboard(ctx)
             });
             return;
         }
@@ -227,11 +260,11 @@ async function calllogDetailsFlow(conversation, ctx) {
         }
         await ctx.reply(section('📄 Call Details', lines), {
             parse_mode: 'Markdown',
-            reply_markup: buildMainMenuKeyboard(ctx)
+            reply_markup: buildCalllogResultKeyboard(ctx)
         });
     } catch (error) {
         await ctx.reply(httpClient.getUserMessage(error, 'Failed to fetch call details.'), {
-            reply_markup: buildMainMenuKeyboard(ctx)
+            reply_markup: buildCalllogResultKeyboard(ctx)
         });
     }
 }
@@ -246,10 +279,18 @@ async function calllogEventsFlow(conversation, ctx) {
             await ctx.reply('❌ You are not authorized to use this bot.');
             return;
         }
-        await ctx.reply('🧾 Enter the call SID to view recent events.');
+        await ctx.reply('🧾 Enter the call SID to view recent events, or type `cancel`.', {
+            parse_mode: 'Markdown'
+        });
         const update = await conversation.wait();
         ensureActive();
         const callSid = update?.message?.text?.trim();
+        if (isCancelInput(callSid)) {
+            await ctx.reply('🛑 Call events lookup cancelled.', {
+                reply_markup: buildCalllogResultKeyboard(ctx)
+            });
+            return;
+        }
         if (!callSid) {
             await ctx.reply('❌ Call SID is required.');
             return;
@@ -261,7 +302,7 @@ async function calllogEventsFlow(conversation, ctx) {
         const states = res.data?.recent_states || [];
         if (!states.length) {
             await ctx.reply('ℹ️ No recent events found.', {
-                reply_markup: buildMainMenuKeyboard(ctx)
+                reply_markup: buildCalllogResultKeyboard(ctx)
             });
             return;
         }
@@ -272,11 +313,11 @@ async function calllogEventsFlow(conversation, ctx) {
         });
         await ctx.reply(section('🧾 Recent Events', lines), {
             parse_mode: 'Markdown',
-            reply_markup: buildMainMenuKeyboard(ctx)
+            reply_markup: buildCalllogResultKeyboard(ctx)
         });
     } catch (error) {
         await ctx.reply(httpClient.getUserMessage(error, 'Failed to fetch recent events.'), {
-            reply_markup: buildMainMenuKeyboard(ctx)
+            reply_markup: buildCalllogResultKeyboard(ctx)
         });
     }
 }

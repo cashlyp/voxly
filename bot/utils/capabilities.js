@@ -151,6 +151,19 @@ function getCapabilityForAction(action = '') {
   return null;
 }
 
+function escapeHtml(text = '') {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function formatActionLabel(actionLabel = '') {
+  const raw = String(actionLabel || '').trim();
+  if (!raw) return '';
+  return raw.replace(/_/g, ' ');
+}
+
 function buildAccessKeyboard(ctx) {
   const adminUsername = (config.admin.username || '').replace(/^@/, '');
   const keyboard = new InlineKeyboard()
@@ -232,12 +245,19 @@ function getDeniedAuditSummary() {
 }
 
 async function sendAccessDenied(ctx, capability, options = {}) {
-  const actionLabel = options.actionLabel ? `\n\nAction: ${options.actionLabel}` : '';
-  const message =
-    `🔒 Access required to use this action.` +
-    `\n\nYou can explore menus, but execution is disabled without approval.` +
-    `${actionLabel}`;
-  await ctx.reply(message, { reply_markup: buildAccessKeyboard(ctx) });
+  const actionText = formatActionLabel(options.actionLabel);
+  const lines = [
+    '<b>🔒 Access Required</b>',
+    'This action is not available for your current role.',
+    'You can still use <b>Menu</b>, <b>Guide</b>, and <b>Help</b> while waiting for approval.'
+  ];
+  if (actionText) {
+    lines.push(`<b>Action:</b> <code>${escapeHtml(actionText)}</code>`);
+  }
+  await ctx.reply(lines.join('\n\n'), {
+    parse_mode: 'HTML',
+    reply_markup: buildAccessKeyboard(ctx)
+  });
 }
 
 async function requireCapability(ctx, capability, options = {}) {
@@ -256,6 +276,7 @@ async function requireCapability(ctx, capability, options = {}) {
   console.warn(`Access denied for user ${userId} (${profile.role}) on capability ${capability}${options.action ? ` via ${options.action}` : ''}`);
   if (isRateLimited(userId)) {
     await ctx.reply('⏳ Too many access attempts. Please wait a moment and try again.', {
+      parse_mode: 'HTML',
       reply_markup: buildAccessKeyboard(ctx)
     });
     return false;
@@ -265,6 +286,7 @@ async function requireCapability(ctx, capability, options = {}) {
     if (Date.now() - lastNotice > COOLDOWN_MS) {
       lastCooldownNotice.set(userId, Date.now());
       await ctx.reply('⏳ Please wait 30 seconds before retrying locked actions.', {
+        parse_mode: 'HTML',
         reply_markup: buildAccessKeyboard(ctx)
       });
       return false;
