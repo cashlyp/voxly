@@ -4975,10 +4975,6 @@ async function scriptsFlow(conversation, ctx) {
     console.error('Scripts flow unexpected error:', error?.message || error);
     await ctx.reply(formatScriptsApiError(error, 'Script command failed'));
     return;
-  } finally {
-    if (ctx.session?.currentOp?.id === opId) {
-      ctx.session.currentOp = null;
-    }
   }
 }
 
