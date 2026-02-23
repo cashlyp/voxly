@@ -67,15 +67,27 @@ db.serialize(() => {
 });
 
 function getUser(id, cb) {
-  if (!id || typeof cb !== "function") {
-    return cb ? cb(new Error("Invalid parameters"), null) : null;
+  if (typeof cb !== "function") {
+    return null;
+  }
+  if (!id) {
+    if (cb.length >= 2) {
+      return cb(new Error("Invalid parameters"), null);
+    }
+    return cb(null);
   }
   db.get(`SELECT * FROM users WHERE telegram_id = ?`, [id], (e, r) => {
     if (e) {
       console.error("getUser database error:", e.message);
-      return cb(e);
+      if (cb.length >= 2) {
+        return cb(e, null);
+      }
+      return cb(null);
     }
-    cb(null, r || null);
+    if (cb.length >= 2) {
+      return cb(null, r || null);
+    }
+    return cb(r || null);
   });
 }
 function addUser(id, username, role = "USER", cb = () => {}) {
@@ -110,7 +122,10 @@ function removeUser(id, cb = () => {}) {
   db.run(`DELETE FROM users WHERE telegram_id = ?`, [id], cb);
 }
 function isAdmin(id, cb) {
-  if (!id || typeof cb !== "function") {
+  if (typeof cb !== "function") {
+    return null;
+  }
+  if (!id) {
     return cb(false);
   }
   db.get(`SELECT role FROM users WHERE telegram_id = ?`, [id], (e, r) => {
