@@ -390,7 +390,8 @@ async function askOptionWithButtons(
     const optionToken = String(index);
     optionLookupByToken.set(optionToken, option);
     const action = `${prefixKey}:${optionToken}`;
-    keyboard.text(label, buildCallbackData(ctx, action));
+    // Keep conversation menu callback_data restart-safe and worker-safe.
+    keyboard.text(label, buildCallbackData(ctx, action, { ttlMs: 0 }));
     if ((index + 1) % resolvedColumns === 0) {
       keyboard.row();
     }
@@ -408,8 +409,34 @@ async function askOptionWithButtons(
       const data = callbackCtx?.callbackQuery?.data;
       return matchesCallbackPrefix(data, prefixKey);
     });
-    activeChecker();
+    const callbackRawData = String(selectionCtx?.callbackQuery?.data || '');
+    const selectionAction = parseCallbackData(callbackRawData).action || callbackRawData;
     const callbackChatId = selectionCtx?.callbackQuery?.message?.chat?.id || null;
+    console.log(JSON.stringify({
+      type: 'conversation_callback',
+      callback_data: callbackRawData,
+      action: selectionAction,
+      user_id: selectionCtx?.from?.id || ctx.from?.id || null,
+      chat_id: callbackChatId || ctx.chat?.id || null,
+      state: {
+        op_id: ctx.session?.currentOp?.id || null,
+        op_token: ctx.session?.currentOp?.token || null,
+        op_command: ctx.session?.currentOp?.command || null,
+        flow_name: ctx.session?.flow?.name || null,
+        flow_step: ctx.session?.flow?.step || null
+      }
+    }));
+    try {
+      activeChecker();
+    } catch (error) {
+      try {
+        await selectionCtx.answerCallbackQuery({
+          text: '⚠️ This menu is no longer active.',
+          show_alert: false
+        });
+      } catch (_) {}
+      throw error;
+    }
     if (expectedChatId && callbackChatId && callbackChatId !== expectedChatId) {
       try {
         await selectionCtx.answerCallbackQuery({
@@ -419,8 +446,6 @@ async function askOptionWithButtons(
       } catch (_) {}
       continue;
     }
-
-    const selectionAction = parseCallbackData(selectionCtx.callbackQuery.data).action || selectionCtx.callbackQuery.data;
     const parts = selectionAction.split(':');
     const selectedToken = parts.length ? parts[parts.length - 1] : '';
     selected = optionLookupByToken.get(selectedToken)

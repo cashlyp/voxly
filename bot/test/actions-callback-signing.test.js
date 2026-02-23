@@ -35,10 +35,24 @@ function testShortActionUsesRegularSignedPayload() {
   assert.strictEqual(parsed.valid, true);
 }
 
-function testLongActionUsesAliasSignedPayload() {
+function testLongSessionBoundActionUsesPortableRawPayload() {
   const ctx = createCtx();
-  const longAction =
-    "call-script-main:1234abcd:prompt:select:very-long-option-token-value";
+  const longAction = "call-script-main:1234abcd:ab12:0";
+  const payload = buildCallbackData(ctx, longAction);
+  assert.strictEqual(payload, longAction);
+
+  const parsed = parseCallbackData(payload);
+  assert.strictEqual(parsed.action, longAction);
+  assert.strictEqual(parsed.signed, false);
+
+  const validation = validateCallback(ctx, payload);
+  assert.strictEqual(validation.status, "ok");
+  assert.strictEqual(validation.action, longAction);
+}
+
+function testLongNonSessionActionUsesAliasSignedPayload() {
+  const ctx = createCtx();
+  const longAction = `EMAIL_STATUS:msg_${"x".repeat(44)}`;
   const payload = buildCallbackData(ctx, longAction);
   assert.ok(payload.startsWith("cbk|"));
 
@@ -48,15 +62,13 @@ function testLongActionUsesAliasSignedPayload() {
 
   const validation = validateCallback(ctx, payload);
   assert.strictEqual(validation.status, "ok");
-  assert.strictEqual(validation.action, longAction);
 }
 
-function testAliasSignedPayloadRespectsOperationToken() {
+function testSessionBoundPayloadRespectsOperationToken() {
   const sourceCtx = createCtx("1234abcd");
-  const longAction =
-    "sms-script-select:1234abcd:prompt:select:another-long-option-token";
+  const longAction = "sms-script-select:1234abcd:xy99:1";
   const payload = buildCallbackData(sourceCtx, longAction);
-  assert.ok(payload.startsWith("cbk|"));
+  assert.strictEqual(payload, longAction);
 
   const staleCtx = createCtx("deadbeef");
   const validation = validateCallback(staleCtx, payload);
@@ -64,5 +76,6 @@ function testAliasSignedPayloadRespectsOperationToken() {
 }
 
 testShortActionUsesRegularSignedPayload();
-testLongActionUsesAliasSignedPayload();
-testAliasSignedPayloadRespectsOperationToken();
+testLongSessionBoundActionUsesPortableRawPayload();
+testLongNonSessionActionUsesAliasSignedPayload();
+testSessionBoundPayloadRespectsOperationToken();

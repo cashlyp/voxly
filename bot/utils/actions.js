@@ -7,6 +7,7 @@ const DEFAULT_DEDUPE_TTL_MS = 8000;
 const SIGN_PREFIX = 'cb';
 const SHORT_SIGN_PREFIX = 'cbk';
 const MAX_CALLBACK_DATA_LENGTH = 64;
+const SESSION_BOUND_ACTION_PATTERN = /^[A-Za-z0-9_-]+:[0-9a-fA-F-]{8,}(?::|$)/;
 const CALLBACK_ALIAS_MAX_ENTRIES = 4000;
 const MENU_ACTION_LOG_INTERVAL = 25;
 const MENU_ACTIONS = new Set([
@@ -97,6 +98,10 @@ function createCallbackAlias(action, token, timestamp, ttlMs) {
   return null;
 }
 
+function isSessionBoundAction(action) {
+  return SESSION_BOUND_ACTION_PATTERN.test(String(action || ''));
+}
+
 function buildCallbackData(ctx, action, options = {}) {
   const safeAction = String(action || '');
   if (!safeAction) {
@@ -111,6 +116,9 @@ function buildCallbackData(ctx, action, options = {}) {
   const data = `${SIGN_PREFIX}|${safeAction}|${token}|${ts}|${sig}`;
   if (data.length <= MAX_CALLBACK_DATA_LENGTH && ttlMs > 0) {
     return data;
+  }
+  if (isSessionBoundAction(safeAction) && safeAction.length <= MAX_CALLBACK_DATA_LENGTH) {
+    return safeAction;
   }
   if (ttlMs <= 0) {
     return safeAction;
@@ -236,7 +244,7 @@ function validateCallback(ctx, rawAction, options = {}) {
       return { status: 'invalid', reason: parsed.reason, action: parsed.action };
     }
     const action = String(parsed.action || '');
-    const sessionBound = action.includes(':');
+    const sessionBound = isSessionBoundAction(action);
     if (sessionBound && parsed.timestamp && now - parsed.timestamp > ttlMs) {
       return { status: 'expired', reason: 'ttl', action: parsed.action };
     }

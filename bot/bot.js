@@ -604,6 +604,16 @@ async function safeAnswerCallbackQuery(ctx, options = {}) {
   }
 }
 
+function buildCallbackStateSnapshot(ctx) {
+  return {
+    op_id: ctx.session?.currentOp?.id || null,
+    op_token: ctx.session?.currentOp?.token || null,
+    op_command: ctx.session?.currentOp?.command || null,
+    flow_name: ctx.session?.flow?.name || null,
+    flow_step: ctx.session?.flow?.step || null,
+  };
+}
+
 function getRequesterChatId(ctx) {
   const chatId =
     ctx.callbackQuery?.message?.chat?.id || ctx.chat?.id || ctx.from?.id || "";
@@ -873,10 +883,23 @@ bot.command("start", async (ctx) => {
 bot.on("callback_query:data", async (ctx) => {
   const rawAction = String(ctx.callbackQuery?.data || "");
   const metric = startActionMetric(ctx, "callback", { raw_action: rawAction });
+  const callbackMeta = {
+    user_id: ctx.from?.id || null,
+    chat_id: ctx.callbackQuery?.message?.chat?.id || ctx.chat?.id || null,
+    message_id: ctx.callbackQuery?.message?.message_id || null,
+    state: buildCallbackStateSnapshot(ctx),
+  };
   const finishMetric = (status, extra = {}) => {
     finishActionMetric(metric, status, extra);
   };
   try {
+    console.log(
+      JSON.stringify({
+        type: "callback_query_received",
+        callback_data: rawAction,
+        ...callbackMeta,
+      }),
+    );
     if (!rawAction) {
       await safeAnswerCallbackQuery(ctx, {
         text: "⚠️ That option is unavailable.",
@@ -902,6 +925,16 @@ bot.on("callback_query:data", async (ctx) => {
       ? { status: "ok", action: rawAction }
       : validateCallback(ctx, rawAction);
     if (validation.status !== "ok") {
+      console.warn(
+        JSON.stringify({
+          type: "callback_query_rejected",
+          callback_data: rawAction,
+          action: validation.action || null,
+          status: validation.status,
+          reason: validation.reason || null,
+          ...callbackMeta,
+        }),
+      );
       const message =
         validation.status === "expired"
           ? "⌛ This menu expired. Opening the latest view…"
@@ -934,7 +967,14 @@ bot.on("callback_query:data", async (ctx) => {
 
     // Answer callback query immediately to prevent timeout
     await safeAnswerCallbackQuery(ctx);
-    console.log(`Callback query received: ${action} from user ${ctx.from.id}`);
+    console.log(
+      JSON.stringify({
+        type: "callback_query_routed",
+        callback_data: rawAction,
+        action,
+        ...callbackMeta,
+      }),
+    );
 
     await getAccessProfile(ctx);
     const requiredCapability = getCapabilityForAction(action);
