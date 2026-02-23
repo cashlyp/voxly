@@ -48,6 +48,25 @@ async function safeReplyMarkdown(ctx, text, options = {}) {
   return safeReply(ctx, text, { parse_mode: 'Markdown', ...options });
 }
 
+async function deleteMessageSafely(ctx, message) {
+  const chatId = message?.chat?.id;
+  const messageId = message?.message_id;
+  if (!chatId || !messageId) {
+    return;
+  }
+  try {
+    await ctx.api.deleteMessage(chatId, messageId);
+    return;
+  } catch (_) {
+    // Ignore and fall back to clearing reply markup when deletion is blocked.
+  }
+  try {
+    await ctx.api.editMessageReplyMarkup(chatId, messageId);
+  } catch (_) {
+    // Ignore if message is missing or cannot be edited.
+  }
+}
+
 async function waitForTextInput(conversation, ctx, ensureActive, options = {}) {
   const { update, text } = await waitForConversationText(conversation, ctx, {
     ensureActive,
@@ -753,22 +772,27 @@ async function searchEmailTemplatesFlow(conversation, ctx, ensureActive) {
 async function showEmailTemplateDetail(conversation, ctx, template, ensureActive) {
   let viewing = true;
   while (viewing) {
-    await safeReplyMarkdown(ctx, formatEmailTemplateSummary(template));
-    const action = await askOptionWithButtons(
-      conversation,
-      ctx,
-      'Choose an action.',
-      [
-        { id: 'preview', label: '🔍 Preview' },
-        { id: 'edit', label: '✏️ Edit' },
-        { id: 'clone', label: '🧬 Clone' },
-        { id: 'export', label: '📤 Export' },
-        { id: 'versions', label: '🗂️ Versions' },
-        { id: 'delete', label: '🗑️ Delete' },
-        { id: 'back', label: '⬅️ Back' }
-      ],
-      { prefix: 'email-template-action', columns: 2, ensureActive }
-    );
+    const summaryMessage = await safeReplyMarkdown(ctx, formatEmailTemplateSummary(template));
+    let action;
+    try {
+      action = await askOptionWithButtons(
+        conversation,
+        ctx,
+        'Choose an action.',
+        [
+          { id: 'preview', label: '🔍 Preview' },
+          { id: 'edit', label: '✏️ Edit' },
+          { id: 'clone', label: '🧬 Clone' },
+          { id: 'export', label: '📤 Export' },
+          { id: 'versions', label: '🗂️ Versions' },
+          { id: 'delete', label: '🗑️ Delete' },
+          { id: 'back', label: '⬅️ Back' }
+        ],
+        { prefix: 'email-template-action', columns: 2, ensureActive }
+      );
+    } finally {
+      await deleteMessageSafely(ctx, summaryMessage);
+    }
     switch (action.id) {
       case 'preview':
         await previewEmailTemplate(conversation, ctx, template, ensureActive);

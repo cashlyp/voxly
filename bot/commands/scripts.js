@@ -806,6 +806,25 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+async function deleteMessageSafely(ctx, message) {
+  const chatId = message?.chat?.id;
+  const messageId = message?.message_id;
+  if (!chatId || !messageId) {
+    return;
+  }
+  try {
+    await ctx.api.deleteMessage(chatId, messageId);
+    return;
+  } catch (_) {
+    // Ignore and fall back to clearing reply markup when deletion is blocked.
+  }
+  try {
+    await ctx.api.editMessageReplyMarkup(chatId, messageId);
+  } catch (_) {
+    // Ignore if the message no longer exists or cannot be edited.
+  }
+}
+
 function getDraftOwnerId(ctx) {
   return String(ctx?.from?.id || '').trim();
 }
@@ -3116,7 +3135,7 @@ async function showCallScriptVersions(conversation, ctx, script, ensureActive) {
       return;
     }
     const lines = versions.map((v) => `v${v.version_number} • ${new Date(v.created_at).toLocaleString()}`);
-    await ctx.reply(`🗂️ Saved versions\n${lines.join('\n')}`);
+    const versionsMessage = await ctx.reply(`🗂️ Saved versions\n${lines.join('\n')}`);
 
     const options = versions.map((v) => ({
       id: String(v.version_number),
@@ -3124,13 +3143,18 @@ async function showCallScriptVersions(conversation, ctx, script, ensureActive) {
     }));
     options.push({ id: 'back', label: '⬅️ Back' });
 
-    const selection = await askOptionWithButtons(
-      conversation,
-      ctx,
-      'Select a version to restore.',
-      options,
-      { prefix: 'call-script-version', columns: 2, ensureActive: safeEnsureActive }
-    );
+    let selection;
+    try {
+      selection = await askOptionWithButtons(
+        conversation,
+        ctx,
+        'Select a version to restore.',
+        options,
+        { prefix: 'call-script-version', columns: 2, ensureActive: safeEnsureActive }
+      );
+    } finally {
+      await deleteMessageSafely(ctx, versionsMessage);
+    }
     if (!selection || selection.id === 'back') return;
     const versionNumber = Number(selection.id);
     if (Number.isNaN(versionNumber)) {
@@ -3467,7 +3491,7 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
     const lifecycle = await getCallScriptLifecycleState(script.id);
     const lifecycleStatus = normalizeScriptStatus(lifecycle?.status);
     const summary = formatCallScriptSummary(script, lifecycle);
-    await ctx.reply(summary, { parse_mode: 'Markdown' });
+    const summaryMessage = await ctx.reply(summary, { parse_mode: 'Markdown' });
 
     const actions = [
       { id: 'preview', label: '📞 Preview' },
@@ -3493,13 +3517,18 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
     actions.push({ id: 'delete', label: '🗑️ Delete' });
     actions.push({ id: 'back', label: '⬅️ Back' });
 
-    const action = await askOptionWithButtons(
-      conversation,
-      ctx,
-      'Choose an action for this script.',
-      actions,
-      { prefix: 'call-script-action', columns: 2, ensureActive: safeEnsureActive }
-    );
+    let action;
+    try {
+      action = await askOptionWithButtons(
+        conversation,
+        ctx,
+        'Choose an action for this script.',
+        actions,
+        { prefix: 'call-script-action', columns: 2, ensureActive: safeEnsureActive }
+      );
+    } finally {
+      await deleteMessageSafely(ctx, summaryMessage);
+    }
 
     switch (action.id) {
       case 'preview':
@@ -4454,7 +4483,7 @@ async function showSmsScriptVersions(conversation, ctx, script) {
       return;
     }
     const lines = versions.map((v) => `v${v.version_number} • ${new Date(v.created_at).toLocaleString()}`);
-    await ctx.reply(`🗂️ Saved versions\n${lines.join('\n')}`);
+    const versionsMessage = await ctx.reply(`🗂️ Saved versions\n${lines.join('\n')}`);
 
     const options = versions.map((v) => ({
       id: String(v.version_number),
@@ -4462,13 +4491,18 @@ async function showSmsScriptVersions(conversation, ctx, script) {
     }));
     options.push({ id: 'back', label: '⬅️ Back' });
 
-    const selection = await askOptionWithButtons(
-      conversation,
-      ctx,
-      'Select a version to restore.',
-      options,
-      { prefix: 'sms-script-version', columns: 2 }
-    );
+    let selection;
+    try {
+      selection = await askOptionWithButtons(
+        conversation,
+        ctx,
+        'Select a version to restore.',
+        options,
+        { prefix: 'sms-script-version', columns: 2 }
+      );
+    } finally {
+      await deleteMessageSafely(ctx, versionsMessage);
+    }
     if (!selection || selection.id === 'back') return;
     const versionNumber = Number(selection.id);
     if (Number.isNaN(versionNumber)) {
@@ -4584,7 +4618,7 @@ async function showSmsScriptDetail(conversation, ctx, script) {
   let viewing = true;
   while (viewing) {
     const summary = formatSmsScriptSummary(script);
-    await ctx.reply(summary, { parse_mode: 'Markdown' });
+    const summaryMessage = await ctx.reply(summary, { parse_mode: 'Markdown' });
 
     const actions = [
       { id: 'preview', label: '📲 Preview' },
@@ -4599,13 +4633,18 @@ async function showSmsScriptDetail(conversation, ctx, script) {
 
     actions.push({ id: 'back', label: '⬅️ Back' });
 
-    const action = await askOptionWithButtons(
-      conversation,
-      ctx,
-      'Choose an action for this SMS script.',
-      actions,
-      { prefix: 'sms-script-action', columns: 2 }
-    );
+    let action;
+    try {
+      action = await askOptionWithButtons(
+        conversation,
+        ctx,
+        'Choose an action for this SMS script.',
+        actions,
+        { prefix: 'sms-script-action', columns: 2 }
+      );
+    } finally {
+      await deleteMessageSafely(ctx, summaryMessage);
+    }
 
     switch (action.id) {
       case 'preview':

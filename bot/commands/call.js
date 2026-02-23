@@ -747,29 +747,39 @@ async function selectCallScript(conversation, ctx, ensureActive, objective) {
     return String(a.name || '').localeCompare(String(b.name || ''));
   });
 
-  const options = objectiveScripts.map((script) => ({
-    id: script.id.toString(),
-    label: `📄 ${script.name}${activeScripts.length ? '' : ` (${formatScriptStatusLabel(script._status)})`}${script._objectiveScore > 0 ? ' ⭐' : ''}`
-  }));
-  if (!objectiveTarget.requiresPayment && !objectiveTarget.requiresDigitFlow) {
-    options.push({ id: 'custom', label: '✍️ Custom persona setup' });
-  }
-  options.push({ id: 'back', label: '⬅️ Back' });
+  let selection = null;
+  while (true) {
+    const options = objectiveScripts.map((script) => ({
+      id: script.id.toString(),
+      label: `📄 ${script.name}${activeScripts.length ? '' : ` (${formatScriptStatusLabel(script._status)})`}${script._objectiveScore > 0 ? ' ⭐' : ''}`
+    }));
+    if (!objectiveTarget.requiresPayment && !objectiveTarget.requiresDigitFlow) {
+      options.push({ id: 'custom', label: '✍️ Custom persona setup' });
+    }
+    options.push({ id: 'back', label: '⬅️ Back' });
 
-  const selection = await askOptionWithButtons(
-    conversation,
-    ctx,
-    `📚 *Call Setup*\nObjective: *${escapeMarkdown(objectiveTarget.label)}*\nChoose a script${objectiveTarget.requiresPayment ? ' (payment-ready only).' : objectiveTarget.requiresDigitFlow ? ' (digit-flow capable only).' : ' or continue with custom persona setup.'}`,
-    options,
-    { prefix: 'call-script', columns: 1 }
-  );
-  ensureActive();
+    selection = await askOptionWithButtons(
+      conversation,
+      ctx,
+      `📚 *Call Setup*\nObjective: *${escapeMarkdown(objectiveTarget.label)}*\nChoose a script${objectiveTarget.requiresPayment ? ' (payment-ready only).' : objectiveTarget.requiresDigitFlow ? ' (digit-flow capable only).' : ' or continue with custom persona setup.'}`,
+      options,
+      { prefix: 'call-script', columns: 1 }
+    );
+    ensureActive();
 
-  if (selection.id === 'back') {
-    return { status: 'back' };
-  }
-  if (selection.id === 'custom') {
-    return selectCustomPersonaFallback(conversation, ctx, ensureActive, objectiveTarget);
+    if (selection.id === 'back') {
+      return { status: 'back' };
+    }
+    if (selection.id !== 'custom') {
+      break;
+    }
+
+    const customSelection = await selectCustomPersonaFallback(conversation, ctx, ensureActive, objectiveTarget);
+    ensureActive();
+    if (customSelection?.status === 'back') {
+      continue;
+    }
+    return customSelection;
   }
 
   const scriptId = Number(selection.id);
@@ -1003,7 +1013,6 @@ async function callFlow(conversation, ctx) {
     flow.touch('authorized');
     const objectiveSelection = await selectCallObjective(conversation, ctx, ensureActive);
     if (objectiveSelection?.status === 'back') {
-      await ctx.reply('❌ Call setup cancelled.');
       return;
     }
     if (objectiveSelection?.status !== 'ok' || !objectiveSelection.objective) {
@@ -1013,7 +1022,7 @@ async function callFlow(conversation, ctx) {
       });
       return;
     }
-    const selectedObjective = objectiveSelection.objective;
+    let selectedObjective = objectiveSelection.objective;
     flow.touch('objective-selected');
 
     const prefill = ctx.session.meta?.prefill || {};
@@ -1059,28 +1068,47 @@ async function callFlow(conversation, ctx) {
     }
 
     let configuration = null;
-    const selection = await selectCallScript(conversation, ctx, ensureActive, selectedObjective);
-    if (selection?.status === 'ok') {
-      configuration = selection;
-    } else if (selection?.status === 'empty') {
-      await ctx.reply('⚠️ No call scripts found. Use /scripts to create one before calling.');
-      return;
-    } else if (selection?.status === 'objective_blocked') {
-      return;
-    } else if (selection?.status === 'back') {
-      await ctx.reply('❌ Call setup cancelled.');
-      return;
-    } else if (selection?.status === 'error') {
-      await safeReset(ctx, 'call_script_error', {
-        message: '⚠️ Unable to load call scripts.',
-        menuHint: '📋 Check API credentials or use /call to try again.'
-      });
+    while (!configuration) {
+      const selection = await selectCallScript(conversation, ctx, ensureActive, selectedObjective);
+      if (selection?.status === 'ok') {
+        configuration = selection;
+        break;
+      }
+      if (selection?.status === 'empty') {
+        await ctx.reply('⚠️ No call scripts found. Use /scripts to create one before calling.');
+        return;
+      }
+      if (selection?.status === 'objective_blocked') {
+        return;
+      }
+      if (selection?.status === 'back') {
+        const retryObjectiveSelection = await selectCallObjective(conversation, ctx, ensureActive);
+        if (retryObjectiveSelection?.status === 'back') {
+          return;
+        }
+        if (retryObjectiveSelection?.status !== 'ok' || !retryObjectiveSelection.objective) {
+          await safeReset(ctx, 'call_objective_error', {
+            message: '⚠️ Unable to set call objective.',
+            menuHint: '📋 Use /call to try again.'
+          });
+          return;
+        }
+        selectedObjective = retryObjectiveSelection.objective;
+        flow.touch('objective-selected');
+        continue;
+      }
+      if (selection?.status === 'error') {
+        await safeReset(ctx, 'call_script_error', {
+          message: '⚠️ Unable to load call scripts.',
+          menuHint: '📋 Check API credentials or use /call to try again.'
+        });
+        return;
+      }
       return;
     }
     flow.touch('mode-selected');
 
     if (!configuration) {
-      await ctx.reply('❌ Call setup cancelled.');
       return;
     }
     flow.touch('configuration-ready');
