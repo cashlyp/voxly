@@ -32,6 +32,7 @@ const {
 const {
   buildCallbackData,
   validateCallback,
+  parseCallbackData,
   isDuplicateAction,
   startActionMetric,
   finishActionMetric,
@@ -1010,7 +1011,10 @@ bot.on("callback_query:data", async (ctx) => {
       rawAction.startsWith(prefix),
     );
     const validation = isMenuExempt
-      ? { status: "ok", action: rawAction }
+      ? {
+          status: "ok",
+          action: parseCallbackData(rawAction).action || rawAction,
+        }
       : validateCallback(ctx, rawAction);
 
     if (isMenuExempt && validation.status === "ok") {
@@ -1042,11 +1046,8 @@ bot.on("callback_query:data", async (ctx) => {
       const staleTarget = getConversationRecoveryTarget(validation.action);
       const hasActiveConversationOp = Boolean(
         staleTarget &&
-          (ctx.session?.currentOp?.id ||
-            isConversationTargetActive(
-              ctx,
-              staleTarget.conversationTarget,
-            )),
+        (ctx.session?.currentOp?.id ||
+          isConversationTargetActive(ctx, staleTarget.conversationTarget)),
       );
       await safeAnswerCallbackQuery(ctx, { text: message, show_alert: false });
       // Keep stale conversation-scoped callbacks side-effect free.
