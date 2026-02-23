@@ -39,7 +39,11 @@ const {
 const {
   getConversationRecoveryTarget,
 } = require("./utils/conversationRecovery");
-const { normalizeReply, logCommandError } = require("./utils/ui");
+const { normalizeReply, logCommandError, escapeMarkdown } = require("./utils/ui");
+const {
+  hasActiveConversation,
+  isSafeCallIdentifier,
+} = require("./utils/runtimeGuards");
 const {
   getAccessProfile,
   getCapabilityForCommand,
@@ -103,6 +107,16 @@ bot.use(session({ initial: initialSessionState }));
 // Ensure every update touches a session object
 bot.use(async (ctx, next) => {
   ensureSession(ctx);
+  return next();
+});
+
+// Drop interactive updates without a user context to avoid downstream crashes
+// in handlers that require ctx.from.id.
+bot.use(async (ctx, next) => {
+  const isInteractive = Boolean(ctx.message || ctx.callbackQuery);
+  if (isInteractive && !ctx.from?.id) {
+    return;
+  }
   return next();
 });
 
@@ -212,7 +226,13 @@ bot.use(async (ctx, next) => {
 bot.callbackQuery(/^alert:/, async (ctx) => {
   const data = ctx.callbackQuery.data || "";
   const parts = data.split(":");
-  if (parts.length < 3) return;
+  if (parts.length < 3) {
+    await safeAnswerCallbackQuery(ctx, {
+      text: "Invalid action payload.",
+      show_alert: false,
+    });
+    return;
+  }
   const dedupeKey = `alert:${data}|${ctx.callbackQuery?.message?.message_id || ""}`;
   if (isDuplicateAction(ctx, dedupeKey)) {
     await safeAnswerCallbackQuery(ctx, {
@@ -222,7 +242,14 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
     return;
   }
   const action = parts[1];
-  const callSid = parts[2];
+  const callSid = parts.slice(2).join(":").trim();
+  if (!isSafeCallIdentifier(callSid)) {
+    await safeAnswerCallbackQuery(ctx, {
+      text: "Invalid call id.",
+      show_alert: false,
+    });
+    return;
+  }
 
   try {
     const allowed = await requireCapability(ctx, "call", {
@@ -239,7 +266,7 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
       case "mute":
         await httpClient.post(
           ctx,
-          `${API_BASE}/api/calls/${callSid}/operator`,
+          `${API_BASE}/api/calls/${encodeURIComponent(callSid)}/operator`,
           { action: "mute_alerts" },
           { timeout: 8000 },
         );
@@ -251,7 +278,7 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
       case "retry":
         await httpClient.post(
           ctx,
-          `${API_BASE}/api/calls/${callSid}/operator`,
+          `${API_BASE}/api/calls/${encodeURIComponent(callSid)}/operator`,
           { action: "clarify", text: "Let me retry that step." },
           { timeout: 8000 },
         );
@@ -263,7 +290,7 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
       case "transfer":
         await httpClient.post(
           ctx,
-          `${API_BASE}/api/calls/${callSid}/operator`,
+          `${API_BASE}/api/calls/${encodeURIComponent(callSid)}/operator`,
           { action: "transfer" },
           { timeout: 8000 },
         );
@@ -339,9 +366,9 @@ bot.callbackQuery(/^(tr|rca):/, async (ctx) => {
     return;
   }
   const [prefix, callSid] = data.split(":");
-  if (!callSid) {
+  if (!callSid || !isSafeCallIdentifier(callSid)) {
     await safeAnswerCallbackQuery(ctx, {
-      text: "Missing call id",
+      text: "Missing or invalid call id",
       show_alert: false,
     });
     return;
@@ -746,17 +773,21 @@ bot.command("start", async (ctx) => {
 
     const access = await getAccessProfile(ctx);
     const isOwner = access.isAdmin;
+    const safeUsername = escapeMarkdown(`@${ctx.from?.username || "none"}`);
+    const safeRole = access.user?.role
+      ? escapeMarkdown(String(access.user.role))
+      : "Guest";
     await syncChatCommands(ctx, access);
 
     const userStats = access.user
       ? `👤 *User Information*
 • ID: \`${ctx.from.id}\`
-• Username: @${ctx.from.username || "none"}
-• Role: ${access.user.role}
+• Username: ${safeUsername}
+• Role: ${safeRole}
 • Joined: ${new Date(access.user.timestamp).toLocaleDateString()}`
       : `👤 *Guest Access*
 • ID: \`${ctx.from.id}\`
-• Username: @${ctx.from.username || "none"}
+• Username: ${safeUsername}
 • Role: Guest`;
 
     const welcomeText = access.user
@@ -1436,6 +1467,11 @@ bot.on("message:text", async (ctx) => {
     return;
   }
 
+  // Let active conversation flows control their own prompts/replies.
+  if (hasActiveConversation(ctx)) {
+    return;
+  }
+
   await ctx.reply(
     "👋 Use the current buttons. You can also use /help or /menu.",
   );
@@ -1463,13 +1499,21 @@ async function bootstrap() {
 }
 
 let isShuttingDown = false;
+const FORCE_SHUTDOWN_MS = 15000;
 
 async function shutdown(signal, exitCode = 0) {
   if (isShuttingDown) return;
   isShuttingDown = true;
   console.log(`🛑 Shutting down bot (${signal})...`);
+  const forceTimer = setTimeout(() => {
+    console.error(`Forced shutdown after ${FORCE_SHUTDOWN_MS}ms (${signal})`);
+    process.exit(exitCode || 1);
+  }, FORCE_SHUTDOWN_MS);
+  if (typeof forceTimer.unref === "function") {
+    forceTimer.unref();
+  }
   try {
-   await bot.stop();
+    await bot.stop();
   } catch (error) {
     console.error("Bot stop error:", error?.message || error);
   }
@@ -1477,6 +1521,8 @@ async function shutdown(signal, exitCode = 0) {
     await closeDb();
   } catch (error) {
     console.error("Database shutdown error:", error?.message || error);
+  } finally {
+    clearTimeout(forceTimer);
   }
   process.exit(exitCode);
 }
@@ -1491,6 +1537,7 @@ process.on("SIGTERM", () => {
 
 process.on("unhandledRejection", (reason) => {
   console.error("Unhandled promise rejection in bot:", reason);
+  void shutdown("unhandledRejection", 1);
 });
 
 process.on("uncaughtException", (error) => {
