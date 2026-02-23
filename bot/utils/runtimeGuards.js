@@ -6,7 +6,16 @@ function hasActiveConversation(ctx) {
       return false;
     }
     const active = ctx.conversation.active();
-    return Array.isArray(active) && active.length > 0;
+    if (Array.isArray(active)) {
+      return active.length > 0;
+    }
+    if (typeof active === "number") {
+      return active > 0;
+    }
+    if (active && typeof active === "object") {
+      return Object.values(active).some((count) => Number(count) > 0);
+    }
+    return Boolean(active);
   } catch (_) {
     return false;
   }

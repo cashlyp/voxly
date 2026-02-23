@@ -38,6 +38,7 @@ const {
 } = require("./utils/actions");
 const {
   getConversationRecoveryTarget,
+  recoverConversationFromCallback,
 } = require("./utils/conversationRecovery");
 const {
   normalizeReply,
@@ -668,8 +669,24 @@ function isConversationTargetActive(ctx, conversationTarget) {
     if (!ctx?.conversation || typeof ctx.conversation.active !== "function") {
       return false;
     }
+    const scoped = ctx.conversation.active(conversationTarget);
+    if (typeof scoped === "number") {
+      return scoped > 0;
+    }
+    if (typeof scoped === "boolean") {
+      return scoped;
+    }
     const active = ctx.conversation.active();
-    return Array.isArray(active) && active.includes(conversationTarget);
+    if (Array.isArray(active)) {
+      return active.includes(conversationTarget);
+    }
+    if (active && typeof active === "object") {
+      return Number(active[conversationTarget] || 0) > 0;
+    }
+    if (typeof active === "number") {
+      return active > 0;
+    }
+    return false;
   } catch (_) {
     return false;
   }
@@ -1229,6 +1246,13 @@ bot.on("callback_query:data", async (ctx) => {
         ctx,
         recoveryTarget.conversationTarget,
       );
+      const recoveryPrefix = String(recoveryTarget?.parsed?.prefix || "");
+      const shouldRecoverMissingScriptOp =
+        recoveryPrefix.startsWith("call-script-") ||
+        recoveryPrefix.startsWith("sms-script-") ||
+        recoveryPrefix.startsWith("script-") ||
+        recoveryPrefix.startsWith("inbound-default") ||
+        recoveryPrefix.startsWith("email-template-");
 
       // Conversation-scoped callback reached the global router while the same op is active.
       // Keep current flow state and avoid noisy forced restarts.
@@ -1244,6 +1268,29 @@ bot.on("callback_query:data", async (ctx) => {
             reason: "active_conversation_router_leak",
           });
           return;
+        }
+        if (shouldRecoverMissingScriptOp) {
+          try {
+            const recovered = await recoverConversationFromCallback(
+              ctx,
+              action,
+              recoveryTarget.conversationTarget,
+              {
+                cancelActiveFlow,
+                resetSession,
+                clearMenuMessages,
+              },
+            );
+            if (recovered) {
+              finishMetric("ok", { reason: "recovered_missing_active_op" });
+              return;
+            }
+          } catch (recoveryError) {
+            console.warn(
+              `Conversation recovery failed for ${action}:`,
+              recoveryError?.message || recoveryError,
+            );
+          }
         }
         await clearMenuMessages(ctx);
         await handleMenu(ctx);

@@ -23,6 +23,24 @@ function testHasActiveConversation() {
   );
   assert.strictEqual(
     hasActiveConversation({
+      conversation: { active: () => ({ "scripts-conversation": 1 }) },
+    }),
+    true,
+  );
+  assert.strictEqual(
+    hasActiveConversation({
+      conversation: { active: () => ({ "scripts-conversation": 0 }) },
+    }),
+    false,
+  );
+  assert.strictEqual(
+    hasActiveConversation({
+      conversation: { active: () => 1 },
+    }),
+    true,
+  );
+  assert.strictEqual(
+    hasActiveConversation({
       conversation: { active: () => { throw new Error("boom"); } },
     }),
     false,
