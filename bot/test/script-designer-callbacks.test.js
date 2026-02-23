@@ -35,8 +35,17 @@ function testParserAcceptsModernAction() {
   assert.strictEqual(parsed.legacy, false);
 }
 
-function testParserRejectsInvalidSelection() {
-  const parsed = parseScriptDesignerCallbackAction("script-channel:abc");
+function testParserAcceptsStringSelectionId() {
+  const parsed = parseScriptDesignerCallbackAction("script-channel:call");
+  assert.strictEqual(parsed.isScriptDesigner, true);
+  assert.strictEqual(parsed.valid, true);
+  assert.strictEqual(parsed.selectionToken, "call");
+  assert.strictEqual(parsed.selectionIndex, null);
+  assert.strictEqual(parsed.isStringId, true);
+}
+
+function testParserRejectsInvalidSelectionToken() {
+  const parsed = parseScriptDesignerCallbackAction("script-channel:ABC");
   assert.strictEqual(parsed.isScriptDesigner, true);
   assert.strictEqual(parsed.valid, false);
   assert.strictEqual(parsed.reason, "invalid_selection_token");
@@ -59,7 +68,7 @@ function testIsScriptDesignerAction() {
 testScriptDesignerPrefixMatcher();
 testParserNormalizesLegacyAction();
 testParserAcceptsModernAction();
-testParserRejectsInvalidSelection();
+testParserAcceptsStringSelectionId();
+testParserRejectsInvalidSelectionToken();
 testParserRejectsInvalidNonce();
 testIsScriptDesignerAction();
-

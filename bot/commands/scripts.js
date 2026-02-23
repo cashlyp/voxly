@@ -49,6 +49,7 @@ const SCRIPTS_CIRCUIT_FAILURE_THRESHOLD = 3;
 const SCRIPTS_CIRCUIT_OPEN_MS = 30000;
 const SCRIPTS_METRIC_WINDOW_MS = 5 * 60 * 1000;
 const SCRIPTS_ALERT_COOLDOWN_MS = 60 * 1000;
+const SCRIPTS_AUTH_LOOKUP_TIMEOUT_MS = 5000;
 const PAGE_NAV_PREV = '__page_prev__';
 const PAGE_NAV_NEXT = '__page_next__';
 const PAGE_NAV_BACK = '__page_back__';
@@ -1172,6 +1173,48 @@ function logScriptsError(context, error) {
     code,
     message
   });
+}
+
+function dbLookupWithTimeout(fn, userId, timeoutMs = SCRIPTS_AUTH_LOOKUP_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      const timeoutError = new Error(`Timed out waiting for ${fn?.name || 'db_lookup'}`);
+      timeoutError.code = 'db_lookup_timeout';
+      reject(timeoutError);
+    }, timeoutMs);
+
+    try {
+      fn(userId, (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result);
+      });
+    } catch (error) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    }
+  });
+}
+
+async function getScriptsAccessState(ctx) {
+  const userId = ctx?.from?.id;
+  if (!userId) {
+    return { user: null, adminStatus: false };
+  }
+  const [user, adminStatus] = await Promise.all([
+    dbLookupWithTimeout(getUser, userId),
+    dbLookupWithTimeout(isAdmin, userId)
+  ]);
+  return {
+    user,
+    adminStatus: Boolean(adminStatus)
+  };
 }
 
 async function promptText(
@@ -4911,15 +4954,22 @@ async function scriptsFlow(conversation, ctx) {
   const ensureActive = () => ensureOperationActive(ctx, opId);
 
   try {
-    const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
+    let accessState;
+    try {
+      accessState = await getScriptsAccessState(ctx);
+      ensureActive();
+    } catch (authError) {
+      console.error('[scripts] Failed to validate access state in scriptsFlow:', authError?.message || authError);
+      await ctx.reply('❌ Unable to verify authorization. Please try again shortly.');
+      return;
+    }
+    const { user, adminStatus } = accessState;
     ensureActive();
     if (!user) {
       await ctx.reply('❌ You are not authorized to use this bot.');
       return;
     }
 
-    const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
-    ensureActive();
     if (!adminStatus) {
       await ctx.reply('❌ This command is for administrators only.');
       return;
@@ -5019,12 +5069,18 @@ function getScriptsMetricsSnapshot() {
 
 function registerScriptsCommand(bot) {
   bot.command('scripts', async (ctx) => {
-    const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
+    let accessState;
+    try {
+      accessState = await getScriptsAccessState(ctx);
+    } catch (authError) {
+      console.error('[scripts] Failed to validate access state in /scripts:', authError?.message || authError);
+      return ctx.reply('❌ Unable to verify authorization. Please try again shortly.');
+    }
+    const { user, adminStatus } = accessState;
     if (!user) {
       return ctx.reply('❌ You are not authorized to use this bot.');
     }
 
-    const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
     if (!adminStatus) {
       return ctx.reply('❌ This command is for administrators only.');
     }
@@ -5045,6 +5101,8 @@ module.exports = {
     scriptsApiRequest,
     formatScriptsApiError,
     nonJsonResponseError,
+    dbLookupWithTimeout,
+    getScriptsAccessState,
     beginCloneRequest,
     finishCloneRequest,
     beginMutationRequest,

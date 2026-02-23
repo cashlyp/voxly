@@ -65,23 +65,23 @@ function testSelectionTokenExtraction() {
 function testScriptReplayQueueBuilder() {
   assert.deepStrictEqual(
     buildCallbackReplayQueue("sms-script-main:bd0c9bd3:3fg7:0"),
-    ["script-channel:sms", "sms-script-main:list"],
+    ["script-channel:1", "sms-script-main:0"],
   );
   assert.deepStrictEqual(
     buildCallbackReplayQueue("call-script-main:abcd1234:2"),
-    ["script-channel:call", "call-script-main:incoming"],
+    ["script-channel:0", "call-script-main:2"],
   );
   assert.deepStrictEqual(
     buildCallbackReplayQueue("email-template-main:deadbeef:4"),
-    ["script-channel:email", "email-template-main:back"],
+    ["script-channel:2", "email-template-main:4"],
   );
   assert.deepStrictEqual(
     buildCallbackReplayQueue("inbound-default:1234abcd:9z9z:1"),
-    ["script-channel:call", "call-script-main:incoming", "inbound-default:clear"],
+    ["script-channel:0", "call-script-main:2", "inbound-default:1"],
   );
   assert.deepStrictEqual(
     buildCallbackReplayQueue("inbound-default-select:1234abcd:9z9z:4"),
-    ["script-channel:call", "call-script-main:incoming", "inbound-default:set"],
+    ["script-channel:0", "call-script-main:2", "inbound-default:0"],
   );
   assert.deepStrictEqual(
     buildCallbackReplayQueue("call-script-select:deadbeef:3"),

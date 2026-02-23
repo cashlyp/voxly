@@ -1,3 +1,54 @@
+'use strict';
+
+/**
+ * persona.js
+ *
+ * Utility for fetching/caching business persona profiles and providing the
+ * askOptionWithButtons helper used throughout every conversation flow.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * BUG FIX — "⚠️ This menu is no longer active." on Script Designer buttons
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * PROBLEM:
+ *   Inside the `while (!selected)` callback-waiting loop in `askOptionWithButtons`,
+ *   there is a guard:
+ *
+ *       if (expectedMessageId && callbackMessageId !== expectedMessageId) {
+ *         await selectionCtx.answerCallbackQuery({ text: '⚠️ This menu is no longer active.' });
+ *         continue;  // ← silently drops the tap and loops forever
+ *       }
+ *
+ *   This guard fires when the message ID of the button the user tapped differs
+ *   from the message ID of the menu the conversation most recently rendered.
+ *
+ *   For non-Script-Designer menus this is correct — a stale button from an old
+ *   prompt should be rejected.
+ *
+ *   For SCRIPT DESIGNER menus (script-channel, call-script-main, sms-script-main,
+ *   email-template-main, inbound-default) the guard caused a permanent loop
+ *   because after a bot restart or recovery the conversation re-enters,
+ *   re-renders the menu (new message_id), but the user's tap references the
+ *   freshly-rendered menu — and due to a grammY conversation-replay timing issue,
+ *   the `expectedMessageId` captured inside `askOptionWithButtons` sometimes
+ *   still pointed to the message from the PREVIOUS session.
+ *
+ *   Result: every single button tap was rejected with the "no longer active" alert.
+ *
+ * FIX:
+ *   For Script Designer menus (`isScriptDesignerMenu = true`) the message-ID
+ *   guard is RELAXED:
+ *     • Mismatches are LOGGED as diagnostic JSON (type: conversation_msg_id_mismatch)
+ *       so they remain observable in production logs.
+ *     • The callback is NOT rejected — execution falls through to the normal
+ *       option-matching and tap-lock logic.
+ *     • Non-Script-Designer menus are UNCHANGED — the guard remains strict.
+ *
+ *   This is safe because Script Designer menus use prefix-based matching
+ *   (matchesCallbackPrefix) which already ensures only callbacks for the correct
+ *   prefix are accepted, and the tap-lock prevents duplicate processing.
+ */
+
 const { InlineKeyboard } = require('grammy');
 const config = require('../config');
 const httpClient = require('./httpClient');
@@ -279,7 +330,7 @@ let personaCache = {
 
 async function fetchRemotePersonas() {
   try {
-  const response = await httpClient.get(null, `${config.apiUrl}/api/personas`, { timeout: 10000 });
+    const response = await httpClient.get(null, `${config.apiUrl}/api/personas`, { timeout: 10000 });
     const data = response.data || {};
     const builtin = Array.isArray(data.builtin) ? data.builtin : [];
     const custom = Array.isArray(data.custom) ? data.custom : [];
@@ -355,6 +406,7 @@ const TECH_LEVEL_OPTIONS = [
   { id: 'novice', label: 'Beginner-friendly' },
   { id: 'advanced', label: 'Advanced / technical specialist' },
 ];
+
 const CALLBACK_REPLAY_TTL_MS = 2 * 60 * 1000;
 const CALLBACK_REPLAY_MAX_ACTIONS = 8;
 const MENU_TAP_LOCK_TTL_MS = 8 * 1000;
@@ -721,19 +773,54 @@ async function askOptionWithButtons(
       } catch (_) {}
       continue;
     }
+
+    // ── Message-ID stale-guard ────────────────────────────────────────────────
+    // FIX: For Script Designer menus, relax the strict message-ID check.
+    //
+    // Background: after a bot restart or conversation recovery, the conversation
+    // re-enters and re-renders the menu.  Due to grammY's conversation-replay
+    // mechanism, the `expectedMessageId` captured here can briefly refer to the
+    // PREVIOUS session's message.  The user's tap arrives for the freshly-
+    // rendered menu, so `callbackMessageId !== expectedMessageId` fires and the
+    // tap is silently dropped — causing the "no longer active" loop forever.
+    //
+    // For Script Designer menus we instead: log the mismatch for observability
+    // and then ALLOW the callback to proceed to option-matching.  This is safe
+    // because prefix-matching already filters only correct-prefix callbacks, and
+    // the tap-lock prevents duplicate processing.
+    //
+    // Non-Script-Designer menus retain the original strict rejection behaviour.
     if (
       expectedMessageId &&
       callbackMessageId &&
       callbackMessageId !== expectedMessageId
     ) {
-      try {
-        await selectionCtx.answerCallbackQuery({
-          text: '⚠️ This menu is no longer active.',
-          show_alert: false
-        });
-      } catch (_) {}
-      continue;
+      if (isScriptDesignerMenu) {
+        // FIX: Log mismatch but DO NOT reject — allow the tap through.
+        console.log(JSON.stringify({
+          type: 'conversation_msg_id_mismatch',
+          prefix_key: prefixKey,
+          expected_message_id: expectedMessageId,
+          callback_message_id: callbackMessageId,
+          action: selectionAction,
+          note: 'script_designer_relaxed_guard_accepted',
+          user_id: selectionCtx?.from?.id || ctx?.from?.id || null,
+          chat_id: callbackChatId || ctx?.chat?.id || null
+        }));
+        // Fall through — do NOT `continue` — let the option-matching proceed.
+      } else {
+        // Non-script-designer menus: reject the stale tap as before.
+        try {
+          await selectionCtx.answerCallbackQuery({
+            text: '⚠️ This menu is no longer active.',
+            show_alert: false
+          });
+        } catch (_) {}
+        continue;
+      }
     }
+    // ─────────────────────────────────────────────────────────────────────────
+
     if (!acquireTapLock(ctx, tapLockKey)) {
       try {
         await selectionCtx.answerCallbackQuery({

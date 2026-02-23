@@ -735,8 +735,8 @@ function isScriptDesignerRecoveryPrefix(prefix) {
   );
 }
 
-const SCRIPT_RECOVERY_GUARD_WINDOW_MS = 30 * 1000;
-const SCRIPT_RECOVERY_GUARD_MAX_ATTEMPTS = 2;
+const SCRIPT_RECOVERY_GUARD_WINDOW_MS = 60 * 1000;
+const SCRIPT_RECOVERY_GUARD_MAX_ATTEMPTS = 3;
 
 function reserveScriptRecoveryAttempt(ctx, action, messageId = null) {
   ensureSession(ctx);
@@ -1242,6 +1242,13 @@ bot.on("callback_query:data", async (ctx) => {
       "tr:",
       "rca:",
       "call-script-", // Call Script Designer menus
+      "call-script", // selectCallScript bare prefix
+      "call-objective", // /call objective selection menu
+      "call-voice", // /call voice selection menu
+      "call-persona", // /call persona selection menu
+      "call-tone", // /call tone/emotion menu
+      "call-urgency", // /call urgency menu
+      "call-tech", // /call technical-level menu
       "sms-script-", // SMS Script Designer menus
       "inbound-default", // Inbound default submenus
       "script-", // General script menus (business, persona, draft, etc.)
