@@ -353,6 +353,7 @@ const TECH_LEVEL_OPTIONS = [
 ];
 const CALLBACK_REPLAY_TTL_MS = 2 * 60 * 1000;
 const CALLBACK_REPLAY_MAX_ACTIONS = 8;
+const MENU_TAP_LOCK_TTL_MS = 8 * 1000;
 
 function formatOptionLabel(option) {
   if (option.emoji) {
@@ -414,6 +415,65 @@ function writePendingCallbackReplay(ctx, actions, sourceAction = null) {
     createdAt: Date.now(),
     sourceAction: sourceAction || null
   };
+}
+
+function readTapLocks(ctx) {
+  if (!ctx.session) {
+    return {};
+  }
+  ctx.session.meta = ctx.session.meta || {};
+  const locks = ctx.session.meta.menuTapLocks;
+  if (!locks || typeof locks !== 'object') {
+    ctx.session.meta.menuTapLocks = {};
+    return ctx.session.meta.menuTapLocks;
+  }
+  return locks;
+}
+
+function pruneTapLocks(ctx, now = Date.now()) {
+  const locks = readTapLocks(ctx);
+  Object.entries(locks).forEach(([key, expiresAt]) => {
+    if (!Number.isFinite(expiresAt) || expiresAt <= now) {
+      delete locks[key];
+    }
+  });
+  return locks;
+}
+
+function acquireTapLock(ctx, lockKey) {
+  if (!lockKey) {
+    return true;
+  }
+  const now = Date.now();
+  const locks = pruneTapLocks(ctx, now);
+  const expiresAt = Number(locks[lockKey] || 0);
+  if (expiresAt > now) {
+    return false;
+  }
+  locks[lockKey] = now + MENU_TAP_LOCK_TTL_MS;
+  return true;
+}
+
+function releaseTapLock(ctx, lockKey) {
+  if (!ctx?.session?.meta?.menuTapLocks || !lockKey) {
+    return;
+  }
+  delete ctx.session.meta.menuTapLocks[lockKey];
+}
+
+async function disableMessageButtons(apiCtx, chatId, messageId) {
+  if (!apiCtx || !chatId || !messageId) {
+    return;
+  }
+  try {
+    await apiCtx.api.editMessageReplyMarkup(chatId, messageId, {
+      reply_markup: { inline_keyboard: [] }
+    });
+  } catch (_) {
+    try {
+      await apiCtx.api.editMessageReplyMarkup(chatId, messageId);
+    } catch (_) {}
+  }
 }
 
 async function askOptionWithButtons(
@@ -515,6 +575,9 @@ async function askOptionWithButtons(
   const message = await sendMenu(ctx, prompt, { parse_mode: 'Markdown', reply_markup: keyboard });
   const expectedChatId = message?.chat?.id || ctx.chat?.id || null;
   const expectedMessageId = message?.message_id || null;
+  const tapLockKey = expectedChatId && expectedMessageId
+    ? `${expectedChatId}:${expectedMessageId}`
+    : null;
   let selected = null;
   while (!selected) {
     const selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {
@@ -574,24 +637,41 @@ async function askOptionWithButtons(
       } catch (_) {}
       continue;
     }
-    const parts = selectionAction.split(':');
-    const selectedToken = parts.length ? parts[parts.length - 1] : '';
-    selected = optionLookupByToken.get(selectedToken)
-      || options.find((option) => String(option.id) === selectedToken);
-
-    if (!selected) {
+    if (!acquireTapLock(ctx, tapLockKey)) {
       try {
         await selectionCtx.answerCallbackQuery({
-          text: 'That option is no longer available. Please choose again.',
+          text: '⏳ Processing previous tap…',
           show_alert: false
         });
       } catch (_) {}
       continue;
     }
-
+    let lockHeld = Boolean(tapLockKey);
+    const parts = selectionAction.split(':');
+    const selectedToken = parts.length ? parts[parts.length - 1] : '';
+    const matchedOption = optionLookupByToken.get(selectedToken)
+      || options.find((option) => String(option.id) === selectedToken);
     try {
+      if (!matchedOption) {
+        releaseTapLock(ctx, tapLockKey);
+        lockHeld = false;
+        await selectionCtx.answerCallbackQuery({
+          text: 'That option is no longer available. Please choose again.',
+          show_alert: false
+        });
+        continue;
+      }
       await selectionCtx.answerCallbackQuery();
-    } catch (_) {}
+      await disableMessageButtons(selectionCtx, expectedChatId, expectedMessageId);
+      selected = matchedOption;
+    } catch (_) {
+      releaseTapLock(ctx, tapLockKey);
+      lockHeld = false;
+    } finally {
+      if (lockHeld) {
+        releaseTapLock(ctx, tapLockKey);
+      }
+    }
   }
 
   console.log(JSON.stringify({

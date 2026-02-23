@@ -43,6 +43,10 @@ const {
   recoverConversationFromCallback,
 } = require("./utils/conversationRecovery");
 const {
+  parseScriptDesignerCallbackAction,
+  isScriptDesignerAction,
+} = require("./utils/scriptDesignerCallbacks");
+const {
   normalizeReply,
   logCommandError,
   escapeMarkdown,
@@ -703,6 +707,108 @@ function isConversationTargetActive(ctx, conversationTarget) {
   }
 }
 
+function isScriptDesignerRecoveryPrefix(prefix) {
+  const value = String(prefix || "");
+  return (
+    value.startsWith("call-script-") ||
+    value.startsWith("sms-script-") ||
+    value.startsWith("script-") ||
+    value.startsWith("inbound-default") ||
+    value.startsWith("email-template-")
+  );
+}
+
+async function handleScriptDesignerCallbackRouting(
+  ctx,
+  action,
+  recoveryTarget,
+  {
+    isMenuExemptAction = false,
+    finishMetric,
+  } = {},
+) {
+  if (!isScriptDesignerAction(action) || !recoveryTarget) {
+    return false;
+  }
+
+  const hasActiveOp = Boolean(ctx.session?.currentOp?.id);
+  const hasMatchingOpToken = hasMatchingConversationOpToken(ctx, recoveryTarget);
+  const hasActiveRecoveryConversation = isConversationTargetActive(
+    ctx,
+    recoveryTarget.conversationTarget,
+  );
+
+  if (hasActiveOp && hasMatchingOpToken) {
+    finishMetric?.("ignored", { reason: "active_op_router_leak" });
+    return true;
+  }
+
+  if (isMenuExemptAction && hasActiveRecoveryConversation && !hasMatchingOpToken) {
+    finishMetric?.("ignored", {
+      reason: "menu_exempt_conversation_listener",
+    });
+    return true;
+  }
+
+  if (!hasActiveOp) {
+    if (hasActiveRecoveryConversation) {
+      finishMetric?.("ignored", {
+        reason: "active_conversation_router_leak",
+      });
+      return true;
+    }
+
+    const recoveryPrefix = String(recoveryTarget?.parsed?.prefix || "");
+    if (isScriptDesignerRecoveryPrefix(recoveryPrefix)) {
+      try {
+        const replayQueue = buildCallbackReplayQueue(action);
+        const recovered = await recoverConversationFromCallback(
+          ctx,
+          action,
+          recoveryTarget.conversationTarget,
+          {
+            cancelActiveFlow,
+            resetSession,
+            clearMenuMessages,
+          },
+          {
+            notify: false,
+            sessionMeta: replayQueue.length > 0
+              ? {
+                pendingCallbackReplay: {
+                  actions: replayQueue,
+                  createdAt: Date.now(),
+                  sourceAction: action,
+                },
+              }
+              : null,
+          },
+        );
+        if (recovered) {
+          finishMetric?.("ok", {
+            reason: "recovered_missing_active_op",
+            replay_count: replayQueue.length,
+          });
+          return true;
+        }
+      } catch (recoveryError) {
+        console.warn(
+          `Conversation recovery failed for ${action}:`,
+          recoveryError?.message || recoveryError,
+        );
+      }
+    }
+
+    await clearMenuMessages(ctx);
+    await handleMenu(ctx);
+    finishMetric?.("stale", { reason: "missing_active_op" });
+    return true;
+  }
+
+  finishMetric?.("stale", { reason: "op_token_mismatch" });
+  return true;
+}
+
 function splitTelegramMessage(text, maxLength = 3900) {
   const source = String(text || "");
   if (source.length <= maxLength) return [source];
@@ -1062,7 +1168,33 @@ bot.on("callback_query:data", async (ctx) => {
       return;
     }
 
-    const action = validation.action;
+    const scriptActionDetails = parseScriptDesignerCallbackAction(
+      validation.action,
+    );
+    if (scriptActionDetails.isScriptDesigner && !scriptActionDetails.valid) {
+      console.warn(
+        JSON.stringify({
+          type: "script_designer_callback_rejected",
+          callback_data: rawAction,
+          action: validation.action,
+          reason: scriptActionDetails.reason,
+          ...callbackMeta,
+        }),
+      );
+      await safeAnswerCallbackQuery(ctx, {
+        text: "⚠️ Invalid script menu action.",
+        show_alert: false,
+      });
+      finishMetric("invalid", {
+        reason: `script_designer_${scriptActionDetails.reason}`,
+      });
+      return;
+    }
+
+    const action =
+      scriptActionDetails.isScriptDesigner && scriptActionDetails.valid
+        ? scriptActionDetails.normalizedAction
+        : validation.action;
     const recoveryTarget = getConversationRecoveryTarget(action);
     const isConversationAction = Boolean(recoveryTarget);
     const actionKey = `${action}|${ctx.callbackQuery?.message?.message_id || ""}`;
@@ -1248,6 +1380,19 @@ bot.on("callback_query:data", async (ctx) => {
     }
 
     if (recoveryTarget) {
+      const scriptDesignerHandled = await handleScriptDesignerCallbackRouting(
+        ctx,
+        action,
+        recoveryTarget,
+        {
+          isMenuExemptAction,
+          finishMetric,
+        },
+      );
+      if (scriptDesignerHandled) {
+        return;
+      }
+
       const hasActiveOp = Boolean(ctx.session?.currentOp?.id);
       const hasMatchingOpToken = hasMatchingConversationOpToken(
         ctx,
@@ -1257,13 +1402,6 @@ bot.on("callback_query:data", async (ctx) => {
         ctx,
         recoveryTarget.conversationTarget,
       );
-      const recoveryPrefix = String(recoveryTarget?.parsed?.prefix || "");
-      const shouldRecoverMissingScriptOp =
-        recoveryPrefix.startsWith("call-script-") ||
-        recoveryPrefix.startsWith("sms-script-") ||
-        recoveryPrefix.startsWith("script-") ||
-        recoveryPrefix.startsWith("inbound-default") ||
-        recoveryPrefix.startsWith("email-template-");
 
       // Conversation-scoped callback reached the global router while the same op is active.
       // Keep current flow state and avoid noisy forced restarts.
@@ -1294,45 +1432,6 @@ bot.on("callback_query:data", async (ctx) => {
             reason: "active_conversation_router_leak",
           });
           return;
-        }
-        if (shouldRecoverMissingScriptOp) {
-          try {
-            const replayQueue = buildCallbackReplayQueue(action);
-            const recovered = await recoverConversationFromCallback(
-              ctx,
-              action,
-              recoveryTarget.conversationTarget,
-              {
-                cancelActiveFlow,
-                resetSession,
-                clearMenuMessages,
-              },
-              {
-                notify: false,
-                sessionMeta: replayQueue.length > 0
-                  ? {
-                    pendingCallbackReplay: {
-                      actions: replayQueue,
-                      createdAt: Date.now(),
-                      sourceAction: action,
-                    },
-                  }
-                  : null,
-              },
-            );
-            if (recovered) {
-              finishMetric("ok", {
-                reason: "recovered_missing_active_op",
-                replay_count: replayQueue.length,
-              });
-              return;
-            }
-          } catch (recoveryError) {
-            console.warn(
-              `Conversation recovery failed for ${action}:`,
-              recoveryError?.message || recoveryError,
-            );
-          }
         }
         await clearMenuMessages(ctx);
         await handleMenu(ctx);

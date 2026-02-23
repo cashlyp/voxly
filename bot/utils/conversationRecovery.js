@@ -1,5 +1,9 @@
 'use strict';
 
+const {
+  parseScriptDesignerCallbackAction,
+} = require('./scriptDesignerCallbacks');
+
 function parseCallbackAction(action) {
   if (!action || !action.includes(':')) {
     return null;
@@ -59,14 +63,15 @@ function getSelectionTokenFromAction(action) {
 }
 
 function buildCallbackReplayQueue(action) {
-  const parsed = parseCallbackAction(action);
-  if (!parsed) {
+  const parsedScriptAction = parseScriptDesignerCallbackAction(action);
+  if (!parsedScriptAction.isScriptDesigner || !parsedScriptAction.valid) {
     return [];
   }
-  const selectionToken = getSelectionTokenFromAction(action);
-  if (!selectionToken) {
+  const parsed = parseCallbackAction(parsedScriptAction.normalizedAction);
+  if (!parsed || !parsed.value) {
     return [];
   }
+  const selectionToken = parsedScriptAction.selectionToken;
 
   const normalizedSelection = String(selectionToken);
   const normalizedAction = `${parsed.prefix}:${normalizedSelection}`;
