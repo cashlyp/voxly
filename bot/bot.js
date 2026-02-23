@@ -50,6 +50,10 @@ const {
   isSafeCallIdentifier,
 } = require("./utils/runtimeGuards");
 const {
+  validateCallbackDataSize,
+  validateCallSid,
+} = require("./utils/inputValidator");
+const {
   getAccessProfile,
   getCapabilityForCommand,
   getCapabilityForAction,
@@ -76,6 +80,7 @@ const {
   startOperation,
   resetSession,
   OperationCancelledError,
+  getCurrentOpId,
 } = require("./utils/sessionState");
 
 // Bot initialization
@@ -239,6 +244,18 @@ bot.use(async (ctx, next) => {
 // Operator/alert inline actions
 bot.callbackQuery(/^alert:/, async (ctx) => {
   const data = ctx.callbackQuery.data || "";
+
+  // Validate callback data size to prevent DoS/injection attacks
+  const sizeValidation = validateCallbackDataSize(data);
+  if (sizeValidation !== true) {
+    console.warn(`Invalid callback data size: ${sizeValidation}`);
+    await safeAnswerCallbackQuery(ctx, {
+      text: "Invalid action payload.",
+      show_alert: false,
+    });
+    return;
+  }
+
   const parts = data.split(":");
   if (parts.length < 3) {
     await safeAnswerCallbackQuery(ctx, {
@@ -257,7 +274,11 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
   }
   const action = parts[1];
   const callSid = parts.slice(2).join(":").trim();
-  if (!isSafeCallIdentifier(callSid)) {
+
+  // Validate call SID format
+  const sidValidation = validateCallSid(callSid);
+  if (sidValidation !== true) {
+    console.warn(`Invalid call SID: ${sidValidation}`);
     await safeAnswerCallbackQuery(ctx, {
       text: "Invalid call id.",
       show_alert: false,
@@ -321,7 +342,12 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
         break;
     }
   } catch (error) {
-    console.error("Operator action error:", error?.message || error);
+    const opId = getCurrentOpId(ctx);
+    const userId = ctx.from?.id || "unknown";
+    console.error(
+      `Operator action error [opId=${opId}] [user=${userId}]:`,
+      error?.message || error,
+    );
     await safeAnswerCallbackQuery(ctx, {
       text: "⚠️ Failed to execute action",
       show_alert: false,
@@ -400,7 +426,10 @@ bot.callbackQuery(/^(tr|rca):/, async (ctx) => {
     }
 
     await safeAnswerCallbackQuery(ctx, {
-      text: prefix === "tr" ? "Loading transcript..." : "Loading transcript audio...",
+      text:
+        prefix === "tr"
+          ? "Loading transcript..."
+          : "Loading transcript audio...",
       show_alert: false,
     });
 
@@ -427,7 +456,9 @@ bot.catch(async (err) => {
   console.error(errorMessage);
 
   try {
-    await err.ctx.reply("❌ An error occurred. Please try again or contact support.");
+    await err.ctx.reply(
+      "❌ An error occurred. Please try again or contact support.",
+    );
   } catch (replyError) {
     console.error("Failed to send error message:", replyError);
   }
@@ -629,7 +660,9 @@ function normalizeOpToken(opId) {
 function hasMatchingConversationOpToken(ctx, recoveryTarget) {
   const callbackOpToken = normalizeOpToken(recoveryTarget?.parsed?.opId);
   const currentOpToken = ctx.session?.currentOp?.token || null;
-  return Boolean(callbackOpToken && currentOpToken && callbackOpToken === currentOpToken);
+  return Boolean(
+    callbackOpToken && currentOpToken && callbackOpToken === currentOpToken,
+  );
 }
 
 function splitTelegramMessage(text, maxLength = 3900) {
@@ -738,7 +771,9 @@ async function sendFullTranscriptFromApi(ctx, callSid) {
       await ctx.reply("⚠️ Transcript service is temporarily unavailable.");
       return;
     }
-    await ctx.reply(httpClient.getUserMessage(error, "Failed to fetch transcript."));
+    await ctx.reply(
+      httpClient.getUserMessage(error, "Failed to fetch transcript."),
+    );
   }
 }
 
@@ -755,8 +790,13 @@ async function sendTranscriptAudioFromApi(ctx, callSid) {
     const status = Number(response?.status || 0);
     const payload = response?.data || {};
 
-    if (status === 202 || String(payload?.status || "").toLowerCase() === "pending") {
-      await ctx.reply(payload?.message || "🎧 Transcript audio is not available yet.");
+    if (
+      status === 202 ||
+      String(payload?.status || "").toLowerCase() === "pending"
+    ) {
+      await ctx.reply(
+        payload?.message || "🎧 Transcript audio is not available yet.",
+      );
       return;
     }
 
@@ -781,7 +821,9 @@ async function sendTranscriptAudioFromApi(ctx, callSid) {
       return;
     }
     if (status >= 500) {
-      await ctx.reply("⚠️ Transcript audio service is temporarily unavailable.");
+      await ctx.reply(
+        "⚠️ Transcript audio service is temporarily unavailable.",
+      );
       return;
     }
     await ctx.reply(
@@ -917,13 +959,35 @@ bot.on("callback_query:data", async (ctx) => {
       finishMetric("skipped");
       return;
     }
-    const menuExemptPrefixes = ["alert:", "lc:", "tr:", "rca:"];
+    const menuExemptPrefixes = [
+      "alert:",
+      "lc:",
+      "tr:",
+      "rca:",
+      "call-script-", // Call Script Designer menus
+      "sms-script-", // SMS Script Designer menus
+      "script-", // General script menus (business, persona, draft, etc.)
+      "email-template-", // Email template menus (covers all email sub-menus)
+      "persona-", // Persona selection menus
+    ];
     const isMenuExempt = menuExemptPrefixes.some((prefix) =>
       rawAction.startsWith(prefix),
     );
     const validation = isMenuExempt
       ? { status: "ok", action: rawAction }
       : validateCallback(ctx, rawAction);
+
+    if (isMenuExempt && validation.status === "ok") {
+      console.log(
+        JSON.stringify({
+          type: "callback_query_exempt",
+          callback_data: rawAction,
+          reason: "conversation_menu",
+          ...callbackMeta,
+        }),
+      );
+    }
+
     if (validation.status !== "ok") {
       console.warn(
         JSON.stringify({
@@ -1170,7 +1234,11 @@ bot.on("callback_query:data", async (ctx) => {
     if (isSessionBoundAction) {
       const callbackOpToken = normalizeOpToken(action.split(":")[1]);
       const currentOpToken = ctx.session?.currentOp?.token || null;
-      if (callbackOpToken && currentOpToken && callbackOpToken === currentOpToken) {
+      if (
+        callbackOpToken &&
+        currentOpToken &&
+        callbackOpToken === currentOpToken
+      ) {
         finishMetric("ignored", { reason: "session_bound_router_leak" });
         return;
       }
@@ -1312,7 +1380,9 @@ bot.on("callback_query:data", async (ctx) => {
         break;
 
       case "MENU_EXIT":
-        await ctx.reply("✅ Menu closed. Use /menu or /start to open it again.");
+        await ctx.reply(
+          "✅ Menu closed. Use /menu or /start to open it again.",
+        );
         finishMetric("ok");
         break;
 
@@ -1435,10 +1505,7 @@ bot.on("callback_query:data", async (ctx) => {
     const fallback = isGuest
       ? "🔒 This option is not available in guest mode. Use Request Access to unlock actions."
       : "❌ An error occurred processing your request. Please try again.";
-    const message =
-      isGuest
-        ? fallback
-        : error?.userMessage || fallback;
+    const message = isGuest ? fallback : error?.userMessage || fallback;
     await ctx.reply(message);
     finishMetric("error", { error: error?.message || String(error) });
   }
@@ -1495,7 +1562,10 @@ function buildCommandsFingerprint(commands = []) {
 
 function pruneCommandSyncState(now = Date.now()) {
   for (const [chatId, state] of commandSyncState.entries()) {
-    if (!state || now - Number(state.updatedAt || 0) > COMMAND_SYNC_RETENTION_MS) {
+    if (
+      !state ||
+      now - Number(state.updatedAt || 0) > COMMAND_SYNC_RETENTION_MS
+    ) {
       commandSyncState.delete(chatId);
     }
   }
@@ -1587,29 +1657,81 @@ async function bootstrap() {
 
 let isShuttingDown = false;
 const FORCE_SHUTDOWN_MS = 15000;
+const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 10000;
+let pendingQueryCount = 0;
+
+/**
+ * Register a pending database query
+ * Call the returned function when the query completes
+ */
+function trackPendingQuery() {
+  pendingQueryCount++;
+  return () => {
+    pendingQueryCount = Math.max(0, pendingQueryCount - 1);
+  };
+}
 
 async function shutdown(signal, exitCode = 0) {
   if (isShuttingDown) return;
   isShuttingDown = true;
   console.log(`🛑 Shutting down bot (${signal})...`);
+
   const forceTimer = setTimeout(() => {
-    console.error(`Forced shutdown after ${FORCE_SHUTDOWN_MS}ms (${signal})`);
+    console.error(
+      `⚠️ Forced shutdown after ${FORCE_SHUTDOWN_MS}ms (${signal}). ` +
+        `Pending queries: ${pendingQueryCount}`,
+    );
     process.exit(exitCode || 1);
   }, FORCE_SHUTDOWN_MS);
+
   if (typeof forceTimer.unref === "function") {
     forceTimer.unref();
   }
+
   try {
+    // Step 1: Stop accepting new updates
+    console.log("📍 Stopping bot polling...");
     await bot.stop();
+    console.log("✅ Bot polling stopped");
   } catch (error) {
     console.error("Bot stop error:", error?.message || error);
   }
+
   try {
+    // Step 2: Wait for pending database queries to drain
+    console.log("📍 Draining pending queries...");
+    const drainStartTime = Date.now();
+    const maxDrainTime = GRACEFUL_SHUTDOWN_TIMEOUT_MS;
+
+    while (
+      pendingQueryCount > 0 &&
+      Date.now() - drainStartTime < maxDrainTime
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+
+    if (pendingQueryCount > 0) {
+      console.warn(
+        `⚠️ Shutdown timeout: ${pendingQueryCount} pending queries still running ` +
+          `after ${maxDrainTime}ms`,
+      );
+    } else {
+      console.log(`✅ All pending queries drained`);
+    }
+  } catch (error) {
+    console.error("Query drain error:", error?.message || error);
+  }
+
+  try {
+    // Step 3: Close database connections
+    console.log("📍 Closing database...");
     await closeDb();
+    console.log("✅ Database closed");
   } catch (error) {
     console.error("Database shutdown error:", error?.message || error);
   } finally {
     clearTimeout(forceTimer);
+    console.log(`✅ Shutdown complete`);
   }
   process.exit(exitCode);
 }

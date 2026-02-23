@@ -413,9 +413,11 @@ async function askOptionWithButtons(
     const selectionAction = parseCallbackData(callbackRawData).action || callbackRawData;
     const callbackChatId = selectionCtx?.callbackQuery?.message?.chat?.id || null;
     console.log(JSON.stringify({
-      type: 'conversation_callback',
+      type: 'conversation_callback_matched',
       callback_data: callbackRawData,
       action: selectionAction,
+      prefix_key: prefixKey,
+      matched: true,
       user_id: selectionCtx?.from?.id || ctx.from?.id || null,
       chat_id: callbackChatId || ctx.chat?.id || null,
       state: {
@@ -465,6 +467,14 @@ async function askOptionWithButtons(
       await selectionCtx.answerCallbackQuery();
     } catch (_) {}
   }
+
+  console.log(JSON.stringify({
+    type: 'conversation_callback_completed',
+    prefix_key: prefixKey,
+    selected_id: selected?.id || null,
+    user_id: ctx?.from?.id || null,
+    chat_id: ctx?.chat?.id || null
+  }));
 
   try {
     await ctx.api.deleteMessage(message.chat.id, message.message_id);

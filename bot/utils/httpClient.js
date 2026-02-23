@@ -1,8 +1,8 @@
-const axios = require('axios');
-const config = require('../config');
+const axios = require("axios");
+const config = require("../config");
 
 const DEFAULT_TIMEOUT_MS = 12000;
-const ADMIN_HEADER = 'x-admin-token';
+const ADMIN_HEADER = "x-admin-token";
 const ADMIN_ORIGINS = new Set();
 try {
   if (config.apiUrl) {
@@ -27,13 +27,22 @@ async function withRetry(fn, options = {}) {
     jitterRatio = 0.2,
     retryOn = (error) => {
       if (!error) return false;
-      if (error.code && ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'ECONNABORTED'].includes(error.code)) {
+      if (
+        error.code &&
+        [
+          "ECONNRESET",
+          "ECONNREFUSED",
+          "ETIMEDOUT",
+          "ENOTFOUND",
+          "ECONNABORTED",
+        ].includes(error.code)
+      ) {
         return true;
       }
       const status = error.response?.status;
       if (status === 429) return true;
       return status >= 500 && status < 600;
-    }
+    },
   } = options;
 
   let attempt = 0;
@@ -45,11 +54,15 @@ async function withRetry(fn, options = {}) {
       if (attempt > retries || !retryOn(error)) {
         throw error;
       }
-      const retryAfter = Number(error?.response?.headers?.['retry-after']);
-      const expDelay = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt - 1));
-      const baseDelay = Number.isFinite(retryAfter) && retryAfter > 0
-        ? retryAfter * 1000
-        : expDelay;
+      const retryAfter = Number(error?.response?.headers?.["retry-after"]);
+      const expDelay = Math.min(
+        maxDelayMs,
+        baseDelayMs * Math.pow(2, attempt - 1),
+      );
+      const baseDelay =
+        Number.isFinite(retryAfter) && retryAfter > 0
+          ? retryAfter * 1000
+          : expDelay;
       const jitter = baseDelay * jitterRatio * (Math.random() * 2 - 1);
       const delay = Math.max(0, Math.round(baseDelay + jitter));
       await sleep(delay);
@@ -57,25 +70,25 @@ async function withRetry(fn, options = {}) {
   }
 }
 
-function redactSensitiveRoute(value = '') {
-  return String(value || '')
-    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[redacted-email]')
-    .replace(/\+?\d[\d\s().-]{6,}\d/g, '[redacted-phone]');
+function redactSensitiveRoute(value = "") {
+  return String(value || "")
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[redacted-email]")
+    .replace(/\+?\d[\d\s().-]{6,}\d/g, "[redacted-phone]");
 }
 
-function sanitizeUrl(url = '') {
+function sanitizeUrl(url = "") {
   try {
     const parsed = new URL(url);
     const decodedPath = (() => {
       try {
-        return decodeURIComponent(parsed.pathname || '');
+        return decodeURIComponent(parsed.pathname || "");
       } catch (_) {
-        return parsed.pathname || '';
+        return parsed.pathname || "";
       }
     })();
     return `${parsed.origin}${redactSensitiveRoute(decodedPath)}`;
   } catch (_) {
-    return redactSensitiveRoute(String(url || ''));
+    return redactSensitiveRoute(String(url || ""));
   }
 }
 
@@ -100,18 +113,20 @@ function withAdminHeader(headers = {}, enableAdmin = true) {
 function normalizeOptions(options = {}, url) {
   const enableAdmin = options.admin !== false && shouldAttachAdmin(url);
   const headers = withAdminHeader(options.headers || {}, enableAdmin);
-  const timeout = Number.isFinite(options.timeout) ? options.timeout : DEFAULT_TIMEOUT_MS;
+  const timeout = Number.isFinite(options.timeout)
+    ? options.timeout
+    : DEFAULT_TIMEOUT_MS;
   return {
     ...options,
     headers,
-    timeout
+    timeout,
   };
 }
 
 function extractRequestId(error) {
   return (
-    error?.response?.headers?.['x-request-id'] ||
-    error?.response?.headers?.['x-requestid'] ||
+    error?.response?.headers?.["x-request-id"] ||
+    error?.response?.headers?.["x-requestid"] ||
     error?.response?.data?.request_id ||
     error?.response?.data?.requestId ||
     null
@@ -121,43 +136,44 @@ function extractRequestId(error) {
 function mapErrorToUserMessage(error) {
   const status = error?.response?.status;
   if (status === 401 || status === 403) {
-    return 'Not authorized. Check the ADMIN token / API secret.';
+    return "Not authorized. Check the ADMIN token / API secret.";
   }
   if (status === 404) {
-    return 'API endpoint not found.';
+    return "API endpoint not found.";
   }
   if (status === 422) {
-    return 'Invalid request. Please review the inputs.';
+    return "Invalid request. Please review the inputs.";
   }
   if (status === 429) {
-    return 'Rate limited by the API. Please try again shortly.';
+    return "Rate limited by the API. Please try again shortly.";
   }
   if (status >= 500) {
-    return 'API error. Please try again.';
+    return "API error. Please try again.";
   }
-  if (error?.code === 'ECONNABORTED') {
-    return 'API timeout. Please try again.';
+  if (error?.code === "ECONNABORTED") {
+    return "API timeout. Please try again.";
   }
   if (error?.request && !error?.response) {
-    return 'API unreachable. Please check the server and network.';
+    return "API unreachable. Please check the server and network.";
   }
-  return 'API request failed. Please try again.';
+  return "API request failed. Please try again.";
 }
 
 function enrichError(error, context = {}) {
-  if (!error || typeof error !== 'object') {
+  if (!error || typeof error !== "object") {
     return error;
   }
   const requestId = extractRequestId(error);
   const status = error?.response?.status;
-  const method = context.method || error?.config?.method?.toUpperCase() || 'GET';
-  const url = sanitizeUrl(context.url || error?.config?.url || '');
+  const method =
+    context.method || error?.config?.method?.toUpperCase() || "GET";
+  const url = sanitizeUrl(context.url || error?.config?.url || "");
   error.userMessage = error.userMessage || mapErrorToUserMessage(error);
   error.apiContext = {
     method,
     url,
     status,
-    requestId
+    requestId,
   };
   return error;
 }
@@ -165,10 +181,16 @@ function enrichError(error, context = {}) {
 function logError(error, context = {}) {
   const enriched = enrichError(error, context);
   const apiContext = enriched?.apiContext || {};
-  console.error('API request failed', apiContext);
+  const opId = context.opId || "unknown";
+  const userId = context.userId || "unknown";
+
+  console.error(
+    `[${opId}] API request failed [${apiContext.method}] [status=${apiContext.status}] [requestId=${apiContext.requestId}] [user=${userId}] ${apiContext.url}`,
+    apiContext,
+  );
 }
 
-function getUserMessage(error, fallback = 'API request failed.') {
+function getUserMessage(error, fallback = "API request failed.") {
   if (!error) return fallback;
   return error.userMessage || mapErrorToUserMessage(error) || fallback;
 }
@@ -177,20 +199,24 @@ async function request(method, ctx, url, data, options = {}) {
   const normalized = normalizeOptions(options, url);
   const { retry, admin, ...axiosOptions } = normalized;
   try {
-    if (method === 'get') {
+    if (method === "get") {
       return await withRetry(() => axios.get(url, axiosOptions), retry);
     }
-    if (method === 'delete') {
+    if (method === "delete") {
       return await withRetry(() => axios.delete(url, axiosOptions), retry);
     }
-    if (method === 'put') {
+    if (method === "put") {
       return await withRetry(() => axios.put(url, data, axiosOptions), retry);
     }
     return await withRetry(() => axios.post(url, data, axiosOptions), retry);
   } catch (error) {
     logError(error, { method: method.toUpperCase(), url });
     const enriched = enrichError(error, { method: method.toUpperCase(), url });
-    if (enriched?.userMessage && typeof enriched.message === 'string' && /request failed/i.test(enriched.message)) {
+    if (
+      enriched?.userMessage &&
+      typeof enriched.message === "string" &&
+      /request failed/i.test(enriched.message)
+    ) {
       enriched.message = enriched.userMessage;
     }
     throw enriched;
@@ -198,19 +224,19 @@ async function request(method, ctx, url, data, options = {}) {
 }
 
 async function get(ctx, url, options = {}) {
-  return request('get', ctx, url, null, options);
+  return request("get", ctx, url, null, options);
 }
 
 async function post(ctx, url, data, options = {}) {
-  return request('post', ctx, url, data, options);
+  return request("post", ctx, url, data, options);
 }
 
 async function put(ctx, url, data, options = {}) {
-  return request('put', ctx, url, data, options);
+  return request("put", ctx, url, data, options);
 }
 
 async function del(ctx, url, options = {}) {
-  return request('delete', ctx, url, null, options);
+  return request("delete", ctx, url, null, options);
 }
 
 module.exports = {
@@ -221,5 +247,5 @@ module.exports = {
   get,
   post,
   put,
-  del
+  del,
 };
