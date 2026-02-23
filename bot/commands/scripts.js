@@ -2337,13 +2337,15 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
   const workingDraft = { ...draftPayload };
 
   if ((fastResume || reviewResume) && Object.keys(workingDraft).length) {
-    await ctx.reply('↩️ Loaded saved draft values.');
+    const resumeMessage = fastResume
+      ? '↩️ Continuing from your saved draft.'
+      : '↩️ Reviewing with saved draft values prefilled.';
+    await ctx.reply(resumeMessage);
   }
 
   let name = null;
   if (fastResume && String(workingDraft.name || '').trim()) {
     name = String(workingDraft.name).trim();
-    await ctx.reply(`↩️ Using saved script name: *${escapeMarkdown(name)}*`, { parse_mode: 'Markdown' });
   } else {
     name = await promptText(
       conversation,
@@ -2370,7 +2372,6 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
     fastResume && Object.prototype.hasOwnProperty.call(workingDraft, 'description');
   if (usingSavedDescription) {
     description = workingDraft.description;
-    await ctx.reply('↩️ Using saved description.');
   } else {
     description = await promptText(
       conversation,
@@ -2409,7 +2410,6 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
           ? workingDraft.persona_config
           : {}
     };
-    await ctx.reply('↩️ Using saved persona settings.');
   } else {
     personaResult = await collectPersonaConfig(
       conversation,
@@ -2442,7 +2442,6 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
       first_message: workingDraft.first_message || '',
       voice_model: workingDraft.voice_model || null
     };
-    await ctx.reply('↩️ Using saved prompt/voice settings.');
   } else {
     promptAndVoice = await collectPromptAndVoice(
       conversation,
@@ -2476,7 +2475,6 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
       terminator_char: workingDraft.terminator_char || null,
       capture_group: workingDraft.capture_group || null
     };
-    await ctx.reply('↩️ Using saved digit capture settings.');
   } else {
     captureConfig = await collectDigitCaptureConfig(
       conversation,
@@ -2532,7 +2530,6 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
       payment_failure_message: workingDraft.payment_failure_message || null,
       payment_retry_message: workingDraft.payment_retry_message || null
     };
-    await ctx.reply('↩️ Using saved payment defaults.');
   } else {
     paymentConfig = await collectPaymentDefaultsConfig(
       conversation,
@@ -2575,7 +2572,6 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
       supports_payment: normalizeOptionalCapabilityFlag(workingDraft.supports_payment),
       supports_digit_capture: normalizeOptionalCapabilityFlag(workingDraft.supports_digit_capture)
     };
-    await ctx.reply('↩️ Using saved objective compatibility settings.');
   } else {
     objectiveConfig = await collectObjectiveMetadataConfig(
       conversation,
@@ -4096,11 +4092,16 @@ async function createSmsScriptFlow(conversation, ctx) {
     : {};
   const fastResume = String(draftMode?.mode || '') === 'resume';
   const reviewResume = String(draftMode?.mode || '') === 'review';
+  if ((fastResume || reviewResume) && Object.keys(draftPayload).length) {
+    const resumeMessage = fastResume
+      ? '↩️ Continuing from your saved SMS draft.'
+      : '↩️ Reviewing with saved SMS draft values prefilled.';
+    await ctx.reply(resumeMessage);
+  }
 
   let name = null;
   if (fastResume && String(draftPayload.name || '').trim()) {
     name = String(draftPayload.name).trim().toLowerCase();
-    await ctx.reply(`↩️ Using saved script name: ${name}`);
   } else {
     name = await promptText(
       conversation,
@@ -4131,7 +4132,6 @@ async function createSmsScriptFlow(conversation, ctx) {
     fastResume && Object.prototype.hasOwnProperty.call(draftPayload, 'description');
   if (usingSavedSmsDescription) {
     description = draftPayload.description;
-    await ctx.reply('↩️ Using saved description.');
   } else {
     description = await promptText(
       conversation,
@@ -4159,7 +4159,6 @@ async function createSmsScriptFlow(conversation, ctx) {
   let content = null;
   if (fastResume && String(draftPayload.content || '').trim()) {
     content = String(draftPayload.content || '').trim();
-    await ctx.reply('↩️ Using saved SMS content.');
   } else {
     content = await promptText(
       conversation,
