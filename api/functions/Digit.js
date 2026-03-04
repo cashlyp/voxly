@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const { resolvePaymentExecutionMode } = require('../adapters/providerFlowPolicy');
 
 const DIGIT_WORD_MAP = {
   zero: '0',
@@ -4318,19 +4319,24 @@ function createDigitCollectionService(options = {}) {
   function isPaymentFeatureEnabledForCall(callConfig = {}) {
     const cfg = getPaymentFeatureRuntimeConfig();
     if (!cfg) return { enabled: true, reason: null, config: null };
-    if (cfg.enabled !== true) {
-      return { enabled: false, reason: 'feature_disabled', config: cfg };
-    }
-    if (cfg.kill_switch === true) {
-      return { enabled: false, reason: 'kill_switch', config: cfg };
-    }
     const provider = resolvePaymentProvider(callConfig);
     const adapter = getPaymentProviderAdapter(provider);
-    if (!adapter) {
-      return { enabled: false, reason: 'unsupported_provider', config: cfg };
-    }
-    if (provider === 'twilio' && cfg.allow_twilio !== true) {
-      return { enabled: false, reason: 'twilio_disabled', config: cfg };
+    const executionMode = resolvePaymentExecutionMode({
+      provider,
+      featureConfig: cfg,
+      hasNativeAdapter: Boolean(adapter),
+      smsFallbackEnabled:
+        config?.payment?.smsFallback?.enabled === true &&
+        cfg?.allow_sms_fallback !== false,
+      smsServiceReady: Boolean(smsService && typeof smsService.sendSMS === 'function'),
+    });
+    if (!executionMode.enabled) {
+      return {
+        enabled: false,
+        reason: executionMode.reason || 'unsupported_provider',
+        config: cfg,
+        mode: executionMode.mode,
+      };
     }
     if (cfg.require_script_opt_in === true) {
       const hasScript = Boolean(
@@ -4342,7 +4348,12 @@ function createDigitCollectionService(options = {}) {
         return { enabled: false, reason: 'script_required', config: cfg };
       }
     }
-    return { enabled: true, reason: null, config: cfg };
+    return {
+      enabled: true,
+      reason: null,
+      config: cfg,
+      mode: executionMode.mode,
+    };
   }
 
   function resolvePaymentProvider(callConfig = {}) {
@@ -4817,6 +4828,7 @@ function createDigitCollectionService(options = {}) {
           amount: fallback.amount || null,
           currency: fallback.currency || 'USD',
           provider: fallback.payment_provider || resolvePaymentProvider(callConfig),
+          execution_mode: fallback.execution_mode || null,
           payment_connector: fallback.payment_connector || null,
           description: fallback.description || null,
           start_message: fallback.start_message || null,
@@ -4853,16 +4865,13 @@ function createDigitCollectionService(options = {}) {
     const paymentFeature = isPaymentFeatureEnabledForCall(callConfig);
     if (!paymentFeature.enabled) {
       const reasonCode = String(paymentFeature.reason || '').trim().toLowerCase();
-      if (reasonCode === 'unsupported_provider') {
-        return {
-          error: 'unsupported_provider',
-          message: 'Phone payment is currently supported only for Twilio calls.'
-        };
-      }
       const reasonMessages = {
         feature_disabled: 'Phone payment is currently disabled by system policy.',
         kill_switch: 'Phone payment is temporarily unavailable right now.',
         twilio_disabled: 'Twilio phone payments are currently disabled by system policy.',
+        native_adapter_unavailable: 'Native phone payment adapter is unavailable for this provider.',
+        sms_fallback_disabled: 'Secure SMS fallback is disabled for non-native payment providers.',
+        sms_service_unavailable: 'Secure SMS fallback is unavailable because SMS service is not ready.',
         script_required: 'Phone payment requires a script-enabled call.'
       };
       return {
@@ -4873,10 +4882,20 @@ function createDigitCollectionService(options = {}) {
     }
     const provider = resolvePaymentProvider(callConfig);
     const paymentAdapter = getPaymentAdapterForCall(callConfig);
-    if (!paymentAdapter) {
+    const paymentMode = resolvePaymentExecutionMode({
+      provider,
+      featureConfig: paymentFeature?.config || {},
+      hasNativeAdapter: Boolean(paymentAdapter),
+      smsFallbackEnabled:
+        config?.payment?.smsFallback?.enabled === true &&
+        paymentFeature?.config?.allow_sms_fallback !== false,
+      smsServiceReady: Boolean(smsService && typeof smsService.sendSMS === 'function')
+    });
+    if (!paymentMode.enabled) {
       return {
-        error: 'unsupported_provider',
-        message: 'Phone payment is currently supported only for Twilio calls.'
+        error: 'payment_mode_unavailable',
+        reason: paymentMode.reason || null,
+        message: 'Phone payment is unavailable for the active provider in current runtime mode.'
       };
     }
     if (callConfig.payment_enabled !== true) {
@@ -4971,25 +4990,10 @@ function createDigitCollectionService(options = {}) {
       || 'USD'
     ).trim().toUpperCase();
     const paymentConnector = String(args.payment_connector || callConfig.payment_connector || '').trim();
-    if (!paymentConnector) {
+    if (paymentMode.mode === 'native' && !paymentConnector) {
       return {
         error: 'missing_payment_connector',
         message: 'Missing payment connector. Set payment_connector in call payload or tool args.'
-      };
-    }
-    const host = config?.server?.hostname;
-    if (!host) {
-      return {
-        error: 'missing_server_hostname',
-        message: 'Server hostname is not configured.'
-      };
-    }
-    const accountSid = config?.twilio?.accountSid;
-    const authToken = config?.twilio?.authToken;
-    if (!accountSid || !authToken || !twilioClient) {
-      return {
-        error: 'twilio_credentials_missing',
-        message: 'Twilio credentials are not configured.'
       };
     }
 
@@ -5000,6 +5004,7 @@ function createDigitCollectionService(options = {}) {
       amount: amountNumber.toFixed(2),
       currency: currency || 'USD',
       provider,
+      execution_mode: paymentMode.mode,
       payment_connector: paymentConnector,
       description: String(args.description || callConfig.payment_description || '').trim().slice(0, 240),
       start_message: messages.start_message || null,
@@ -5011,7 +5016,7 @@ function createDigitCollectionService(options = {}) {
 
     const requestedTransition = transitionPaymentState(callSid, PAYMENT_STATES.REQUESTED, {
       reason: 'payment_session_requested',
-      payment_in_progress: true,
+      payment_in_progress: paymentMode.mode === 'native',
       payment_session: session,
       payment_last_result: null
     });
@@ -5025,7 +5030,7 @@ function createDigitCollectionService(options = {}) {
     activeConfig.payment_attempt_count = safeAttempts + 1;
     activeConfig.payment_attempt_last_at = new Date().toISOString();
     callConfigurations.set(callSid, activeConfig);
-    if (typeof setCallFlowState === 'function') {
+    if (typeof setCallFlowState === 'function' && paymentMode.mode === 'native') {
       setCallFlowState(
         callSid,
         {
@@ -5045,6 +5050,7 @@ function createDigitCollectionService(options = {}) {
         currency: session.currency,
         payment_connector: session.payment_connector,
         description: session.description || null,
+        execution_mode: session.execution_mode || null,
         start_message: session.start_message || null,
         success_message: session.success_message || null,
         failure_message: session.failure_message || null,
@@ -5056,6 +5062,115 @@ function createDigitCollectionService(options = {}) {
       })).catch(() => {});
     }
 
+    if (paymentMode.mode === 'sms_fallback') {
+      let smsFallbackResult = null;
+      try {
+        smsFallbackResult = await sendPaymentSmsFallback(
+          callSid,
+          session,
+          activeConfig,
+          'manual'
+        );
+      } catch (error) {
+        logDigitMetric('payment_sms_fallback_error', {
+          callSid,
+          reason: 'manual',
+          error: String(error?.message || error || 'unknown_error')
+        });
+      }
+      if (!smsFallbackResult?.sent) {
+        const failedTransition = transitionPaymentState(callSid, PAYMENT_STATES.FAILED, {
+          reason: 'payment_sms_fallback_failed',
+          payment_in_progress: false,
+          payment_session: null
+        });
+        const failedConfig = failedTransition.callConfig || callConfig;
+        if (typeof setCallFlowState === 'function') {
+          setCallFlowState(
+            callSid,
+            {
+              flow_state: 'normal',
+              flow_state_reason: 'payment_sms_fallback_failed',
+              call_mode: 'normal',
+              digit_capture_active: false
+            },
+            { callConfig: failedConfig, source: 'digit.requestPhonePayment.sms_fallback_failed' }
+          );
+        }
+        if (db?.updateCallState) {
+          await db.updateCallState(callSid, 'payment_session_sms_fallback_failed', buildPaymentStatePayload(failedConfig, {
+            payment_id: session.payment_id,
+            execution_mode: session.execution_mode || 'sms_fallback',
+            reason: smsFallbackResult?.reason || 'sms_fallback_failed',
+            at: new Date().toISOString()
+          })).catch(() => {});
+        }
+        return {
+          error: 'payment_sms_fallback_failed',
+          message: 'Unable to send secure payment link right now.'
+        };
+      }
+
+      const activeTransition = transitionPaymentState(callSid, PAYMENT_STATES.ACTIVE, {
+        reason: 'payment_sms_fallback_sent',
+        payment_in_progress: false,
+        payment_session: session
+      });
+      const persistedConfig = activeTransition.callConfig || activeConfig;
+      callConfigurations.set(callSid, persistedConfig);
+      if (typeof setCallFlowState === 'function') {
+        setCallFlowState(
+          callSid,
+          {
+            flow_state: 'normal',
+            flow_state_reason: 'payment_sms_fallback_sent',
+            call_mode: 'normal',
+            digit_capture_active: false
+          },
+          { callConfig: persistedConfig, source: 'digit.requestPhonePayment.sms_fallback' }
+        );
+      }
+      if (db?.updateCallState) {
+        await db.updateCallState(callSid, 'payment_session_sms_fallback_sent', buildPaymentStatePayload(persistedConfig, {
+          payment_id: session.payment_id,
+          payment_provider: provider,
+          execution_mode: session.execution_mode || 'sms_fallback',
+          amount: session.amount,
+          currency: session.currency,
+          payment_url: smsFallbackResult.url || null,
+          sent_to: smsFallbackResult.to || null,
+          at: new Date().toISOString()
+        })).catch(() => {});
+      }
+      webhookService.addLiveEvent(
+        callSid,
+        `💳 Payment link sent via SMS (${session.currency} ${session.amount})`,
+        { force: true }
+      );
+      return {
+        status: 'sms_fallback_sent',
+        payment_id: session.payment_id,
+        amount: session.amount,
+        currency: session.currency,
+        execution_mode: 'sms_fallback'
+      };
+    }
+
+    const host = config?.server?.hostname;
+    if (!host) {
+      return {
+        error: 'missing_server_hostname',
+        message: 'Server hostname is not configured.'
+      };
+    }
+    const accountSid = config?.twilio?.accountSid;
+    const authToken = config?.twilio?.authToken;
+    if (!accountSid || !authToken || !twilioClient) {
+      return {
+        error: 'twilio_credentials_missing',
+        message: 'Twilio credentials are not configured.'
+      };
+    }
     const startUrl = paymentAdapter.buildStartUrl(host, callSid, session.payment_id);
     const client = twilioClient(accountSid, authToken);
     try {
@@ -5100,7 +5215,8 @@ function createDigitCollectionService(options = {}) {
       status: 'started',
       payment_id: session.payment_id,
       amount: session.amount,
-      currency: session.currency
+      currency: session.currency,
+      execution_mode: 'native'
     };
   }
 
@@ -5166,6 +5282,17 @@ function createDigitCollectionService(options = {}) {
         ok: false,
         code: 'payment_session_missing',
         message: 'Payment session not found',
+        twiml: fallback.toString()
+      };
+    }
+    if (String(session.execution_mode || 'native').toLowerCase() !== 'native') {
+      const fallback = new VoiceResponse();
+      fallback.say('This payment flow is running via secure SMS. Returning to the call.');
+      fallback.redirect({ method: 'POST' }, `https://${host}/incoming?resume=1`);
+      return {
+        ok: false,
+        code: 'payment_mode_not_native',
+        message: 'Payment session is not in native voice mode',
         twiml: fallback.toString()
       };
     }

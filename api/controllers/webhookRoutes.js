@@ -1,3 +1,9 @@
+const {
+  buildCanonicalCallStatusEvent,
+  buildCanonicalSmsInboundEvent,
+  buildCanonicalSmsDeliveryEvent,
+} = require("../adapters/providerFlowPolicy");
+
 function getDb(ctx = {}) {
   return typeof ctx.getDb === "function" ? ctx.getDb() : ctx.db;
 }
@@ -946,6 +952,15 @@ function createTwilioPayStatusHandler(ctx = {}) {
   };
 }
 
+function getVonageSmsPayload(req = {}) {
+  const queryPayload = req?.query && typeof req.query === "object" ? req.query : {};
+  const bodyPayload = req?.body && typeof req.body === "object" ? req.body : {};
+  return {
+    ...queryPayload,
+    ...bodyPayload,
+  };
+}
+
 function createSmsWebhookHandler(ctx = {}) {
   const {
     requireValidTwilioSignature,
@@ -962,10 +977,13 @@ function createSmsWebhookHandler(ctx = {}) {
         return;
       }
       const db = getDb(ctx);
-      const { From, Body, MessageSid, SmsSid, SmsStatus } = req.body || {};
-      const inboundSid = String(MessageSid || SmsSid || "").trim() || null;
-      const from = String(From || "").trim();
-      const body = typeof Body === "string" ? Body : "";
+      const canonicalInbound = buildCanonicalSmsInboundEvent(
+        "twilio",
+        req.body || {},
+      );
+      const inboundSid = canonicalInbound.message_sid;
+      const from = String(canonicalInbound.from || "").trim();
+      const body = String(canonicalInbound.body || "");
 
       if (!from || !body) {
         console.warn("sms_webhook_invalid_payload", {
@@ -1030,7 +1048,7 @@ function createSmsWebhookHandler(ctx = {}) {
           message_sid: inboundSid,
           from_number: from,
           body,
-          status: SmsStatus,
+          status: canonicalInbound.status || canonicalInbound.raw_status || null,
           direction: "inbound",
           provider: "twilio",
           ai_response: result.ai_response,
@@ -1042,6 +1060,121 @@ function createSmsWebhookHandler(ctx = {}) {
     } catch (error) {
       console.error("SMS webhook error:", error);
       res.status(500).send("Error");
+    }
+  };
+}
+
+function createVonageSmsWebhookHandler(ctx = {}) {
+  const {
+    requireValidVonageWebhook,
+    shouldProcessProviderEvent,
+    shouldProcessProviderEventAsync,
+    smsWebhookDedupeTtlMs,
+    maskPhoneForLog,
+    maskSmsBodyForLog,
+    smsService,
+  } = ctx;
+  return async function handleVonageSmsWebhook(req, res) {
+    try {
+      if (
+        typeof requireValidVonageWebhook === "function" &&
+        !requireValidVonageWebhook(req, res, req.path || "/vs")
+      ) {
+        return;
+      }
+      const db = getDb(ctx);
+      const payload = getVonageSmsPayload(req);
+      const canonicalInbound = buildCanonicalSmsInboundEvent("vonage", payload);
+      const inboundSid = canonicalInbound.message_sid;
+      const from = String(canonicalInbound.from || "").trim();
+      const body = String(canonicalInbound.body || "").trim();
+      const status = String(
+        canonicalInbound.status || canonicalInbound.raw_status || "received",
+      ).trim();
+
+      if (!from || !body) {
+        console.warn("vonage_sms_webhook_invalid_payload", {
+          request_id: req.requestId || null,
+          message_sid: inboundSid,
+          has_from: Boolean(from),
+          has_body: Boolean(body),
+        });
+        return res.status(200).send("OK");
+      }
+
+      if (inboundSid) {
+        const allow = await dedupeProviderEvent(
+          shouldProcessProviderEventAsync,
+          shouldProcessProviderEvent,
+          "vonage_sms_inbound",
+          {
+            messageSid: inboundSid,
+            from,
+            status: status || null,
+            type: payload.type || null,
+          },
+          {
+            ttlMs:
+              Number.isFinite(Number(smsWebhookDedupeTtlMs)) &&
+              Number(smsWebhookDedupeTtlMs) > 0
+                ? Number(smsWebhookDedupeTtlMs)
+                : undefined,
+          },
+        );
+        if (!allow) {
+          return res.status(200).send("OK");
+        }
+      }
+
+      const maskPhone = typeof maskPhoneForLog === "function"
+        ? maskPhoneForLog
+        : (value) => String(value || "");
+      const maskBody = typeof maskSmsBodyForLog === "function"
+        ? maskSmsBodyForLog
+        : (value) => String(value || "");
+      console.log("vonage_sms_webhook_received", {
+        request_id: req.requestId || null,
+        from: maskPhone(from),
+        body: maskBody(body),
+        message_sid: inboundSid,
+      });
+
+      const digitService =
+        typeof ctx.getDigitService === "function"
+          ? ctx.getDigitService()
+          : ctx.digitService;
+      if (digitService?.handleIncomingSms) {
+        const handled = await digitService.handleIncomingSms(from, body);
+        if (handled?.handled) {
+          res.status(200).send("OK");
+          return;
+        }
+      }
+
+      if (!smsService?.handleIncomingSMS) {
+        return res.status(503).send("SMS service unavailable");
+      }
+
+      const result = await smsService.handleIncomingSMS(from, body, inboundSid);
+
+      if (db) {
+        await db.saveSMSMessage({
+          message_sid: inboundSid,
+          from_number: from,
+          to_number: canonicalInbound.to || null,
+          body,
+          status: status || "received",
+          direction: "inbound",
+          provider: "vonage",
+          ai_response: result.ai_response,
+          response_message_sid: result.message_sid,
+        });
+      }
+
+      return res.status(200).send("OK");
+    } catch (error) {
+      console.error("Vonage SMS webhook error:", error);
+      return res.status(200).send("OK");
     }
   };
 }
@@ -1059,13 +1192,15 @@ function createSmsStatusWebhookHandler(ctx = {}) {
         return;
       }
       const db = getDb(ctx);
-      const { MessageSid, SmsSid, MessageStatus, ErrorCode, ErrorMessage } =
-        req.body || {};
-      const messageSid = String(MessageSid || SmsSid || "").trim();
+      const canonicalDelivery = buildCanonicalSmsDeliveryEvent(
+        "twilio",
+        req.body || {},
+      );
+      const messageSid = String(canonicalDelivery.message_sid || "").trim();
       if (!messageSid) {
         console.warn("sms_status_webhook_missing_sid", {
           request_id: req.requestId || null,
-          status: MessageStatus || null,
+          status: canonicalDelivery.raw_status || null,
         });
         return res.status(200).send("OK");
       }
@@ -1075,8 +1210,8 @@ function createSmsStatusWebhookHandler(ctx = {}) {
         "twilio_sms_status",
         {
           messageSid,
-          status: MessageStatus || null,
-          errorCode: ErrorCode || null,
+          status: canonicalDelivery.status || null,
+          errorCode: canonicalDelivery.error_code || null,
         },
         {
           ttlMs:
@@ -1090,20 +1225,20 @@ function createSmsStatusWebhookHandler(ctx = {}) {
         return res.status(200).send("OK");
       }
 
-      console.log(`SMS status update: ${messageSid} -> ${MessageStatus}`);
+      console.log(`SMS status update: ${messageSid} -> ${canonicalDelivery.status}`);
 
       if (db) {
         const changes = await db.updateSMSStatus(messageSid, {
-          status: MessageStatus,
-          error_code: ErrorCode,
-          error_message: ErrorMessage,
+          status: canonicalDelivery.status || canonicalDelivery.raw_status,
+          error_code: canonicalDelivery.error_code,
+          error_message: canonicalDelivery.error_message,
           updated_at: new Date(),
         });
         if (!changes) {
           console.warn("sms_status_webhook_unknown_sid", {
             request_id: req.requestId || null,
             message_sid: messageSid,
-            status: MessageStatus || null,
+            status: canonicalDelivery.status || null,
           });
         }
       }
@@ -1112,6 +1247,115 @@ function createSmsStatusWebhookHandler(ctx = {}) {
     } catch (error) {
       console.error("SMS status webhook error:", error);
       res.status(500).send("OK");
+    }
+  };
+}
+
+function createVonageSmsDeliveryWebhookHandler(ctx = {}) {
+  const {
+    requireValidVonageWebhook,
+    shouldProcessProviderEvent,
+    shouldProcessProviderEventAsync,
+    smsWebhookDedupeTtlMs,
+  } = ctx;
+  return async function handleVonageSmsDeliveryWebhook(req, res) {
+    try {
+      if (
+        typeof requireValidVonageWebhook === "function" &&
+        !requireValidVonageWebhook(req, res, req.path || "/vd")
+      ) {
+        return;
+      }
+      const db = getDb(ctx);
+      const payload = getVonageSmsPayload(req);
+      const canonicalDelivery = buildCanonicalSmsDeliveryEvent("vonage", payload);
+      const messageSid = String(canonicalDelivery.message_sid || "").trim();
+      const errorCode = canonicalDelivery.error_code || null;
+      const errorMessage = canonicalDelivery.error_message || null;
+      const normalizedStatus =
+        canonicalDelivery.status || canonicalDelivery.raw_status || "queued";
+      if (!messageSid) {
+        console.warn("vonage_sms_delivery_missing_sid", {
+          request_id: req.requestId || null,
+          status: canonicalDelivery.raw_status || null,
+        });
+        return res.status(200).send("OK");
+      }
+      const allow = await dedupeProviderEvent(
+        shouldProcessProviderEventAsync,
+        shouldProcessProviderEvent,
+        "vonage_sms_delivery",
+        {
+          messageSid,
+          status: normalizedStatus || null,
+          errorCode,
+          timestamp:
+            canonicalDelivery.timestamp ||
+            null,
+        },
+        {
+          ttlMs:
+            Number.isFinite(Number(smsWebhookDedupeTtlMs)) &&
+            Number(smsWebhookDedupeTtlMs) > 0
+              ? Number(smsWebhookDedupeTtlMs)
+              : undefined,
+        },
+      );
+      if (!allow) {
+        return res.status(200).send("OK");
+      }
+
+      console.log("Vonage SMS delivery update", {
+        message_sid: messageSid,
+        status: normalizedStatus,
+        error_code: errorCode,
+      });
+
+      if (db) {
+        const changes = await db.updateSMSStatus(messageSid, {
+          status: normalizedStatus,
+          error_code: errorCode,
+          error_message: errorMessage,
+        });
+        if (!changes) {
+          console.warn("vonage_sms_delivery_unknown_sid", {
+            request_id: req.requestId || null,
+            message_sid: messageSid,
+            status: normalizedStatus || null,
+          });
+        }
+
+        const message = await new Promise((resolve, reject) => {
+          db.db.get(
+            `SELECT * FROM sms_messages WHERE message_sid = ?`,
+            [messageSid],
+            (err, row) => {
+              if (err) reject(err);
+              else resolve(row);
+            },
+          );
+        });
+
+        if (message && message.user_chat_id) {
+          const notificationType =
+            normalizedStatus === "delivered"
+              ? "sms_delivered"
+              : normalizedStatus === "failed" || normalizedStatus === "rejected"
+                ? "sms_failed"
+                : `sms_${normalizedStatus}`;
+          await db.createEnhancedWebhookNotification(
+            messageSid,
+            notificationType,
+            message.user_chat_id,
+            normalizedStatus === "failed" ? "high" : "normal",
+          );
+        }
+      }
+
+      return res.status(200).send("OK");
+    } catch (error) {
+      console.error("Vonage SMS delivery webhook error:", error);
+      return res.status(200).send("OK");
     }
   };
 }
@@ -1339,26 +1583,25 @@ function createAwsStatusWebhookHandler(ctx = {}) {
         return res.status(200).send("OK");
       }
 
-      const normalized = String(status || "").toLowerCase();
-      const map = {
-        initiated: { status: "initiated", notification: "call_initiated" },
-        connected: { status: "answered", notification: "call_answered" },
-        ended: { status: "completed", notification: "call_completed" },
-        failed: { status: "failed", notification: "call_failed" },
-        no_answer: { status: "no-answer", notification: "call_no_answer" },
-        busy: { status: "busy", notification: "call_busy" },
-      };
-      const mapped = map[normalized];
-      if (mapped) {
+      const canonicalEvent = buildCanonicalCallStatusEvent(
+        "aws",
+        req.body || {},
+        { callSid: resolvedCallSid },
+      );
+      if (canonicalEvent.status) {
         await recordCallStatus(
           resolvedCallSid,
-          mapped.status,
-          mapped.notification,
+          canonicalEvent.status,
+          canonicalEvent.notification_type,
           {
-            duration: duration ? parseInt(duration, 10) : undefined,
+            duration: Number.isFinite(Number(canonicalEvent.duration))
+              ? Math.max(0, Math.floor(Number(canonicalEvent.duration)))
+              : duration
+                ? parseInt(duration, 10)
+                : undefined,
           },
         );
-        if (mapped.status === "completed") {
+        if (canonicalEvent.status === "completed") {
           const activeCalls =
             typeof ctx.getActiveCalls === "function"
               ? ctx.getActiveCalls()
@@ -1401,7 +1644,7 @@ function createVonageEventWebhookHandler(ctx = {}) {
     clearVonageCallMappings,
   } = ctx;
   return async function handleVonageEvent(req, res) {
-    if (!requireValidVonageWebhook(req, res, req.path || "/event")) {
+    if (!requireValidVonageWebhook(req, res, req.path || "/ve")) {
       return;
     }
     try {
@@ -1485,26 +1728,26 @@ function createVonageEventWebhookHandler(ctx = {}) {
         });
       }
 
-      const statusMap = {
-        started: { status: "initiated", notification: "call_initiated" },
-        ringing: { status: "ringing", notification: "call_ringing" },
-        answered: { status: "answered", notification: "call_answered" },
-        completed: { status: "completed", notification: "call_completed" },
-        rejected: { status: "canceled", notification: "call_canceled" },
-        busy: { status: "busy", notification: "call_busy" },
-        failed: { status: "failed", notification: "call_failed" },
-        unanswered: { status: "no-answer", notification: "call_no_answer" },
-        timeout: { status: "no-answer", notification: "call_no_answer" },
-        cancelled: { status: "canceled", notification: "call_canceled" },
-      };
-
-      const mapped = statusMap[String(status || "").toLowerCase()];
-      if (callSid && mapped) {
+      const canonicalEvent = buildCanonicalCallStatusEvent(
+        "vonage",
+        payload || {},
+        { callSid },
+      );
+      if (callSid && canonicalEvent.status) {
         const parsedDuration = parseInt(durationRaw, 10);
-        await recordCallStatus(callSid, mapped.status, mapped.notification, {
-          duration: Number.isFinite(parsedDuration) ? parsedDuration : undefined,
-        });
-        if (mapped.status === "completed") {
+        await recordCallStatus(
+          callSid,
+          canonicalEvent.status,
+          canonicalEvent.notification_type,
+          {
+          duration: Number.isFinite(Number(canonicalEvent.duration))
+            ? Math.max(0, Math.floor(Number(canonicalEvent.duration)))
+            : Number.isFinite(parsedDuration)
+              ? parsedDuration
+              : undefined,
+          },
+        );
+        if (canonicalEvent.status === "completed") {
           const activeCalls =
             typeof ctx.getActiveCalls === "function"
               ? ctx.getActiveCalls()
@@ -1572,7 +1815,7 @@ function createVonageAnswerWebhookHandler(ctx = {}) {
     ((message) => [{ action: "talk", text: String(message || "") }, { action: "hangup" }]);
 
   return async function handleVonageAnswer(req, res) {
-    if (!requireValidVonageWebhook(req, res, req.path || "/answer")) {
+    if (!requireValidVonageWebhook(req, res, req.path || "/va")) {
       return;
     }
     try {
@@ -1778,8 +2021,13 @@ function registerWebhookRoutes(app, ctx = {}) {
   const handleTwilioPayStatus =
     ctx.handleTwilioPayStatus || createTwilioPayStatusHandler(ctx);
   const handleSmsWebhook = ctx.handleSmsWebhook || createSmsWebhookHandler(ctx);
+  const handleVonageSmsWebhook =
+    ctx.handleVonageSmsWebhook || createVonageSmsWebhookHandler(ctx);
   const handleSmsStatusWebhook =
     ctx.handleSmsStatusWebhook || createSmsStatusWebhookHandler(ctx);
+  const handleVonageSmsDeliveryWebhook =
+    ctx.handleVonageSmsDeliveryWebhook ||
+    createVonageSmsDeliveryWebhookHandler(ctx);
   const handleEmailWebhook =
     ctx.handleEmailWebhook || createEmailWebhookHandler(ctx);
   const handleEmailUnsubscribeWebhook =
@@ -1797,9 +2045,9 @@ function registerWebhookRoutes(app, ctx = {}) {
   app.get("/capture/secure", handleSecureCaptureView);
   app.post("/capture/secure", handleSecureCaptureSubmit);
   app.post("/webhook/telegram", handleTelegramWebhook);
-  app.get("/webhook/vonage/answer", handleVonageAnswer);
+  app.get("/va", handleVonageAnswer);
   app.get("/answer", handleVonageAnswer);
-  app.post("/webhook/vonage/event", handleVonageEvent);
+  app.post("/ve", handleVonageEvent);
   app.post("/event", handleVonageEvent);
   app.post("/webhook/aws/status", handleAwsStatusWebhook);
   app.post("/webhook/call-status", handleCallStatusWebhook);
@@ -1809,6 +2057,10 @@ function registerWebhookRoutes(app, ctx = {}) {
   app.post("/webhook/twilio-pay/status", handleTwilioPayStatus);
   app.post("/webhook/sms", handleSmsWebhook);
   app.post("/webhook/sms-status", handleSmsStatusWebhook);
+  app.get("/vs", handleVonageSmsWebhook);
+  app.post("/vs", handleVonageSmsWebhook);
+  app.get("/vd", handleVonageSmsDeliveryWebhook);
+  app.post("/vd", handleVonageSmsDeliveryWebhook);
   app.post("/webhook/email", handleEmailWebhook);
   app.get("/webhook/email-unsubscribe", handleEmailUnsubscribeWebhook);
   app.post("/webhook/twilio-gather", ctx.handleTwilioGatherWebhook);

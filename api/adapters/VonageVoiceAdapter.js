@@ -20,8 +20,9 @@ function maskPhoneForLog(value) {
 class VonageVoiceAdapter {
   constructor(config = {}, logger = console) {
     const { apiKey, apiSecret, applicationId, privateKey, voice = {} } = config;
+    const injectedClient = config.client || null;
 
-    if (!apiKey || !apiSecret || !applicationId || !privateKey) {
+    if (!injectedClient && (!apiKey || !apiSecret || !applicationId || !privateKey)) {
       throw new Error(
         "VonageVoiceAdapter requires apiKey, apiSecret, applicationId, and privateKey",
       );
@@ -35,12 +36,14 @@ class VonageVoiceAdapter {
     this.requestTimeoutMs =
       Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 15000;
 
-    this.client = new Vonage({
-      apiKey,
-      apiSecret,
-      applicationId,
-      privateKey,
-    });
+    this.client =
+      injectedClient ||
+      new Vonage({
+        apiKey,
+        apiSecret,
+        applicationId,
+        privateKey,
+      });
   }
 
   withTimeout(promise, label = "vonage_request_timeout") {

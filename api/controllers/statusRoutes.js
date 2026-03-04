@@ -102,6 +102,7 @@ function createSystemStatusHandler(ctx = {}) {
     getCurrentSmsProvider,
     getCurrentEmailProvider,
     callConfigurations,
+    getProviderCompatibilityReport,
   } = ctx;
 
   return async function handleSystemStatus(req, res) {
@@ -117,6 +118,10 @@ function createSystemStatusHandler(ctx = {}) {
           email: getCurrentEmailProvider(),
         },
         providers: readiness,
+        provider_compatibility:
+          typeof getProviderCompatibilityReport === "function"
+            ? getProviderCompatibilityReport()
+            : null,
         active_calls: callConfigurations.size,
       });
     } catch (error) {
@@ -124,6 +129,30 @@ function createSystemStatusHandler(ctx = {}) {
         status: "error",
         timestamp: new Date().toISOString(),
         error: "Failed to compute status",
+      });
+    }
+  };
+}
+
+function createProviderCompatibilityHandler(ctx = {}) {
+  const { getProviderCompatibilityReport } = ctx;
+  return async function handleProviderCompatibility(_req, res) {
+    try {
+      if (typeof getProviderCompatibilityReport !== "function") {
+        return res.status(503).json({
+          success: false,
+          error: "Provider compatibility report is unavailable",
+        });
+      }
+      return res.json({
+        success: true,
+        timestamp: new Date().toISOString(),
+        compatibility: getProviderCompatibilityReport(),
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: "Failed to compute provider compatibility report",
       });
     }
   };
@@ -445,11 +474,13 @@ function registerStatusRoutes(app, ctx = {}) {
       : (_req, _res, next) => next();
   const handleGetCallStatus = createGetCallStatusHandler(ctx);
   const handleSystemStatus = createSystemStatusHandler(ctx);
+  const handleProviderCompatibility = createProviderCompatibilityHandler(ctx);
   const handleHealth = createHealthHandler(ctx);
   const handleGptObservability = createGptObservabilityHandler(ctx);
 
   app.get("/api/calls/:callSid/status", requireOutboundAuthorization, handleGetCallStatus);
   app.get("/api/observability/gpt", requireOutboundAuthorization, handleGptObservability);
+  app.get("/status/provider-compat", requireOutboundAuthorization, handleProviderCompatibility);
   app.get("/ready", requireOutboundAuthorization, handleHealth);
   app.get("/status", handleSystemStatus);
   app.get("/health", handleHealth);

@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const config = require('../config');
 const { PinpointClient, SendMessagesCommand } = require('@aws-sdk/client-pinpoint');
 const { Vonage } = require('@vonage/server-sdk');
+const { resolveProviderExecutionOrder } = require('../adapters/providerFlowPolicy');
 
 const SUPPORTED_SMS_PROVIDERS = ['twilio', 'aws', 'vonage'];
 const RETRYABLE_NETWORK_CODES = new Set([
@@ -357,13 +358,15 @@ class VonageSmsAdapter {
         this.defaultFrom = options.defaultFrom || null;
         this.apiKey = options.apiKey || null;
         this.apiSecret = options.apiSecret || null;
+        const injectedClient = options.client || null;
         this.client =
-            this.apiKey && this.apiSecret
+            injectedClient ||
+            (this.apiKey && this.apiSecret
                 ? new Vonage({
                     apiKey: this.apiKey,
                     apiSecret: this.apiSecret,
                 })
-                : null;
+                : null);
     }
 
     resolveFromNumber(from) {
@@ -412,19 +415,27 @@ class VonageSmsAdapter {
             });
         }
         try {
+            const requestPayload = {
+                to: payload.to,
+                from: payload.from,
+                text: payload.body,
+            };
+            if (payload.statusCallback) {
+                requestPayload.callback = payload.statusCallback;
+                requestPayload['status-report-req'] = 1;
+            }
+            if (payload.idempotencyKey) {
+                requestPayload['client-ref'] = String(payload.idempotencyKey).slice(0, 40);
+            }
             const response = await withTimeout(
-                this.client.sms.send({
-                    to: payload.to,
-                    from: payload.from,
-                    text: payload.body,
-                }),
+                this.client.sms.send(requestPayload),
                 providerTimeoutMs,
                 'sms_provider_timeout',
             );
             const message = Array.isArray(response?.messages) ? response.messages[0] : null;
             const vonageStatus = Number(message?.status);
             if (Number.isFinite(vonageStatus) && vonageStatus !== 0) {
-                const retryable = vonageStatus === 1;
+                const retryable = [1, 5].includes(vonageStatus);
                 throw createSmsProviderError(this.provider, {
                     message: message?.['error-text'] || 'Vonage SMS rejected',
                     code: 'sms_provider_error',
@@ -436,7 +447,7 @@ class VonageSmsAdapter {
             return {
                 provider: this.provider,
                 messageSid: message?.['message-id'] || null,
-                status: 'accepted',
+                status: 'queued',
                 from: payload.from,
                 response: response || null,
             };
@@ -587,6 +598,9 @@ class EnhancedSmsService extends EventEmitter {
     }
 
     getProviderReadiness() {
+        const vonageWebhookMode = String(config.vonage?.webhookValidation || 'warn').toLowerCase();
+        const vonageWebhookReady =
+            vonageWebhookMode !== 'strict' || Boolean(config.vonage?.webhookSignatureSecret);
         return {
             twilio: !!(
                 config.twilio?.accountSid &&
@@ -601,7 +615,8 @@ class EnhancedSmsService extends EventEmitter {
             vonage: !!(
                 config.vonage?.apiKey &&
                 config.vonage?.apiSecret &&
-                config.vonage?.sms?.fromNumber
+                config.vonage?.sms?.fromNumber &&
+                vonageWebhookReady
             ),
         };
     }
@@ -714,16 +729,23 @@ class EnhancedSmsService extends EventEmitter {
         return this.isRetryableSmsError(error);
     }
 
-    getCandidateProviders(preferredProvider, providerReadiness = {}) {
+    getCandidateProviders(preferredProvider, providerReadiness = {}, options = {}) {
         const preferred = this.resolveProvider(preferredProvider);
-        const order = this.providerFailoverEnabled
-            ? [preferred, ...SUPPORTED_SMS_PROVIDERS.filter((item) => item !== preferred)]
+        const requestedFlow = String(options.flow || 'outbound_sms').trim().toLowerCase();
+        const candidatePool = this.providerFailoverEnabled
+            ? SUPPORTED_SMS_PROVIDERS
             : [preferred];
-        const readyProviders = [];
-        const openCircuitProviders = [];
-
-        for (const candidate of order) {
-            if (!providerReadiness[candidate]) continue;
+        const plan = resolveProviderExecutionOrder({
+            channel: 'sms',
+            preferredProvider: preferred,
+            providers: candidatePool,
+            readiness: providerReadiness || {},
+            requestedFlow,
+            failoverEnabled: this.providerFailoverEnabled,
+            isProviderDegraded: (provider) => this.isProviderCircuitOpen(provider),
+        });
+        const providers = [];
+        for (const candidate of plan.attempt_order || []) {
             let adapter;
             try {
                 adapter = this.getAdapter(candidate);
@@ -731,17 +753,12 @@ class EnhancedSmsService extends EventEmitter {
                 continue;
             }
             if (!adapter?.isConfigured?.()) continue;
-            if (this.isProviderCircuitOpen(candidate)) {
-                openCircuitProviders.push(candidate);
-                continue;
-            }
-            readyProviders.push(candidate);
+            providers.push(candidate);
         }
-
-        if (readyProviders.length > 0) {
-            return readyProviders;
-        }
-        return openCircuitProviders;
+        return {
+            providers,
+            plan,
+        };
     }
 
     normalizeDeliveryStatus(status) {
@@ -847,6 +864,7 @@ class EnhancedSmsService extends EventEmitter {
             providerTimeoutMs = this.defaultProviderTimeoutMs,
             userChatId = null,
             provider = null,
+            flow = 'outbound_sms',
         } = options;
 
         if (!normalizedTo) {
@@ -873,7 +891,12 @@ class EnhancedSmsService extends EventEmitter {
         const segmentInfo = getSmsSegmentInfo(body);
         const preferredProvider = this.resolveProvider(provider);
         const providerReadiness = this.getProviderReadiness();
-        const candidateProviders = this.getCandidateProviders(preferredProvider, providerReadiness);
+        const providerSelection = this.getCandidateProviders(
+            preferredProvider,
+            providerReadiness,
+            { flow },
+        );
+        const candidateProviders = providerSelection.providers || [];
         if (!candidateProviders.length) {
             throw createSmsProviderError(preferredProvider, {
                 message: `No configured SMS providers are currently available`,
@@ -881,6 +904,14 @@ class EnhancedSmsService extends EventEmitter {
                 retryable: true,
             });
         }
+        this.logger?.info?.('sms_provider_selection', {
+            flow,
+            preferred_provider: preferredProvider,
+            selected_provider: candidateProviders[0] || null,
+            attempt_order: candidateProviders,
+            blocked_providers: providerSelection?.plan?.blocked_providers || [],
+            degraded_providers: providerSelection?.plan?.degraded_providers || [],
+        });
 
         const defaultScheduleProvider = candidateProviders[0] || preferredProvider;
         const defaultAdapter = this.getAdapter(defaultScheduleProvider);
@@ -911,6 +942,7 @@ class EnhancedSmsService extends EventEmitter {
                     minIntervalMs,
                     mediaUrl,
                     provider: defaultScheduleProvider,
+                    flow,
                 },
             });
             return { success: true, scheduled: true, scheduled_time: scheduledTime.toISOString(), segment_info: segmentInfo };
@@ -931,6 +963,7 @@ class EnhancedSmsService extends EventEmitter {
                     minIntervalMs: 0,
                     mediaUrl,
                     provider: defaultScheduleProvider,
+                    flow,
                 },
             });
             return { success: true, scheduled: true, scheduled_time: scheduledTime.toISOString(), segment_info: segmentInfo };
@@ -1009,8 +1042,12 @@ class EnhancedSmsService extends EventEmitter {
                 from: fromNumber,
                 to: normalizedTo,
                 statusCallback:
-                    currentProvider === 'twilio' && config.server.hostname
-                        ? `https://${config.server.hostname}/webhook/sms-status`
+                    config.server.hostname
+                        ? currentProvider === 'twilio'
+                            ? `https://${config.server.hostname}/webhook/sms-status`
+                            : currentProvider === 'vonage'
+                                ? `https://${config.server.hostname}/vd`
+                                : undefined
                         : undefined,
                 idempotencyKey: idempotencyKey || undefined,
             };
@@ -1120,6 +1157,7 @@ class EnhancedSmsService extends EventEmitter {
                 from_provider: currentProvider,
                 to_provider: candidateProviders[providerIndex + 1],
                 to: redactPhoneForLog(normalizedTo),
+                flow,
                 reason: sanitizeErrorMessage(lastError?.message || 'provider_unavailable'),
             });
         }
@@ -1832,4 +1870,13 @@ class EnhancedSmsService extends EventEmitter {
     }
 }
 
-module.exports = { EnhancedSmsService };
+module.exports = {
+    EnhancedSmsService,
+    __testables: {
+        TwilioSmsAdapter,
+        VonageSmsAdapter,
+        AwsPinpointSmsAdapter,
+        getSmsSegmentInfo,
+        createSmsProviderError,
+    },
+};

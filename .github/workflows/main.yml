@@ -41,6 +41,7 @@ jobs:
             # Deploy API
             cd api
             npm install
+            npm run parity:providers
             pm2 startOrRestart ecosystem.config.js --env production
 
             # Deploy Bot
