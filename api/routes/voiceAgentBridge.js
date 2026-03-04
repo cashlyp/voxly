@@ -197,7 +197,7 @@ function buildManagedVoiceAgentSettings(options = {}) {
 
   const greeting = normalizeText(options?.greeting);
   if (greeting) {
-    settings.greeting = greeting;
+    settings.agent.greeting = greeting;
   }
 
   return settings;

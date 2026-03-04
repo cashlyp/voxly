@@ -105,6 +105,7 @@ describe("VoiceAgentBridge smoke", () => {
     expect(payload.agent.think.endpoint).toBeUndefined();
     expect(payload.agent.language).toBe("en");
     expect(typeof payload.agent.language).toBe("string");
+    expect(payload.agent.greeting).toBeUndefined();
 
     connection.emit(sdk.AgentEvents.SettingsApplied, { ok: true });
     await expect(promise).resolves.toBeUndefined();
@@ -185,6 +186,22 @@ describe("VoiceAgentBridge smoke", () => {
     });
     expect(payload.agent.language).toBe("en");
     expect(typeof payload.agent.language).toBe("string");
+  });
+
+  test("maps greeting into agent.greeting (not top-level)", () => {
+    const payload = buildManagedVoiceAgentSettings({
+      greeting: "Hello there",
+      agent: {
+        think: {
+          provider: {
+            type: "open_ai",
+            model: "gpt-4o-mini",
+          },
+        },
+      },
+    });
+    expect(payload.agent.greeting).toBe("Hello there");
+    expect(payload.greeting).toBeUndefined();
   });
 
   test("emits audio base64 and function call request events", async () => {
