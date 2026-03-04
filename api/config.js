@@ -541,9 +541,17 @@ const emailSpfEnabled =
   String(readEnv("EMAIL_SPF_ENABLED") || "true").toLowerCase() === "true";
 const emailDmarcPolicy = readEnv("EMAIL_DMARC_POLICY") || "none";
 const emailWebhookSecret = readEnv("EMAIL_WEBHOOK_SECRET") || "";
-const emailWebhookValidation = (
-  readEnv("EMAIL_WEBHOOK_VALIDATION") || "warn"
+const emailWebhookValidationRaw = (
+  readEnv("EMAIL_WEBHOOK_VALIDATION") || (isProduction ? "strict" : "warn")
 ).toLowerCase();
+const emailWebhookValidationModes = new Set(["strict", "warn", "off"]);
+const emailWebhookValidation = emailWebhookValidationModes.has(
+  emailWebhookValidationRaw,
+)
+  ? emailWebhookValidationRaw
+  : isProduction
+    ? "strict"
+    : "warn";
 const emailUnsubscribeSecret = readEnv("EMAIL_UNSUBSCRIBE_SECRET") || "";
 const sendgridApiKey = readEnv("SENDGRID_API_KEY");
 const sendgridBaseUrl = readEnv("SENDGRID_BASE_URL");
@@ -736,6 +744,10 @@ module.exports = {
     port: Number(ensure("PORT", "3000")),
     hostname: serverHostname,
     corsOrigins,
+    requestTimeoutMs: Number(readEnv("SERVER_REQUEST_TIMEOUT_MS") || "120000"),
+    headersTimeoutMs: Number(readEnv("SERVER_HEADERS_TIMEOUT_MS") || "65000"),
+    keepAliveTimeoutMs: Number(readEnv("SERVER_KEEPALIVE_TIMEOUT_MS") || "5000"),
+    maxRequestsPerSocket: Number(readEnv("SERVER_MAX_REQUESTS_PER_SOCKET") || "0"),
     rateLimit: {
       windowMs: Number(ensure("RATE_LIMIT_WINDOW_MS", "60000")),
       max: Number(ensure("RATE_LIMIT_MAX", "300")),

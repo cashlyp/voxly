@@ -20,9 +20,9 @@ const { recordingService } = require("./routes/recording");
 const { EnhancedSmsService } = require("./routes/sms.js");
 const { EmailService } = require("./routes/email");
 const { createTwilioGatherHandler } = require("./routes/gather");
-const { registerCallRoutes } = require("./controllers/callRoutes");
-const { registerStatusRoutes } = require("./controllers/statusRoutes");
-const { registerWebhookRoutes } = require("./controllers/webhookRoutes");
+const { registerCallRoutes } = require("./services/callRoutes");
+const { registerStatusRoutes } = require("./services/statusRoutes");
+const { registerWebhookRoutes } = require("./services/webhookRoutes");
 const Database = require("./db/db");
 const { webhookService } = require("./routes/status");
 const twilioSignature = require("./middleware/twilioSignature");
@@ -2051,7 +2051,10 @@ async function shouldProcessProviderEventAsync(
     return reserved?.reserved !== false;
   } catch (error) {
     console.error("Provider event idempotency persistence failed:", error);
-    return true;
+    const dedupeError = new Error("provider_event_idempotency_unavailable");
+    dedupeError.code = "provider_event_idempotency_unavailable";
+    dedupeError.cause = error;
+    throw dedupeError;
   }
 }
 
@@ -5098,6 +5101,7 @@ app.use(
     crossOriginEmbedderPolicy: false,
   }),
 );
+app.disable("x-powered-by");
 app.use(
   cors({
     origin: (origin, callback) => {
@@ -6871,7 +6875,7 @@ function requireAdminToken(req, res, next) {
       .json({ success: false, error: "Admin token not configured" });
   }
   const provided = req.headers[ADMIN_HEADER_NAME];
-  if (!provided || provided !== token) {
+  if (!safeCompareSecret(provided, token)) {
     return res
       .status(403)
       .json({ success: false, error: "Admin token required" });
@@ -6883,7 +6887,7 @@ function hasAdminToken(req) {
   const token = config.admin?.apiToken;
   if (!token) return false;
   const provided = req.headers[ADMIN_HEADER_NAME];
-  return Boolean(provided && provided === token);
+  return safeCompareSecret(provided, token);
 }
 
 function requireOutboundAuthorization(req, res, next) {
@@ -7666,6 +7670,17 @@ function warnIfMachineDetectionDisabled(context = "") {
   warnedMachineDetection = true;
 }
 
+function assertEmailWebhookAuthConfiguration() {
+  const mode = String(config.email?.webhookValidation || "warn").toLowerCase();
+  if (mode !== "strict") return;
+  const hasEmailSecret = Boolean(String(config.email?.webhookSecret || "").trim());
+  const hasHmacSecret = Boolean(String(config.apiAuth?.hmacSecret || "").trim());
+  if (hasEmailSecret || hasHmacSecret) return;
+  throw new Error(
+    "EMAIL_WEBHOOK_VALIDATION is strict but no email webhook auth secret is configured. Set EMAIL_WEBHOOK_SECRET or API_SECRET/API_HMAC_SECRET.",
+  );
+}
+
 function getAwsConnectAdapter() {
   if (!awsConnectAdapter) {
     awsConnectAdapter = new AwsConnectAdapter(config.aws);
@@ -8369,6 +8384,7 @@ async function startServer(options = {}) {
   try {
     console.log("🚀 Initializing Adaptive AI Call System...");
     warnIfMachineDetectionDisabled("startup");
+    assertEmailWebhookAuthConfiguration();
 
     // Initialize database first
     console.log("Initializing enhanced database...");
@@ -8482,6 +8498,47 @@ async function startServer(options = {}) {
         console.log(
           `📞 Twilio Media Stream track mode: ${TWILIO_STREAM_TRACK}`,
         );
+      });
+      const configuredRequestTimeoutMs = Number(config.server?.requestTimeoutMs);
+      if (
+        Number.isFinite(configuredRequestTimeoutMs) &&
+        configuredRequestTimeoutMs > 0
+      ) {
+        server.requestTimeout = configuredRequestTimeoutMs;
+      }
+      const configuredKeepAliveTimeoutMs = Number(config.server?.keepAliveTimeoutMs);
+      if (
+        Number.isFinite(configuredKeepAliveTimeoutMs) &&
+        configuredKeepAliveTimeoutMs > 0
+      ) {
+        server.keepAliveTimeout = configuredKeepAliveTimeoutMs;
+      }
+      const configuredHeadersTimeoutMs = Number(config.server?.headersTimeoutMs);
+      if (
+        Number.isFinite(configuredHeadersTimeoutMs) &&
+        configuredHeadersTimeoutMs > 0
+      ) {
+        // Node requires headers timeout to be larger than keep-alive timeout.
+        const minHeadersTimeout = (server.keepAliveTimeout || 0) + 1000;
+        server.headersTimeout = Math.max(
+          configuredHeadersTimeoutMs,
+          minHeadersTimeout,
+        );
+      }
+      const configuredMaxRequestsPerSocket = Number(
+        config.server?.maxRequestsPerSocket,
+      );
+      if (
+        Number.isFinite(configuredMaxRequestsPerSocket) &&
+        configuredMaxRequestsPerSocket >= 0
+      ) {
+        server.maxRequestsPerSocket = Math.floor(configuredMaxRequestsPerSocket);
+      }
+      console.log("HTTP timeout profile", {
+        request_timeout_ms: server.requestTimeout,
+        headers_timeout_ms: server.headersTimeout,
+        keep_alive_timeout_ms: server.keepAliveTimeout,
+        max_requests_per_socket: server.maxRequestsPerSocket,
       });
       server.on("error", (error) => {
         console.error("❌ API listen error:", error);

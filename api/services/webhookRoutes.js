@@ -18,17 +18,68 @@ async function dedupeProviderEvent(asyncFn, syncFn, source, payload, options = {
     : typeof syncFn === "function"
       ? syncFn
       : null;
-  if (!fn) return true;
+  if (!fn) {
+    return { allow: true };
+  }
   try {
     const result = await fn(source, payload, options);
-    return result !== false;
+    if (result === false) {
+      return { allow: false, duplicate: true };
+    }
+    if (result && typeof result === "object" && Object.hasOwn(result, "allow")) {
+      return result;
+    }
+    return { allow: true };
   } catch (error) {
+    const errorCode = error?.code || "provider_event_dedupe_error";
+    const retryable = errorCode === "provider_event_idempotency_unavailable";
     console.error("provider_event_dedupe_error", {
       source: source || null,
+      code: errorCode,
+      retryable,
       error: error?.message || String(error || "unknown"),
     });
+    return {
+      allow: false,
+      duplicate: false,
+      retryable,
+      reason: errorCode,
+    };
+  }
+}
+
+function shouldShortCircuitProviderDedupe(res, decision = {}) {
+  if (decision?.allow !== false) return false;
+  if (decision?.retryable) {
+    res.status(503).send("Service unavailable");
     return true;
   }
+  res.status(200).send("OK");
+  return true;
+}
+
+function shouldSkipProviderDedupeDecision(decision = {}) {
+  return decision?.allow === false && !decision?.retryable;
+}
+
+function shouldFailProviderDedupeDecision(decision = {}) {
+  return decision?.allow === false && decision?.retryable;
+}
+
+function logProviderDedupeSkip(eventName, req, decision = {}) {
+  if (!shouldSkipProviderDedupeDecision(decision)) return;
+  console.log(eventName, {
+    request_id: req?.requestId || null,
+    reason: decision?.reason || "duplicate",
+  });
+}
+
+function logProviderDedupeFailure(eventName, req, decision = {}) {
+  if (!shouldFailProviderDedupeDecision(decision)) return;
+  console.warn(eventName, {
+    request_id: req?.requestId || null,
+    reason: decision?.reason || "provider_event_dedupe_error",
+  });
 }
 
 function escapeHtml(value = "") {
@@ -996,7 +1047,7 @@ function createSmsWebhookHandler(ctx = {}) {
       }
 
       if (inboundSid) {
-        const allow = await dedupeProviderEvent(
+        const dedupeDecision = await dedupeProviderEvent(
           shouldProcessProviderEventAsync,
           shouldProcessProviderEvent,
           "twilio_sms_inbound",
@@ -1013,8 +1064,10 @@ function createSmsWebhookHandler(ctx = {}) {
                 : undefined,
           },
         );
-        if (!allow) {
-          return res.status(200).send("OK");
+        if (shouldShortCircuitProviderDedupe(res, dedupeDecision)) {
+          logProviderDedupeFailure("sms_webhook_dedupe_unavailable", req, dedupeDecision);
+          logProviderDedupeSkip("sms_webhook_duplicate_ignored", req, dedupeDecision);
+          return;
         }
       }
 
@@ -1103,7 +1156,7 @@ function createVonageSmsWebhookHandler(ctx = {}) {
       }
 
       if (inboundSid) {
-        const allow = await dedupeProviderEvent(
+        const dedupeDecision = await dedupeProviderEvent(
           shouldProcessProviderEventAsync,
           shouldProcessProviderEvent,
           "vonage_sms_inbound",
@@ -1121,8 +1174,14 @@ function createVonageSmsWebhookHandler(ctx = {}) {
                 : undefined,
           },
         );
-        if (!allow) {
-          return res.status(200).send("OK");
+        if (shouldShortCircuitProviderDedupe(res, dedupeDecision)) {
+          logProviderDedupeFailure(
+            "vonage_sms_webhook_dedupe_unavailable",
+            req,
+            dedupeDecision,
+          );
+          logProviderDedupeSkip("vonage_sms_webhook_duplicate_ignored", req, dedupeDecision);
+          return;
         }
       }
 
@@ -1204,7 +1263,7 @@ function createSmsStatusWebhookHandler(ctx = {}) {
         });
         return res.status(200).send("OK");
       }
-      const allow = await dedupeProviderEvent(
+      const dedupeDecision = await dedupeProviderEvent(
         shouldProcessProviderEventAsync,
         shouldProcessProviderEvent,
         "twilio_sms_status",
@@ -1221,8 +1280,10 @@ function createSmsStatusWebhookHandler(ctx = {}) {
               : undefined,
         },
       );
-      if (!allow) {
-        return res.status(200).send("OK");
+      if (shouldShortCircuitProviderDedupe(res, dedupeDecision)) {
+        logProviderDedupeFailure("sms_status_dedupe_unavailable", req, dedupeDecision);
+        logProviderDedupeSkip("sms_status_duplicate_ignored", req, dedupeDecision);
+        return;
       }
 
       console.log(`SMS status update: ${messageSid} -> ${canonicalDelivery.status}`);
@@ -1281,7 +1342,7 @@ function createVonageSmsDeliveryWebhookHandler(ctx = {}) {
         });
         return res.status(200).send("OK");
       }
-      const allow = await dedupeProviderEvent(
+      const dedupeDecision = await dedupeProviderEvent(
         shouldProcessProviderEventAsync,
         shouldProcessProviderEvent,
         "vonage_sms_delivery",
@@ -1301,8 +1362,14 @@ function createVonageSmsDeliveryWebhookHandler(ctx = {}) {
               : undefined,
         },
       );
-      if (!allow) {
-        return res.status(200).send("OK");
+      if (shouldShortCircuitProviderDedupe(res, dedupeDecision)) {
+        logProviderDedupeFailure(
+          "vonage_sms_delivery_dedupe_unavailable",
+          req,
+          dedupeDecision,
+        );
+        logProviderDedupeSkip("vonage_sms_delivery_duplicate_ignored", req, dedupeDecision);
+        return;
       }
 
       console.log("Vonage SMS delivery update", {
@@ -1462,7 +1529,7 @@ function createSmsDeliveryWebhookHandler(ctx = {}) {
         });
         return res.status(200).send("OK");
       }
-      const allow = await dedupeProviderEvent(
+      const dedupeDecision = await dedupeProviderEvent(
         shouldProcessProviderEventAsync,
         shouldProcessProviderEvent,
         "twilio_sms_delivery",
@@ -1479,8 +1546,14 @@ function createSmsDeliveryWebhookHandler(ctx = {}) {
               : undefined,
         },
       );
-      if (!allow) {
-        return res.status(200).send("OK");
+      if (shouldShortCircuitProviderDedupe(res, dedupeDecision)) {
+        logProviderDedupeFailure(
+          "twilio_sms_delivery_dedupe_unavailable",
+          req,
+          dedupeDecision,
+        );
+        logProviderDedupeSkip("twilio_sms_delivery_duplicate_ignored", req, dedupeDecision);
+        return;
       }
 
       console.log(`📱 SMS Delivery Status: ${messageSid} -> ${MessageStatus}`);
@@ -1573,14 +1646,16 @@ function createAwsStatusWebhookHandler(ctx = {}) {
           req.body?.updatedAt ||
           null,
       };
-      const allow = await dedupeProviderEvent(
+      const dedupeDecision = await dedupeProviderEvent(
         shouldProcessProviderEventAsync,
         shouldProcessProviderEvent,
         "aws_status",
         dedupePayload,
       );
-      if (!allow) {
-        return res.status(200).send("OK");
+      if (shouldShortCircuitProviderDedupe(res, dedupeDecision)) {
+        logProviderDedupeFailure("aws_status_dedupe_unavailable", req, dedupeDecision);
+        logProviderDedupeSkip("aws_status_duplicate_ignored", req, dedupeDecision);
+        return;
       }
 
       const canonicalEvent = buildCanonicalCallStatusEvent(
@@ -1664,14 +1739,16 @@ function createVonageEventWebhookHandler(ctx = {}) {
         dtmf: dtmfDigits || null,
         direction: normalizedPayload?.direction || null,
       };
-      const allow = await dedupeProviderEvent(
+      const dedupeDecision = await dedupeProviderEvent(
         shouldProcessProviderEventAsync,
         shouldProcessProviderEvent,
         "vonage_event",
         dedupePayload,
       );
-      if (!allow) {
-        return res.status(200).send("OK");
+      if (shouldShortCircuitProviderDedupe(res, dedupeDecision)) {
+        logProviderDedupeFailure("vonage_event_dedupe_unavailable", req, dedupeDecision);
+        logProviderDedupeSkip("vonage_event_duplicate_ignored", req, dedupeDecision);
+        return;
       }
       const durationRaw =
         payload.duration ||

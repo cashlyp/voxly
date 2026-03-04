@@ -23,6 +23,7 @@ logs
 **/dist
 **/build
 **/dist-ssr
+/docs/
 
 # Local overrides/secrets
 *.local
