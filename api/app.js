@@ -15,6 +15,7 @@ const { EnhancedGptService } = require("./routes/gpt");
 const { StreamService } = require("./routes/stream");
 const { TranscriptionService } = require("./routes/transcription");
 const { TextToSpeechService } = require("./routes/tts");
+const { VoiceAgentBridge } = require("./routes/voiceAgentBridge");
 const { recordingService } = require("./routes/recording");
 const { EnhancedSmsService } = require("./routes/sms.js");
 const { EmailService } = require("./routes/email");
@@ -67,6 +68,19 @@ const {
 const { v4: uuidv4 } = require("uuid");
 const { WaveFile } = require("wavefile");
 const { runWithTimeout: runOperationWithTimeout } = require("./utils/asyncControl");
+const {
+  VOICE_RUNTIME_CONTROL_SETTING_KEY,
+  clampCanaryPercent: clampVoiceRuntimeCanaryPercent,
+  normalizeVoiceRuntimeMode: normalizeVoiceRuntimeModeShared,
+  normalizeVoiceAgentAutoCanaryConfig,
+  sanitizePersistedVoiceRuntimeControls,
+  buildPersistedVoiceRuntimeControlsPayload,
+  shouldFallbackVoiceAgentOnDtmf,
+  pruneVoiceAgentAutoCanaryEvents,
+  summarizeVoiceAgentAutoCanaryEvents,
+  evaluateVoiceAgentAutoCanaryDecision,
+  applyVoiceRuntimeControlMutation,
+} = require("./services/voiceRuntimeControl");
 
 const isProduction = process.env.NODE_ENV === "production";
 const appVersion = (() => {
@@ -174,6 +188,15 @@ const CALL_PROVIDER_SETTING_KEY = "call_provider_v1";
 const SMS_PROVIDER_SETTING_KEY = "sms_provider_v1";
 const EMAIL_PROVIDER_SETTING_KEY = "email_provider_v1";
 const PAYMENT_FEATURE_SETTING_KEY = "payment_feature_config_v1";
+const voiceAgentCircuitEvents = []; // { kind, callSid, at, reason }
+const voiceAgentRuntimeEvents = []; // { kind, callSid, at, reason }
+let voiceAgentForcedLegacyUntilMs = 0;
+let voiceRuntimeModeOverride = null;
+let voiceRuntimeCanaryPercentOverride = null;
+let voiceRuntimeCanaryPercentOverrideSource = null;
+let voiceRuntimeOverrideUpdatedAtMs = 0;
+let voiceAgentAutoCanaryCooldownUntilMs = 0;
+let voiceAgentAutoCanaryLastEvalAtMs = 0;
 
 const defaultPaymentFeatureConfig = Object.freeze({
   enabled: config.payment?.enabled !== false,
@@ -258,6 +281,495 @@ function normalizeBooleanFlag(value, fallback = false) {
   if (value === true || value === 1) return true;
   const normalized = String(value).trim().toLowerCase();
   return ["1", "true", "yes", "on"].includes(normalized);
+}
+
+function clampCanaryPercent(value, fallback = 0) {
+  return clampVoiceRuntimeCanaryPercent(value, fallback);
+}
+
+function getVoiceAgentCircuitConfig() {
+  const cfg = config.deepgram?.voiceAgent?.circuitBreaker || {};
+  return {
+    enabled: cfg.enabled !== false,
+    failureThreshold: Math.max(1, Number(cfg.failureThreshold) || 3),
+    windowMs: Math.max(1000, Number(cfg.windowMs) || 120000),
+    cooldownMs: Math.max(5000, Number(cfg.cooldownMs) || 180000),
+  };
+}
+
+function isVoiceAgentCircuitOpen(nowMs = Date.now()) {
+  return Number(voiceAgentForcedLegacyUntilMs || 0) > Number(nowMs || Date.now());
+}
+
+function pruneVoiceAgentCircuitEvents(nowMs = Date.now()) {
+  const cfg = getVoiceAgentCircuitConfig();
+  const keepAfter = Number(nowMs || Date.now()) - cfg.windowMs;
+  while (voiceAgentCircuitEvents.length > 0 && voiceAgentCircuitEvents[0].at < keepAfter) {
+    voiceAgentCircuitEvents.shift();
+  }
+  return voiceAgentCircuitEvents.length;
+}
+
+function recordVoiceAgentCircuitEvent(kind, callSid, reason = "unknown") {
+  const cfg = getVoiceAgentCircuitConfig();
+  if (!cfg.enabled) return;
+  const now = Date.now();
+  voiceAgentCircuitEvents.push({
+    kind: String(kind || "runtime_error"),
+    callSid: String(callSid || "unknown"),
+    reason: String(reason || "unknown"),
+    at: now,
+  });
+  const recentFailures = pruneVoiceAgentCircuitEvents(now);
+  if (recentFailures < cfg.failureThreshold) return;
+  const nextUntil = now + cfg.cooldownMs;
+  if (nextUntil <= voiceAgentForcedLegacyUntilMs) return;
+  voiceAgentForcedLegacyUntilMs = nextUntil;
+  const payload = {
+    type: "voice_agent_circuit_opened",
+    timestamp: new Date(now).toISOString(),
+    recent_failures: recentFailures,
+    failure_threshold: cfg.failureThreshold,
+    window_ms: cfg.windowMs,
+    cooldown_ms: cfg.cooldownMs,
+    forced_legacy_until: new Date(voiceAgentForcedLegacyUntilMs).toISOString(),
+  };
+  console.warn(JSON.stringify(payload));
+  db?.logServiceHealth?.("voice_agent_runtime", "circuit_opened", payload).catch(
+    () => {},
+  );
+  persistVoiceRuntimeControlSettings("circuit_opened").catch(() => {});
+}
+
+function normalizeVoiceRuntimeMode(value) {
+  return normalizeVoiceRuntimeModeShared(value);
+}
+
+function getEffectiveVoiceAgentRuntimeConfig() {
+  const runtimeConfig = config.deepgram?.voiceAgent || {};
+  const effective = { ...runtimeConfig };
+  if (voiceRuntimeModeOverride) {
+    effective.mode = voiceRuntimeModeOverride;
+  }
+  if (Number.isFinite(voiceRuntimeCanaryPercentOverride)) {
+    effective.canaryPercent = clampCanaryPercent(voiceRuntimeCanaryPercentOverride, 0);
+  }
+  return effective;
+}
+
+function getVoiceAgentCircuitStatus() {
+  const now = Date.now();
+  const cfg = getVoiceAgentCircuitConfig();
+  const recentFailures = pruneVoiceAgentCircuitEvents(now);
+  const activeUntil = Number(voiceAgentForcedLegacyUntilMs || 0);
+  return {
+    enabled: cfg.enabled,
+    is_open: activeUntil > now,
+    forced_legacy_until_ms: activeUntil || null,
+    forced_legacy_until:
+      activeUntil > 0 ? new Date(activeUntil).toISOString() : null,
+    recent_failures: recentFailures,
+    failure_threshold: cfg.failureThreshold,
+    window_ms: cfg.windowMs,
+    cooldown_ms: cfg.cooldownMs,
+  };
+}
+
+function getVoiceAgentAutoCanaryConfig() {
+  return normalizeVoiceAgentAutoCanaryConfig(
+    config.deepgram?.voiceAgent?.autoCanary || {},
+  );
+}
+
+function pruneVoiceAgentRuntimeEvents(nowMs = Date.now()) {
+  const circuitCfg = getVoiceAgentCircuitConfig();
+  const autoCfg = getVoiceAgentAutoCanaryConfig();
+  const keepWindowMs = Math.max(circuitCfg.windowMs, autoCfg.windowMs);
+  return pruneVoiceAgentAutoCanaryEvents(
+    voiceAgentRuntimeEvents,
+    keepWindowMs,
+    Number(nowMs || Date.now()),
+    4000,
+  );
+}
+
+function mapVoiceAgentFallbackKind(reason = "") {
+  const normalizedReason = String(reason || "")
+    .trim()
+    .toLowerCase();
+  if (normalizedReason === "voice_agent_dtmf_detected") {
+    return "fallback_dtmf";
+  }
+  if (normalizedReason === "voice_agent_no_audio_timeout") {
+    return "fallback_no_audio";
+  }
+  if (normalizedReason.includes("runtime_error")) {
+    return "fallback_runtime";
+  }
+  return "fallback_other";
+}
+
+function recordVoiceAgentRuntimeEvent(kind, callSid, reason = "unknown") {
+  const now = Date.now();
+  voiceAgentRuntimeEvents.push({
+    kind: String(kind || "unknown"),
+    callSid: String(callSid || "unknown"),
+    reason: String(reason || "unknown"),
+    at: now,
+  });
+  pruneVoiceAgentRuntimeEvents(now);
+}
+
+function getVoiceAgentAutoCanaryStatus() {
+  const cfg = getVoiceAgentAutoCanaryConfig();
+  const now = Date.now();
+  pruneVoiceAgentRuntimeEvents(now);
+  const summary = summarizeVoiceAgentAutoCanaryEvents(
+    voiceAgentRuntimeEvents,
+    cfg.windowMs,
+    now,
+    voiceAgentAutoCanaryLastEvalAtMs,
+  );
+  return {
+    enabled: cfg.enabled === true,
+    interval_ms: cfg.intervalMs,
+    window_ms: cfg.windowMs,
+    cooldown_ms: cfg.cooldownMs,
+    min_samples: cfg.minSamples,
+    min_percent: cfg.minPercent,
+    max_percent: cfg.maxPercent,
+    step_up_percent: cfg.stepUpPercent,
+    step_down_percent: cfg.stepDownPercent,
+    max_error_rate: cfg.maxErrorRate,
+    max_fallback_rate: cfg.maxFallbackRate,
+    fail_closed_on_breach: cfg.failClosedOnBreach !== false,
+    cooldown_until_ms:
+      voiceAgentAutoCanaryCooldownUntilMs > now
+        ? voiceAgentAutoCanaryCooldownUntilMs
+        : 0,
+    cooldown_until:
+      voiceAgentAutoCanaryCooldownUntilMs > now
+        ? new Date(voiceAgentAutoCanaryCooldownUntilMs).toISOString()
+        : null,
+    last_eval_at:
+      voiceAgentAutoCanaryLastEvalAtMs > 0
+        ? new Date(voiceAgentAutoCanaryLastEvalAtMs).toISOString()
+        : null,
+    summary,
+  };
+}
+
+function getVoiceRuntimeAdminStatus() {
+  const runtimeConfig = config.deepgram?.voiceAgent || {};
+  const effectiveRuntimeConfig = getEffectiveVoiceAgentRuntimeConfig();
+  return {
+    enabled: effectiveRuntimeConfig.enabled === true,
+    configured_mode: normalizeVoiceRuntimeMode(runtimeConfig.mode),
+    effective_mode: normalizeVoiceRuntimeMode(effectiveRuntimeConfig.mode),
+    mode_override: voiceRuntimeModeOverride,
+    configured_canary_percent: clampCanaryPercent(runtimeConfig.canaryPercent, 0),
+    effective_canary_percent: clampCanaryPercent(
+      effectiveRuntimeConfig.canaryPercent,
+      0,
+    ),
+    canary_percent_override:
+      Number.isFinite(voiceRuntimeCanaryPercentOverride)
+        ? clampCanaryPercent(voiceRuntimeCanaryPercentOverride, 0)
+        : null,
+    canary_percent_override_source:
+      Number.isFinite(voiceRuntimeCanaryPercentOverride) &&
+      voiceRuntimeCanaryPercentOverrideSource
+        ? voiceRuntimeCanaryPercentOverrideSource
+        : null,
+    canary_seed:
+      String(effectiveRuntimeConfig.canarySeed || "voice_agent").trim() ||
+      "voice_agent",
+    managed_think_only: effectiveRuntimeConfig.managedThinkOnly !== false,
+    override_updated_at:
+      voiceRuntimeOverrideUpdatedAtMs > 0
+        ? new Date(voiceRuntimeOverrideUpdatedAtMs).toISOString()
+        : null,
+    circuit: getVoiceAgentCircuitStatus(),
+    auto_canary: getVoiceAgentAutoCanaryStatus(),
+  };
+}
+
+async function loadVoiceRuntimeControlSettings() {
+  voiceRuntimeModeOverride = null;
+  voiceRuntimeCanaryPercentOverride = null;
+  voiceRuntimeCanaryPercentOverrideSource = null;
+  voiceAgentAutoCanaryCooldownUntilMs = 0;
+  voiceAgentAutoCanaryLastEvalAtMs = 0;
+  voiceAgentForcedLegacyUntilMs = 0;
+  voiceRuntimeOverrideUpdatedAtMs = 0;
+  if (!db?.getSetting) {
+    return getVoiceRuntimeAdminStatus();
+  }
+  try {
+    const raw = await db.getSetting(VOICE_RUNTIME_CONTROL_SETTING_KEY);
+    if (!raw) {
+      return getVoiceRuntimeAdminStatus();
+    }
+    const parsed = JSON.parse(raw);
+    const controls = sanitizePersistedVoiceRuntimeControls(parsed, Date.now());
+    voiceRuntimeModeOverride = controls.modeOverride;
+    voiceRuntimeCanaryPercentOverride = controls.canaryPercentOverride;
+    voiceRuntimeCanaryPercentOverrideSource =
+      controls.canaryPercentOverrideSource || null;
+    voiceAgentForcedLegacyUntilMs = controls.forcedLegacyUntilMs;
+    voiceAgentAutoCanaryCooldownUntilMs = controls.autoCanaryCooldownUntilMs;
+    voiceAgentAutoCanaryLastEvalAtMs = controls.autoCanaryLastEvalAtMs;
+    voiceRuntimeOverrideUpdatedAtMs = controls.updatedAt
+      ? new Date(controls.updatedAt).getTime()
+      : 0;
+  } catch (error) {
+    console.error("Failed to load voice runtime control settings:", error);
+  }
+  return getVoiceRuntimeAdminStatus();
+}
+
+async function persistVoiceRuntimeControlSettings(source = "runtime_update") {
+  if (!db?.setSetting) return;
+  try {
+    const payload = buildPersistedVoiceRuntimeControlsPayload(
+      {
+        modeOverride: voiceRuntimeModeOverride,
+        canaryPercentOverride: voiceRuntimeCanaryPercentOverride,
+        canaryPercentOverrideSource: voiceRuntimeCanaryPercentOverrideSource,
+        forcedLegacyUntilMs: voiceAgentForcedLegacyUntilMs,
+        autoCanaryCooldownUntilMs: voiceAgentAutoCanaryCooldownUntilMs,
+        autoCanaryLastEvalAtMs: voiceAgentAutoCanaryLastEvalAtMs,
+      },
+      Date.now(),
+    );
+    payload.source = String(source || "runtime_update");
+    await db.setSetting(
+      VOICE_RUNTIME_CONTROL_SETTING_KEY,
+      JSON.stringify(payload),
+    );
+  } catch (error) {
+    console.error("Failed to persist voice runtime control settings:", error);
+  }
+}
+
+async function evaluateVoiceAgentAutoCanary(options = {}) {
+  const now = Date.now();
+  const runtimeCfg = config.deepgram?.voiceAgent || {};
+  const autoCfg = getVoiceAgentAutoCanaryConfig();
+  if (!autoCfg.enabled) {
+    voiceAgentAutoCanaryLastEvalAtMs = now;
+    return { applied: false, reason: "disabled" };
+  }
+
+  pruneVoiceAgentRuntimeEvents(now);
+  const summary = summarizeVoiceAgentAutoCanaryEvents(
+    voiceAgentRuntimeEvents,
+    autoCfg.windowMs,
+    now,
+    voiceAgentAutoCanaryLastEvalAtMs,
+  );
+  const effectiveMode = normalizeVoiceRuntimeMode(
+    voiceRuntimeModeOverride || runtimeCfg.mode,
+  );
+  const manualCanaryOverrideActive =
+    Number.isFinite(voiceRuntimeCanaryPercentOverride) &&
+    voiceRuntimeCanaryPercentOverrideSource !== "auto_canary";
+  const currentCanaryPercent = Number.isFinite(voiceRuntimeCanaryPercentOverride)
+    ? clampCanaryPercent(voiceRuntimeCanaryPercentOverride, 0)
+    : clampCanaryPercent(runtimeCfg.canaryPercent, 0);
+  const decision = evaluateVoiceAgentAutoCanaryDecision({
+    config: autoCfg,
+    mode: effectiveMode,
+    manualCanaryOverride: manualCanaryOverrideActive,
+    currentCanaryPercent,
+    configuredCanaryPercent: clampCanaryPercent(runtimeCfg.canaryPercent, 0),
+    summary,
+    circuitOpen: isVoiceAgentCircuitOpen(now),
+    cooldownUntilMs: voiceAgentAutoCanaryCooldownUntilMs,
+    nowMs: now,
+  });
+  voiceAgentAutoCanaryLastEvalAtMs = now;
+
+  if (decision.action !== "set_canary") {
+    if (decision.reason === "manual_override_active") {
+      // Keep auto-controller from overriding explicit admin canary selections.
+      voiceAgentAutoCanaryCooldownUntilMs = Math.max(
+        voiceAgentAutoCanaryCooldownUntilMs,
+        now + autoCfg.cooldownMs,
+      );
+    }
+    return { applied: false, ...decision };
+  }
+
+  const nextCanaryPercent = clampCanaryPercent(decision.nextCanaryPercent, 0);
+  const nextCooldownUntilMs = Number.isFinite(Number(decision.nextCooldownUntilMs))
+    ? Math.max(0, Math.floor(Number(decision.nextCooldownUntilMs)))
+    : 0;
+  const changedCanary =
+    !Number.isFinite(voiceRuntimeCanaryPercentOverride) ||
+    clampCanaryPercent(voiceRuntimeCanaryPercentOverride, 0) !== nextCanaryPercent ||
+    voiceRuntimeCanaryPercentOverrideSource !== "auto_canary";
+  const changedCooldown =
+    nextCooldownUntilMs > 0 && nextCooldownUntilMs !== voiceAgentAutoCanaryCooldownUntilMs;
+  if (!changedCanary && !changedCooldown) {
+    return { applied: false, ...decision };
+  }
+
+  voiceRuntimeCanaryPercentOverride = nextCanaryPercent;
+  voiceRuntimeCanaryPercentOverrideSource = "auto_canary";
+  voiceRuntimeOverrideUpdatedAtMs = now;
+  if (nextCooldownUntilMs > 0) {
+    voiceAgentAutoCanaryCooldownUntilMs = nextCooldownUntilMs;
+  }
+
+  const payload = {
+    type: "voice_agent_auto_canary_update",
+    reason: decision.reason,
+    source: String(options.source || "interval"),
+    now: new Date(now).toISOString(),
+    current_canary_percent: currentCanaryPercent,
+    next_canary_percent: nextCanaryPercent,
+    configured_canary_percent: clampCanaryPercent(runtimeCfg.canaryPercent, 0),
+    cooldown_until:
+      voiceAgentAutoCanaryCooldownUntilMs > 0
+        ? new Date(voiceAgentAutoCanaryCooldownUntilMs).toISOString()
+        : null,
+    summary,
+  };
+  console.warn(JSON.stringify(payload));
+  db?.logServiceHealth?.("voice_agent_runtime", "auto_canary_update", payload).catch(
+    () => {},
+  );
+  await persistVoiceRuntimeControlSettings(
+    `auto_canary_${String(decision.reason || "update")}`,
+  );
+  return { applied: true, ...decision, summary };
+}
+
+function stableVoiceRuntimeBucket(callSid, seed = "voice_agent") {
+  const raw = `${String(seed || "voice_agent")}::${String(callSid || "unknown")}`;
+  const hash = crypto.createHash("sha1").update(raw).digest("hex").slice(0, 8);
+  const parsed = Number.parseInt(hash, 16);
+  if (!Number.isFinite(parsed)) return 0;
+  return parsed % 100;
+}
+
+function buildVoiceAgentFunctionDefinitions(functionSystem) {
+  const toolDefs = Array.isArray(functionSystem?.tools) ? functionSystem.tools : [];
+  return toolDefs
+    .map((tool) => (tool && typeof tool === "object" ? tool.function || tool : null))
+    .filter(Boolean)
+    .map((fn) => {
+      const name = String(fn.name || "").trim();
+      if (!name) return null;
+      return {
+        name,
+        description: String(fn.description || "").trim() || undefined,
+        parameters:
+          fn.parameters && typeof fn.parameters === "object"
+            ? fn.parameters
+            : { type: "object", properties: {}, required: [] },
+      };
+    })
+    .filter(Boolean);
+}
+
+function extractVoiceAgentFunctionRequests(payload) {
+  if (Array.isArray(payload?.functions) && payload.functions.length > 0) {
+    return payload.functions;
+  }
+  if (payload && typeof payload === "object") {
+    const name = String(payload.name || payload.function_name || "").trim();
+    if (!name) return [];
+    return [
+      {
+        id:
+          payload.id ||
+          payload.function_id ||
+          payload.call_id ||
+          `${name}:${Date.now()}`,
+        name,
+        arguments:
+          payload.arguments !== undefined
+            ? payload.arguments
+            : payload.input !== undefined
+              ? payload.input
+              : payload.params !== undefined
+                ? payload.params
+                : "{}",
+      },
+    ];
+  }
+  return [];
+}
+
+function selectTwilioVoiceRuntime(callSid, callConfig) {
+  const runtimeConfig = getEffectiveVoiceAgentRuntimeConfig();
+  const mode = normalizeVoiceRuntimeMode(runtimeConfig.mode);
+  const enabled = runtimeConfig.enabled === true;
+  if (!enabled || mode === "legacy") {
+    return {
+      mode: "legacy",
+      useVoiceAgent: false,
+      reason: enabled ? "mode_legacy" : "voice_agent_disabled",
+    };
+  }
+
+  if (isVoiceAgentCircuitOpen()) {
+    return {
+      mode: "legacy",
+      useVoiceAgent: false,
+      reason: "voice_agent_circuit_open",
+      forcedLegacyUntilMs: voiceAgentForcedLegacyUntilMs,
+    };
+  }
+
+  const provider = String(callConfig?.provider || "twilio")
+    .trim()
+    .toLowerCase();
+  if (provider !== "twilio") {
+    return {
+      mode: "legacy",
+      useVoiceAgent: false,
+      reason: "provider_not_supported",
+    };
+  }
+
+  const captureActive = isCaptureActiveConfig(callConfig);
+  if (captureActive || digitService?.hasPlan?.(callSid) || digitService?.hasExpectation?.(callSid)) {
+    return {
+      mode: "legacy",
+      useVoiceAgent: false,
+      reason: "digit_capture_active",
+    };
+  }
+
+  if (mode === "voice_agent") {
+    return {
+      mode: "voice_agent",
+      useVoiceAgent: true,
+      reason: "forced_voice_agent_mode",
+    };
+  }
+
+  const canaryPercent = clampCanaryPercent(runtimeConfig.canaryPercent, 0);
+  if (canaryPercent <= 0) {
+    return {
+      mode: "legacy",
+      useVoiceAgent: false,
+      reason: "canary_zero",
+    };
+  }
+
+  const bucket = stableVoiceRuntimeBucket(callSid, runtimeConfig.canarySeed);
+  const selected = bucket < canaryPercent;
+  return {
+    mode: selected ? "voice_agent" : "legacy",
+    useVoiceAgent: selected,
+    reason: selected ? "canary_selected" : "canary_skipped",
+    canaryBucket: bucket,
+    canaryPercent,
+  };
 }
 
 function sanitizePaymentFeatureConfig(raw = {}, previous = {}) {
@@ -7300,6 +7812,22 @@ function startBackgroundWorkers() {
     },
     60 * 60 * 1000,
   );
+
+  const autoCanaryConfig = getVoiceAgentAutoCanaryConfig();
+  if (autoCanaryConfig.enabled) {
+    setInterval(() => {
+      evaluateVoiceAgentAutoCanary({
+        source: "background_interval",
+      }).catch((error) => {
+        console.error("❌ Voice auto-canary worker error:", error);
+      });
+    }, autoCanaryConfig.intervalMs);
+    evaluateVoiceAgentAutoCanary({
+      source: "background_startup",
+    }).catch((error) => {
+      console.error("❌ Voice auto-canary startup run failed:", error);
+    });
+  }
 }
 
 async function speakAndEndCall(callSid, message, reason = "completed") {
@@ -7774,6 +8302,7 @@ async function startServer(options = {}) {
     await loadStoredSmsProvider();
     await loadStoredEmailProvider();
     await loadPaymentFeatureConfig();
+    await loadVoiceRuntimeControlSettings();
     await refreshInboundDefaultScript(true);
     await loadKeypadProviderOverrides();
     logStartupRuntimeProfile();
@@ -7787,7 +8316,10 @@ async function startServer(options = {}) {
     console.log(
       `📧 Default email provider: ${String(storedEmailProvider || currentEmailProvider || "sendgrid").toUpperCase()} (active: ${String(currentEmailProvider || "sendgrid").toUpperCase()})`,
     );
-    console.log("🤖 Voice runtime mode: legacy STT+GPT+TTS");
+    const runtimeStatus = getVoiceRuntimeAdminStatus();
+    console.log(
+      `🤖 Voice runtime mode: ${runtimeStatus.effective_mode} (configured=${runtimeStatus.configured_mode}, canary=${runtimeStatus.effective_canary_percent}%)`,
+    );
 
     // Start webhook service after database is ready
     console.log("Starting enhanced webhook service...");
@@ -7865,6 +8397,7 @@ function logStartupRuntimeProfile() {
   ).toLowerCase();
   const envEmailProvider = String(config.email?.provider || "sendgrid").toLowerCase();
 
+  const runtimeStatus = getVoiceRuntimeAdminStatus();
   const payload = {
     type: "startup_runtime_profile",
     timestamp: new Date().toISOString(),
@@ -7899,7 +8432,11 @@ function logStartupRuntimeProfile() {
       },
     },
     voice_runtime: {
-      mode: "legacy_stt_gpt_tts",
+      mode: runtimeStatus.effective_mode,
+      configured_mode: runtimeStatus.configured_mode,
+      canary_percent: runtimeStatus.effective_canary_percent,
+      canary_override_source: runtimeStatus.canary_percent_override_source,
+      managed_think_only: runtimeStatus.managed_think_only,
     },
   };
 
@@ -7950,7 +8487,7 @@ app.ws("/connection", (ws, req) => {
   const ua = req?.headers?.["user-agent"] || "unknown-ua";
   const host = req?.headers?.host || "unknown-host";
   console.log(`New WebSocket connection established (host=${host}, ua=${ua})`);
-  console.log("Using legacy STT+GPT+TTS pipeline");
+  console.log("Voice runtime selector active (legacy/hybrid/voice_agent)");
 
   try {
     ws.on("error", (error) => {
@@ -7970,6 +8507,13 @@ app.ws("/connection", (ws, req) => {
 
     let gptErrorCount = 0;
     let gptService;
+    let voiceAgentBridge = null;
+    let voiceRuntimeMode = "legacy";
+    let voiceAgentRuntimeErrorCount = 0;
+    let voiceAgentNoAudioTimer = null;
+    let voiceAgentLastAudioAt = 0;
+    let voiceAgentLastUserSpeechAt = 0;
+    let voiceAgentRuntimeFallbackInProgress = false;
     const streamService = new StreamService(ws, {
       audioTickIntervalMs: liveConsoleAudioTickMs,
     });
@@ -7991,6 +8535,75 @@ app.ws("/connection", (ws, req) => {
     let interactionCount = 0;
     let isInitialized = false;
     let streamAuthOk = false;
+    const clearVoiceAgentNoAudioTimer = () => {
+      if (voiceAgentNoAudioTimer) {
+        clearTimeout(voiceAgentNoAudioTimer);
+        voiceAgentNoAudioTimer = null;
+      }
+    };
+    const switchVoiceAgentToLegacy = async (reason = "voice_agent_runtime_fallback") => {
+      if (voiceRuntimeMode !== "voice_agent") return;
+      if (voiceAgentRuntimeFallbackInProgress) return;
+      voiceAgentRuntimeFallbackInProgress = true;
+      clearVoiceAgentNoAudioTimer();
+      try {
+        recordVoiceAgentCircuitEvent("runtime_fallback", callSid, reason);
+        recordVoiceAgentRuntimeEvent(
+          mapVoiceAgentFallbackKind(reason),
+          callSid,
+          reason,
+        );
+        try {
+          voiceAgentBridge?.close();
+        } catch {}
+        voiceAgentBridge = null;
+        voiceRuntimeMode = "legacy";
+        const session = activeCalls.get(callSid);
+        if (session) {
+          session.voiceRuntime = "legacy";
+          session.voiceAgentBridge = null;
+        }
+        await db
+          .updateCallState(callSid, "voice_runtime_fallback", {
+            from: "voice_agent",
+            to: "legacy",
+            reason,
+            at: new Date().toISOString(),
+          })
+          .catch(() => {});
+        webhookService.addLiveEvent(
+          callSid,
+          `⚠️ Voice Agent degraded (${reason}); switched to legacy runtime`,
+          { force: true },
+        );
+      } finally {
+        voiceAgentRuntimeFallbackInProgress = false;
+      }
+    };
+    const scheduleVoiceAgentNoAudioWatchdog = () => {
+      if (voiceRuntimeMode !== "voice_agent") return;
+      const noAudioFallbackMs =
+        Number(config.deepgram?.voiceAgent?.noAudioFallbackMs) || 15000;
+      clearVoiceAgentNoAudioTimer();
+      voiceAgentNoAudioTimer = setTimeout(() => {
+        if (voiceRuntimeMode !== "voice_agent") return;
+        const lastAudio = Number(voiceAgentLastAudioAt || 0);
+        const lastUser = Number(voiceAgentLastUserSpeechAt || 0);
+        const now = Date.now();
+        const silentForAudio = lastAudio > 0 ? now - lastAudio : Number.POSITIVE_INFINITY;
+        const silentForUser = lastUser > 0 ? now - lastUser : Number.POSITIVE_INFINITY;
+        if (silentForAudio < noAudioFallbackMs || silentForUser < noAudioFallbackMs) {
+          return;
+        }
+        void switchVoiceAgentToLegacy("voice_agent_no_audio_timeout");
+      }, noAudioFallbackMs);
+      if (
+        voiceAgentNoAudioTimer &&
+        typeof voiceAgentNoAudioTimer.unref === "function"
+      ) {
+        voiceAgentNoAudioTimer.unref();
+      }
+    };
 
     const handleSttFailure = async (tag, error) => {
       if (!callSid) return;
@@ -8234,6 +8847,358 @@ app.ws("/connection", (ws, req) => {
           if (resolvedVoiceModel) {
             ttsService.voiceModel = resolvedVoiceModel;
           }
+          const intentLine = `Call intent: ${callConfig?.script || "general"} | purpose: ${callConfig?.purpose || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`;
+          const runtimeDecision = selectTwilioVoiceRuntime(callSid, callConfig);
+          voiceRuntimeMode = runtimeDecision.mode;
+
+          if (runtimeDecision.useVoiceAgent) {
+            const voiceAgentConfig = getEffectiveVoiceAgentRuntimeConfig();
+            const voiceAgentFunctions =
+              buildVoiceAgentFunctionDefinitions(functionSystem);
+            const greetingText =
+              callConfig?.initial_prompt_played === true
+                ? ""
+                : String(
+                    callConfig?.first_message || DEFAULT_INBOUND_FIRST_MESSAGE,
+                  );
+            const promptText = [callConfig?.prompt || DEFAULT_INBOUND_PROMPT, intentLine]
+              .filter(Boolean)
+              .join("\n");
+            const toolTimeoutMs =
+              Number(config.openRouter?.toolExecutionTimeoutMs) || 12000;
+
+            try {
+              voiceAgentBridge = new VoiceAgentBridge({
+                apiKey: config.deepgram?.apiKey,
+                logPrefix: `voice-agent:${callSid}`,
+                managedThinkOnly: voiceAgentConfig.managedThinkOnly !== false,
+                openTimeoutMs:
+                  Number(voiceAgentConfig.openTimeoutMs) || 8000,
+                settingsTimeoutMs:
+                  Number(voiceAgentConfig.settingsTimeoutMs) || 8000,
+                keepAliveMs:
+                  Number(voiceAgentConfig.keepAliveMs) || 8000,
+                audio: {
+                  input: {
+                    encoding: "mulaw",
+                    sample_rate: 8000,
+                  },
+                  output: {
+                    encoding: "mulaw",
+                    sample_rate: 8000,
+                    container: "none",
+                  },
+                },
+                greeting: greetingText || undefined,
+                agent: {
+                  language: {
+                    type: voiceAgentConfig.language || "en",
+                  },
+                  listen: {
+                    provider: {
+                      model: voiceAgentConfig.listenModel || "nova-2",
+                    },
+                  },
+                  speak: {
+                    provider: {
+                      model:
+                        voiceAgentConfig.speakModel ||
+                        config.deepgram?.voiceModel ||
+                        "aura-asteria-en",
+                    },
+                  },
+                  think: {
+                    provider: {
+                      type: voiceAgentConfig.thinkProvider || "open_ai",
+                      model: voiceAgentConfig.thinkModel || "gpt-4o-mini",
+                      temperature: Number.isFinite(
+                        Number(voiceAgentConfig.thinkTemperature),
+                      )
+                        ? Number(voiceAgentConfig.thinkTemperature)
+                        : undefined,
+                    },
+                    prompt: promptText,
+                    functions: voiceAgentFunctions,
+                  },
+                },
+              });
+
+              voiceAgentBridge.on("audio", ({ base64, bytes }) => {
+                clearVoiceAgentNoAudioTimer();
+                voiceAgentLastAudioAt = Date.now();
+                const level = estimateAudioLevelFromBase64(base64);
+                webhookService
+                  .setLiveCallPhase(callSid, "agent_speaking", {
+                    level,
+                    logEvent: false,
+                  })
+                  .catch(() => {});
+                scheduleSpeechTicksFromAudio(callSid, "agent_speaking", base64);
+                if (callSid) {
+                  db.updateCallState(callSid, "voice_agent_audio_ready", {
+                    bytes: Number(bytes) || null,
+                    runtime: "voice_agent",
+                  }).catch(() => {});
+                }
+                streamService.buffer(null, base64);
+              });
+
+              voiceAgentBridge.on("conversationText", async ({ role, content }) => {
+                const normalizedRole = String(role || "").toLowerCase();
+                const isUser = normalizedRole === "user";
+                const isAgent =
+                  normalizedRole === "assistant" || normalizedRole === "agent";
+                if (!isUser && !isAgent) {
+                  return;
+                }
+                try {
+                  if (isUser) {
+                    webhookService
+                      .setLiveCallPhase(callSid, "user_speaking")
+                      .catch(() => {});
+                    await db.addTranscript({
+                      call_sid: callSid,
+                      speaker: "user",
+                      message: content,
+                      interaction_count: interactionCount,
+                    });
+                    await db.updateCallState(callSid, "user_spoke", {
+                      message: content,
+                      interaction_count: interactionCount,
+                      runtime: "voice_agent",
+                    });
+                    webhookService.recordTranscriptTurn(callSid, "user", content);
+                    if (
+                      config.deepgram?.voiceAgent?.parityCloseOnGoodbye !== false &&
+                      shouldCloseConversation(content) &&
+                      interactionCount >= 1
+                    ) {
+                      await speakAndEndCall(
+                        callSid,
+                        CALL_END_MESSAGES.user_goodbye,
+                        "user_goodbye",
+                      );
+                      interactionCount += 1;
+                      const goodbyeSession = activeCalls.get(callSid);
+                      if (goodbyeSession) {
+                        goodbyeSession.interactionCount = interactionCount;
+                      }
+                      queuePersistCallRuntimeState(callSid, {
+                        interaction_count: interactionCount,
+                        snapshot: {
+                          source: "voice_agent_user_goodbye",
+                          runtime: "voice_agent",
+                        },
+                      });
+                      return;
+                    }
+                    interactionCount += 1;
+                    const activeSession = activeCalls.get(callSid);
+                    if (activeSession) {
+                      activeSession.interactionCount = interactionCount;
+                    }
+                    queuePersistCallRuntimeState(callSid, {
+                      interaction_count: interactionCount,
+                    });
+                    return;
+                  }
+
+                  webhookService
+                    .setLiveCallPhase(callSid, "agent_responding")
+                    .catch(() => {});
+                  await db.addTranscript({
+                    call_sid: callSid,
+                    speaker: "ai",
+                    message: content,
+                    interaction_count: interactionCount,
+                    personality_used: "voice_agent",
+                  });
+                  await db.updateCallState(callSid, "ai_responded", {
+                    message: content,
+                    interaction_count: interactionCount,
+                    runtime: "voice_agent",
+                  });
+                  webhookService.recordTranscriptTurn(callSid, "agent", content);
+                  scheduleSilenceTimer(callSid);
+                } catch (error) {
+                  console.error("Voice agent transcript persistence error:", error);
+                }
+              });
+
+              voiceAgentBridge.on("userStartedSpeaking", () => {
+                clearSilenceTimer(callSid);
+                voiceAgentLastUserSpeechAt = Date.now();
+                scheduleVoiceAgentNoAudioWatchdog();
+                webhookService
+                  .setLiveCallPhase(callSid, "user_speaking")
+                  .catch(() => {});
+              });
+
+              voiceAgentBridge.on("agentThinking", () => {
+                webhookService
+                  .setLiveCallPhase(callSid, "agent_responding")
+                  .catch(() => {});
+              });
+
+              voiceAgentBridge.on("agentStartedSpeaking", () => {
+                clearSilenceTimer(callSid);
+                webhookService
+                  .setLiveCallPhase(callSid, "agent_speaking")
+                  .catch(() => {});
+              });
+
+              voiceAgentBridge.on("functionCallRequest", async (payload) => {
+                const requests = extractVoiceAgentFunctionRequests(payload);
+                if (!requests.length) return;
+                for (const request of requests) {
+                  const name = String(request?.name || "").trim();
+                  const requestId =
+                    String(request?.id || `${name}:${Date.now()}`).trim();
+                  if (!name || !requestId) continue;
+                  const implementation = functionSystem?.implementations?.[name];
+                  if (typeof implementation !== "function") {
+                    voiceAgentBridge.respondFunctionCall({
+                      id: requestId,
+                      name,
+                      content: JSON.stringify({
+                        ok: false,
+                        error: "function_not_available",
+                      }),
+                    });
+                    continue;
+                  }
+
+                  let parsedArgs = {};
+                  const rawArgs = request?.arguments;
+                  if (typeof rawArgs === "string" && rawArgs.trim().length > 0) {
+                    try {
+                      parsedArgs = JSON.parse(rawArgs);
+                    } catch {
+                      parsedArgs = { raw: rawArgs };
+                    }
+                  } else if (rawArgs && typeof rawArgs === "object") {
+                    parsedArgs = rawArgs;
+                  }
+
+                  try {
+                    const result = await runOperationWithTimeout(
+                      Promise.resolve().then(() => implementation(parsedArgs)),
+                      toolTimeoutMs,
+                      `voice_agent_function_timeout:${name}`,
+                    );
+                    voiceAgentBridge.respondFunctionCall({
+                      id: requestId,
+                      name,
+                      content:
+                        typeof result === "string"
+                          ? result
+                          : JSON.stringify(result ?? { ok: true }),
+                    });
+                  } catch (error) {
+                    voiceAgentBridge.respondFunctionCall({
+                      id: requestId,
+                      name,
+                      content: JSON.stringify({
+                        ok: false,
+                        error: error?.message || "function_execution_failed",
+                      }),
+                    });
+                  }
+                }
+              });
+
+              voiceAgentBridge.on("error", (error) => {
+                console.error("Voice agent runtime error:", error);
+                voiceAgentRuntimeErrorCount += 1;
+                recordVoiceAgentRuntimeEvent(
+                  "runtime_error",
+                  callSid,
+                  error?.message || "runtime_error",
+                );
+                webhookService.addLiveEvent(
+                  callSid,
+                  `⚠️ Voice agent error: ${error?.message || "runtime_error"}`,
+                  { force: true },
+                );
+                const cfg = getVoiceAgentCircuitConfig();
+                if (cfg.enabled) {
+                  recordVoiceAgentCircuitEvent(
+                    "runtime_error",
+                    callSid,
+                    error?.message || "runtime_error",
+                  );
+                  if (voiceAgentRuntimeErrorCount >= cfg.failureThreshold) {
+                    void switchVoiceAgentToLegacy("voice_agent_runtime_error_threshold");
+                  }
+                }
+              });
+
+              await voiceAgentBridge.connect();
+              voiceAgentRuntimeErrorCount = 0;
+              voiceAgentLastAudioAt = 0;
+              voiceAgentLastUserSpeechAt = 0;
+              await db.updateCallState(callSid, "voice_runtime_selected", {
+                mode: "voice_agent",
+                reason: runtimeDecision.reason,
+                canary_bucket: runtimeDecision.canaryBucket ?? null,
+                canary_percent: runtimeDecision.canaryPercent ?? null,
+              });
+              recordVoiceAgentRuntimeEvent(
+                "selected",
+                callSid,
+                runtimeDecision.reason,
+              );
+              if (greetingText && callConfig) {
+                callConfig.initial_prompt_played = true;
+                callConfigurations.set(callSid, callConfig);
+              }
+              webhookService.addLiveEvent(
+                callSid,
+                "🧠 Voice runtime: Deepgram Voice Agent (managed think)",
+                { force: true },
+              );
+              console.log(
+                `Voice runtime selected: deepgram_voice_agent (${runtimeDecision.reason})`,
+              );
+            } catch (voiceAgentError) {
+              console.error("Voice agent setup failed:", voiceAgentError);
+              recordVoiceAgentRuntimeEvent(
+                "settings_failure",
+                callSid,
+                voiceAgentError?.message || "setup_failed",
+              );
+              recordVoiceAgentCircuitEvent(
+                "settings_failure",
+                callSid,
+                voiceAgentError?.message || "setup_failed",
+              );
+              try {
+                voiceAgentBridge?.close();
+              } catch {}
+              voiceAgentBridge = null;
+              const failoverToLegacy = voiceAgentConfig.failoverToLegacy !== false;
+              await db.updateCallState(callSid, "voice_agent_setup_failed", {
+                error: voiceAgentError?.message || "unknown_error",
+                reason: runtimeDecision.reason,
+                failover_to_legacy: failoverToLegacy,
+              });
+              if (!failoverToLegacy) {
+                await speakAndEndCall(
+                  callSid,
+                  CALL_END_MESSAGES.error,
+                  "voice_agent_setup_failed",
+                );
+                isInitialized = true;
+                return;
+              }
+              voiceRuntimeMode = "legacy";
+              webhookService.addLiveEvent(
+                callSid,
+                "⚠️ Voice Agent unavailable, falling back to legacy runtime",
+                { force: true },
+              );
+            }
+          }
 
           if (callConfig && functionSystem) {
             console.log(
@@ -8286,7 +9251,6 @@ app.ws("/connection", (ws, req) => {
             channel: "voice",
             urgency: callConfig?.urgency || "normal",
           });
-          const intentLine = `Call intent: ${callConfig?.script || "general"} | purpose: ${callConfig?.purpose || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`;
           gptService.setCallIntent(intentLine);
           if (callConfig) {
             await applyInitialDigitIntent(
@@ -8419,10 +9383,15 @@ app.ws("/connection", (ws, req) => {
             personalityChanges: [],
             ttsService,
             interactionCount,
+            voiceRuntime: voiceRuntimeMode,
+            voiceAgentBridge: voiceRuntimeMode === "voice_agent" ? voiceAgentBridge : null,
           });
           queuePersistCallRuntimeState(callSid, {
             interaction_count: interactionCount,
-            snapshot: { source: "twilio_stream_start" },
+            snapshot: {
+              source: "twilio_stream_start",
+              runtime: voiceRuntimeMode,
+            },
           });
 
           const pendingDigitActions = popPendingDigitActions(callSid);
@@ -8434,6 +9403,18 @@ app.ws("/connection", (ws, req) => {
           try {
             if (skipGreeting) {
               isInitialized = true;
+              if (voiceRuntimeMode === "voice_agent") {
+                await db
+                  .updateCallState(callSid, "voice_agent_active_legacy_standby", {
+                    at: new Date().toISOString(),
+                    runtime: voiceRuntimeMode,
+                  })
+                  .catch(() => {});
+                console.log(
+                  `Voice agent active for ${callSid}; legacy runtime ready for failover`,
+                );
+                return;
+              }
               console.log(
                 `Stream reconnected for ${callSid} (skipping greeting)`,
               );
@@ -8774,7 +9755,7 @@ app.ws("/connection", (ws, req) => {
           if (!streamAuthOk) {
             return;
           }
-          if (isInitialized && transcriptionService) {
+          if (isInitialized) {
             const now = Date.now();
             streamLastMediaAt.set(callSid, now);
             if (shouldSampleUserAudioLevel(callSid, now)) {
@@ -8784,7 +9765,17 @@ app.ws("/connection", (ws, req) => {
               updateUserAudioLevel(callSid, level, now);
             }
             markStreamMediaSeen(callSid);
-            transcriptionService.send(msg.media.payload);
+            if (voiceRuntimeMode === "voice_agent" && voiceAgentBridge) {
+              const sent = voiceAgentBridge.sendAudioBase64(msg.media.payload);
+              if (sent) {
+                voiceAgentLastUserSpeechAt = Date.now();
+                scheduleVoiceAgentNoAudioWatchdog();
+              }
+              return;
+            }
+            if (transcriptionService) {
+              transcriptionService.send(msg.media.payload);
+            }
           }
         } else if (event === "mark") {
           const label = msg.mark.name;
@@ -8792,6 +9783,14 @@ app.ws("/connection", (ws, req) => {
         } else if (event === "dtmf") {
           const digits = msg?.dtmf?.digits || msg?.dtmf?.digit || "";
           if (digits) {
+            if (shouldFallbackVoiceAgentOnDtmf(voiceRuntimeMode)) {
+              webhookService.addLiveEvent(
+                callSid,
+                `🔢 Keypad: ${digits} (voice agent -> legacy fallback)`,
+                { force: true },
+              );
+              await switchVoiceAgentToLegacy("voice_agent_dtmf_detected");
+            }
             clearSilenceTimer(callSid);
             markStreamMediaSeen(callSid);
             streamLastMediaAt.set(callSid, Date.now());
@@ -8896,6 +9895,13 @@ app.ws("/connection", (ws, req) => {
           if (streamStopSeen.has(stopKey)) {
             console.log(`Duplicate stream stop ignored for ${stopKey}`);
             return;
+          }
+          clearVoiceAgentNoAudioTimer();
+          if (voiceAgentBridge) {
+            try {
+              voiceAgentBridge.close();
+            } catch {}
+            voiceAgentBridge = null;
           }
           streamStopSeen.add(stopKey);
           clearFirstMediaWatchdog(callSid);
@@ -9211,6 +10217,13 @@ app.ws("/connection", (ws, req) => {
       console.log(
         `WebSocket connection closed for adaptive call: ${callSid || "unknown"}`,
       );
+      clearVoiceAgentNoAudioTimer();
+      if (voiceAgentBridge) {
+        try {
+          voiceAgentBridge.close();
+        } catch {}
+        voiceAgentBridge = null;
+      }
       transcriptionService.close();
       streamService.close();
       if (digitService) {
@@ -10797,6 +11810,105 @@ function getProviderStateByChannel(channel, stateSnapshot = null) {
   if (channel === PROVIDER_CHANNELS.EMAIL) return snapshot.emailState;
   return null;
 }
+
+function getActiveVoiceRuntimeSessionCounts() {
+  let legacy = 0;
+  let voiceAgent = 0;
+  let unknown = 0;
+  for (const session of activeCalls.values()) {
+    const runtime = String(session?.voiceRuntime || "legacy")
+      .trim()
+      .toLowerCase();
+    if (runtime === "voice_agent") {
+      voiceAgent += 1;
+      continue;
+    }
+    if (runtime === "legacy" || runtime === "hybrid") {
+      legacy += 1;
+      continue;
+    }
+    unknown += 1;
+  }
+  return {
+    total: activeCalls.size,
+    legacy,
+    voice_agent: voiceAgent,
+    unknown,
+  };
+}
+
+app.get("/admin/voice-runtime", requireAdminToken, async (req, res) => {
+  try {
+    return res.json({
+      success: true,
+      runtime: getVoiceRuntimeAdminStatus(),
+      active_calls: getActiveVoiceRuntimeSessionCounts(),
+    });
+  } catch (error) {
+    console.error("Failed to fetch voice runtime status:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch voice runtime status",
+    });
+  }
+});
+
+app.post("/admin/voice-runtime", requireAdminToken, async (req, res) => {
+  try {
+    const mutation = applyVoiceRuntimeControlMutation({
+      body: req.body && typeof req.body === "object" ? req.body : {},
+      nowMs: Date.now(),
+      circuitCooldownMs: getVoiceAgentCircuitConfig().cooldownMs,
+      state: {
+        modeOverride: voiceRuntimeModeOverride,
+        canaryPercentOverride: voiceRuntimeCanaryPercentOverride,
+        canaryPercentOverrideSource: voiceRuntimeCanaryPercentOverrideSource,
+        forcedLegacyUntilMs: voiceAgentForcedLegacyUntilMs,
+        autoCanaryCooldownUntilMs: voiceAgentAutoCanaryCooldownUntilMs,
+        autoCanaryLastEvalAtMs: voiceAgentAutoCanaryLastEvalAtMs,
+        runtimeOverrideUpdatedAtMs: voiceRuntimeOverrideUpdatedAtMs,
+      },
+    });
+    if (!mutation.ok) {
+      return res.status(400).json({
+        success: false,
+        error: mutation.error || "Invalid voice runtime control payload",
+      });
+    }
+
+    voiceRuntimeModeOverride = mutation.state.modeOverride;
+    voiceRuntimeCanaryPercentOverride = mutation.state.canaryPercentOverride;
+    voiceRuntimeCanaryPercentOverrideSource =
+      mutation.state.canaryPercentOverrideSource;
+    voiceAgentForcedLegacyUntilMs = mutation.state.forcedLegacyUntilMs;
+    voiceAgentAutoCanaryCooldownUntilMs =
+      mutation.state.autoCanaryCooldownUntilMs;
+    voiceAgentAutoCanaryLastEvalAtMs = mutation.state.autoCanaryLastEvalAtMs;
+    voiceRuntimeOverrideUpdatedAtMs = mutation.state.runtimeOverrideUpdatedAtMs;
+    if (mutation.resetCircuitRequested) {
+      voiceAgentCircuitEvents.length = 0;
+      voiceAgentRuntimeEvents.length = 0;
+    }
+
+    if (mutation.actions.length > 0) {
+      await persistVoiceRuntimeControlSettings("admin_endpoint");
+    }
+
+    return res.json({
+      success: true,
+      actions: mutation.actions,
+      applied: mutation.applied,
+      runtime: getVoiceRuntimeAdminStatus(),
+      active_calls: getActiveVoiceRuntimeSessionCounts(),
+    });
+  } catch (error) {
+    console.error("Failed to update voice runtime controls:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to update voice runtime controls",
+    });
+  }
+});
 
 app.get("/admin/provider", requireAdminToken, async (req, res) => {
   syncRuntimeProviderMirrors();

@@ -67,6 +67,54 @@ const recordingEnabled =
 const transferNumber = readEnv("TRANSFER_NUMBER");
 const defaultSmsBusinessId = readEnv("DEFAULT_SMS_BUSINESS_ID") || null;
 const deepgramModel = readEnv("DEEPGRAM_MODEL") || "nova-2";
+const voiceRuntimeModeRaw = (readEnv("VOICE_RUNTIME_MODE") || "legacy")
+  .toLowerCase()
+  .trim();
+const voiceRuntimeModes = new Set(["legacy", "hybrid", "voice_agent"]);
+const voiceRuntimeMode = voiceRuntimeModes.has(voiceRuntimeModeRaw)
+  ? voiceRuntimeModeRaw
+  : "legacy";
+const voiceAgentEnabled =
+  String(readEnv("VOICE_AGENT_SECONDARY_ENABLED") || "false").toLowerCase() ===
+  "true";
+const voiceAgentDefaults = Object.freeze({
+  canaryPercent: 0,
+  canarySeed: "voice_agent",
+  failoverToLegacy: true,
+  openTimeoutMs: 8000,
+  settingsTimeoutMs: 8000,
+  idleTimeoutMs: 12000,
+  keepAliveMs: 8000,
+  noAudioFallbackMs: 15000,
+  managedThinkOnly: true,
+  parityCloseOnGoodbye: true,
+  language: "en",
+  listenModel: String(deepgramModel || "nova-2").trim() || "nova-2",
+  speakModel: String(readEnv("VOICE_MODEL") || "aura-asteria-en").trim() || "aura-asteria-en",
+  thinkProvider: "open_ai",
+  thinkModel: "gpt-4o-mini",
+  thinkTemperature: undefined,
+  circuitBreaker: {
+    enabled: true,
+    failureThreshold: 3,
+    windowMs: 120000,
+    cooldownMs: 180000,
+  },
+  autoCanary: {
+    enabled: false,
+    intervalMs: 60000,
+    windowMs: 300000,
+    cooldownMs: 180000,
+    minSamples: 8,
+    minPercent: 5,
+    maxPercent: 50,
+    stepUpPercent: 5,
+    stepDownPercent: 10,
+    maxErrorRate: 0.2,
+    maxFallbackRate: 0.25,
+    failClosedOnBreach: true,
+  },
+});
 const twilioGatherFallback =
   String(readEnv("TWILIO_GATHER_FALLBACK") || "true").toLowerCase() === "true";
 const twilioMachineDetection = readEnv("TWILIO_MACHINE_DETECTION") || "Enable";
@@ -643,6 +691,46 @@ module.exports = {
     apiKey: ensure("DEEPGRAM_API_KEY"),
     voiceModel: ensure("VOICE_MODEL", "aura-asteria-en"),
     model: deepgramModel,
+    voiceAgent: {
+      enabled: voiceAgentEnabled,
+      mode: voiceRuntimeMode,
+      canaryPercent: voiceAgentDefaults.canaryPercent,
+      canarySeed: voiceAgentDefaults.canarySeed,
+      failoverToLegacy: voiceAgentDefaults.failoverToLegacy,
+      openTimeoutMs: voiceAgentDefaults.openTimeoutMs,
+      settingsTimeoutMs: voiceAgentDefaults.settingsTimeoutMs,
+      idleTimeoutMs: voiceAgentDefaults.idleTimeoutMs,
+      keepAliveMs: voiceAgentDefaults.keepAliveMs,
+      noAudioFallbackMs: voiceAgentDefaults.noAudioFallbackMs,
+      managedThinkOnly: voiceAgentDefaults.managedThinkOnly,
+      parityCloseOnGoodbye: voiceAgentDefaults.parityCloseOnGoodbye,
+      language: voiceAgentDefaults.language,
+      listenModel: voiceAgentDefaults.listenModel,
+      speakModel: voiceAgentDefaults.speakModel,
+      thinkProvider: voiceAgentDefaults.thinkProvider,
+      thinkModel: voiceAgentDefaults.thinkModel,
+      thinkTemperature: voiceAgentDefaults.thinkTemperature,
+      circuitBreaker: {
+        enabled: voiceAgentDefaults.circuitBreaker.enabled,
+        failureThreshold: voiceAgentDefaults.circuitBreaker.failureThreshold,
+        windowMs: voiceAgentDefaults.circuitBreaker.windowMs,
+        cooldownMs: voiceAgentDefaults.circuitBreaker.cooldownMs,
+      },
+      autoCanary: {
+        enabled: voiceAgentDefaults.autoCanary.enabled,
+        intervalMs: voiceAgentDefaults.autoCanary.intervalMs,
+        windowMs: voiceAgentDefaults.autoCanary.windowMs,
+        cooldownMs: voiceAgentDefaults.autoCanary.cooldownMs,
+        minSamples: voiceAgentDefaults.autoCanary.minSamples,
+        minPercent: voiceAgentDefaults.autoCanary.minPercent,
+        maxPercent: voiceAgentDefaults.autoCanary.maxPercent,
+        stepUpPercent: voiceAgentDefaults.autoCanary.stepUpPercent,
+        stepDownPercent: voiceAgentDefaults.autoCanary.stepDownPercent,
+        maxErrorRate: voiceAgentDefaults.autoCanary.maxErrorRate,
+        maxFallbackRate: voiceAgentDefaults.autoCanary.maxFallbackRate,
+        failClosedOnBreach: voiceAgentDefaults.autoCanary.failClosedOnBreach,
+      },
+    },
   },
   server: {
     port: Number(ensure("PORT", "3000")),
