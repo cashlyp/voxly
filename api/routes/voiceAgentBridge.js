@@ -13,6 +13,61 @@ function normalizeText(value, fallback = "") {
   return text || fallback;
 }
 
+function normalizeAgentError(event, fallbackMessage) {
+  const fallback = normalizeText(fallbackMessage, "voice_agent_runtime_error");
+  const codeCandidates = [
+    event?.error?.code,
+    event?.code,
+    event?.status,
+  ];
+  const code = codeCandidates
+    .map((value) => normalizeText(value))
+    .find(Boolean);
+
+  const messageCandidates = [
+    event?.error?.message,
+    event?.message,
+    event?.description,
+    event?.detail,
+    event?.reason,
+    event?.error,
+  ];
+  let message = messageCandidates
+    .map((value) => normalizeText(value))
+    .find(Boolean);
+
+  if (!message && event && typeof event === "object") {
+    try {
+      const serialized = JSON.stringify(event);
+      if (serialized && serialized !== "{}") {
+        message = serialized;
+      }
+    } catch {
+      message = "";
+    }
+  }
+
+  if (!message) {
+    message = fallback;
+  }
+
+  const error = new Error(message);
+  if (code) {
+    error.code = code;
+  }
+  return error;
+}
+
+function normalizeCloseError(payload, fallbackMessage) {
+  const fallback = normalizeText(fallbackMessage, "voice_agent_connection_closed");
+  const code = normalizeText(payload?.code);
+  const reason = normalizeText(payload?.reason);
+  const pieces = [fallback];
+  if (code) pieces.push(`code=${code}`);
+  if (reason) pieces.push(`reason=${reason}`);
+  return new Error(pieces.join(":"));
+}
+
 function sanitizeFunctionDefinition(tool) {
   const source = tool && typeof tool === "object" && tool.function
     ? tool.function
@@ -235,9 +290,13 @@ class VoiceAgentBridge extends EventEmitter {
 
       this.connection.once(AgentEvents.Error, (event) => {
         if (!this.settingsApplied) {
-          const message =
-            event?.error?.message || event?.message || "voice_agent_connection_error";
-          finish(new Error(String(message)));
+          finish(normalizeAgentError(event, "voice_agent_connection_error"));
+        }
+      });
+
+      this.connection.once(AgentEvents.Close, (payload) => {
+        if (!this.settingsApplied) {
+          finish(normalizeCloseError(payload, "voice_agent_connection_closed"));
         }
       });
 
@@ -304,9 +363,8 @@ class VoiceAgentBridge extends EventEmitter {
     });
 
     this.connection.on(AgentEvents.Error, (event) => {
-      const message =
-        event?.error?.message || event?.message || "voice_agent_runtime_error";
-      this.emit("error", new Error(String(message)));
+      if (!this.settingsApplied) return;
+      this.emit("error", normalizeAgentError(event, "voice_agent_runtime_error"));
     });
 
     this.connection.on(AgentEvents.Close, (payload) => {

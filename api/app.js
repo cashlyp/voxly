@@ -69,6 +69,10 @@ const { v4: uuidv4 } = require("uuid");
 const { WaveFile } = require("wavefile");
 const { runWithTimeout: runOperationWithTimeout } = require("./utils/asyncControl");
 const {
+  executeDeepgramVoiceAgentThinkPreflight,
+  shouldRunDeepgramVoiceAgentPreflight,
+} = require("./services/deepgramVoiceAgentPreflight");
+const {
   VOICE_RUNTIME_CONTROL_SETTING_KEY,
   clampCanaryPercent: clampVoiceRuntimeCanaryPercent,
   normalizeVoiceRuntimeMode: normalizeVoiceRuntimeModeShared,
@@ -2858,6 +2862,110 @@ async function getTwilioTtsAudioUrlSafe(
   } catch (error) {
     console.error("Twilio TTS timeout fallback:", error);
     return null;
+  }
+}
+
+async function runDeepgramVoiceAgentStartupPreflight() {
+  const voiceAgentConfig = config.deepgram?.voiceAgent || {};
+  const mode = String(voiceAgentConfig.mode || "legacy")
+    .trim()
+    .toLowerCase();
+  const enabled = voiceAgentConfig.enabled === true;
+  const shouldRun = shouldRunDeepgramVoiceAgentPreflight({ enabled, mode });
+
+  if (!shouldRun) {
+    const skippedPayload = {
+      mode,
+      enabled,
+      skipped: true,
+      reason: "voice_agent_runtime_not_active",
+    };
+    console.log(
+      JSON.stringify({
+        type: "voice_agent_startup_preflight",
+        status: "skipped",
+        ...skippedPayload,
+      }),
+    );
+    return {
+      ok: true,
+      ...skippedPayload,
+    };
+  }
+
+  const strictMode = mode === "voice_agent";
+  const timeoutMs = Math.max(2000, Number(voiceAgentConfig.settingsTimeoutMs) || 8000);
+  try {
+    const result = await executeDeepgramVoiceAgentThinkPreflight({
+      fetchImpl: fetch,
+      apiKey: config.deepgram?.apiKey,
+      enabled,
+      mode,
+      thinkProvider: voiceAgentConfig.thinkProvider,
+      thinkModel: voiceAgentConfig.thinkModel,
+      timeoutMs,
+    });
+    const payload = {
+      mode,
+      enabled,
+      strict_mode: strictMode,
+      provider: result.provider || null,
+      model: result.model || null,
+      provider_model_count: result.providerModelCount || 0,
+      catalog_size: result.catalogSize || 0,
+      provider_models_sample: result.providerModelsSample || [],
+    };
+    console.log(
+      JSON.stringify({
+        type: "voice_agent_startup_preflight",
+        status: "ok",
+        ...payload,
+      }),
+    );
+    db?.logServiceHealth?.("voice_agent_runtime", "startup_preflight_ok", payload).catch(
+      () => {},
+    );
+    return {
+      ok: true,
+      ...payload,
+    };
+  } catch (error) {
+    const payload = {
+      mode,
+      enabled,
+      strict_mode: strictMode,
+      error_code: error?.code || "voice_agent_preflight_failed",
+      error: error?.message || "voice_agent_preflight_failed",
+      provider: error?.provider || String(voiceAgentConfig.thinkProvider || "open_ai"),
+      model: error?.model || String(voiceAgentConfig.thinkModel || "gpt-4o-mini"),
+      provider_model_count: Number(error?.providerModelCount) || 0,
+      provider_models_sample: Array.isArray(error?.providerModelsSample)
+        ? error.providerModelsSample
+        : [],
+      http_status: Number(error?.httpStatus) || null,
+      timeout_ms: Number(error?.timeoutMs) || null,
+    };
+    console.error(
+      "Voice Agent startup preflight failed:",
+      JSON.stringify({
+        type: "voice_agent_startup_preflight",
+        status: "failed",
+        ...payload,
+      }),
+    );
+    db?.logServiceHealth?.("voice_agent_runtime", "startup_preflight_failed", payload).catch(
+      () => {},
+    );
+    if (strictMode) {
+      throw error;
+    }
+    console.warn(
+      "Voice Agent preflight failed in hybrid mode; continuing with legacy fallback availability.",
+    );
+    return {
+      ok: false,
+      ...payload,
+    };
   }
 }
 
@@ -8320,6 +8428,7 @@ async function startServer(options = {}) {
     console.log(
       `🤖 Voice runtime mode: ${runtimeStatus.effective_mode} (configured=${runtimeStatus.configured_mode}, canary=${runtimeStatus.effective_canary_percent}%)`,
     );
+    await runDeepgramVoiceAgentStartupPreflight();
 
     // Start webhook service after database is ready
     console.log("Starting enhanced webhook service...");
@@ -17342,6 +17451,7 @@ module.exports = {
     failCallScriptMutationIdempotency,
     applyIdempotencyResponse,
     resetCallScriptMutationIdempotencyForTests,
+    runDeepgramVoiceAgentStartupPreflight,
   },
 };
 

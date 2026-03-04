@@ -119,6 +119,56 @@ describe("VoiceAgentBridge smoke", () => {
     await expect(promise).rejects.toThrow("voice_agent_open_timeout");
   });
 
+  test("setup errors reject connect without emitting runtime error", async () => {
+    const bridge = new VoiceAgentBridge({
+      apiKey: "test-key",
+      openTimeoutMs: 5000,
+      settingsTimeoutMs: 5000,
+    });
+    const runtimeErrors = [];
+    bridge.on("error", (error) => runtimeErrors.push(error));
+
+    const promise = bridge.connect();
+    const connection = getConnection();
+    connection.emit(sdk.AgentEvents.Open);
+    connection.emit(sdk.AgentEvents.Error, {
+      type: "Error",
+      code: "invalid_settings",
+      description: "Invalid think provider model",
+    });
+
+    await expect(promise).rejects.toThrow("Invalid think provider model");
+    expect(runtimeErrors).toHaveLength(0);
+  });
+
+  test("runtime errors include extracted provider details after settings", async () => {
+    const bridge = new VoiceAgentBridge({
+      apiKey: "test-key",
+      openTimeoutMs: 5000,
+      settingsTimeoutMs: 5000,
+    });
+
+    const promise = bridge.connect();
+    const connection = getConnection();
+
+    connection.emit(sdk.AgentEvents.Open);
+    connection.emit(sdk.AgentEvents.SettingsApplied, { ok: true });
+    await promise;
+
+    const runtimeErrors = [];
+    bridge.on("error", (error) => runtimeErrors.push(error));
+
+    connection.emit(sdk.AgentEvents.Error, {
+      type: "Error",
+      code: "llm_provider_unavailable",
+      description: "Managed think provider unavailable",
+    });
+
+    expect(runtimeErrors).toHaveLength(1);
+    expect(runtimeErrors[0].message).toBe("Managed think provider unavailable");
+    expect(runtimeErrors[0].code).toBe("llm_provider_unavailable");
+  });
+
   test("emits audio base64 and function call request events", async () => {
     const bridge = new VoiceAgentBridge({
       apiKey: "test-key",
