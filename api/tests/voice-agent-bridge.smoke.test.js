@@ -103,6 +103,8 @@ describe("VoiceAgentBridge smoke", () => {
     const payload = connection.configure.mock.calls[0][0];
     expect(payload.agent.think.provider.type).toBe("open_ai");
     expect(payload.agent.think.endpoint).toBeUndefined();
+    expect(payload.agent.language).toBe("en");
+    expect(typeof payload.agent.language).toBe("string");
 
     connection.emit(sdk.AgentEvents.SettingsApplied, { ok: true });
     await expect(promise).resolves.toBeUndefined();
@@ -167,6 +169,22 @@ describe("VoiceAgentBridge smoke", () => {
     expect(runtimeErrors).toHaveLength(1);
     expect(runtimeErrors[0].message).toBe("Managed think provider unavailable");
     expect(runtimeErrors[0].code).toBe("llm_provider_unavailable");
+  });
+
+  test("accepts language as string and preserves valid settings shape", () => {
+    const payload = buildManagedVoiceAgentSettings({
+      agent: {
+        language: "en",
+        think: {
+          provider: {
+            type: "open_ai",
+            model: "gpt-4o-mini",
+          },
+        },
+      },
+    });
+    expect(payload.agent.language).toBe("en");
+    expect(typeof payload.agent.language).toBe("string");
   });
 
   test("emits audio base64 and function call request events", async () => {

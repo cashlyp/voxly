@@ -9000,9 +9000,7 @@ app.ws("/connection", (ws, req) => {
                 },
                 greeting: greetingText || undefined,
                 agent: {
-                  language: {
-                    type: voiceAgentConfig.language || "en",
-                  },
+                  language: voiceAgentConfig.language || "en",
                   listen: {
                     provider: {
                       model: voiceAgentConfig.listenModel || "nova-2",

@@ -157,7 +157,10 @@ function buildManagedVoiceAgentSettings(options = {}) {
     options?.agent?.speak?.provider?.model,
     "aura-asteria-en",
   );
-  const language = normalizeText(options?.agent?.language?.type, "en");
+  const language = normalizeText(
+    options?.agent?.language?.type || options?.agent?.language,
+    "en",
+  );
 
   const settings = {
     audio: {
@@ -172,9 +175,7 @@ function buildManagedVoiceAgentSettings(options = {}) {
       },
     },
     agent: {
-      language: {
-        type: language,
-      },
+      language,
       listen: {
         provider: {
           type: "deepgram",
