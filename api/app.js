@@ -8716,6 +8716,17 @@ app.ws("/connection", (ws, req) => {
 
     const handleSttFailure = async (tag, error) => {
       if (!callSid) return;
+      if (voiceRuntimeMode === "voice_agent") {
+        const message = error?.message || error?.reason || error || "";
+        console.warn(
+          `Ignoring STT failure (${tag}) while voice agent runtime is active for ${callSid}`,
+          message,
+        );
+        db?.addCallMetric?.(callSid, "stt_failure_ignored_voice_agent", 1, { tag }).catch(
+          () => {},
+        );
+        return;
+      }
       console.error(
         `STT failure (${tag}) for ${callSid}`,
         error?.message || error || "",
@@ -8753,8 +8764,8 @@ app.ws("/connection", (ws, req) => {
         console.error("STT fallback activation error:", sttFailureError);
       });
     });
-    transcriptionService.on("close", () => {
-      void handleSttFailure("stt_closed").catch((sttFailureError) => {
+    transcriptionService.on("close", (closeEvent) => {
+      void handleSttFailure("stt_closed", closeEvent).catch((sttFailureError) => {
         console.error("STT fallback activation error:", sttFailureError);
       });
     });
