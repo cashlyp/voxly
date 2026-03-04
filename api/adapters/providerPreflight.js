@@ -1,6 +1,7 @@
 const twilio = require("twilio");
 const fetch = require("node-fetch");
 const { Vonage } = require("@vonage/server-sdk");
+const { runWithTimeout } = require("../utils/asyncControl");
 
 const CHECK_STATUS = Object.freeze({
   PASS: "pass",
@@ -176,37 +177,6 @@ function redactError(error) {
 function formatDurationMs(startedAtMs) {
   const elapsed = Date.now() - startedAtMs;
   return Number.isFinite(elapsed) && elapsed >= 0 ? elapsed : 0;
-}
-
-function withTimeout(promise, timeoutMs = 7000, timeoutCode = "preflight_timeout") {
-  const safeTimeoutMs = Number(timeoutMs);
-  if (!Number.isFinite(safeTimeoutMs) || safeTimeoutMs <= 0) {
-    return Promise.resolve(promise);
-  }
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      const err = new Error(`Operation timed out after ${safeTimeoutMs}ms`);
-      err.code = timeoutCode;
-      reject(err);
-    }, safeTimeoutMs);
-
-    Promise.resolve(promise)
-      .then((result) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        resolve(result);
-      })
-      .catch((error) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        reject(error);
-      });
-  });
 }
 
 function createCheckResult(id, label, status, options = {}) {
@@ -416,21 +386,35 @@ async function probeHttpReachability(url, timeoutMs = 4000) {
 
   let response;
   try {
-    response = await withTimeout(
+    response = await runWithTimeout(
       fetch(safeUrl, {
         method: "HEAD",
       }),
-      timeoutMs,
-      "preflight_probe_timeout",
+      {
+        timeoutMs,
+        label: "provider_preflight_http_head_probe",
+        timeoutCode: "preflight_probe_timeout",
+        logger: console,
+        meta: {
+          scope: "provider_preflight",
+        },
+      },
     );
   } catch (headError) {
     try {
-      response = await withTimeout(
+      response = await runWithTimeout(
         fetch(safeUrl, {
           method: "GET",
         }),
-        timeoutMs,
-        "preflight_probe_timeout",
+        {
+          timeoutMs,
+          label: "provider_preflight_http_get_probe",
+          timeoutCode: "preflight_probe_timeout",
+          logger: console,
+          meta: {
+            scope: "provider_preflight",
+          },
+        },
       );
     } catch (getError) {
       return {
@@ -474,10 +458,18 @@ async function runTwilioCredentialCheck(channel, config, options = {}) {
 
   try {
     const client = twilio(config.twilio.accountSid, config.twilio.authToken);
-    const account = await withTimeout(
+    const account = await runWithTimeout(
       client.api.v2010.accounts(config.twilio.accountSid).fetch(),
-      options.timeoutMs,
-      "twilio_auth_probe_timeout",
+      {
+        timeoutMs: options.timeoutMs,
+        label: "provider_preflight_twilio_auth_probe",
+        timeoutCode: "twilio_auth_probe_timeout",
+        logger: console,
+        meta: {
+          provider: "twilio",
+          scope: "provider_preflight",
+        },
+      },
     );
     if (!account?.sid) {
       return {
@@ -541,10 +533,18 @@ async function runVonageCredentialCheck(channel, config, options = {}) {
       applicationId: config.vonage.applicationId,
       privateKey: config.vonage.privateKey,
     });
-    const balance = await withTimeout(
+    const balance = await runWithTimeout(
       client.account.getBalance(),
-      options.timeoutMs,
-      "vonage_auth_probe_timeout",
+      {
+        timeoutMs: options.timeoutMs,
+        label: "provider_preflight_vonage_auth_probe",
+        timeoutCode: "vonage_auth_probe_timeout",
+        logger: console,
+        meta: {
+          provider: "vonage",
+          scope: "provider_preflight",
+        },
+      },
     );
     const value = Number(balance?.value ?? balance?.balance);
     if (!Number.isFinite(value)) {

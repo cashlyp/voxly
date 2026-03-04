@@ -1,4 +1,5 @@
 const { Vonage } = require("@vonage/server-sdk");
+const { runWithTimeout } = require("../utils/asyncControl");
 
 function isValidHttpsUrl(value) {
   if (!value || typeof value !== "string") return false;
@@ -44,25 +45,6 @@ class VonageVoiceAdapter {
         applicationId,
         privateKey,
       });
-  }
-
-  withTimeout(promise, label = "vonage_request_timeout") {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        const timeoutError = new Error(label);
-        timeoutError.code = "vonage_provider_timeout";
-        reject(timeoutError);
-      }, this.requestTimeoutMs);
-      Promise.resolve(promise)
-        .then((result) => {
-          clearTimeout(timer);
-          resolve(result);
-        })
-        .catch((error) => {
-          clearTimeout(timer);
-          reject(error);
-        });
-    });
   }
 
   /**
@@ -140,9 +122,22 @@ class VonageVoiceAdapter {
       eventUrl: payload.event_url?.[0] || null,
     });
 
-    const response = await this.withTimeout(
+    const response = await runWithTimeout(
       this.client.voice.createOutboundCall(payload),
-      "vonage_create_call_timeout",
+      {
+        timeoutMs: this.requestTimeoutMs,
+        label: "vonage_create_call_timeout",
+        timeoutCode: "vonage_provider_timeout",
+        logger: this.logger,
+        meta: {
+          provider: "vonage",
+          operation: "create_outbound_call",
+        },
+        warnAfterMs: Math.min(
+          5000,
+          Math.max(1000, Math.floor(this.requestTimeoutMs / 2)),
+        ),
+      },
     );
     return response;
   }
@@ -151,10 +146,20 @@ class VonageVoiceAdapter {
     if (!callUuid) {
       throw new Error("VonageVoiceAdapter.hangupCall requires call UUID");
     }
-    await this.withTimeout(
-      this.client.voice.updateCall(callUuid, { action: "hangup" }),
-      "vonage_hangup_timeout",
-    );
+    await runWithTimeout(this.client.voice.updateCall(callUuid, { action: "hangup" }), {
+      timeoutMs: this.requestTimeoutMs,
+      label: "vonage_hangup_timeout",
+      timeoutCode: "vonage_provider_timeout",
+      logger: this.logger,
+      meta: {
+        provider: "vonage",
+        operation: "hangup",
+      },
+      warnAfterMs: Math.min(
+        5000,
+        Math.max(1000, Math.floor(this.requestTimeoutMs / 2)),
+      ),
+    });
   }
 
   async transferCallWithURL(callUuid, url) {
@@ -166,10 +171,20 @@ class VonageVoiceAdapter {
         "VonageVoiceAdapter.transferCallWithURL requires a valid HTTPS URL",
       );
     }
-    await this.withTimeout(
-      this.client.voice.transferCallWithURL(callUuid, url),
-      "vonage_transfer_timeout",
-    );
+    await runWithTimeout(this.client.voice.transferCallWithURL(callUuid, url), {
+      timeoutMs: this.requestTimeoutMs,
+      label: "vonage_transfer_timeout",
+      timeoutCode: "vonage_provider_timeout",
+      logger: this.logger,
+      meta: {
+        provider: "vonage",
+        operation: "transfer_with_url",
+      },
+      warnAfterMs: Math.min(
+        5000,
+        Math.max(1000, Math.floor(this.requestTimeoutMs / 2)),
+      ),
+    });
   }
 }
 

@@ -1,4 +1,5 @@
 const { ConnectClient, StartOutboundVoiceContactCommand, StopContactCommand, UpdateContactAttributesCommand } = require('@aws-sdk/client-connect');
+const { runWithTimeout } = require('../utils/asyncControl');
 
 function maskPhoneForLog(value) {
   const digits = String(value || '').replace(/\D/g, '');
@@ -41,25 +42,6 @@ class AwsConnectAdapter {
       Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 15000;
   }
 
-  withTimeout(promise, label = 'aws_connect_timeout') {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        const timeoutError = new Error(label);
-        timeoutError.code = 'aws_connect_timeout';
-        reject(timeoutError);
-      }, this.requestTimeoutMs);
-      Promise.resolve(promise)
-        .then((result) => {
-          clearTimeout(timer);
-          resolve(result);
-        })
-        .catch((error) => {
-          clearTimeout(timer);
-          reject(error);
-        });
-    });
-  }
-
   /**
    * Start an outbound voice contact using the configured contact flow.
    * @param {object} options
@@ -100,10 +82,17 @@ class AwsConnectAdapter {
     });
 
     const command = new StartOutboundVoiceContactCommand(params);
-    const response = await this.withTimeout(
-      this.client.send(command),
-      'aws_connect_start_outbound_timeout',
-    );
+    const response = await runWithTimeout(this.client.send(command), {
+      timeoutMs: this.requestTimeoutMs,
+      label: 'aws_connect_start_outbound_timeout',
+      timeoutCode: 'aws_connect_timeout',
+      logger: this.logger,
+      meta: {
+        provider: 'aws_connect',
+        operation: 'start_outbound_call',
+      },
+      warnAfterMs: Math.min(5000, Math.max(1000, Math.floor(this.requestTimeoutMs / 2))),
+    });
     this.logger.info?.('Amazon Connect outbound contact started', {
       contactId: response.ContactId,
       clientToken,
@@ -129,10 +118,17 @@ class AwsConnectAdapter {
     };
 
     const command = new StopContactCommand(params);
-    await this.withTimeout(
-      this.client.send(command),
-      'aws_connect_stop_contact_timeout',
-    );
+    await runWithTimeout(this.client.send(command), {
+      timeoutMs: this.requestTimeoutMs,
+      label: 'aws_connect_stop_contact_timeout',
+      timeoutCode: 'aws_connect_timeout',
+      logger: this.logger,
+      meta: {
+        provider: 'aws_connect',
+        operation: 'stop_contact',
+      },
+      warnAfterMs: Math.min(5000, Math.max(1000, Math.floor(this.requestTimeoutMs / 2))),
+    });
     this.logger.info?.('Amazon Connect contact stopped', params);
   }
 
@@ -167,10 +163,17 @@ class AwsConnectAdapter {
       Attributes: attributes,
     });
 
-    await this.withTimeout(
-      this.client.send(command),
-      'aws_connect_update_contact_attributes_timeout',
-    );
+    await runWithTimeout(this.client.send(command), {
+      timeoutMs: this.requestTimeoutMs,
+      label: 'aws_connect_update_contact_attributes_timeout',
+      timeoutCode: 'aws_connect_timeout',
+      logger: this.logger,
+      meta: {
+        provider: 'aws_connect',
+        operation: 'update_contact_attributes',
+      },
+      warnAfterMs: Math.min(5000, Math.max(1000, Math.floor(this.requestTimeoutMs / 2))),
+    });
     this.logger.info?.('Updated contact attributes for audio playback', {
       contactId,
       audioKey,
