@@ -66,6 +66,7 @@ const {
 } = require("./adapters");
 const { v4: uuidv4 } = require("uuid");
 const { WaveFile } = require("wavefile");
+const { runWithTimeout: runOperationWithTimeout } = require("./utils/asyncControl");
 
 const isProduction = process.env.NODE_ENV === "production";
 const appVersion = (() => {
@@ -12246,34 +12247,18 @@ async function runWithTimeout(
   timeoutCode = "operation_timeout",
 ) {
   const safeTimeoutMs = Number(timeoutMs);
-  if (!Number.isFinite(safeTimeoutMs) || safeTimeoutMs <= 0) {
-    return operationPromise;
-  }
-  let settled = false;
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      const timeoutError = new Error(
-        `${label} timed out after ${safeTimeoutMs}ms`,
-      );
-      timeoutError.code = timeoutCode;
-      reject(timeoutError);
-    }, safeTimeoutMs);
-
-    Promise.resolve(operationPromise)
-      .then((result) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        resolve(result);
-      })
-      .catch((error) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        reject(error);
-      });
+  return runOperationWithTimeout(operationPromise, {
+    timeoutMs: safeTimeoutMs,
+    label,
+    timeoutCode,
+    logger: console,
+    meta: {
+      scope: "app_runtime",
+    },
+    warnAfterMs:
+      Number.isFinite(safeTimeoutMs) && safeTimeoutMs > 0
+        ? Math.max(1000, Math.min(10000, Math.floor(safeTimeoutMs / 2)))
+        : null,
   });
 }
 
@@ -12711,7 +12696,16 @@ async function placeOutboundCall(payload, hostOverride = null) {
         console.log(
           `Twilio call URLs: twiml=${callPayload.url} statusCallback=${callPayload.statusCallback}`,
         );
-        const call = await client.calls.create(callPayload);
+        const providerTimeoutMs =
+          Number(config.callProvider?.requestTimeoutMs) ||
+          Number(config.outboundLimits?.handlerTimeoutMs) ||
+          30000;
+        const call = await runWithTimeout(
+          client.calls.create(callPayload),
+          providerTimeoutMs,
+          "twilio_outbound_call",
+          "call_provider_timeout",
+        );
         callId = call.sid;
         callStatus = call.status || "queued";
       } else if (provider === "aws") {
@@ -16249,18 +16243,25 @@ process.on("uncaughtException", (error) => {
   console.error("Uncaught exception:", details);
 });
 
-// Enhanced graceful shutdown with comprehensive cleanup
-process.on("SIGINT", async () => {
-  console.log("\n🛑 Shutting down enhanced adaptive system gracefully...");
+async function gracefulShutdown(options = {}) {
+  const signal = String(options.signal || "shutdown").toUpperCase();
+  const startMessage =
+    options.startMessage || "Shutting down enhanced adaptive system gracefully...";
+  const successMessage =
+    options.successMessage || "Enhanced adaptive system shutdown complete";
+  const errorPrefix = options.errorPrefix || "Error during shutdown:";
+
+  console.log(`\n${startMessage}`);
 
   try {
-    // Log shutdown start
-    await db.logServiceHealth("system", "shutdown_initiated", {
-      active_calls: callConfigurations.size,
-      tracked_calls: callFunctionSystems.size,
-    });
+    if (db?.logServiceHealth) {
+      await db.logServiceHealth("system", "shutdown_initiated", {
+        active_calls: callConfigurations.size,
+        tracked_calls: callFunctionSystems.size,
+        reason: signal,
+      });
+    }
 
-    // Stop services
     webhookService.stop();
     callConfigurations.clear();
     callFunctionSystems.clear();
@@ -16281,62 +16282,37 @@ process.on("SIGINT", async () => {
     providerEventDedupe.clear();
     callStatusDedupe.clear();
 
-    // Log successful shutdown
-    await db.logServiceHealth("system", "shutdown_completed", {
-      timestamp: new Date().toISOString(),
-    });
-
-    await db.close();
-    console.log("✅ Enhanced adaptive system shutdown complete");
+    if (db?.logServiceHealth) {
+      await db.logServiceHealth("system", "shutdown_completed", {
+        timestamp: new Date().toISOString(),
+        reason: signal,
+      });
+    }
+    if (db?.close) {
+      await db.close();
+    }
+    console.log(successMessage);
   } catch (shutdownError) {
-    console.error("❌ Error during shutdown:", shutdownError);
+    console.error(errorPrefix, shutdownError);
   }
 
   process.exit(0);
+}
+
+process.on("SIGINT", async () => {
+  await gracefulShutdown({
+    signal: "SIGINT",
+    startMessage: "🛑 Shutting down enhanced adaptive system gracefully...",
+    successMessage: "✅ Enhanced adaptive system shutdown complete",
+    errorPrefix: "❌ Error during shutdown:",
+  });
 });
 
 process.on("SIGTERM", async () => {
-  console.log("\nShutting down enhanced adaptive system gracefully...");
-
-  try {
-    // Log shutdown start
-    await db.logServiceHealth("system", "shutdown_initiated", {
-      active_calls: callConfigurations.size,
-      tracked_calls: callFunctionSystems.size,
-      reason: "SIGTERM",
-    });
-
-    // Stop services
-    webhookService.stop();
-    callConfigurations.clear();
-    callFunctionSystems.clear();
-    callDirections.clear();
-    for (const timer of keypadDtmfWatchdogs.values()) {
-      clearTimeout(timer);
-    }
-    keypadDtmfWatchdogs.clear();
-    keypadDtmfSeen.clear();
-    keypadProviderOverrides.clear();
-    keypadProviderGuardWarnings.clear();
-    for (const timer of callRuntimePersistTimers.values()) {
-      clearTimeout(timer);
-    }
-    callRuntimePersistTimers.clear();
-    callRuntimePendingWrites.clear();
-    callToolInFlight.clear();
-    providerEventDedupe.clear();
-    callStatusDedupe.clear();
-
-    // Log successful shutdown
-    await db.logServiceHealth("system", "shutdown_completed", {
-      timestamp: new Date().toISOString(),
-    });
-
-    await db.close();
-    console.log("Enhanced adaptive system shutdown complete");
-  } catch (shutdownError) {
-    console.error("Error during shutdown:", shutdownError);
-  }
-
-  process.exit(0);
+  await gracefulShutdown({
+    signal: "SIGTERM",
+    startMessage: "Shutting down enhanced adaptive system gracefully...",
+    successMessage: "Enhanced adaptive system shutdown complete",
+    errorPrefix: "Error during shutdown:",
+  });
 });

@@ -4,6 +4,7 @@ const config = require('../config');
 const { PinpointClient, SendMessagesCommand } = require('@aws-sdk/client-pinpoint');
 const { Vonage } = require('@vonage/server-sdk');
 const { resolveProviderExecutionOrder } = require('../adapters/providerFlowPolicy');
+const { runWithTimeout } = require('../utils/asyncControl');
 
 const SUPPORTED_SMS_PROVIDERS = ['twilio', 'aws', 'vonage'];
 const RETRYABLE_NETWORK_CODES = new Set([
@@ -489,6 +490,14 @@ class EnhancedSmsService extends EventEmitter {
         this.messageQueue = new Map(); // Queue for outbound messages
         this.optOutCache = new Map();
         this.idempotencyCache = new Map();
+        this.idempotencyCacheTtlMs = Math.max(
+            60_000,
+            Number(config.sms?.idempotencyCacheTtlMs) || 24 * 60 * 60 * 1000,
+        );
+        this.idempotencyCacheMax = Math.max(
+            100,
+            Number(config.sms?.idempotencyCacheMax) || 5000,
+        );
         this.lastSendAt = new Map();
         this.scheduledProcessing = false;
         this.defaultQuietHours = { start: 9, end: 20 };
@@ -547,34 +556,56 @@ class EnhancedSmsService extends EventEmitter {
         return crypto.createHash('sha256').update(text).digest('hex');
     }
 
+    pruneIdempotencyCache(now = Date.now()) {
+        if (!this.idempotencyCache.size) return;
+        const ttlMs = Math.max(60_000, Number(this.idempotencyCacheTtlMs) || 60_000);
+        for (const [key, entry] of this.idempotencyCache.entries()) {
+            const createdAt = Number(entry?.createdAt || 0);
+            if (!Number.isFinite(createdAt) || now - createdAt > ttlMs) {
+                this.idempotencyCache.delete(key);
+            }
+        }
+        if (this.idempotencyCache.size <= this.idempotencyCacheMax) return;
+        const overflow = this.idempotencyCache.size - this.idempotencyCacheMax;
+        const keys = this.idempotencyCache.keys();
+        for (let idx = 0; idx < overflow; idx += 1) {
+            const next = keys.next();
+            if (next.done) break;
+            this.idempotencyCache.delete(next.value);
+        }
+    }
+
+    getIdempotencyCacheEntry(idempotencyKey) {
+        const key = String(idempotencyKey || '').trim();
+        if (!key) return null;
+        this.pruneIdempotencyCache();
+        return this.idempotencyCache.get(key) || null;
+    }
+
+    setIdempotencyCacheEntry(idempotencyKey, value) {
+        const key = String(idempotencyKey || '').trim();
+        if (!key) return;
+        this.idempotencyCache.set(key, {
+            ...value,
+            createdAt: Date.now(),
+        });
+        this.pruneIdempotencyCache();
+    }
+
     async withTimeout(promise, timeoutMs, timeoutCode = 'sms_timeout') {
         const safeTimeout = Number(timeoutMs);
-        if (!Number.isFinite(safeTimeout) || safeTimeout <= 0) {
-            return promise;
-        }
-        let settled = false;
-        return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
-                if (settled) return;
-                settled = true;
-                const timeoutError = new Error(`Operation timed out after ${safeTimeout}ms`);
-                timeoutError.code = timeoutCode;
-                reject(timeoutError);
-            }, safeTimeout);
-
-            Promise.resolve(promise)
-                .then((result) => {
-                    if (settled) return;
-                    settled = true;
-                    clearTimeout(timer);
-                    resolve(result);
-                })
-                .catch((error) => {
-                    if (settled) return;
-                    settled = true;
-                    clearTimeout(timer);
-                    reject(error);
-                });
+        return runWithTimeout(promise, {
+            timeoutMs: safeTimeout,
+            label: 'sms_provider_operation',
+            timeoutCode,
+            logger: this.logger,
+            meta: {
+                service: 'sms',
+            },
+            warnAfterMs:
+                Number.isFinite(safeTimeout) && safeTimeout > 0
+                    ? Math.max(1000, Math.min(5000, Math.floor(safeTimeout / 2)))
+                    : null,
         });
     }
 
@@ -970,7 +1001,7 @@ class EnhancedSmsService extends EventEmitter {
         }
 
         if (idempotencyKey) {
-            const cached = this.idempotencyCache.get(idempotencyKey);
+            const cached = this.getIdempotencyCacheEntry(idempotencyKey);
             if (cached?.messageSid) {
                 if (
                     (cached.toNumber && cached.toNumber !== normalizedTo) ||
@@ -999,7 +1030,7 @@ class EnhancedSmsService extends EventEmitter {
                         conflict.code = 'idempotency_conflict';
                         throw conflict;
                     }
-                    this.idempotencyCache.set(idempotencyKey, {
+                    this.setIdempotencyCacheEntry(idempotencyKey, {
                         messageSid: existing.message_sid,
                         toNumber: existing.to_number || normalizedTo,
                         bodyHash: existing.body_hash || bodyHash,
@@ -1090,7 +1121,7 @@ class EnhancedSmsService extends EventEmitter {
                     this.markProviderCircuitSuccess(currentProvider);
                     this.lastSendAt.set(normalizedTo, Date.now());
                     if (idempotencyKey) {
-                        this.idempotencyCache.set(idempotencyKey, {
+                        this.setIdempotencyCacheEntry(idempotencyKey, {
                             messageSid,
                             toNumber: normalizedTo,
                             bodyHash,
