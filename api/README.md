@@ -45,6 +45,37 @@ When running in AWS mode:
 
 Keep the Twilio credentials in place if you want a rapid rollback path—switching the provider back to `twilio` will re-enable the original websocket-based flow without redeploying code.
 
+## Provider Preflight Gate and Parity Smoke
+
+Provider activation is fail-closed for `twilio` and `vonage` on `call` and `sms` channels:
+
+- `POST /admin/provider` now runs provider preflight before activation.
+- On preflight failure, activation is blocked and the currently active provider remains in place.
+- `GET /admin/provider/preflight` runs read-only preflight checks and returns a detailed report.
+
+Preflight checks include:
+
+- Credential/auth probe (minimal safe provider API call).
+- Webhook auth mode + signing secret + validation guard coverage.
+- Callback URL configuration and optional reachability probe.
+- Required route registration for voice and SMS webhooks.
+
+CLI helper:
+
+```bash
+npm run preflight:provider -- --channel call --provider twilio --network 1 --reachability 1
+```
+
+Provider parity smoke suite (no Jest):
+
+```bash
+# Fast deterministic offline checks (default)
+npm run parity:providers
+
+# Optional live provider auth checks
+LIVE_SMOKE=1 npm run parity:providers
+```
+
 ## Worker Reliability Controls
 
 - `CALL_JOB_TIMEOUT_MS` limits each call job execution window.

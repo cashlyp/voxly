@@ -49,12 +49,24 @@ const {
   normalizeProvider,
 } = require("./adapters/providerState");
 const {
+  resolveProviderExecutionOrder,
+  resolvePaymentExecutionMode,
+  buildProviderCompatibilityReport,
+  buildCanonicalCallStatusEvent,
+} = require("./adapters/providerFlowPolicy");
+const {
+  runProviderPreflight,
+  assertProviderPreflight,
+  ProviderPreflightError,
+} = require("./adapters/providerPreflight");
+const {
   AwsConnectAdapter,
   AwsTtsAdapter,
   VonageVoiceAdapter,
 } = require("./adapters");
 const { v4: uuidv4 } = require("uuid");
 const { WaveFile } = require("wavefile");
+const { runWithTimeout: runOperationWithTimeout } = require("./utils/asyncControl");
 
 const isProduction = process.env.NODE_ENV === "production";
 const appVersion = (() => {
@@ -167,6 +179,7 @@ const defaultPaymentFeatureConfig = Object.freeze({
   enabled: config.payment?.enabled !== false,
   kill_switch: config.payment?.killSwitch === true,
   allow_twilio: config.payment?.allowTwilio !== false,
+  allow_sms_fallback: config.payment?.smsFallback?.enabled === true,
   require_script_opt_in: config.payment?.requireScriptOptIn === true,
   default_currency: String(config.payment?.defaultCurrency || "USD")
     .trim()
@@ -270,6 +283,15 @@ function sanitizePaymentFeatureConfig(raw = {}, previous = {}) {
     );
   }
   if (
+    raw.allow_sms_fallback !== undefined ||
+    raw.allowSmsFallback !== undefined
+  ) {
+    next.allow_sms_fallback = normalizeBooleanFlag(
+      raw.allow_sms_fallback ?? raw.allowSmsFallback,
+      base.allow_sms_fallback,
+    );
+  }
+  if (
     raw.require_script_opt_in !== undefined ||
     raw.requireScriptOptIn !== undefined
   ) {
@@ -344,16 +366,26 @@ function getPaymentFeatureConfig() {
 
 function isPaymentFeatureEnabledForProvider(provider, options = {}) {
   const cfg = getPaymentFeatureConfig();
-  if (cfg.enabled !== true) return false;
-  if (cfg.kill_switch === true) return false;
   const normalizedProvider = String(provider || "")
     .trim()
     .toLowerCase();
-  if (normalizedProvider === "twilio") {
-    if (cfg.allow_twilio !== true) return false;
-  } else {
-    return false;
-  }
+  const smsFallbackEnabled =
+    options.smsFallbackEnabled !== undefined
+      ? options.smsFallbackEnabled === true
+      : config.payment?.smsFallback?.enabled === true &&
+        cfg.allow_sms_fallback !== false;
+  const smsServiceReady =
+    options.smsServiceReady !== undefined
+      ? options.smsServiceReady === true
+      : true;
+  const executionMode = resolvePaymentExecutionMode({
+    provider: normalizedProvider,
+    featureConfig: cfg,
+    hasNativeAdapter: normalizedProvider === "twilio",
+    smsFallbackEnabled,
+    smsServiceReady,
+  });
+  if (!executionMode.enabled) return false;
   if (
     cfg.require_script_opt_in === true &&
     normalizeBooleanFlag(options.hasScript, false) !== true
@@ -446,16 +478,37 @@ function normalizePaymentSettings(input = {}, options = {}) {
       ? defaultCurrency
       : null;
 
-  if (normalizedEnabled && provider && provider !== "twilio") {
-    normalizedEnabled = false;
-    warnings.push(
-      `Payment defaults were saved as disabled because active provider is ${provider.toUpperCase()} (Twilio required).`,
-    );
+  if (normalizedEnabled && provider) {
+    const mode = resolvePaymentExecutionMode({
+      provider,
+      featureConfig,
+      hasNativeAdapter: provider === "twilio",
+      smsFallbackEnabled:
+        config.payment?.smsFallback?.enabled === true &&
+        featureConfig.allow_sms_fallback !== false,
+      smsServiceReady: true,
+    });
+    if (!mode.enabled) {
+      normalizedEnabled = false;
+      warnings.push(
+        `Payment defaults were saved as disabled because provider ${provider.toUpperCase()} cannot run payment in current mode (${mode.reason || "unsupported"}).`,
+      );
+    } else if (mode.mode === "sms_fallback") {
+      warnings.push(
+        `Payment for provider ${provider.toUpperCase()} will use SMS fallback mode.`,
+      );
+    }
   }
   if (
     normalizedEnabled &&
     enforceFeatureGate &&
-    !isPaymentFeatureEnabledForProvider(provider, { hasScript })
+    !isPaymentFeatureEnabledForProvider(provider, {
+      hasScript,
+      smsFallbackEnabled:
+        config.payment?.smsFallback?.enabled === true &&
+        featureConfig.allow_sms_fallback !== false,
+      smsServiceReady: Boolean(smsService?.sendSMS),
+    })
   ) {
     normalizedEnabled = false;
     warnings.push("Payment was disabled by runtime feature controls.");
@@ -1126,14 +1179,29 @@ function buildCallCapabilities(callConfig = {}, options = {}) {
     existing.capture !== undefined ? existing.capture === true : true;
   const transfer =
     existing.transfer !== undefined ? existing.transfer === true : true;
+  const paymentFeatureConfig = getPaymentFeatureConfig();
+  const paymentMode = resolvePaymentExecutionMode({
+    provider,
+    featureConfig: paymentFeatureConfig,
+    hasNativeAdapter: provider === "twilio",
+    smsFallbackEnabled:
+      config.payment?.smsFallback?.enabled === true &&
+      paymentFeatureConfig.allow_sms_fallback !== false,
+    smsServiceReady: Boolean(smsService?.sendSMS),
+  });
   const paymentConfigured =
     isPaymentFeatureEnabledForProvider(provider, {
       hasScript:
         options.hasScript !== undefined
           ? options.hasScript
           : Boolean(callConfig?.script_id),
+      smsFallbackEnabled:
+        config.payment?.smsFallback?.enabled === true &&
+        paymentFeatureConfig.allow_sms_fallback !== false,
+      smsServiceReady: Boolean(smsService?.sendSMS),
     }) &&
-    normalizeBooleanFlag(callConfig?.payment_enabled, false);
+    normalizeBooleanFlag(callConfig?.payment_enabled, false) &&
+    paymentMode.enabled;
   const payment =
     existing.payment !== undefined
       ? existing.payment === true && paymentConfigured
@@ -1143,6 +1211,7 @@ function buildCallCapabilities(callConfig = {}, options = {}) {
     capture,
     transfer,
     payment,
+    payment_mode: payment ? paymentMode.mode : null,
     provider: provider || null,
   };
 }
@@ -3872,7 +3941,7 @@ function getVonageWebsocketContentType() {
 
 function buildVonageAnswerWebhookUrl(req, callSid, extraParams = {}) {
   const host = resolveHost(req) || config.server?.hostname;
-  const defaultBase = host ? `https://${host}/answer` : "";
+  const defaultBase = host ? `https://${host}/va` : "";
   const baseUrl = config.vonage?.voice?.answerUrl || defaultBase;
   return appendQueryParamsToUrl(baseUrl, {
     callSid: callSid || undefined,
@@ -3882,7 +3951,7 @@ function buildVonageAnswerWebhookUrl(req, callSid, extraParams = {}) {
 
 function buildVonageEventWebhookUrl(req, callSid, extraParams = {}) {
   const host = resolveHost(req) || config.server?.hostname;
-  const defaultBase = host ? `https://${host}/event` : "";
+  const defaultBase = host ? `https://${host}/ve` : "";
   const baseUrl = config.vonage?.voice?.eventUrl || defaultBase;
   return appendQueryParamsToUrl(baseUrl, {
     callSid: callSid || undefined,
@@ -4366,8 +4435,8 @@ function requireValidVonageWebhook(req, res, label = "") {
     `⚠️ Vonage webhook signature invalid for ${path}: ${result.reason || "unknown"}`,
   );
   if (mode === "strict") {
-    // Signed callbacks may be retried by Vonage on 5xx.
-    res.status(503).send("Temporary validation failure");
+    // Fail closed for unauthorized callbacks to avoid retry amplification.
+    res.status(403).send("Forbidden");
     return false;
   }
   return true;
@@ -5123,7 +5192,7 @@ const telephonyTools = [
     function: {
       name: "start_payment",
       description:
-        "Start a secure phone payment step for this live call. Twilio provider only.",
+        "Start a secure payment step for this live call. Twilio uses native voice capture; other providers can use secure SMS fallback when enabled.",
       parameters: {
         type: "object",
         properties: {
@@ -5138,7 +5207,7 @@ const telephonyTools = [
           payment_connector: {
             type: "string",
             description:
-              "Twilio Pay Connector name configured in your Twilio account.",
+              "Payment connector name (required for native Twilio voice payment mode).",
           },
           description: {
             type: "string",
@@ -5379,6 +5448,18 @@ function buildTelephonyImplementations(callSid, gptService = null) {
               payment_id: result.payment_id || null,
               amount: result.amount || null,
               currency: result.currency || null,
+            },
+          },
+        });
+      } else if (result?.status === "sms_fallback_sent") {
+        queuePersistCallRuntimeState(callSid, {
+          snapshot: {
+            payment_in_progress: false,
+            payment_session: {
+              payment_id: result.payment_id || null,
+              amount: result.amount || null,
+              currency: result.currency || null,
+              execution_mode: "sms_fallback",
             },
           },
         });
@@ -6343,6 +6424,95 @@ async function clearKeypadProviderOverrides(params = {}) {
   };
 }
 
+function shouldRunProviderPreflightForSelection(channel, provider) {
+  const normalizedChannel = String(channel || "")
+    .trim()
+    .toLowerCase();
+  const normalizedProvider = String(provider || "")
+    .trim()
+    .toLowerCase();
+  if (
+    normalizedChannel !== PROVIDER_CHANNELS.CALL &&
+    normalizedChannel !== PROVIDER_CHANNELS.SMS
+  ) {
+    return false;
+  }
+  return normalizedProvider === "twilio" || normalizedProvider === "vonage";
+}
+
+function summarizePreflightReport(report) {
+  if (!report || typeof report !== "object") return null;
+  const failedChecks = (report.checks || [])
+    .filter((check) => check.status === "fail")
+    .map((check) => check.id);
+  const warningChecks = (report.checks || [])
+    .filter((check) => check.status === "warn")
+    .map((check) => check.id);
+  return {
+    provider: report.provider,
+    channel: report.channel,
+    mode: report.mode,
+    ok: report.ok === true,
+    summary: report.summary || {},
+    failed_checks: failedChecks,
+    warning_checks: warningChecks,
+  };
+}
+
+async function evaluateProviderPreflightReport(options = {}) {
+  const {
+    provider,
+    channel,
+    mode = "activation",
+    allowNetwork = true,
+    requireReachability = true,
+    requestId = null,
+    timeoutMs = 7000,
+  } = options;
+  const report = await runProviderPreflight({
+    provider,
+    channel,
+    mode,
+    config,
+    app,
+    allowNetwork,
+    requireReachability,
+    timeoutMs,
+    guards: {
+      twilio: typeof requireValidTwilioSignature === "function",
+      vonage: typeof requireValidVonageWebhook === "function",
+    },
+  });
+  console.log(
+    JSON.stringify({
+      type: "provider_preflight_result",
+      request_id: requestId || null,
+      provider: report.provider || provider || null,
+      channel: report.channel || channel || null,
+      mode: report.mode || mode,
+      ok: report.ok === true,
+      summary: report.summary || null,
+      failed_checks: (report.checks || [])
+        .filter((check) => check.status === "fail")
+        .map((check) => check.id),
+      warning_checks: (report.checks || [])
+        .filter((check) => check.status === "warn")
+        .map((check) => check.id),
+    }),
+  );
+  return report;
+}
+
+async function enforceProviderPreflight(options = {}) {
+  const report = await evaluateProviderPreflightReport(options);
+  assertProviderPreflight(report, {
+    provider: options.provider,
+    channel: options.channel,
+    mode: options.mode,
+  });
+  return report;
+}
+
 async function loadStoredProviderSetting(options = {}) {
   const {
     channel,
@@ -6353,6 +6523,7 @@ async function loadStoredProviderSetting(options = {}) {
     getActive = () => "unknown",
     setActive = () => {},
     setStored = () => {},
+    runPreflight = null,
   } = options;
   if (!db?.getSetting) return;
 
@@ -6378,6 +6549,23 @@ async function loadStoredProviderSetting(options = {}) {
     setStored(normalized);
     const readiness = getReadiness() || {};
     if (readiness[normalized]) {
+      if (typeof runPreflight === "function") {
+        let report = null;
+        try {
+          report = await runPreflight({ provider: normalized, channel });
+        } catch (preflightError) {
+          console.warn(
+            `Stored ${label} provider "${normalized}" preflight execution failed. Keeping active provider "${getActive()}".`,
+          );
+          return;
+        }
+        if (!report?.ok) {
+          console.warn(
+            `Stored ${label} provider "${normalized}" failed preflight checks. Keeping active provider "${getActive()}".`,
+          );
+          return;
+        }
+      }
       setActive(normalized);
       console.log(
         `☎️ Loaded default ${label} provider from storage: ${normalized.toUpperCase()} (active)`,
@@ -6408,6 +6596,18 @@ async function loadStoredCallProvider() {
     getActive: getActiveCallProvider,
     setActive: setActiveCallProvider,
     setStored: setStoredCallProvider,
+    runPreflight: ({ provider, channel }) => {
+      if (!shouldRunProviderPreflightForSelection(channel, provider)) {
+        return Promise.resolve({ ok: true });
+      }
+      return evaluateProviderPreflightReport({
+        provider,
+        channel,
+        mode: "startup_restore",
+        allowNetwork: true,
+        requireReachability: false,
+      });
+    },
   });
 }
 
@@ -6421,6 +6621,18 @@ async function loadStoredSmsProvider() {
     getActive: getActiveSmsProvider,
     setActive: setActiveSmsProvider,
     setStored: setStoredSmsProvider,
+    runPreflight: ({ provider, channel }) => {
+      if (!shouldRunProviderPreflightForSelection(channel, provider)) {
+        return Promise.resolve({ ok: true });
+      }
+      return evaluateProviderPreflightReport({
+        provider,
+        channel,
+        mode: "startup_restore",
+        allowNetwork: true,
+        requireReachability: false,
+      });
+    },
   });
 }
 
@@ -6670,6 +6882,12 @@ function getSmsProviderReadiness() {
   if (smsService?.getProviderReadiness) {
     return smsService.getProviderReadiness();
   }
+  const vonageWebhookMode = String(
+    config.vonage?.webhookValidation || "warn",
+  ).toLowerCase();
+  const vonageWebhookReady =
+    vonageWebhookMode !== "strict" ||
+    Boolean(config.vonage?.webhookSignatureSecret);
   return {
     twilio: !!(
       config.twilio?.accountSid &&
@@ -6684,7 +6902,8 @@ function getSmsProviderReadiness() {
     vonage: !!(
       config.vonage?.apiKey &&
       config.vonage?.apiSecret &&
-      config.vonage?.sms?.fromNumber
+      config.vonage?.sms?.fromNumber &&
+      vonageWebhookReady
     ),
   };
 }
@@ -6761,6 +6980,24 @@ function isProviderDegraded(provider) {
   return true;
 }
 
+function recordProviderFlowMetric(event, meta = {}) {
+  const payload = {
+    event: String(event || "unknown"),
+    provider: String(meta.provider || "unknown").toLowerCase(),
+    flow: meta.flow || null,
+    channel: meta.channel || "call",
+    call_sid: meta.call_sid || null,
+    status: meta.status || null,
+    reason: meta.reason || null,
+    attempt: Number.isFinite(Number(meta.attempt))
+      ? Number(meta.attempt)
+      : null,
+    at: new Date().toISOString(),
+    ...meta,
+  };
+  db?.logServiceHealth?.("provider_flow", payload.event, payload).catch(() => {});
+}
+
 function getProviderOrder(preferred) {
   const order = [];
   if (preferred) order.push(preferred);
@@ -6773,13 +7010,19 @@ function getProviderOrder(preferred) {
 function selectOutboundProvider(preferred) {
   const readiness = getProviderReadiness();
   const failoverEnabled = config.providerFailover?.enabled !== false;
-  const order = getProviderOrder(preferred);
-  for (const provider of order) {
-    if (!readiness[provider]) continue;
-    if (!failoverEnabled) return provider;
-    if (!isProviderDegraded(provider)) return provider;
-  }
-  return null;
+  const plan = resolveProviderExecutionOrder({
+    channel: PROVIDER_CHANNELS.CALL,
+    preferredProvider: preferred,
+    providers: SUPPORTED_PROVIDERS,
+    readiness,
+    requestedFlow: "outbound_voice",
+    context: {
+      vonageDtmfWebhookEnabled: config.vonage?.dtmfWebhookEnabled === true,
+    },
+    failoverEnabled,
+    isProviderDegraded,
+  });
+  return plan.selected_provider || null;
 }
 
 let warnedMachineDetection = false;
@@ -7534,6 +7777,7 @@ async function startServer(options = {}) {
     await refreshInboundDefaultScript(true);
     await loadKeypadProviderOverrides();
     logStartupRuntimeProfile();
+    logStartupProviderCompatibility();
     console.log(
       `☎️ Default call provider: ${String(storedProvider || currentProvider || "twilio").toUpperCase()} (active: ${String(currentProvider || "twilio").toUpperCase()})`,
     );
@@ -7660,6 +7904,45 @@ function logStartupRuntimeProfile() {
   };
 
   console.log(JSON.stringify(payload));
+}
+
+function logStartupProviderCompatibility() {
+  const report = getProviderCompatibilityReport();
+  const activeCallProvider = report?.active_providers?.call || null;
+  const activeSmsProvider = report?.active_providers?.sms || null;
+  const callProviderState =
+    report?.channels?.call?.providers?.[activeCallProvider] || null;
+  const smsProviderState =
+    report?.channels?.sms?.providers?.[activeSmsProvider] || null;
+  const callFlowGaps =
+    report?.channels?.call?.parity_gaps?.[activeCallProvider] || [];
+  const smsFlowGaps =
+    report?.channels?.sms?.parity_gaps?.[activeSmsProvider] || [];
+
+  if (callProviderState && callProviderState.ready !== true) {
+    console.warn(
+      `⚠️ Active call provider ${String(activeCallProvider || "unknown").toUpperCase()} is not ready at startup.`,
+    );
+  }
+  if (smsProviderState && smsProviderState.ready !== true) {
+    console.warn(
+      `⚠️ Active SMS provider ${String(activeSmsProvider || "unknown").toUpperCase()} is not ready at startup.`,
+    );
+  }
+  if (Array.isArray(callFlowGaps) && callFlowGaps.length) {
+    console.warn(
+      `⚠️ Call parity gaps for ${String(activeCallProvider || "unknown").toUpperCase()}: ${callFlowGaps.join(", ")}`,
+    );
+  }
+  if (Array.isArray(smsFlowGaps) && smsFlowGaps.length) {
+    console.warn(
+      `⚠️ SMS parity gaps for ${String(activeSmsProvider || "unknown").toUpperCase()}: ${smsFlowGaps.join(", ")}`,
+    );
+  }
+
+  db?.logServiceHealth?.("provider_compatibility", "startup_snapshot", {
+    report,
+  }).catch(() => {});
 }
 
 // Enhanced WebSocket connection handler with dynamic functions
@@ -10466,6 +10749,33 @@ function getProviderStateSnapshot() {
   };
 }
 
+function getProviderCompatibilityReport() {
+  syncRuntimeProviderMirrors();
+  const snapshot = getProviderStateSnapshot();
+  return buildProviderCompatibilityReport({
+    callReadiness: snapshot.callState.readiness || {},
+    smsReadiness: snapshot.smsState.readiness || {},
+    emailReadiness: snapshot.emailState.readiness || {},
+    activeProviders: {
+      call: snapshot.callState.provider,
+      sms: snapshot.smsState.provider,
+      email: snapshot.emailState.provider,
+    },
+    storedProviders: {
+      call: snapshot.callState.stored_provider,
+      sms: snapshot.smsState.stored_provider,
+      email: snapshot.emailState.stored_provider,
+    },
+    paymentFeatureConfig: getPaymentFeatureConfig(),
+    smsFallbackEnabled:
+      config.payment?.smsFallback?.enabled === true &&
+      getPaymentFeatureConfig().allow_sms_fallback !== false,
+    smsServiceReady: Boolean(smsService?.sendSMS),
+    vonageDtmfWebhookEnabled: config.vonage?.dtmfWebhookEnabled === true,
+    isProviderDegraded,
+  });
+}
+
 function resolveProviderChannel(value) {
   const normalized = String(value || PROVIDER_CHANNELS.CALL)
     .trim()
@@ -10478,6 +10788,14 @@ function resolveProviderChannel(value) {
     return null;
   }
   return normalized;
+}
+
+function getProviderStateByChannel(channel, stateSnapshot = null) {
+  const snapshot = stateSnapshot || getProviderStateSnapshot();
+  if (channel === PROVIDER_CHANNELS.CALL) return snapshot.callState;
+  if (channel === PROVIDER_CHANNELS.SMS) return snapshot.smsState;
+  if (channel === PROVIDER_CHANNELS.EMAIL) return snapshot.emailState;
+  return null;
 }
 
 app.get("/admin/provider", requireAdminToken, async (req, res) => {
@@ -10523,7 +10841,72 @@ app.get("/admin/provider", requireAdminToken, async (req, res) => {
       sms: smsState,
       email: emailState,
     },
+    compatibility: getProviderCompatibilityReport(),
   });
+});
+
+app.get("/admin/provider/preflight", requireAdminToken, async (req, res) => {
+  syncRuntimeProviderMirrors();
+  const requestedChannel = resolveProviderChannel(req.query?.channel);
+  if (!requestedChannel && req.query?.channel) {
+    return res.status(400).json({
+      success: false,
+      error: "Unsupported provider channel",
+    });
+  }
+
+  const channel = requestedChannel || PROVIDER_CHANNELS.CALL;
+  const stateSnapshot = getProviderStateSnapshot();
+  const selectedState = getProviderStateByChannel(channel, stateSnapshot);
+  const requestedProvider = String(req.query?.provider || "")
+    .trim()
+    .toLowerCase();
+  const provider = requestedProvider || String(selectedState?.provider || "");
+  if (!provider || !selectedState?.supported_providers?.includes(provider)) {
+    return res.status(400).json({
+      success: false,
+      error: "Unsupported provider",
+      channel,
+      supported_providers: selectedState?.supported_providers || [],
+    });
+  }
+
+  const allowNetwork =
+    String(req.query?.network ?? req.query?.live ?? "1").toLowerCase() !== "0";
+  const requireReachability =
+    String(req.query?.reachability ?? "1").toLowerCase() !== "0";
+  const timeoutMsRaw = Number(req.query?.timeout_ms ?? req.query?.timeoutMs);
+  const timeoutMs =
+    Number.isFinite(timeoutMsRaw) && timeoutMsRaw > 0
+      ? Math.min(Math.floor(timeoutMsRaw), 20000)
+      : 7000;
+  try {
+    const report = await evaluateProviderPreflightReport({
+      provider,
+      channel,
+      mode: "manual",
+      allowNetwork,
+      requireReachability,
+      timeoutMs,
+      requestId: req.requestId || null,
+    });
+    return res.status(report.ok ? 200 : 409).json({
+      success: report.ok === true,
+      provider,
+      channel,
+      report,
+      summary: summarizePreflightReport(report),
+    });
+  } catch (error) {
+    console.error("Provider preflight endpoint failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Provider preflight execution failed",
+      details: error?.message || String(error || "unknown_error"),
+      provider,
+      channel,
+    });
+  }
 });
 
 app.post("/admin/provider", requireAdminToken, async (req, res) => {
@@ -10539,13 +10922,8 @@ app.post("/admin/provider", requireAdminToken, async (req, res) => {
       error: "Unsupported provider channel",
     });
   }
-  const channelStateMap = getProviderStateSnapshot();
-  const stateByChannel = {
-    [PROVIDER_CHANNELS.CALL]: channelStateMap.callState,
-    [PROVIDER_CHANNELS.SMS]: channelStateMap.smsState,
-    [PROVIDER_CHANNELS.EMAIL]: channelStateMap.emailState,
-  };
-  const selectedState = stateByChannel[channel];
+  const stateSnapshot = getProviderStateSnapshot();
+  const selectedState = getProviderStateByChannel(channel, stateSnapshot);
   if (!provider || !selectedState.supported_providers.includes(provider)) {
     return res
       .status(400)
@@ -10564,6 +10942,49 @@ app.post("/admin/provider", requireAdminToken, async (req, res) => {
       channel,
     });
   }
+
+  let preflightReport = null;
+  if (shouldRunProviderPreflightForSelection(channel, provider)) {
+    try {
+      preflightReport = await enforceProviderPreflight({
+        provider,
+        channel,
+        mode: "activation",
+        allowNetwork: true,
+        requireReachability: true,
+        requestId: req.requestId || null,
+      });
+    } catch (error) {
+      const report = error?.report || preflightReport || null;
+      const statusCode =
+        error instanceof ProviderPreflightError || error?.code === "provider_preflight_failed"
+          ? 409
+          : 500;
+      if (statusCode >= 500) {
+        console.error("Provider activation preflight error:", error);
+      }
+      const activeProvider =
+        channel === PROVIDER_CHANNELS.CALL
+          ? currentProvider
+          : channel === PROVIDER_CHANNELS.SMS
+            ? currentSmsProvider
+            : currentEmailProvider;
+      return res.status(statusCode).json({
+        success: false,
+        error: "provider_preflight_failed",
+        message:
+          error?.message ||
+          `Provider ${provider} failed preflight checks for ${channel}`,
+        channel,
+        provider,
+        active_provider: activeProvider,
+        fallback_provider: activeProvider,
+        preflight: report,
+        summary: summarizePreflightReport(report),
+      });
+    }
+  }
+
   const normalized = provider;
   const changed = normalized !== selectedState.provider;
   if (channel === PROVIDER_CHANNELS.CALL) {
@@ -10624,6 +11045,9 @@ app.post("/admin/provider", requireAdminToken, async (req, res) => {
       sms: smsState,
       email: emailState,
     },
+    preflight: preflightReport,
+    preflight_summary: summarizePreflightReport(preflightReport),
+    compatibility: getProviderCompatibilityReport(),
   });
 });
 
@@ -10693,6 +11117,8 @@ app.get("/admin/payment/feature", requireAdminToken, async (req, res) => {
       success: true,
       feature: paymentConfig,
       twilio_ready: getProviderReadiness()?.twilio === true,
+      sms_fallback_enabled: config.payment?.smsFallback?.enabled === true,
+      sms_service_ready: Boolean(smsService?.sendSMS),
     });
   } catch (error) {
     console.error("Failed to fetch payment feature config:", error);
@@ -10718,6 +11144,8 @@ app.post("/admin/payment/feature", requireAdminToken, async (req, res) => {
       success: true,
       feature: getPaymentFeatureConfig(),
       twilio_ready: getProviderReadiness()?.twilio === true,
+      sms_fallback_enabled: config.payment?.smsFallback?.enabled === true,
+      sms_service_ready: Boolean(smsService?.sendSMS),
     });
   } catch (error) {
     console.error("Failed to update payment feature config:", error);
@@ -11819,34 +12247,18 @@ async function runWithTimeout(
   timeoutCode = "operation_timeout",
 ) {
   const safeTimeoutMs = Number(timeoutMs);
-  if (!Number.isFinite(safeTimeoutMs) || safeTimeoutMs <= 0) {
-    return operationPromise;
-  }
-  let settled = false;
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      const timeoutError = new Error(
-        `${label} timed out after ${safeTimeoutMs}ms`,
-      );
-      timeoutError.code = timeoutCode;
-      reject(timeoutError);
-    }, safeTimeoutMs);
-
-    Promise.resolve(operationPromise)
-      .then((result) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        resolve(result);
-      })
-      .catch((error) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        reject(error);
-      });
+  return runOperationWithTimeout(operationPromise, {
+    timeoutMs: safeTimeoutMs,
+    label,
+    timeoutCode,
+    logger: console,
+    meta: {
+      scope: "app_runtime",
+    },
+    warnAfterMs:
+      Number.isFinite(safeTimeoutMs) && safeTimeoutMs > 0
+        ? Math.max(1000, Math.min(10000, Math.floor(safeTimeoutMs / 2)))
+        : null,
   });
 }
 
@@ -12003,6 +12415,45 @@ async function processCallJobs() {
   } finally {
     callJobProcessing = false;
   }
+}
+
+function buildTwilioOutboundCallPayload(options = {}) {
+  const host = String(options.host || "").trim();
+  const to = String(options.to || "").trim();
+  const from = String(options.from || "").trim();
+  if (!host) {
+    throw new Error("Twilio outbound payload requires host");
+  }
+  if (!to) {
+    throw new Error("Twilio outbound payload requires destination number");
+  }
+  if (!from) {
+    throw new Error("Twilio outbound payload requires source number");
+  }
+  const payload = {
+    url: `https://${host}/incoming`,
+    to,
+    from,
+    statusCallback: `https://${host}/webhook/call-status`,
+    statusCallbackEvent: [
+      "initiated",
+      "ringing",
+      "answered",
+      "completed",
+      "busy",
+      "no-answer",
+      "canceled",
+      "failed",
+    ],
+    statusCallbackMethod: "POST",
+  };
+  if (options.machineDetection) {
+    payload.machineDetection = options.machineDetection;
+  }
+  if (Number.isFinite(Number(options.machineDetectionTimeout))) {
+    payload.machineDetectionTimeout = Number(options.machineDetectionTimeout);
+  }
+  return payload;
 }
 
 async function placeOutboundCall(payload, hostOverride = null) {
@@ -12188,16 +12639,42 @@ async function placeOutboundCall(payload, hostOverride = null) {
     throw new Error("No outbound provider configured");
   }
   const failoverEnabled = config.providerFailover?.enabled !== false;
-  const healthyProviders = failoverEnabled
-    ? availableProviders.filter((provider) => !isProviderDegraded(provider))
-    : availableProviders;
-  const attemptProviders = healthyProviders.length
-    ? healthyProviders
-    : availableProviders;
+  const providerPlan = resolveProviderExecutionOrder({
+    channel: PROVIDER_CHANNELS.CALL,
+    preferredProvider,
+    providers: availableProviders,
+    readiness,
+    requestedFlow: keypadRequired ? "digit_capture" : "outbound_voice",
+    context: {
+      vonageDtmfWebhookEnabled: config.vonage?.dtmfWebhookEnabled === true,
+    },
+    failoverEnabled,
+    isProviderDegraded,
+  });
+  const attemptProviders = providerPlan.attempt_order;
+  recordProviderFlowMetric("provider_selection_plan", {
+    channel: "call",
+    flow: keypadRequired ? "digit_capture" : "outbound_voice",
+    provider: providerPlan.selected_provider || preferredProvider || null,
+    preferred_provider: preferredProvider || null,
+    attempt_order: attemptProviders,
+    blocked_providers: providerPlan.blocked_providers,
+    degraded_providers: providerPlan.degraded_providers,
+  });
+  if (!attemptProviders.length) {
+    throw new Error("No eligible outbound call providers are currently available");
+  }
   let lastError = null;
 
-  for (const provider of attemptProviders) {
+  for (let providerIndex = 0; providerIndex < attemptProviders.length; providerIndex += 1) {
+    const provider = attemptProviders[providerIndex];
     try {
+      recordProviderFlowMetric("outbound_call_attempt", {
+        channel: "call",
+        flow: keypadRequired ? "digit_capture" : "outbound_voice",
+        provider,
+        attempt: providerIndex + 1,
+      });
       if (provider === "twilio") {
         warnIfMachineDetectionDisabled("outbound-call");
         const accountSid = config.twilio.accountSid;
@@ -12209,36 +12686,26 @@ async function placeOutboundCall(payload, hostOverride = null) {
         }
 
         const client = twilio(accountSid, authToken);
-        const twimlUrl = `https://${host}/incoming`;
-        const statusUrl = `https://${host}/webhook/call-status`;
-        console.log(
-          `Twilio call URLs: twiml=${twimlUrl} statusCallback=${statusUrl}`,
-        );
-        const callPayload = {
-          url: twimlUrl,
+        const callPayload = buildTwilioOutboundCallPayload({
+          host,
           to: number,
           from: fromNumber,
-          statusCallback: statusUrl,
-          statusCallbackEvent: [
-            "initiated",
-            "ringing",
-            "answered",
-            "completed",
-            "busy",
-            "no-answer",
-            "canceled",
-            "failed",
-          ],
-          statusCallbackMethod: "POST",
-        };
-        if (config.twilio?.machineDetection) {
-          callPayload.machineDetection = config.twilio.machineDetection;
-        }
-        if (Number.isFinite(config.twilio?.machineDetectionTimeout)) {
-          callPayload.machineDetectionTimeout =
-            config.twilio.machineDetectionTimeout;
-        }
-        const call = await client.calls.create(callPayload);
+          machineDetection: config.twilio?.machineDetection,
+          machineDetectionTimeout: config.twilio?.machineDetectionTimeout,
+        });
+        console.log(
+          `Twilio call URLs: twiml=${callPayload.url} statusCallback=${callPayload.statusCallback}`,
+        );
+        const providerTimeoutMs =
+          Number(config.callProvider?.requestTimeoutMs) ||
+          Number(config.outboundLimits?.handlerTimeoutMs) ||
+          30000;
+        const call = await runWithTimeout(
+          client.calls.create(callPayload),
+          providerTimeoutMs,
+          "twilio_outbound_call",
+          "call_provider_timeout",
+        );
         callId = call.sid;
         callStatus = call.status || "queued";
       } else if (provider === "aws") {
@@ -12310,11 +12777,24 @@ async function placeOutboundCall(payload, hostOverride = null) {
         throw new Error(`Unsupported provider ${provider}`);
       }
       recordProviderSuccess(provider);
+      recordProviderFlowMetric("outbound_call_success", {
+        channel: "call",
+        flow: keypadRequired ? "digit_capture" : "outbound_voice",
+        provider,
+        attempt: providerIndex + 1,
+      });
       selectedProvider = provider;
       break;
     } catch (error) {
       lastError = error;
       recordProviderError(provider, error);
+      recordProviderFlowMetric("outbound_call_error", {
+        channel: "call",
+        flow: keypadRequired ? "digit_capture" : "outbound_voice",
+        provider,
+        attempt: providerIndex + 1,
+        reason: error?.message || String(error || "unknown"),
+      });
       console.error(
         `Outbound call failed for provider ${provider}:`,
         error.message || error,
@@ -12593,7 +13073,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
 }
 
 async function processCallStatusWebhookPayload(payload = {}, options = {}) {
-  const {
+  let {
     CallSid,
     CallStatus,
     Duration,
@@ -12605,6 +13085,16 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
     ErrorMessage,
     DialCallDuration,
   } = payload || {};
+  const canonicalEvent = buildCanonicalCallStatusEvent("twilio", payload || {}, {
+    callSid: CallSid || payload?.callSid || payload?.call_sid || null,
+  });
+  CallSid = canonicalEvent.call_sid || CallSid;
+  CallStatus = canonicalEvent.raw_status || CallStatus;
+  ErrorCode = canonicalEvent.error_code || ErrorCode;
+  ErrorMessage = canonicalEvent.error_message || ErrorMessage;
+  if (canonicalEvent.answered_by) {
+    AnsweredBy = canonicalEvent.answered_by;
+  }
 
   if (!CallSid) {
     const err = new Error("Missing CallSid");
@@ -12628,7 +13118,9 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
   const durationCandidates = [Duration, CallDuration, DialCallDuration]
     .map((value) => parseInt(value, 10))
     .filter((value) => Number.isFinite(value));
-  const durationValue = durationCandidates.length
+  const durationValue = Number.isFinite(Number(canonicalEvent.duration))
+    ? Math.max(0, Math.floor(Number(canonicalEvent.duration)))
+    : durationCandidates.length
     ? Math.max(...durationCandidates)
     : 0;
 
@@ -12885,6 +13377,16 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
     duration: updateData.duration,
     answered_by: AnsweredBy,
     correction_applied: actualStatus !== CallStatus.toLowerCase(),
+    source,
+  });
+  recordProviderFlowMetric("voice_status_transition", {
+    channel: "call",
+    flow: "status_webhooks",
+    provider: "twilio",
+    call_sid: CallSid,
+    status: actualStatus,
+    raw_status: rawStatus,
+    duration: updateData.duration,
     source,
   });
 
@@ -15349,6 +15851,7 @@ registerStatusRoutes(app, {
   getCurrentProvider: () => currentProvider,
   getCurrentSmsProvider: () => currentSmsProvider,
   getCurrentEmailProvider: () => currentEmailProvider,
+  getProviderCompatibilityReport,
   callConfigurations,
   config,
   verifyHmacSignature,
@@ -15712,6 +16215,14 @@ module.exports = {
     verifyTelegramWebhookAuth,
     verifyAwsWebhookAuth,
     verifyAwsStreamAuth,
+    requireValidTwilioSignature,
+    requireValidVonageWebhook,
+    evaluateProviderPreflightReport,
+    enforceProviderPreflight,
+    buildTwilioOutboundCallPayload,
+    buildVonageWebsocketUrl,
+    buildVonageEventWebhookUrl,
+    buildVonageAnswerWebhookUrl,
     buildStreamAuthToken,
     buildCallScriptMutationFingerprint,
     beginCallScriptMutationIdempotency,
@@ -15732,18 +16243,25 @@ process.on("uncaughtException", (error) => {
   console.error("Uncaught exception:", details);
 });
 
-// Enhanced graceful shutdown with comprehensive cleanup
-process.on("SIGINT", async () => {
-  console.log("\n🛑 Shutting down enhanced adaptive system gracefully...");
+async function gracefulShutdown(options = {}) {
+  const signal = String(options.signal || "shutdown").toUpperCase();
+  const startMessage =
+    options.startMessage || "Shutting down enhanced adaptive system gracefully...";
+  const successMessage =
+    options.successMessage || "Enhanced adaptive system shutdown complete";
+  const errorPrefix = options.errorPrefix || "Error during shutdown:";
+
+  console.log(`\n${startMessage}`);
 
   try {
-    // Log shutdown start
-    await db.logServiceHealth("system", "shutdown_initiated", {
-      active_calls: callConfigurations.size,
-      tracked_calls: callFunctionSystems.size,
-    });
+    if (db?.logServiceHealth) {
+      await db.logServiceHealth("system", "shutdown_initiated", {
+        active_calls: callConfigurations.size,
+        tracked_calls: callFunctionSystems.size,
+        reason: signal,
+      });
+    }
 
-    // Stop services
     webhookService.stop();
     callConfigurations.clear();
     callFunctionSystems.clear();
@@ -15764,62 +16282,37 @@ process.on("SIGINT", async () => {
     providerEventDedupe.clear();
     callStatusDedupe.clear();
 
-    // Log successful shutdown
-    await db.logServiceHealth("system", "shutdown_completed", {
-      timestamp: new Date().toISOString(),
-    });
-
-    await db.close();
-    console.log("✅ Enhanced adaptive system shutdown complete");
+    if (db?.logServiceHealth) {
+      await db.logServiceHealth("system", "shutdown_completed", {
+        timestamp: new Date().toISOString(),
+        reason: signal,
+      });
+    }
+    if (db?.close) {
+      await db.close();
+    }
+    console.log(successMessage);
   } catch (shutdownError) {
-    console.error("❌ Error during shutdown:", shutdownError);
+    console.error(errorPrefix, shutdownError);
   }
 
   process.exit(0);
+}
+
+process.on("SIGINT", async () => {
+  await gracefulShutdown({
+    signal: "SIGINT",
+    startMessage: "🛑 Shutting down enhanced adaptive system gracefully...",
+    successMessage: "✅ Enhanced adaptive system shutdown complete",
+    errorPrefix: "❌ Error during shutdown:",
+  });
 });
 
 process.on("SIGTERM", async () => {
-  console.log("\nShutting down enhanced adaptive system gracefully...");
-
-  try {
-    // Log shutdown start
-    await db.logServiceHealth("system", "shutdown_initiated", {
-      active_calls: callConfigurations.size,
-      tracked_calls: callFunctionSystems.size,
-      reason: "SIGTERM",
-    });
-
-    // Stop services
-    webhookService.stop();
-    callConfigurations.clear();
-    callFunctionSystems.clear();
-    callDirections.clear();
-    for (const timer of keypadDtmfWatchdogs.values()) {
-      clearTimeout(timer);
-    }
-    keypadDtmfWatchdogs.clear();
-    keypadDtmfSeen.clear();
-    keypadProviderOverrides.clear();
-    keypadProviderGuardWarnings.clear();
-    for (const timer of callRuntimePersistTimers.values()) {
-      clearTimeout(timer);
-    }
-    callRuntimePersistTimers.clear();
-    callRuntimePendingWrites.clear();
-    callToolInFlight.clear();
-    providerEventDedupe.clear();
-    callStatusDedupe.clear();
-
-    // Log successful shutdown
-    await db.logServiceHealth("system", "shutdown_completed", {
-      timestamp: new Date().toISOString(),
-    });
-
-    await db.close();
-    console.log("Enhanced adaptive system shutdown complete");
-  } catch (shutdownError) {
-    console.error("Error during shutdown:", shutdownError);
-  }
-
-  process.exit(0);
+  await gracefulShutdown({
+    signal: "SIGTERM",
+    startMessage: "Shutting down enhanced adaptive system gracefully...",
+    successMessage: "Enhanced adaptive system shutdown complete",
+    errorPrefix: "Error during shutdown:",
+  });
 });

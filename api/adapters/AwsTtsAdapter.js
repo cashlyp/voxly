@@ -2,6 +2,7 @@ const { PollyClient, SynthesizeSpeechCommand } = require('@aws-sdk/client-polly'
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { streamCollector } = require('@aws-sdk/util-stream-node');
 const { v4: uuidv4 } = require('uuid');
+const { runWithTimeout } = require('../utils/asyncControl');
 
 /**
  * AwsTtsAdapter wraps Amazon Polly to provide synthesized audio suitable for
@@ -37,25 +38,6 @@ class AwsTtsAdapter {
       Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 15000;
   }
 
-  withTimeout(promise, label = 'aws_tts_timeout') {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        const timeoutError = new Error(label);
-        timeoutError.code = 'aws_tts_timeout';
-        reject(timeoutError);
-      }, this.requestTimeoutMs);
-      Promise.resolve(promise)
-        .then((result) => {
-          clearTimeout(timer);
-          resolve(result);
-        })
-        .catch((error) => {
-          clearTimeout(timer);
-          reject(error);
-        });
-    });
-  }
-
   /**
    * Generate audio for the provided text. Returns a Buffer.
    * @param {string} text
@@ -78,10 +60,17 @@ class AwsTtsAdapter {
     };
 
     const command = new SynthesizeSpeechCommand(params);
-    const response = await this.withTimeout(
-      this.polly.send(command),
-      'aws_polly_synthesize_timeout',
-    );
+    const response = await runWithTimeout(this.polly.send(command), {
+      timeoutMs: this.requestTimeoutMs,
+      label: 'aws_polly_synthesize_timeout',
+      timeoutCode: 'aws_tts_timeout',
+      logger: this.logger,
+      meta: {
+        provider: 'aws_tts',
+        operation: 'synthesize',
+      },
+      warnAfterMs: Math.min(5000, Math.max(1000, Math.floor(this.requestTimeoutMs / 2))),
+    });
     const audioArray = await streamCollector(response.AudioStream);
     this.logger.info?.('Polly synthesized speech', {
       voiceId: params.VoiceId,
@@ -121,10 +110,17 @@ class AwsTtsAdapter {
     };
 
     const command = new PutObjectCommand(params);
-    await this.withTimeout(
-      this.s3.send(command),
-      'aws_s3_put_object_timeout',
-    );
+    await runWithTimeout(this.s3.send(command), {
+      timeoutMs: this.requestTimeoutMs,
+      label: 'aws_s3_put_object_timeout',
+      timeoutCode: 'aws_tts_timeout',
+      logger: this.logger,
+      meta: {
+        provider: 'aws_tts',
+        operation: 's3_put_object',
+      },
+      warnAfterMs: Math.min(5000, Math.max(1000, Math.floor(this.requestTimeoutMs / 2))),
+    });
     this.logger.info?.('Uploaded Polly audio to S3', { bucket: params.Bucket, key: params.Key });
 
     return { bucket: params.Bucket, key: params.Key };
