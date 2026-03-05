@@ -33,6 +33,7 @@ const {
   RELATIONSHIP_PROFILE_TYPES,
   RELATIONSHIP_FLOW_TYPES,
   RELATIONSHIP_PROFILE_OBJECTIVE_MAP,
+  RELATIONSHIP_PROFILE_FLOW_MAP,
   normalizeRelationshipProfileType,
   deriveConversationProfile,
   buildConversationProfilePromptBundle,

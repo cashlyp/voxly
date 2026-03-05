@@ -369,7 +369,7 @@ async function askOptionWithButtons(
   const keyboard = new InlineKeyboard();
   const basePrefix = prefix || 'option';
   const opToken = String(ctx.session?.currentOp?.token || '').trim();
-  const prefixKey = opToken ? `${basePrefix}:${opToken}` : basePrefix;
+  const prefixKey = basePrefix;
   const labels = options.map((option) => (formatLabel ? formatLabel(option) : formatOptionLabel(option)));
   const hasLongLabel = labels.some((label) => String(label).length > 22);
   let resolvedColumns = Number.isFinite(columns) ? columns : (labels.length > 6 || hasLongLabel ? 1 : 2);
@@ -391,7 +391,18 @@ async function askOptionWithButtons(
 
   const message = await sendMenu(ctx, prompt, { parse_mode: 'Markdown', reply_markup: keyboard });
   const selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {
-    return matchesCallbackPrefix(callbackCtx.callbackQuery.data, prefixKey);
+    const callbackData = callbackCtx?.callbackQuery?.data;
+    if (!callbackData) {
+      return false;
+    }
+    if (!matchesCallbackPrefix(callbackData, prefixKey)) {
+      return false;
+    }
+    const parsed = parseCallbackData(callbackData);
+    if (parsed?.signed && opToken && parsed.token && parsed.token !== opToken) {
+      return false;
+    }
+    return true;
   });
   const activeChecker = typeof ensureActive === 'function'
     ? ensureActive
@@ -406,7 +417,8 @@ async function askOptionWithButtons(
   }
   await clearMenuMessages(ctx);
 
-  const selectionAction = parseCallbackData(selectionCtx.callbackQuery.data).action || selectionCtx.callbackQuery.data;
+  const selectedData = selectionCtx?.callbackQuery?.data || '';
+  const selectionAction = parseCallbackData(selectedData).action || selectedData;
   const parts = selectionAction.split(':');
   const prefixSegments = prefixKey.split(':').filter(Boolean).length;
   const selectedId = parts.slice(prefixSegments).join(':');

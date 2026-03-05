@@ -306,6 +306,12 @@ bot.callbackQuery(/^lc:/, async (ctx) => {
   return;
 });
 
+// API-origin status callbacks (transcript, recording, retry, recap)
+bot.callbackQuery(/^(tr|rca|retry|recap):/, async (ctx) => {
+  await proxyLiveCallAction(ctx);
+  return;
+});
+
 // Initialize conversations middleware AFTER session
 bot.use(conversations());
 
@@ -614,12 +620,18 @@ bot.on("callback_query:data", async (ctx) => {
     finishActionMetric(metric, status, extra);
   };
   try {
-    const menuExemptPrefixes = ["alert:", "lc:"];
+    const menuExemptPrefixes = ["alert:", "lc:", "tr:", "rca:", "retry:", "recap:"];
     const isMenuExempt = menuExemptPrefixes.some((prefix) =>
       String(resolvedAction || "").startsWith(prefix),
     );
 
-    if (String(resolvedAction || "").startsWith("lc:")) {
+    if (
+      String(resolvedAction || "").startsWith("lc:") ||
+      String(resolvedAction || "").startsWith("tr:") ||
+      String(resolvedAction || "").startsWith("rca:") ||
+      String(resolvedAction || "").startsWith("retry:") ||
+      String(resolvedAction || "").startsWith("recap:")
+    ) {
       await proxyLiveCallAction(ctx);
       finishMetric("ok", { route: "live_call_proxy" });
       return;

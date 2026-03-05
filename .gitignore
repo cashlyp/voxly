@@ -37,6 +37,8 @@ tests/
 
 # Local overrides/secrets
 *.local
+.local/
+**/.local/
 *.pem
 .env*.local
 .vercel
