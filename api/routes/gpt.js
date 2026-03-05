@@ -89,6 +89,9 @@ class EnhancedGptService extends EventEmitter {
       provider: String(options.provider || ''),
       startedAt: new Date().toISOString()
     };
+    this.responsePolicyGate = typeof options.responsePolicyGate === 'function'
+      ? options.responsePolicyGate
+      : null;
     this.db = options.db || null;
     this.webhookService = options.webhookService || null;
     this.memoryLoaded = false;
@@ -137,6 +140,42 @@ class EnhancedGptService extends EventEmitter {
       verification: {
         name: 'verification',
         prompt: 'Call profile: verification. Purpose is identity/OTP/security checks. Never read or share codes or passwords. Prefer keypad entry; if spoken, accept only digits, acknowledge without repeating, and keep responses brief.'
+      },
+      dating: {
+        name: 'dating',
+        prompt: 'Call profile: dating. Keep tone warm, playful, and respectful. Use short natural replies, avoid manipulation and money pressure, set calm boundaries when needed, and guide toward clear, low-pressure conversation.'
+      },
+      celebrity: {
+        name: 'celebrity',
+        prompt: 'Call profile: celebrity fan engagement. Present as an official virtual assistant (not the celebrity directly). Keep tone energetic, respectful, concise, and transparent. Avoid impersonation claims, pressure tactics, or misleading urgency.'
+      },
+      fan: {
+        name: 'fan',
+        prompt: 'Call profile: fan engagement. Stay transparent, supportive, and concise. Do not impersonate public figures or pressure for money.'
+      },
+      creator: {
+        name: 'creator',
+        prompt: 'Call profile: creator collaboration. Keep tone professional and concise, align on fit and next steps, and avoid pressure tactics.'
+      },
+      friendship: {
+        name: 'friendship',
+        prompt: 'Call profile: friendship check-in. Keep tone warm, supportive, concise, and respectful. Avoid manipulative or coercive language.'
+      },
+      networking: {
+        name: 'networking',
+        prompt: 'Call profile: networking outreach. Be concise, respectful, and goal-oriented with one clear next step.'
+      },
+      community: {
+        name: 'community',
+        prompt: 'Call profile: community engagement. Stay inclusive, practical, and policy-compliant with clear, respectful guidance.'
+      },
+      marketplace_seller: {
+        name: 'marketplace_seller',
+        prompt: 'Call profile: marketplace seller. Prioritize trust and clarity, avoid pressure, and recommend safe payment and handoff practices.'
+      },
+      real_estate_agent: {
+        name: 'real_estate_agent',
+        prompt: 'Call profile: real-estate follow-up. Keep communication professional, clear, compliant, and focused on verifiable next steps.'
       }
     };
     this.systemPrompt = this.composeSystemPrompt();
@@ -248,6 +287,40 @@ class EnhancedGptService extends EventEmitter {
     this.systemPrompt = this.composeSystemPrompt();
     this.updateSystemPromptWithPersonality(this.personalityPrompt);
     console.log(`💪 Call profile set: ${this.currentProfileName}`.blue);
+  }
+
+  setResponsePolicyGate(policyGate = null) {
+    this.responsePolicyGate = typeof policyGate === 'function' ? policyGate : null;
+  }
+
+  applyResponsePolicy(text = '', metadata = {}) {
+    const rawText = String(text || '');
+    if (!rawText || typeof this.responsePolicyGate !== 'function') {
+      return { text: rawText, replaced: false, blocked: [] };
+    }
+    try {
+      const result = this.responsePolicyGate(rawText, metadata);
+      if (result && typeof result === 'object') {
+        const nextText = String(result.text ?? rawText);
+        return {
+          text: nextText,
+          replaced: result.replaced === true && nextText !== rawText,
+          blocked: Array.isArray(result.blocked) ? result.blocked : []
+        };
+      }
+      if (typeof result === 'string') {
+        return {
+          text: result,
+          replaced: result !== rawText,
+          blocked: []
+        };
+      }
+    } catch (error) {
+      this.logEvent('policy_gate_failed', {
+        error: error?.message || 'unknown_policy_gate_error'
+      });
+    }
+    return { text: rawText, replaced: false, blocked: [] };
   }
 
   // Set dynamic functions for this conversation
@@ -1571,6 +1644,8 @@ class EnhancedGptService extends EventEmitter {
     let toolCallHandled = false;
     let finishReason = '';
     let streamError = null;
+    let policyBlocked = false;
+    let policyFallbackText = '';
 
     function collectToolInformation(deltas) {
       const toolCalls = Array.isArray(deltas?.tool_calls) ? deltas.tool_calls : [];
@@ -1731,10 +1806,28 @@ class EnhancedGptService extends EventEmitter {
             if (!partialResponse.trim()) {
               continue;
             }
+            if (policyBlocked) {
+              partialResponse = '';
+              continue;
+            }
             const consistency = this.applyPersonaConsistency(partialResponse);
+            const policyResult = this.applyResponsePolicy(consistency.text, {
+              interactionCount,
+              stage: 'partial',
+              phase: this.currentPhase,
+              profile: this.currentProfileName
+            });
+            if (policyResult.replaced) {
+              policyBlocked = true;
+              policyFallbackText = policyResult.text;
+              this.logEvent('policy_gate_blocked', {
+                stage: 'partial',
+                blocked: policyResult.blocked
+              });
+            }
             const gptReply = { 
               partialResponseIndex: this.partialResponseIndex,
-              partialResponse: consistency.text,
+              partialResponse: policyResult.text,
               personalityInfo: this.personalityEngine.getCurrentPersonality(),
               adaptationHistory: this.personalityChanges.slice(-3), // Last 3 changes
               functionsAvailable: Object.keys(this.availableFunctions).length,
@@ -1767,11 +1860,25 @@ class EnhancedGptService extends EventEmitter {
       return;
     }
 
-    if (partialResponse.trim()) {
+    if (partialResponse.trim() && !policyBlocked) {
       const consistency = this.applyPersonaConsistency(partialResponse);
+      const policyResult = this.applyResponsePolicy(consistency.text, {
+        interactionCount,
+        stage: 'partial',
+        phase: this.currentPhase,
+        profile: this.currentProfileName
+      });
+      if (policyResult.replaced) {
+        policyBlocked = true;
+        policyFallbackText = policyResult.text;
+        this.logEvent('policy_gate_blocked', {
+          stage: 'partial_tail',
+          blocked: policyResult.blocked
+        });
+      }
       this.emit('gptreply', {
         partialResponseIndex: this.partialResponseIndex,
-        partialResponse: consistency.text,
+        partialResponse: policyResult.text,
         personalityInfo: this.personalityEngine.getCurrentPersonality(),
         adaptationHistory: this.personalityChanges.slice(-3),
         functionsAvailable: Object.keys(this.availableFunctions).length,
@@ -1785,6 +1892,10 @@ class EnhancedGptService extends EventEmitter {
       partialResponse = '';
     }
 
+    if (policyBlocked) {
+      completeResponse = policyFallbackText;
+    }
+
     if (!String(completeResponse || '').trim()) {
       handleFailure(new Error('gpt_empty_response'));
       return;
@@ -1792,17 +1903,32 @@ class EnhancedGptService extends EventEmitter {
 
     // Store AI response in conversation history
     const correctedComplete = this.applyPersonaConsistency(completeResponse);
+    const finalPolicyResult = policyBlocked
+      ? { text: correctedComplete.text, replaced: true, blocked: ['policy_gate'] }
+      : this.applyResponsePolicy(correctedComplete.text, {
+          interactionCount,
+          stage: 'final',
+          phase: this.currentPhase,
+          profile: this.currentProfileName
+        });
+    if (finalPolicyResult.replaced) {
+      this.logEvent('policy_gate_blocked', {
+        stage: 'final',
+        blocked: finalPolicyResult.blocked
+      });
+    }
+    const finalAssistantText = finalPolicyResult.text;
     this.conversationHistory.push({
       role: 'assistant',
-      content: correctedComplete.text,
+      content: finalAssistantText,
       timestamp: new Date().toISOString(),
       interactionCount: interactionCount,
       personality: this.personalityEngine.currentPersonality,
       functionsUsed: toolInvocations.map((item) => item.tool)
     });
 
-    this.userContext.push({'role': 'assistant', 'content': correctedComplete.text});
-    this.addToPhaseWindow({ role: 'assistant', content: correctedComplete.text });
+    this.userContext.push({'role': 'assistant', 'content': finalAssistantText});
+    this.addToPhaseWindow({ role: 'assistant', content: finalAssistantText });
     
     console.log(`🧠 Context: ${this.userContext.length} | Personality: ${this.personalityEngine.currentPersonality} | Functions: ${Object.keys(this.availableFunctions).length}`.green);
 
@@ -1819,7 +1945,8 @@ class EnhancedGptService extends EventEmitter {
       ttfb_ms: ttfb,
       rtt_ms: rtt,
       tools_invoked: toolInvocations.map((item) => item.tool),
-      persona_consistency_score: correctedComplete.score
+      persona_consistency_score: correctedComplete.score,
+      policy_blocked: policyBlocked
     });
   }
 

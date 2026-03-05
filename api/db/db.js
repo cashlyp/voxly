@@ -2765,19 +2765,30 @@ class EnhancedDatabase {
     // Get enhanced call transcripts (supports both table names)
     async getCallTranscripts(call_sid) {
         return new Promise((resolve, reject) => {
-            // Try the legacy table first for backward compatibility
-            const sql = `
-                SELECT * FROM transcripts 
-                WHERE call_sid = ? 
+            const selectFrom = (tableName) => `
+                SELECT * FROM ${tableName}
+                WHERE call_sid = ?
                 ORDER BY interaction_count ASC, timestamp ASC
             `;
-            
-            this.db.all(sql, [call_sid], (err, rows) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(rows || []);
+            const sqlLegacy = selectFrom("transcripts");
+            const sqlEnhanced = selectFrom("call_transcripts");
+
+            this.db.all(sqlLegacy, [call_sid], (legacyErr, legacyRows) => {
+                if (!legacyErr && Array.isArray(legacyRows) && legacyRows.length > 0) {
+                    resolve(legacyRows);
+                    return;
                 }
+                this.db.all(sqlEnhanced, [call_sid], (enhancedErr, enhancedRows) => {
+                    if (enhancedErr) {
+                        if (!legacyErr) {
+                            resolve(Array.isArray(legacyRows) ? legacyRows : []);
+                            return;
+                        }
+                        reject(legacyErr);
+                        return;
+                    }
+                    resolve(Array.isArray(enhancedRows) ? enhancedRows : []);
+                });
             });
         });
     }

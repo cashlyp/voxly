@@ -23,7 +23,17 @@ logs
 **/dist
 **/build
 **/dist-ssr
-/docs/
+
+# Documentation directories
+docs/
+**/docs/
+
+# Test directories
+test/
+tests/
+**/test/
+**/tests/
+**/__tests__/
 
 # Local overrides/secrets
 *.local

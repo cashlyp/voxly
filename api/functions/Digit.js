@@ -303,10 +303,34 @@ const DIGIT_CAPTURE_GROUPS = {
     id: 'card',
     label: 'Card Details',
     steps: [
-      { profile: 'card_number' },
-      { profile: 'card_expiry' },
-      { profile: 'zip' },
-      { profile: 'cvv' }
+      {
+        profile: 'card_number',
+        min_digits: 16,
+        max_digits: 16,
+        force_exact_length: 16,
+        prompt: 'Please enter the 16 digits of your card number now.'
+      },
+      {
+        profile: 'card_expiry',
+        min_digits: 4,
+        max_digits: 4,
+        force_exact_length: 4,
+        prompt: 'Please enter the expiration date: 2 digits for month and 2 digits for year. For example, zero seven two seven.'
+      },
+      {
+        profile: 'cvv',
+        min_digits: 3,
+        max_digits: 3,
+        force_exact_length: 3,
+        prompt: 'Please enter the 3 digit security code on the back of your card.'
+      },
+      {
+        profile: 'zip',
+        min_digits: 5,
+        max_digits: 5,
+        force_exact_length: 5,
+        prompt: 'Please enter your 5 digit billing ZIP code now.'
+      }
     ]
   }
 };
@@ -670,15 +694,19 @@ function createDigitCollectionService(options = {}) {
 
     switch (profile) {
       case 'card_expiry':
+        if (min === 4 && max === 4) return 'Use MMYY (4 digits).';
         return max >= 6 ? 'Use MMYY or MMYYYY.' : 'Use MMYY (4 digits).';
       case 'dob':
         return max >= 8 ? 'Use MMDDYY or MMDDYYYY.' : 'Use MMDDYY.';
       case 'cvv':
+        if (min === max) return `Use ${min} digits.`;
         return 'Use 3 or 4 digits.';
       case 'zip':
+        if (min === max) return `Use ${min} digits.`;
         return max >= 9 ? 'Use 5 or 9 digits.' : 'Use 5 digits.';
       case 'card_number':
-        return 'Use 13 to 19 digits.';
+        if (min === max) return `Use exactly ${min} digits.`;
+        return `Use ${min} to ${max} digits.`;
       case 'routing_number':
         return 'Use 9 digits.';
       case 'phone':
@@ -3081,9 +3109,11 @@ function createDigitCollectionService(options = {}) {
 
     let normalizedMin = minDigits;
     let normalizedMax = maxDigits < minDigits ? minDigits : maxDigits;
-    if (profile === 'verification' && params.force_exact_length) {
-      normalizedMin = params.force_exact_length;
-      normalizedMax = params.force_exact_length;
+    const exactLength = Number(params.force_exact_length);
+    if (Number.isFinite(exactLength) && exactLength > 0) {
+      const boundedExact = Math.max(1, Math.trunc(exactLength));
+      normalizedMin = boundedExact;
+      normalizedMax = boundedExact;
     }
     if (allowTerminator && terminatorChar === '#') {
       normalizedMax = Math.max(normalizedMax, normalizedMin);
@@ -3487,6 +3517,18 @@ function createDigitCollectionService(options = {}) {
         if (!month || month < 1 || month > 12) {
           return { valid: false, reason: 'invalid_expiry_month' };
         }
+        const year = value.length === 4
+          ? 2000 + Number(value.slice(2, 4))
+          : Number(value.slice(2, 6));
+        if (!Number.isFinite(year) || year < 2000 || year > 2199) {
+          return { valid: false, reason: 'invalid_expiry_year' };
+        }
+        const now = new Date();
+        const currentYear = now.getUTCFullYear();
+        const currentMonth = now.getUTCMonth() + 1;
+        if (year < currentYear || (year === currentYear && month < currentMonth)) {
+          return { valid: false, reason: 'invalid_expiry_past' };
+        }
         return { valid: true };
       }
       default:
@@ -3564,7 +3606,7 @@ function createDigitCollectionService(options = {}) {
       if (!digits) return { accepted: false, reason: 'empty' };
       const exp = this.expectations.get(callSid);
       if (!exp) return { accepted: false, reason: 'no_expectation' };
-      const source = meta.source || 'dtmf';
+      const source = String(meta.source || 'dtmf').toLowerCase();
       const expectedChannelSessionId = exp.channel_session_id
         || syncChannelSession(exp, source, { callSid, forceRotate: false });
       const metaChannelSessionId = meta.channel_session_id
@@ -3674,10 +3716,12 @@ function createDigitCollectionService(options = {}) {
         return { accepted: false, reason: 'exceeds_max_buffer', profile: exp.profile, mask_for_gpt: exp.mask_for_gpt, source };
       }
 
-      const isFullInput = meta.full_input === true
-        || source === 'gather'
+      const isAtomicFullInputSource = source === 'gather'
         || source === 'sms'
         || source === 'link'
+        || source === 'secure_sms_link';
+      const isFullInput = meta.full_input === true
+        || isAtomicFullInputSource
         || source === 'spoken';
       const attemptId = Number.isFinite(Number(meta.attempt_id))
         ? Number(meta.attempt_id)
@@ -3727,7 +3771,7 @@ function createDigitCollectionService(options = {}) {
       }
       if (isFullInput && exp.buffer) {
         const preservePartial = exp.reset_on_interrupt !== true
-          && (source === 'dtmf' || source === 'gather')
+          && source === 'dtmf'
           && String(exp.buffer || '').length < Math.max(1, Number(exp.max_digits) || 1);
         if (!preservePartial) {
           exp.buffer = '';
@@ -3809,6 +3853,9 @@ function createDigitCollectionService(options = {}) {
       } else if (!inRange) {
         accepted = false;
         reason = 'incomplete';
+        if (isAtomicFullInputSource) {
+          exp.buffer = '';
+        }
       } else {
         const validation = validateProfileDigits(exp.profile, currentBuffer);
         if (!validation.valid) {

@@ -29,6 +29,22 @@ const twilioSignature = require("./middleware/twilioSignature");
 const DynamicFunctionEngine = require("./functions/DynamicFunctionEngine");
 const { createDigitCollectionService } = require("./functions/Digit");
 const { formatDigitCaptureLabel } = require("./functions/Labels");
+const {
+  RELATIONSHIP_PROFILE_TYPES,
+  RELATIONSHIP_FLOW_TYPES,
+  RELATIONSHIP_PROFILE_OBJECTIVE_MAP,
+  normalizeRelationshipProfileType,
+  deriveConversationProfile,
+  buildConversationProfilePromptBundle,
+  createConversationProfileToolkit,
+  applyConversationPolicyGates,
+} = require("./functions/Dating");
+const {
+  CALL_OBJECTIVE_IDS,
+  CALL_SCRIPT_FLOW_TYPES,
+  normalizeCallScriptFlowType: normalizeCallScriptFlowTypeShared,
+  normalizeObjectiveTag: normalizeObjectiveTagShared,
+} = require("./functions/relationshipFlowMetadata");
 const config = require("./config");
 const {
   PROVIDER_CHANNELS,
@@ -1214,59 +1230,9 @@ function parsePaymentPolicy(value) {
   }
 }
 
-const CALL_OBJECTIVE_IDS = Object.freeze([
-  "collect_payment",
-  "verify_identity",
-  "appointment_confirm",
-  "service_recovery",
-  "general_outreach",
-]);
-
-const CALL_SCRIPT_FLOW_TYPES = Object.freeze([
-  "payment_collection",
-  "identity_verification",
-  "appointment_confirmation",
-  "service_recovery",
-  "general_outreach",
-  "general",
-]);
-
-const CALL_SCRIPT_FLOW_TYPE_ALIASES = Object.freeze({
-  payment_collection: "payment_collection",
-  "payment-collection": "payment_collection",
-  payment_flow: "payment_collection",
-  payment: "payment_collection",
-  collect_payment: "payment_collection",
-  "collect-payment": "payment_collection",
-  identity_verification: "identity_verification",
-  "identity-verification": "identity_verification",
-  identity: "identity_verification",
-  verify_identity: "identity_verification",
-  "verify-identity": "identity_verification",
-  otp: "identity_verification",
-  digit_capture: "identity_verification",
-  "digit-capture": "identity_verification",
-  appointment_confirmation: "appointment_confirmation",
-  "appointment-confirmation": "appointment_confirmation",
-  appointment_confirm: "appointment_confirmation",
-  "appointment-confirm": "appointment_confirmation",
-  appointment: "appointment_confirmation",
-  service_recovery: "service_recovery",
-  "service-recovery": "service_recovery",
-  recovery: "service_recovery",
-  general_outreach: "general_outreach",
-  "general-outreach": "general_outreach",
-  outreach: "general_outreach",
-  general: "general",
-  default: "general",
-});
-
-function normalizeCallScriptFlowType(value) {
-  if (value === undefined || value === null) return null;
-  const raw = String(value).trim().toLowerCase();
-  if (!raw) return null;
-  return CALL_SCRIPT_FLOW_TYPE_ALIASES[raw] || null;
-}
+const RELATIONSHIP_PROFILE_SET = new Set(RELATIONSHIP_PROFILE_TYPES);
+const normalizeCallScriptFlowType = normalizeCallScriptFlowTypeShared;
+const normalizeObjectiveTag = normalizeObjectiveTagShared;
 
 function parseCallScriptFlowFilter(value) {
   if (value === undefined || value === null) {
@@ -1305,7 +1271,7 @@ function parseObjectiveTags(value) {
   if (value === undefined || value === null) return [];
   if (Array.isArray(value)) {
     return value
-      .map((entry) => String(entry || "").trim().toLowerCase())
+      .map((entry) => normalizeObjectiveTag(entry))
       .filter(Boolean);
   }
   const raw = String(value || "").trim();
@@ -1315,7 +1281,7 @@ function parseObjectiveTags(value) {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
         return parsed
-          .map((entry) => String(entry || "").trim().toLowerCase())
+          .map((entry) => normalizeObjectiveTag(entry))
           .filter(Boolean);
       }
     } catch (_) {
@@ -1325,7 +1291,7 @@ function parseObjectiveTags(value) {
   }
   return raw
     .split(",")
-    .map((entry) => String(entry || "").trim().toLowerCase())
+    .map((entry) => normalizeObjectiveTag(entry))
     .filter(Boolean);
 }
 
@@ -1436,6 +1402,9 @@ function normalizeCallScriptObjectiveMetadata(input = {}, options = {}) {
 function normalizeScriptTemplateRecord(template = null) {
   if (!template || typeof template !== "object") return template;
   const normalized = { ...template };
+  const normalizedDefaultProfile = String(normalized.default_profile || "")
+    .trim()
+    .toLowerCase();
   const parsedVersion = Number(normalized.version);
   normalized.version =
     Number.isFinite(parsedVersion) && parsedVersion > 0
@@ -1472,10 +1441,12 @@ function normalizeScriptTemplateRecord(template = null) {
     ) {
       add("payment_collection");
     }
+    const nonDigitProfiles = new Set(RELATIONSHIP_FLOW_TYPES);
     if (
       normalized.supports_digit_capture === true ||
       normalizeBooleanFlag(normalized.requires_otp, false) === true ||
-      Boolean(String(normalized.default_profile || "").trim()) ||
+      (Boolean(normalizedDefaultProfile) &&
+        !nonDigitProfiles.has(normalizedDefaultProfile)) ||
       tags.has("verify_identity")
     ) {
       add("identity_verification");
@@ -1489,6 +1460,14 @@ function normalizeScriptTemplateRecord(template = null) {
     if (tags.has("general_outreach")) {
       add("general_outreach");
     }
+    for (const profileType of RELATIONSHIP_PROFILE_TYPES) {
+      const objectiveTag = RELATIONSHIP_PROFILE_OBJECTIVE_MAP[profileType];
+      if (!objectiveTag || !tags.has(objectiveTag)) continue;
+      const flowType = RELATIONSHIP_PROFILE_FLOW_MAP[profileType] || profileType;
+      if (flowType) {
+        add(flowType);
+      }
+    }
     if (!flows.length) {
       add("general");
     }
@@ -1497,6 +1476,48 @@ function normalizeScriptTemplateRecord(template = null) {
   normalized.flow_types = flowTypes;
   normalized.flow_type = flowTypes[0] || "general";
   return normalized;
+}
+
+function resolveConversationProfile(input = {}) {
+  return deriveConversationProfile({
+    purpose: input.purpose,
+    scriptTemplate: input.scriptTemplate,
+    prompt: input.prompt,
+    firstMessage: input.firstMessage,
+    fallback: "general",
+  });
+}
+
+function applyConversationProfilePrompt(profile, prompt, firstMessage) {
+  return buildConversationProfilePromptBundle(profile, {
+    basePrompt: String(prompt || "").trim(),
+    firstMessage: String(firstMessage || "").trim(),
+  });
+}
+
+function getProfilePurpose(profile) {
+  const normalized = normalizeRelationshipProfileType(profile, "");
+  if (!normalized || !RELATIONSHIP_PROFILE_SET.has(normalized)) {
+    return null;
+  }
+  return normalized;
+}
+
+function buildCallResponsePolicyGate(callSid, seedConfig = null) {
+  return (rawText = "") => {
+    const runtimeConfig =
+      (callSid ? callConfigurations.get(callSid) : null) || seedConfig || {};
+    const conversationProfile = resolveConversationProfile({
+      purpose:
+        runtimeConfig?.conversation_profile ||
+        runtimeConfig?.purpose ||
+        runtimeConfig?.business_context?.purpose,
+      scriptTemplate: runtimeConfig?.script_policy || null,
+      prompt: runtimeConfig?.prompt,
+      firstMessage: runtimeConfig?.first_message,
+    });
+    return applyConversationPolicyGates(rawText, conversationProfile || "general");
+  };
 }
 
 const SCRIPT_BOUND_PAYMENT_OPTION_FIELDS = Object.freeze([
@@ -1749,6 +1770,18 @@ function buildProviderEventFingerprint(source, dedupePayload = {}) {
   };
 }
 
+function collectRelationshipContextSnapshot(callConfig = {}) {
+  const payload = {};
+  for (const profileType of RELATIONSHIP_PROFILE_TYPES) {
+    const key = `${profileType}_context`;
+    const value = callConfig?.[key];
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      payload[key] = value;
+    }
+  }
+  return payload;
+}
+
 function buildRuntimeSnapshotPayload(callSid, patch = {}) {
   if (!callSid) return null;
   const callConfig = callConfigurations.get(callSid) || {};
@@ -1782,10 +1815,29 @@ function buildRuntimeSnapshotPayload(callSid, patch = {}) {
     patch.snapshot && typeof patch.snapshot === "object"
       ? patch.snapshot
       : {};
+  const relationshipContexts = collectRelationshipContextSnapshot(callConfig);
   payload.snapshot = {
     flow_state_reason: callConfig.flow_state_reason || null,
     digit_intent_mode: callConfig?.digit_intent?.mode || null,
     tool_in_progress: callConfig?.tool_in_progress || null,
+    conversation_profile: callConfig?.conversation_profile || null,
+    purpose: callConfig?.purpose || null,
+    relationship_profile:
+      callConfig?.relationship_profile &&
+      typeof callConfig.relationship_profile === "object"
+        ? callConfig.relationship_profile
+        : null,
+    relationship_contexts:
+      Object.keys(relationshipContexts).length > 0 ? relationshipContexts : null,
+    dating_context:
+      callConfig?.dating_context && typeof callConfig.dating_context === "object"
+        ? callConfig.dating_context
+        : null,
+    celebrity_context:
+      callConfig?.celebrity_context &&
+      typeof callConfig.celebrity_context === "object"
+        ? callConfig.celebrity_context
+        : null,
     updated_at: new Date().toISOString(),
     ...baseSnapshot,
   };
@@ -1838,6 +1890,7 @@ async function restoreCallRuntimeState(callSid, callConfig = null) {
   try {
     const row = await db.getCallRuntimeState(callSid);
     if (!row) return { restored: false, interactionCount: 0 };
+    const snapshot = safeJsonParse(row.snapshot, {}) || {};
     const updatedAt = row.updated_at ? Date.parse(row.updated_at) : NaN;
     if (
       Number.isFinite(updatedAt) &&
@@ -1864,9 +1917,52 @@ async function restoreCallRuntimeState(callSid, callConfig = null) {
         },
         { callConfig: targetConfig, skipToolRefresh: true, skipPersist: true },
       );
+      if (snapshot?.conversation_profile) {
+        targetConfig.conversation_profile = String(
+          snapshot.conversation_profile || "",
+        ).trim();
+      }
+      if (!targetConfig.purpose && snapshot?.purpose) {
+        targetConfig.purpose = String(snapshot.purpose || "").trim() || null;
+      }
+      if (
+        snapshot?.relationship_profile &&
+        typeof snapshot.relationship_profile === "object" &&
+        !Array.isArray(snapshot.relationship_profile)
+      ) {
+        targetConfig.relationship_profile = { ...snapshot.relationship_profile };
+      }
+      if (
+        snapshot?.relationship_contexts &&
+        typeof snapshot.relationship_contexts === "object" &&
+        !Array.isArray(snapshot.relationship_contexts)
+      ) {
+        Object.entries(snapshot.relationship_contexts).forEach(([key, value]) => {
+          const normalizedKey = String(key || "").trim().toLowerCase();
+          if (!normalizedKey.endsWith("_context")) return;
+          const profileType = normalizedKey.slice(0, -"_context".length);
+          if (!RELATIONSHIP_PROFILE_SET.has(profileType)) return;
+          if (!value || typeof value !== "object" || Array.isArray(value)) return;
+          targetConfig[normalizedKey] = { ...value };
+        });
+      }
+      if (
+        snapshot?.dating_context &&
+        typeof snapshot.dating_context === "object" &&
+        !Array.isArray(snapshot.dating_context)
+      ) {
+        targetConfig.dating_context = { ...snapshot.dating_context };
+      }
+      if (
+        snapshot?.celebrity_context &&
+        typeof snapshot.celebrity_context === "object" &&
+        !Array.isArray(snapshot.celebrity_context)
+      ) {
+        targetConfig.celebrity_context = { ...snapshot.celebrity_context };
+      }
+      callConfigurations.set(callSid, targetConfig);
     }
     const restoredInteraction = Number(row.interaction_count);
-    const snapshot = safeJsonParse(row.snapshot, {}) || {};
     return {
       restored: true,
       interactionCount: Number.isFinite(restoredInteraction)
@@ -2203,15 +2299,38 @@ function buildInboundCallConfig(callSid, payload = {}, options = {}) {
     ) || {};
   const routeLabel = route.label || route.name || route.route_label || null;
   const { prompt, firstMessage } = buildInboundDefaults(route);
-  const functionSystem = functionEngine.generateAdaptiveFunctionSystem(
-    prompt,
-    firstMessage,
-  );
   const createdAt = new Date().toISOString();
   const hasRoutePrompt = Boolean(
     route.prompt || route.first_message || route.firstMessage,
   );
   const fallbackScript = !hasRoutePrompt ? inboundDefaultScript : null;
+  const conversationProfile = resolveConversationProfile({
+    purpose: route.purpose,
+    scriptTemplate:
+      (route &&
+      typeof route === "object" &&
+      !Array.isArray(route) &&
+      Object.keys(route).length
+        ? route
+        : null) ||
+      fallbackScript,
+    prompt,
+    firstMessage,
+  });
+  const profilePrompt = applyConversationProfilePrompt(
+    conversationProfile,
+    prompt,
+    firstMessage,
+  );
+  const effectivePrompt = profilePrompt.prompt || prompt;
+  const effectiveFirstMessage = profilePrompt.firstMessage || firstMessage;
+  const functionSystem = functionEngine.generateAdaptiveFunctionSystem(
+    effectivePrompt,
+    effectiveFirstMessage,
+  );
+  const resolvedPurpose =
+    String(route.purpose || "").trim() ||
+    getProfilePurpose(conversationProfile);
   const routePaymentPolicy = parsePaymentPolicy(route.payment_policy);
   const effectivePaymentPolicy =
     routePaymentPolicy || fallbackScript?.payment_policy || null;
@@ -2222,8 +2341,8 @@ function buildInboundCallConfig(callSid, payload = {}, options = {}) {
     enforceFeatureGate: true,
   }).normalized;
   const callConfig = {
-    prompt,
-    first_message: firstMessage,
+    prompt: effectivePrompt,
+    first_message: effectiveFirstMessage,
     created_at: createdAt,
     user_chat_id: config.telegram?.adminChatId || route.user_chat_id || null,
     customer_name: route.customer_name || null,
@@ -2231,7 +2350,9 @@ function buildInboundCallConfig(callSid, payload = {}, options = {}) {
     provider_metadata: null,
     business_context: route.business_context || functionSystem.context,
     function_count: functionSystem.functions.length,
-    purpose: route.purpose || null,
+    purpose: resolvedPurpose,
+    conversation_profile: conversationProfile,
+    dating_profile_applied: profilePrompt.applied === true,
     business_id: route.business_id || null,
     route_label: routeLabel,
     script: route.script || fallbackScript?.name || null,
@@ -2419,6 +2540,8 @@ async function ensureCallRecord(
       script_id: callConfig.script_id || null,
       script_version: callConfig.script_version || null,
       purpose: callConfig.purpose || null,
+      conversation_profile: callConfig.conversation_profile || null,
+      dating_profile_applied: callConfig.dating_profile_applied === true,
       voice_model: callConfig.voice_model || null,
       flow_state: callConfig.flow_state || "normal",
       flow_state_reason: callConfig.flow_state_reason || "call_created",
@@ -2466,8 +2589,24 @@ async function hydrateCallConfigFromDb(callSid) {
       parsedContext = null;
     }
   }
-  const prompt = call.prompt || DEFAULT_INBOUND_PROMPT;
-  const firstMessage = call.first_message || DEFAULT_INBOUND_FIRST_MESSAGE;
+  let prompt = call.prompt || DEFAULT_INBOUND_PROMPT;
+  let firstMessage = call.first_message || DEFAULT_INBOUND_FIRST_MESSAGE;
+  const conversationProfile = resolveConversationProfile({
+    purpose: state?.conversation_profile || state?.purpose,
+    scriptTemplate: state,
+    prompt,
+    firstMessage,
+  });
+  const profilePrompt = applyConversationProfilePrompt(
+    conversationProfile,
+    prompt,
+    firstMessage,
+  );
+  prompt = profilePrompt.prompt || prompt;
+  firstMessage = profilePrompt.firstMessage || firstMessage;
+  const resolvedPurpose =
+    String(state?.purpose || "").trim() ||
+    getProfilePurpose(conversationProfile);
   const functionSystem = functionEngine.generateAdaptiveFunctionSystem(
     prompt,
     firstMessage,
@@ -2484,7 +2623,10 @@ async function hydrateCallConfigFromDb(callSid) {
     business_context:
       state?.business_context || parsedContext || functionSystem.context,
     function_count: functionSystem.functions.length,
-    purpose: state?.purpose || null,
+    purpose: resolvedPurpose,
+    conversation_profile: conversationProfile,
+    dating_profile_applied:
+      state?.dating_profile_applied === true || profilePrompt.applied === true,
     business_id: state?.business_id || null,
     script: state?.script || null,
     script_id: state?.script_id || null,
@@ -6214,8 +6356,58 @@ function configureCallTools(gptService, callSid, callConfig, functionSystem) {
   if (!gptService) return;
   const baseTools = functionSystem?.functions || [];
   const baseImpl = functionSystem?.implementations || {};
+  const conversationProfile = resolveConversationProfile({
+    purpose:
+      callConfig?.conversation_profile ||
+      callConfig?.purpose ||
+      callConfig?.business_context?.purpose,
+    scriptTemplate: callConfig?.script_policy || null,
+    prompt: callConfig?.prompt,
+    firstMessage: callConfig?.first_message,
+  });
+  if (callConfig && !callConfig.conversation_profile) {
+    callConfig.conversation_profile = conversationProfile;
+    if (!callConfig.purpose) {
+      callConfig.purpose = getProfilePurpose(conversationProfile);
+    }
+    callConfigurations.set(callSid, callConfig);
+  }
+
+  let tools = baseTools;
+  let implementations = baseImpl;
+  const sharedToolkitOptions = {
+    callSid,
+    getCallConfig: () => callConfigurations.get(callSid) || callConfig || {},
+    setCallConfig: (nextConfig) => {
+      if (nextConfig && typeof nextConfig === "object") {
+        callConfigurations.set(callSid, nextConfig);
+      }
+    },
+    queueRuntimePersist: queuePersistCallRuntimeState,
+    updateCallState: (sid, status, payload) =>
+      db?.updateCallState?.(sid, status, payload),
+    addLiveEvent: (sid, message, options = {}) =>
+      webhookService?.addLiveEvent?.(sid, message, options),
+  };
+  const normalizedProfile = normalizeRelationshipProfileType(
+    conversationProfile,
+    "",
+  );
+  if (normalizedProfile && RELATIONSHIP_PROFILE_SET.has(normalizedProfile)) {
+    const profileToolkit = createConversationProfileToolkit(
+      normalizedProfile,
+      sharedToolkitOptions,
+    );
+    if (Array.isArray(profileToolkit.tools) && profileToolkit.tools.length) {
+      tools = [...baseTools, ...profileToolkit.tools];
+      implementations = {
+        ...baseImpl,
+        ...(profileToolkit.implementations || {}),
+      };
+    }
+  }
   const options = getCallToolOptions(callSid, callConfig);
-  applyTelephonyTools(gptService, callSid, baseTools, baseImpl, options);
+  applyTelephonyTools(gptService, callSid, tools, implementations, options);
   if (
     !options.policyAllowsTransfer &&
     callConfig &&
@@ -8183,6 +8375,7 @@ async function ensureAwsSession(callSid) {
         channel: "voice",
         provider: callConfig?.provider || getCurrentProvider(),
         traceId: `call:${callSid}`,
+        responsePolicyGate: buildCallResponsePolicyGate(callSid, callConfig),
       },
     );
   } else {
@@ -8195,6 +8388,7 @@ async function ensureAwsSession(callSid) {
         channel: "voice",
         provider: callConfig?.provider || getCurrentProvider(),
         traceId: `call:${callSid}`,
+        responsePolicyGate: buildCallResponsePolicyGate(callSid, callConfig),
       },
     );
   }
@@ -8205,18 +8399,24 @@ async function ensureAwsSession(callSid) {
     channel: "voice",
     provider: callConfig?.provider || getCurrentProvider(),
   });
+  const conversationProfile = resolveConversationProfile({
+    purpose:
+      callConfig?.conversation_profile ||
+      callConfig?.purpose ||
+      callConfig?.business_context?.purpose,
+    prompt: callConfig?.prompt,
+    firstMessage: callConfig?.first_message,
+  });
   gptService.setCustomerName(
     callConfig?.customer_name || callConfig?.victim_name,
   );
-  gptService.setCallProfile(
-    callConfig?.purpose || callConfig?.business_context?.purpose,
-  );
+  gptService.setCallProfile(conversationProfile);
   gptService.setPersonaContext({
-    domain: callConfig?.purpose || callConfig?.business_context?.purpose || "general",
+    domain: conversationProfile || "general",
     channel: "voice",
     urgency: callConfig?.urgency || "normal",
   });
-  const intentLine = `Call intent: ${callConfig?.script || "general"} | purpose: ${callConfig?.purpose || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`;
+  const intentLine = `Call intent: ${callConfig?.script || "general"} | profile: ${conversationProfile || "general"} | purpose: ${callConfig?.purpose || conversationProfile || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`;
   gptService.setCallIntent(intentLine);
   const restoredCount = Number(runtimeRestore?.interactionCount || 0);
   await applyInitialDigitIntent(callSid, callConfig, gptService, restoredCount);
@@ -9024,7 +9224,15 @@ app.ws("/connection", (ws, req) => {
           if (resolvedVoiceModel) {
             ttsService.voiceModel = resolvedVoiceModel;
           }
-          const intentLine = `Call intent: ${callConfig?.script || "general"} | purpose: ${callConfig?.purpose || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`;
+          const sessionProfile = resolveConversationProfile({
+            purpose:
+              callConfig?.conversation_profile ||
+              callConfig?.purpose ||
+              callConfig?.business_context?.purpose,
+            prompt: callConfig?.prompt,
+            firstMessage: callConfig?.first_message,
+          });
+          const intentLine = `Call intent: ${callConfig?.script || "general"} | profile: ${sessionProfile || "general"} | purpose: ${callConfig?.purpose || sessionProfile || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`;
           const runtimeDecision = selectTwilioVoiceRuntime(callSid, callConfig);
           voiceRuntimeMode = runtimeDecision.mode;
 
@@ -9391,6 +9599,7 @@ app.ws("/connection", (ws, req) => {
                 channel: "voice",
                 provider: callConfig?.provider || getCurrentProvider(),
                 traceId: `call:${callSid}`,
+                responsePolicyGate: buildCallResponsePolicyGate(callSid, callConfig),
               },
             );
           } else {
@@ -9404,6 +9613,7 @@ app.ws("/connection", (ws, req) => {
                 channel: "voice",
                 provider: callConfig?.provider || getCurrentProvider(),
                 traceId: `call:${callSid}`,
+                responsePolicyGate: buildCallResponsePolicyGate(callSid, callConfig),
               },
             );
           }
@@ -9414,19 +9624,26 @@ app.ws("/connection", (ws, req) => {
             channel: "voice",
             provider: callConfig?.provider || getCurrentProvider(),
           });
+          const conversationProfile = resolveConversationProfile({
+            purpose:
+              callConfig?.conversation_profile ||
+              callConfig?.purpose ||
+              callConfig?.business_context?.purpose,
+            prompt: callConfig?.prompt,
+            firstMessage: callConfig?.first_message,
+          });
           gptService.setCustomerName(
             callConfig?.customer_name || callConfig?.victim_name,
           );
-          gptService.setCallProfile(
-            callConfig?.purpose || callConfig?.business_context?.purpose,
-          );
+          gptService.setCallProfile(conversationProfile);
           gptService.setPersonaContext({
-            domain:
-              callConfig?.purpose || callConfig?.business_context?.purpose || "general",
+            domain: conversationProfile || "general",
             channel: "voice",
             urgency: callConfig?.urgency || "normal",
           });
-          gptService.setCallIntent(intentLine);
+          gptService.setCallIntent(
+            `Call intent: ${callConfig?.script || "general"} | profile: ${conversationProfile || "general"} | purpose: ${callConfig?.purpose || conversationProfile || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`,
+          );
           if (callConfig) {
             await applyInitialDigitIntent(
               callSid,
@@ -10603,6 +10820,7 @@ app.ws("/vonage/stream", async (ws, req) => {
           channel: "voice",
           provider: callConfig?.provider || getCurrentProvider(),
           traceId: `call:${callSid}`,
+          responsePolicyGate: buildCallResponsePolicyGate(callSid, callConfig),
         },
       );
     } else {
@@ -10615,6 +10833,7 @@ app.ws("/vonage/stream", async (ws, req) => {
           channel: "voice",
           provider: callConfig?.provider || getCurrentProvider(),
           traceId: `call:${callSid}`,
+          responsePolicyGate: buildCallResponsePolicyGate(callSid, callConfig),
         },
       );
     }
@@ -10625,18 +10844,24 @@ app.ws("/vonage/stream", async (ws, req) => {
       channel: "voice",
       provider: callConfig?.provider || getCurrentProvider(),
     });
+    const conversationProfile = resolveConversationProfile({
+      purpose:
+        callConfig?.conversation_profile ||
+        callConfig?.purpose ||
+        callConfig?.business_context?.purpose,
+      prompt: callConfig?.prompt,
+      firstMessage: callConfig?.first_message,
+    });
     gptService.setCustomerName(
       callConfig?.customer_name || callConfig?.victim_name,
     );
-    gptService.setCallProfile(
-      callConfig?.purpose || callConfig?.business_context?.purpose,
-    );
+    gptService.setCallProfile(conversationProfile);
     gptService.setPersonaContext({
-      domain: callConfig?.purpose || callConfig?.business_context?.purpose || "general",
+      domain: conversationProfile || "general",
       channel: "voice",
       urgency: callConfig?.urgency || "normal",
     });
-    const intentLine = `Call intent: ${callConfig?.script || "general"} | purpose: ${callConfig?.purpose || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`;
+    const intentLine = `Call intent: ${callConfig?.script || "general"} | profile: ${conversationProfile || "general"} | purpose: ${callConfig?.purpose || conversationProfile || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`;
     gptService.setCallIntent(intentLine);
     await applyInitialDigitIntent(
       callSid,
@@ -13746,8 +13971,8 @@ function buildTwilioOutboundCallPayload(options = {}) {
 async function placeOutboundCall(payload, hostOverride = null) {
   const {
     number,
-    prompt,
-    first_message,
+    prompt: rawPrompt,
+    first_message: rawFirstMessage,
     user_chat_id,
     customer_name,
     business_id,
@@ -13783,10 +14008,8 @@ async function placeOutboundCall(payload, hostOverride = null) {
   assertScriptBoundPayment(payloadObject, script_id);
   assertScriptBoundPaymentPolicy(payloadObject, script_id);
 
-  if (!number || !prompt || !first_message) {
-    throw new Error(
-      "Missing required fields: number, prompt, and first_message are required",
-    );
+  if (!number) {
+    throw new Error("Missing required field: number is required");
   }
 
   if (!number.match(/^\+[1-9]\d{1,14}$/)) {
@@ -13800,15 +14023,6 @@ async function placeOutboundCall(payload, hostOverride = null) {
     throw new Error("Server hostname not configured");
   }
 
-  console.log("Generating adaptive function system for call...".blue);
-  const functionSystem = functionEngine.generateAdaptiveFunctionSystem(
-    prompt,
-    first_message,
-  );
-  console.log(
-    `Generated ${functionSystem.functions.length} functions for ${functionSystem.context.industry} industry`,
-  );
-
   const callWarnings = [];
   const normalizedScriptId = normalizeScriptId(script_id);
   const requestedScriptVersion = Number(script_version);
@@ -13819,12 +14033,14 @@ async function placeOutboundCall(payload, hostOverride = null) {
   let scriptPolicy = {};
   let scriptPaymentDefaults = {};
   let scriptPaymentPolicy = null;
+  let resolvedScriptTemplate = null;
   if (normalizedScriptId) {
     try {
       const tpl = normalizeScriptTemplateRecord(
         await db.getCallTemplateById(Number(normalizedScriptId)),
       );
       if (tpl) {
+        resolvedScriptTemplate = tpl;
         const currentTemplateVersion =
           Number.isFinite(Number(tpl.version)) && Number(tpl.version) > 0
             ? Math.max(1, Math.floor(Number(tpl.version)))
@@ -13864,6 +14080,42 @@ async function placeOutboundCall(payload, hostOverride = null) {
       console.error("Script metadata load error:", err);
     }
   }
+
+  const resolvedPrompt = String(rawPrompt || resolvedScriptTemplate?.prompt || "").trim();
+  const resolvedFirstMessage = String(
+    rawFirstMessage || resolvedScriptTemplate?.first_message || "",
+  ).trim();
+  if (!resolvedPrompt || !resolvedFirstMessage) {
+    throw new Error(
+      "Missing required fields: number, prompt, and first_message are required",
+    );
+  }
+
+  const conversationProfile = resolveConversationProfile({
+    purpose,
+    scriptTemplate: resolvedScriptTemplate,
+    prompt: resolvedPrompt,
+    firstMessage: resolvedFirstMessage,
+  });
+  const profilePrompt = applyConversationProfilePrompt(
+    conversationProfile,
+    resolvedPrompt,
+    resolvedFirstMessage,
+  );
+  const effectivePrompt = profilePrompt.prompt || resolvedPrompt;
+  const effectiveFirstMessage = profilePrompt.firstMessage || resolvedFirstMessage;
+  const resolvedPurpose =
+    String(purpose || "").trim() ||
+    getProfilePurpose(conversationProfile);
+
+  console.log("Generating adaptive function system for call...".blue);
+  const functionSystem = functionEngine.generateAdaptiveFunctionSystem(
+    effectivePrompt,
+    effectiveFirstMessage,
+  );
+  console.log(
+    `Generated ${functionSystem.functions.length} functions for ${functionSystem.context.industry} industry`,
+  );
 
   let callId;
   let callStatus = "queued";
@@ -14003,7 +14255,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
           clientToken: callId,
           attributes: {
             CALL_SID: callId,
-            FIRST_MESSAGE: first_message,
+            FIRST_MESSAGE: effectiveFirstMessage,
           },
         });
         providerMetadata = { contact_id: response.ContactId };
@@ -14196,8 +14448,8 @@ async function placeOutboundCall(payload, hostOverride = null) {
   const normalizedPaymentAmount =
     normalizedPayment.normalized.payment_amount || null;
   const callConfig = {
-    prompt: prompt,
-    first_message: first_message,
+    prompt: effectivePrompt,
+    first_message: effectiveFirstMessage,
     created_at: createdAt,
     user_chat_id: user_chat_id,
     customer_name: customer_name || null,
@@ -14205,7 +14457,9 @@ async function placeOutboundCall(payload, hostOverride = null) {
     provider_metadata: providerMetadata,
     business_context: functionSystem.context,
     function_count: functionSystem.functions.length,
-    purpose: purpose || null,
+    purpose: resolvedPurpose,
+    conversation_profile: conversationProfile,
+    dating_profile_applied: profilePrompt.applied === true,
     business_id: business_id || null,
     script: script || null,
     script_id: normalizedScriptId || null,
@@ -14264,15 +14518,20 @@ async function placeOutboundCall(payload, hostOverride = null) {
     { callConfig, skipToolRefresh: true, source: "placeOutboundCall" },
   );
   queuePersistCallRuntimeState(callId, {
-    snapshot: { source: "placeOutboundCall" },
+    snapshot: {
+      source: "placeOutboundCall",
+      conversation_profile: conversationProfile,
+      purpose: resolvedPurpose,
+      dating_profile_applied: profilePrompt.applied === true,
+    },
   });
 
   try {
     await db.createCall({
       call_sid: callId,
       phone_number: number,
-      prompt: prompt,
-      first_message: first_message,
+      prompt: effectivePrompt,
+      first_message: effectiveFirstMessage,
       user_chat_id: user_chat_id,
       business_context: JSON.stringify(functionSystem.context),
       generated_functions: JSON.stringify(
@@ -14286,7 +14545,9 @@ async function placeOutboundCall(payload, hostOverride = null) {
       script: script || null,
       script_id: normalizedScriptId || null,
       script_version: resolvedScriptVersion || null,
-      purpose: purpose || null,
+      purpose: resolvedPurpose,
+      conversation_profile: conversationProfile,
+      dating_profile_applied: profilePrompt.applied === true,
       emotion: emotion || null,
       urgency: urgency || null,
       technical_level: technical_level || null,
@@ -14794,20 +15055,65 @@ async function applyScriptInjection(callSid, scriptId, userId) {
   callConfig.script_id = script.id || callConfig.script_id;
   callConfig.script_version = script.version || callConfig.script_version || 1;
   callConfig.payment_policy = script.payment_policy || null;
-  if (script.prompt) {
-    callConfig.prompt = script.prompt;
+  const basePrompt = script.prompt || callConfig.prompt || DEFAULT_INBOUND_PROMPT;
+  const baseFirstMessage =
+    script.first_message || callConfig.first_message || DEFAULT_INBOUND_FIRST_MESSAGE;
+  const conversationProfile = resolveConversationProfile({
+    purpose:
+      callConfig.conversation_profile ||
+      callConfig.purpose ||
+      script.purpose ||
+      script.default_profile,
+    scriptTemplate: script,
+    prompt: basePrompt,
+    firstMessage: baseFirstMessage,
+  });
+  const profilePrompt = applyConversationProfilePrompt(
+    conversationProfile,
+    basePrompt,
+    baseFirstMessage,
+  );
+  callConfig.prompt = profilePrompt.prompt || basePrompt;
+  callConfig.first_message = profilePrompt.firstMessage || baseFirstMessage;
+  callConfig.conversation_profile = conversationProfile;
+  if (!callConfig.purpose) {
+    callConfig.purpose = getProfilePurpose(conversationProfile);
   }
-  if (script.first_message) {
-    callConfig.first_message = script.first_message;
-  }
+  callConfig.dating_profile_applied = profilePrompt.applied === true;
+  const functionSystem = functionEngine.generateAdaptiveFunctionSystem(
+    callConfig.prompt,
+    callConfig.first_message,
+  );
+  callConfig.function_count = functionSystem.functions.length;
+  callConfig.business_context = functionSystem.context;
+  callFunctionSystems.set(callSid, functionSystem);
   callConfigurations.set(callSid, callConfig);
+  queuePersistCallRuntimeState(callSid, {
+    snapshot: {
+      source: "script_injection",
+      conversation_profile: conversationProfile,
+      purpose: callConfig.purpose || null,
+      dating_profile_applied: profilePrompt.applied === true,
+    },
+  });
 
   const session = activeCalls.get(callSid);
   if (session?.gptService) {
-    const promptPreview = truncatePrompt(script.prompt || "");
-    const intentLine = `Injected script: ${script.name || "custom"}. ${promptPreview}`;
+    session.functionSystem = functionSystem;
+    if (typeof session.gptService.updateSystemPromptWithPersonality === "function") {
+      session.gptService.updateSystemPromptWithPersonality(callConfig.prompt);
+    }
+    session.gptService.setCallProfile(conversationProfile);
+    session.gptService.setPersonaContext({
+      domain: conversationProfile || "general",
+      channel: "voice",
+      urgency: callConfig?.urgency || "normal",
+    });
+    const promptPreview = truncatePrompt(callConfig.prompt || "");
+    const intentLine = `Injected script: ${script.name || "custom"} | profile: ${conversationProfile || "general"}. ${promptPreview}`;
     session.gptService.setCallIntent(intentLine);
   }
+  refreshActiveCallTools(callSid);
 
   await db
     .updateCallState(callSid, "script_injected", {
@@ -14815,6 +15121,13 @@ async function applyScriptInjection(callSid, scriptId, userId) {
       script_name: script.name || null,
       script_version: script.version || null,
       payment_policy: script.payment_policy || null,
+      conversation_profile: conversationProfile,
+      purpose: callConfig.purpose || null,
+      dating_profile_applied: profilePrompt.applied === true,
+      business_context: functionSystem.context,
+      generated_functions: functionSystem.functions
+        .map((tool) => tool?.function?.name)
+        .filter(Boolean),
       user_id: userId || null,
       at: new Date().toISOString(),
     })
@@ -17214,6 +17527,16 @@ registerWebhookRoutes(app, {
   smsWebhookDedupeTtlMs: Number(config.sms?.webhookDedupeTtlMs) || null,
   getDigitService: () => digitService,
   getEmailService: () => emailService,
+  getTranscriptAudioUrl: (text, callConfig, options = {}) => {
+    const timeoutMs = Number(options?.timeoutMs);
+    const effectiveTimeoutMs =
+      Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 12000;
+    return getTwilioTtsAudioUrl(text, callConfig, effectiveTimeoutMs, {
+      forceGenerate: true,
+    });
+  },
+  transcriptAudioTimeoutMs: Number(config.api?.transcriptAudioTimeoutMs) || 12000,
+  transcriptAudioMaxChars: Number(config.api?.transcriptAudioMaxChars) || 2600,
 });
 
 // Get SMS statistics
