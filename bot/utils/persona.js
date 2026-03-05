@@ -367,9 +367,9 @@ async function askOptionWithButtons(
   { prefix, columns = 2, formatLabel, ensureActive } = {}
 ) {
   const keyboard = new InlineKeyboard();
-  const opId = getCurrentOpId(ctx);
   const basePrefix = prefix || 'option';
-  const prefixKey = opId ? `${basePrefix}:${opId}` : basePrefix;
+  const opToken = String(ctx.session?.currentOp?.token || '').trim();
+  const prefixKey = opToken ? `${basePrefix}:${opToken}` : basePrefix;
   const labels = options.map((option) => (formatLabel ? formatLabel(option) : formatOptionLabel(option)));
   const hasLongLabel = labels.some((label) => String(label).length > 22);
   let resolvedColumns = Number.isFinite(columns) ? columns : (labels.length > 6 || hasLongLabel ? 1 : 2);
@@ -408,7 +408,8 @@ async function askOptionWithButtons(
 
   const selectionAction = parseCallbackData(selectionCtx.callbackQuery.data).action || selectionCtx.callbackQuery.data;
   const parts = selectionAction.split(':');
-  const selectedId = opId ? parts.slice(2).join(':') : parts.slice(1).join(':');
+  const prefixSegments = prefixKey.split(':').filter(Boolean).length;
+  const selectedId = parts.slice(prefixSegments).join(':');
   return options.find((option) => option.id === selectedId);
 }
 

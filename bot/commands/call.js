@@ -22,6 +22,7 @@ const {
 } = require('../utils/sessionState');
 const {
   RELATIONSHIP_FLOW_TYPES,
+  deriveConversationProfile,
 } = require('../../api/functions/Dating');
 const {
   normalizeCallScriptFlowType: normalizeCallScriptFlowTypeShared,
@@ -29,6 +30,7 @@ const {
   getCallScriptFlowTypes: getCallScriptFlowTypesShared,
   getPrimaryFlowType: getPrimaryFlowTypeShared,
   getEffectiveObjectiveTags: getEffectiveObjectiveTagsShared,
+  isRelationshipFlowType,
 } = require('../../api/functions/relationshipFlowMetadata');
 function buildMainMenuReplyMarkup(ctx) {
   return {
@@ -508,7 +510,49 @@ async function buildCustomCallConfig(conversation, ctx, ensureActive, businessOp
     summary.push('Persona: Custom prompt');
     summary.push(`Prompt: ${prompt.substring(0, 120)}${prompt.length > 120 ? '...' : ''}`);
     summary.push(`First message: ${firstMessage.substring(0, 120)}${firstMessage.length > 120 ? '...' : ''}`);
-    payloadUpdates.purpose = 'custom';
+    const inferredProfile = deriveConversationProfile({
+      purpose: null,
+      prompt,
+      firstMessage,
+      fallback: 'general',
+    });
+
+    const customFlowOptions = [
+      { id: 'general', label: `🧩 ${CALL_SCRIPT_FLOW_LABELS.general || 'General'}` },
+      ...RELATIONSHIP_FLOW_TYPES.map((flowType) => ({
+        id: flowType,
+        label: CALL_SCRIPT_FLOW_BADGES[flowType]
+          ? `${CALL_SCRIPT_FLOW_BADGES[flowType]} ${CALL_SCRIPT_FLOW_LABELS[flowType] || flowType}`
+          : CALL_SCRIPT_FLOW_LABELS[flowType] || flowType
+      }))
+    ];
+
+    const recommendedLabel = CALL_SCRIPT_FLOW_LABELS[inferredProfile] || inferredProfile || 'General';
+    const selectedFlow = await askOptionWithButtons(
+      conversation,
+      ctx,
+      `🧭 *Select call flow for this custom prompt*\nRecommended from prompt text: *${recommendedLabel}*.\nThis will be applied explicitly during call setup.`,
+      customFlowOptions,
+      {
+        prefix: 'custom-flow',
+        columns: 1
+      }
+    );
+    ensureActive();
+
+    if (!selectedFlow?.id) {
+      await ctx.reply('❌ Flow selection is required for custom prompt mode.');
+      return null;
+    }
+
+    if (isRelationshipFlowType(selectedFlow.id)) {
+      payloadUpdates.call_profile = selectedFlow.id;
+      payloadUpdates.purpose = selectedFlow.id;
+      summary.push(`Flow: ${CALL_SCRIPT_FLOW_LABELS[selectedFlow.id] || selectedFlow.id}`);
+    } else {
+      payloadUpdates.purpose = 'general';
+      summary.push(`Flow: ${CALL_SCRIPT_FLOW_LABELS.general || 'General'}`);
+    }
   } else {
     const availablePurposes = selectedBusiness.purposes || [];
     let selectedPurpose = availablePurposes.find((p) => p.id === selectedBusiness.defaultPurpose) || availablePurposes[0];

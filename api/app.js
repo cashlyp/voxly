@@ -13979,6 +13979,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
     script,
     script_id,
     script_version,
+    call_profile,
     purpose,
     emotion,
     urgency,
@@ -14092,7 +14093,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
   }
 
   const conversationProfile = resolveConversationProfile({
-    purpose,
+    purpose: call_profile || purpose,
     scriptTemplate: resolvedScriptTemplate,
     prompt: resolvedPrompt,
     firstMessage: resolvedFirstMessage,
@@ -14105,7 +14106,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
   const effectivePrompt = profilePrompt.prompt || resolvedPrompt;
   const effectiveFirstMessage = profilePrompt.firstMessage || resolvedFirstMessage;
   const resolvedPurpose =
-    String(purpose || "").trim() ||
+    String(call_profile || purpose || "").trim() ||
     getProfilePurpose(conversationProfile);
 
   console.log("Generating adaptive function system for call...".blue);
