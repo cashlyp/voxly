@@ -6264,6 +6264,13 @@ const TWILIO_TTS_CACHE_MAX = Number(config.twilio?.ttsCacheMax) || 200;
 const TWILIO_TTS_MAX_CHARS = Number(config.twilio?.ttsMaxChars) || 500;
 const TWILIO_TTS_FETCH_TIMEOUT_MS =
   Number(config.twilio?.ttsFetchTimeoutMs) || 4000;
+const FIRST_MESSAGE_TTS_MAX_CHARS = (() => {
+  const configured = Number(config.openRouter?.voiceOutputFirstMessageMaxChars);
+  if (Number.isFinite(configured) && configured > 0) {
+    return Math.max(260, Math.floor(configured));
+  }
+  return 1000;
+})();
 const pendingStreams = new Map(); // callSid -> timeout to detect missing websocket
 const streamFirstMediaTimers = new Map();
 const streamFirstMediaSeen = new Set();
@@ -6332,6 +6339,16 @@ function markGptReplyProgress(callSid) {
 
 function getLastGptReplyAt(callSid) {
   return Number(gptStallState.get(callSid)?.lastReplyAt || 0);
+}
+
+function isLikelyBargeInUtterance(text = "") {
+  const normalized = String(text || "").trim();
+  if (!normalized) return false;
+  const cleaned = normalized.replace(/[^a-z0-9\s]/gi, " ").replace(/\s+/g, " ").trim();
+  if (!cleaned || cleaned.length < 10) return false;
+  const words = cleaned.split(" ").filter(Boolean);
+  if (words.length < 2) return false;
+  return true;
 }
 
 function scheduleGptStallGuard(callSid, stallAt) {
@@ -10233,7 +10250,7 @@ app.ws("/connection", (ws, req) => {
               callConfig?.initial_prompt_played === true
                 ? ""
                 : sanitizeVoiceOutputText(rawGreeting, {
-                    maxChars: 220,
+                    maxChars: FIRST_MESSAGE_TTS_MAX_CHARS,
                     fallbackText: DEFAULT_INBOUND_FIRST_MESSAGE,
                   }).text;
             const promptText = [
@@ -10915,6 +10932,7 @@ app.ws("/connection", (ws, req) => {
                     partialResponse: firstMessage,
                   },
                   0,
+                  { maxChars: FIRST_MESSAGE_TTS_MAX_CHARS },
                 );
               } catch (ttsError) {
                 console.error("Initial TTS error:", ttsError);
@@ -10925,6 +10943,7 @@ app.ws("/connection", (ws, req) => {
                       partialResponse: fallbackPrompt,
                     },
                     0,
+                    { maxChars: FIRST_MESSAGE_TTS_MAX_CHARS },
                   );
                   promptUsed = fallbackPrompt;
                 } catch (fallbackError) {
@@ -11078,6 +11097,7 @@ app.ws("/connection", (ws, req) => {
                     partialResponse: firstMessage,
                   },
                   0,
+                  { maxChars: FIRST_MESSAGE_TTS_MAX_CHARS },
                 );
               } catch (ttsError) {
                 console.error("Initial TTS error:", ttsError);
@@ -11088,6 +11108,7 @@ app.ws("/connection", (ws, req) => {
                       partialResponse: fallbackPrompt,
                     },
                     0,
+                    { maxChars: FIRST_MESSAGE_TTS_MAX_CHARS },
                   );
                   promptUsed = fallbackPrompt;
                 } catch (fallbackError) {
@@ -11411,6 +11432,9 @@ app.ws("/connection", (ws, req) => {
     });
 
     transcriptionService.on("utterance", (text) => {
+      if (!isInitialized) {
+        return;
+      }
       clearSilenceTimer(callSid);
       if (callSid) {
         sttLastFrameAt.set(callSid, Date.now());
@@ -11420,7 +11444,7 @@ app.ws("/connection", (ws, req) => {
           .setLiveCallPhase(callSid, "user_speaking")
           .catch(() => {});
       }
-      if (marks.length > 0 && text?.length > 5) {
+      if (marks.length > 0 && isLikelyBargeInUtterance(text)) {
         console.log("Interruption detected, clearing stream".red);
         clearOutgoingAudioForBargeIn("legacy_stt_interruption");
       }
@@ -12197,6 +12221,7 @@ app.ws("/vonage/stream", async (ws, req) => {
       ttsService.generate(
         { partialResponseIndex: null, partialResponse: firstMessage },
         0,
+        { maxChars: FIRST_MESSAGE_TTS_MAX_CHARS },
       );
       webhookService.recordTranscriptTurn(callSid, "agent", firstMessage);
       if (digitService?.hasExpectation(callSid)) {
