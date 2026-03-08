@@ -35,6 +35,7 @@ const {
 const { emailTemplatesFlow } = require('./email');
 const { section, buildLine, tipLine, sendMenu, clearMenuMessages } = require('../utils/ui');
 const { buildCallbackData, matchesCallbackPrefix, parseCallbackData } = require('../utils/actions');
+const { selectionExpiredMessage } = require('../utils/flowMessages');
 const { attachHmacAuth } = require('../utils/apiAuth');
 const {
   RELATIONSHIP_FLOW_TYPES,
@@ -1828,6 +1829,11 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
       { prefix: 'call-script-action', columns: 2, ensureActive: safeEnsureActive }
     );
 
+    if (!action?.id) {
+      await ctx.reply(selectionExpiredMessage(), { parse_mode: 'Markdown' });
+      continue;
+    }
+
     switch (action.id) {
       case 'preview':
         await previewCallScript(conversation, ctx, script, safeEnsureActive);
@@ -1976,6 +1982,11 @@ async function inboundDefaultScriptMenu(conversation, ctx, ensureActive) {
       { prefix: 'inbound-default', columns: 1, ensureActive: safeEnsureActive }
     );
 
+    if (!action?.id) {
+      await ctx.reply(selectionExpiredMessage(), { parse_mode: 'Markdown' });
+      continue;
+    }
+
     switch (action.id) {
       case 'set': {
         let scripts;
@@ -2065,10 +2076,15 @@ async function callScriptsMenu(conversation, ctx, ensureActive) {
         { id: 'create', label: '➕ Create script' },
         { id: 'flow', label: '🧭 List by flow type' },
         { id: 'incoming', label: '📥 Incoming default' },
-        { id: 'back', label: '⬅️ Back' }
+        { id: 'back', label: '⬅️ Back to Script Designer' }
       ],
       { prefix: 'call-script-main', columns: 1, ensureActive: safeEnsureActive }
     );
+
+    if (!action?.id) {
+      await ctx.reply(selectionExpiredMessage(), { parse_mode: 'Markdown' });
+      continue;
+    }
 
     switch (action.id) {
       case 'list':
@@ -2084,7 +2100,7 @@ async function callScriptsMenu(conversation, ctx, ensureActive) {
           'Select the flow type to list.',
           [
             ...CALL_SCRIPT_FLOW_FILTER_OPTIONS,
-            { id: 'back', label: '⬅️ Back' }
+            { id: 'back', label: '⬅️ Back to Call Scripts' }
           ],
           { prefix: 'call-script-flow', columns: 1, ensureActive: safeEnsureActive }
         );
@@ -2555,6 +2571,11 @@ async function showSmsScriptDetail(conversation, ctx, script) {
       { prefix: 'sms-script-action', columns: 2 }
     );
 
+    if (!action?.id) {
+      await ctx.reply(selectionExpiredMessage(), { parse_mode: 'Markdown' });
+      continue;
+    }
+
     switch (action.id) {
       case 'preview':
         await previewSmsScript(conversation, ctx, script);
@@ -2649,10 +2670,15 @@ async function smsScriptsMenu(conversation, ctx) {
       [
         { id: 'list', label: '📄 List scripts' },
         { id: 'create', label: '➕ Create script' },
-        { id: 'back', label: '⬅️ Back' }
+        { id: 'back', label: '⬅️ Back to Script Designer' }
       ],
       { prefix: 'sms-script-main', columns: 1 }
     );
+
+    if (!action?.id) {
+      await ctx.reply(selectionExpiredMessage(), { parse_mode: 'Markdown' });
+      continue;
+    }
 
     switch (action.id) {
       case 'list':
@@ -2678,14 +2704,14 @@ async function scriptsFlow(conversation, ctx) {
     const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
     ensureActive();
     if (!user) {
-      await ctx.reply('❌ You are not authorized to use this bot.');
+      await ctx.reply('❌ Access denied. Your account is not authorized for this action.');
       return;
     }
 
     const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
     ensureActive();
     if (!adminStatus) {
-      await ctx.reply('❌ This command is for administrators only.');
+      await ctx.reply('❌ Access denied. This action is available to administrators only.');
       return;
     }
 
@@ -2703,10 +2729,15 @@ async function scriptsFlow(conversation, ctx) {
           { id: 'call', label: '☎️ Call scripts' },
           { id: 'sms', label: '💬 SMS scripts' },
           { id: 'email', label: '📧 Email templates' },
-          { id: 'exit', label: '🚪 Exit' }
+          { id: 'exit', label: '⬅️ Main Menu' }
         ],
         { prefix: 'script-channel', columns: 1, ensureActive }
       );
+
+      if (!selection?.id) {
+        await ctx.reply(selectionExpiredMessage(), { parse_mode: 'Markdown' });
+        continue;
+      }
 
       switch (selection.id) {
         case 'call':
@@ -2726,7 +2757,11 @@ async function scriptsFlow(conversation, ctx) {
       }
     }
 
-    await ctx.reply('✅ Script designer closed.');
+    await ctx.reply('✅ Script designer closed.', {
+      reply_markup: {
+        inline_keyboard: [[{ text: '⬅️ Main Menu', callback_data: buildCallbackData(ctx, 'MENU') }]]
+      }
+    });
   } catch (error) {
     if (error instanceof OperationCancelledError) {
       console.log('Scripts flow cancelled:', error.message);
@@ -2744,12 +2779,12 @@ function registerScriptsCommand(bot) {
   bot.command('scripts', async (ctx) => {
     const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
     if (!user) {
-      return ctx.reply('❌ You are not authorized to use this bot.');
+      return ctx.reply('❌ Access denied. Your account is not authorized for this action.');
     }
 
     const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
     if (!adminStatus) {
-      return ctx.reply('❌ This command is for administrators only.');
+      return ctx.reply('❌ Access denied. This action is available to administrators only.');
     }
 
     await ctx.conversation.enter('scripts-conversation');

@@ -48,11 +48,11 @@ async function handleHelp(ctx) {
 
         const supportBlock = [
             `🆘 Contact admin: @${escapeHtml(config.admin.username || '')}`,
-            '🧭 Bot edition: v2.0.0 — secrets aged to perfection'
+            '🧭 Bot edition: v2.0.0'
         ];
 
         const helpSections = [
-            `<b>${escapeHtml('Ready to guide your AI calls with sparkling clarity.')}</b>`,
+            `<b>${escapeHtml('AI calling controls and command guide.')}</b>`,
             `<b>Call Tools</b>\n${formatLines(callList)}`,
             `<b>SMS Tools</b>\n${formatLines(smsList)}`,
             `<b>Email Tools</b>\n${formatLines(emailList)}`,

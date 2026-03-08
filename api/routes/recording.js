@@ -19,7 +19,7 @@ async function recordingService(ttsService, callSid) {
       await ttsService.generate({
         partialResponseIndex: null, 
         partialResponse: 'This call will be recorded.'
-      }, 0);
+      }, 0, { throwOnError: true });
       
       // Wait a moment for the message to be sent
       await new Promise(resolve => setTimeout(resolve, 1000));

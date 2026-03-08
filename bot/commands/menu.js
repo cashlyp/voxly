@@ -65,7 +65,7 @@ async function handleMenu(ctx) {
         await renderMenu(ctx, menuText, kb, { parseMode: 'HTML' });
     } catch (error) {
         console.error('Menu command error:', error);
-        await ctx.reply('❌ Error displaying menu. Please try again.');
+        await ctx.reply('❌ Unable to open the menu right now. Please run /menu again.');
     }
 }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-require('./config/bootstrapLogger');
+require('./utils/bootstrapLogger');
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');

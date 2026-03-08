@@ -214,7 +214,7 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
     });
     if (!allowed) {
       await ctx.answerCallbackQuery({
-        text: "Access required.",
+        text: "Access denied.",
         show_alert: false,
       });
       return;
@@ -279,7 +279,7 @@ async function proxyLiveCallAction(ctx) {
     });
     if (!allowed) {
       await ctx.answerCallbackQuery({
-        text: "Access required.",
+        text: "Access denied.",
         show_alert: false,
       });
       return;

@@ -99,9 +99,9 @@ class TextToSpeechService extends EventEmitter {
     const { partialResponseIndex, partialResponse } = gptReply || {};
     const silent = !!options.silent;
 
-    if (!partialResponse) { 
+    if (!partialResponse) {
       console.warn('⚠️ TTS: No partialResponse provided');
-      return; 
+      return { ok: false, reason: 'missing_partial_response' };
     }
 
     const sanitized = sanitizeVoiceOutputText(partialResponse, {
@@ -111,7 +111,7 @@ class TextToSpeechService extends EventEmitter {
     const speechText = String(sanitized.text || '').trim();
     if (!speechText) {
       console.warn('⚠️ TTS: Sanitized response is empty');
-      return;
+      return { ok: false, reason: 'empty_speech_text' };
     }
 
     console.log(`🎵 TTS generating for: "${speechText.substring(0, 50)}..."`.cyan);
@@ -130,7 +130,12 @@ class TextToSpeechService extends EventEmitter {
         if (!silent) {
           this.emit('speech', partialResponseIndex, cached.audio, speechText, interactionCount);
         }
-        return;
+        return {
+          ok: true,
+          cached: true,
+          voiceModel,
+          text: speechText
+        };
       }
       if (cached) {
         ttsCache.delete(key);
@@ -141,7 +146,12 @@ class TextToSpeechService extends EventEmitter {
         if (sharedAudio && !silent) {
           this.emit('speech', partialResponseIndex, sharedAudio, speechText, interactionCount);
         }
-        return;
+        return {
+          ok: Boolean(sharedAudio),
+          shared: true,
+          voiceModel,
+          text: speechText
+        };
       }
 
       const requestPromise = (async () => {
@@ -187,15 +197,28 @@ class TextToSpeechService extends EventEmitter {
         console.log(`✅ TTS audio generated, size: ${base64String.length} chars`.green);
         this.emit('speech', partialResponseIndex, base64String, speechText, interactionCount);
       }
+      return {
+        ok: Boolean(base64String),
+        voiceModel,
+        text: speechText
+      };
     } catch (err) {
       console.error('❌ Error occurred in TextToSpeech service:', err.message);
       console.error('Error stack:', err.stack);
-      
-      // Emit an error event so the caller can handle it
-      this.emit('error', err);
-      
-      // Don't throw the error to prevent crashing the call
-      // Instead, try to continue without this audio
+
+      // Keep runtime behavior deterministic:
+      // - Throw only when caller explicitly asks for strict failure semantics.
+      // - Emit error only when a listener exists to avoid unhandled EventEmitter errors.
+      if (options.throwOnError === true) {
+        throw err;
+      }
+      if (this.listenerCount('error') > 0) {
+        this.emit('error', err);
+      }
+      return {
+        ok: false,
+        error: err
+      };
     }
   }
 }

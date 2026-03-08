@@ -44,7 +44,7 @@ async function handleGuide(ctx) {
     const formatLines = (items) => items.map((item) => `• ${escapeHtml(item)}`).join('\n');
 
     const guideSections = [
-        `<b>${escapeHtml('Voice Call Bot Guide — stylized steps for smooth operations.')}</b>`,
+        `<b>${escapeHtml('Voice Call Bot Guide - Reliable operating steps.')}</b>`,
         `<b>Making Calls</b>\n${formatLines(callSteps)}`,
         `<b>Phone Number Rules</b>\n${formatLines(formatRules)}`,
         `<b>Best Practices</b>\n${formatLines(bestPractices)}`,
@@ -52,7 +52,7 @@ async function handleGuide(ctx) {
         `<b>Troubleshooting</b>\n${formatLines(troubleshooting)}`,
         `<b>Need Help?</b>\n${formatLines([
             `🆘 Contact: @${escapeHtml(config.admin.username || '')}`,
-            '🧭 Version: 1.0.0'
+            'Use /help for the full command list.'
         ])}`
     ];
 

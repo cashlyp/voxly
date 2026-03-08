@@ -1,6 +1,10 @@
 const twilio = require("twilio");
 const fetch = require("node-fetch");
 const { Vonage } = require("@vonage/server-sdk");
+const {
+  ConnectClient,
+  ListInstancesCommand,
+} = require("@aws-sdk/client-connect");
 const { runWithTimeout } = require("../utils/asyncControl");
 
 const CHECK_STATUS = Object.freeze({
@@ -11,7 +15,7 @@ const CHECK_STATUS = Object.freeze({
 });
 
 const SUPPORTED_PROVIDER_PREFLIGHT_CHANNELS = Object.freeze({
-  call: Object.freeze(["twilio", "vonage"]),
+  call: Object.freeze(["twilio", "aws", "vonage"]),
   sms: Object.freeze(["twilio", "vonage"]),
 });
 
@@ -63,6 +67,22 @@ const REQUIRED_ROUTE_GROUPS = Object.freeze({
         label: "Vonage media websocket route",
         anyOf: Object.freeze([
           Object.freeze({ method: "GET", path: "/vonage/stream" }),
+        ]),
+      }),
+    ]),
+    aws: Object.freeze([
+      Object.freeze({
+        id: "aws_transcripts",
+        label: "AWS transcripts webhook route",
+        anyOf: Object.freeze([
+          Object.freeze({ method: "POST", path: "/aws/transcripts" }),
+        ]),
+      }),
+      Object.freeze({
+        id: "aws_stream_ws",
+        label: "AWS media websocket route",
+        anyOf: Object.freeze([
+          Object.freeze({ method: "GET", path: "/aws/stream" }),
         ]),
       }),
     ]),
@@ -358,10 +378,41 @@ function buildVonageCallbackUrls(channel, config, options = {}) {
   };
 }
 
+function buildAwsCallbackUrls(channel, config, options = {}) {
+  const normalizedChannel = normalizeChannel(channel);
+  const host = normalizeHost(options.hostOverride || config?.server?.hostname);
+  if (!host) {
+    return {
+      host: "",
+      base_url: "",
+      urls: [],
+      reason: "SERVER is not configured for AWS callback URLs",
+    };
+  }
+  const baseUrl = `https://${host}`;
+  if (normalizedChannel === "call") {
+    return {
+      host,
+      base_url: baseUrl,
+      urls: [`${baseUrl}/aws/transcripts`, `${baseUrl}/aws/stream`],
+      reason: null,
+    };
+  }
+  return {
+    host,
+    base_url: baseUrl,
+    urls: [],
+    reason: null,
+  };
+}
+
 function buildProviderCallbackUrls(provider, channel, config, options = {}) {
   const normalizedProvider = normalizeProvider(provider);
   if (normalizedProvider === "twilio") {
     return buildTwilioCallbackUrls(channel, config, options);
+  }
+  if (normalizedProvider === "aws") {
+    return buildAwsCallbackUrls(channel, config, options);
   }
   if (normalizedProvider === "vonage") {
     return buildVonageCallbackUrls(channel, config, options);
@@ -570,6 +621,73 @@ async function runVonageCredentialCheck(channel, config, options = {}) {
   }
 }
 
+async function runAwsCredentialCheck(channel, config, options = {}) {
+  const missing = [];
+  if (!config?.aws?.region) missing.push("AWS_REGION");
+  if (normalizeChannel(channel) === "call") {
+    if (!config?.aws?.connect?.instanceId) missing.push("AWS_CONNECT_INSTANCE_ID");
+    if (!config?.aws?.connect?.contactFlowId) {
+      missing.push("AWS_CONNECT_CONTACT_FLOW_ID");
+    }
+  }
+
+  if (missing.length > 0) {
+    return {
+      status: CHECK_STATUS.FAIL,
+      reason: `Missing required credentials: ${missing.join(", ")}`,
+      suggestedFix: "Set required AWS env vars and redeploy.",
+      details: { missing },
+    };
+  }
+
+  if (options.allowNetwork !== true) {
+    return {
+      status: CHECK_STATUS.WARN,
+      reason: "Network auth probe skipped (allowNetwork=false)",
+      suggestedFix: "Run live preflight with network checks enabled before promotion.",
+    };
+  }
+
+  try {
+    const client = new ConnectClient({
+      region: config.aws.region,
+    });
+    const response = await runWithTimeout(
+      client.send(
+        new ListInstancesCommand({
+          MaxResults: 1,
+        }),
+      ),
+      {
+        timeoutMs: options.timeoutMs,
+        label: "provider_preflight_aws_auth_probe",
+        timeoutCode: "aws_auth_probe_timeout",
+        logger: console,
+        meta: {
+          provider: "aws",
+          scope: "provider_preflight",
+        },
+      },
+    );
+    return {
+      status: CHECK_STATUS.PASS,
+      details: {
+        instance_count: Array.isArray(response?.InstanceSummaryList)
+          ? response.InstanceSummaryList.length
+          : 0,
+        channel: normalizeChannel(channel),
+      },
+    };
+  } catch (error) {
+    return {
+      status: CHECK_STATUS.FAIL,
+      reason: redactError(error),
+      suggestedFix:
+        "Confirm AWS credentials/region are valid and IAM allows Amazon Connect list operations.",
+    };
+  }
+}
+
 function runWebhookAuthCheck(provider, channel, config, options = {}) {
   const normalizedProvider = normalizeProvider(provider);
   const normalizedChannel = normalizeChannel(channel);
@@ -636,6 +754,53 @@ function runWebhookAuthCheck(provider, channel, config, options = {}) {
       details: {
         validation_mode: mode,
         channel: normalizedChannel,
+      },
+    };
+  }
+
+  if (normalizedProvider === "aws") {
+    const mode = String(config?.aws?.webhookValidation || "warn").toLowerCase();
+    if (mode === "off") {
+      return {
+        status: CHECK_STATUS.FAIL,
+        reason: "AWS_WEBHOOK_VALIDATION is off",
+        suggestedFix: "Set AWS_WEBHOOK_VALIDATION to warn or strict.",
+      };
+    }
+    const hasAwsSecret = Boolean(String(config?.aws?.webhookSecret || "").trim());
+    const hasHmacSecret = Boolean(String(config?.apiAuth?.hmacSecret || "").trim());
+    if (mode === "strict" && !hasAwsSecret && !hasHmacSecret) {
+      return {
+        status: CHECK_STATUS.FAIL,
+        reason:
+          "Strict AWS webhook validation requires AWS_WEBHOOK_SECRET or API_SECRET/API_HMAC_SECRET",
+        suggestedFix:
+          "Set AWS_WEBHOOK_SECRET (or shared HMAC secret) or lower AWS_WEBHOOK_VALIDATION risk mode.",
+      };
+    }
+    if (options?.guards?.awsWebhook !== true) {
+      return {
+        status: CHECK_STATUS.FAIL,
+        reason: "AWS webhook guard is not wired",
+        suggestedFix:
+          "Ensure AWS webhook handlers call requireValidAwsWebhook before state mutation.",
+      };
+    }
+    if (normalizedChannel === "call" && options?.guards?.awsStream !== true) {
+      return {
+        status: CHECK_STATUS.FAIL,
+        reason: "AWS stream webhook guard is not wired",
+        suggestedFix:
+          "Ensure AWS stream handlers call verifyAwsStreamAuth before processing media.",
+      };
+    }
+    return {
+      status: CHECK_STATUS.PASS,
+      details: {
+        validation_mode: mode,
+        channel: normalizedChannel,
+        has_aws_secret: hasAwsSecret,
+        has_hmac_secret: hasHmacSecret,
       },
     };
   }
@@ -801,6 +966,12 @@ async function runProviderPreflight(options = {}) {
     async () => {
       if (provider === "twilio") {
         return runTwilioCredentialCheck(channel, config, {
+          allowNetwork: options.allowNetwork,
+          timeoutMs: options.timeoutMs,
+        });
+      }
+      if (provider === "aws") {
+        return runAwsCredentialCheck(channel, config, {
           allowNetwork: options.allowNetwork,
           timeoutMs: options.timeoutMs,
         });

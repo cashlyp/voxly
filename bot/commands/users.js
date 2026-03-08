@@ -3,6 +3,7 @@ const { getUser, getUserList, addUser, promoteUser, removeUser, isAdmin } = requ
 const { buildCallbackData } = require('../utils/actions');
 const { guardAgainstCommandInterrupt, OperationCancelledError } = require('../utils/sessionState');
 const { renderMenu } = require('../utils/ui');
+const { cancelledMessage, setupStepMessage } = require('../utils/flowMessages');
 
 const CANCEL_KEYWORDS = new Set(['cancel', 'exit', 'quit']);
 
@@ -13,13 +14,13 @@ function isCancelInput(value) {
 async function ensureAdminAccess(ctx) {
   const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
   if (!user) {
-    await ctx.reply('❌ You are not authorized to use this bot.');
+    await ctx.reply('❌ Access denied. Your account is not authorized for this action.');
     return false;
   }
 
   const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
   if (!adminStatus) {
-    await ctx.reply('❌ This command is for administrators only.');
+    await ctx.reply('❌ Access denied. This action is available to administrators only.');
     return false;
   }
 
@@ -40,16 +41,16 @@ function buildUsersKeyboard(ctx) {
 
 function buildUsersResultKeyboard(ctx) {
   return new InlineKeyboard()
-    .text('⬅️ Back to Users', buildCallbackData(ctx, 'USERS'))
+    .text('⬅️ Back to User Management', buildCallbackData(ctx, 'USERS'))
     .row()
     .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
 }
 
 async function renderUsersMenu(ctx, note = '') {
   const message = note
-    ? `👥 User Management\n${note}`
-    : '👥 User Management\nChoose an action below.';
-  await renderMenu(ctx, message, buildUsersKeyboard(ctx));
+    ? setupStepMessage('User Management', [note])
+    : setupStepMessage('User Management', ['Choose an action below.']);
+  await renderMenu(ctx, message, buildUsersKeyboard(ctx), { parseMode: 'Markdown' });
 }
 
 async function sendUsersList(ctx) {
@@ -98,14 +99,20 @@ async function sendUsersList(ctx) {
 // ------------------------- Add User Flow -------------------------
 async function addUserFlow(conversation, ctx) {
   try {
-    await ctx.reply('🆔 Enter Telegram ID (or type cancel):');
+    await ctx.reply(setupStepMessage('Add User', [
+      'Enter the Telegram numeric ID.',
+      'Type `cancel` to stop.'
+    ]), {
+      parse_mode: 'Markdown'
+    });
     const idMsg = await conversation.wait();
     const idText = idMsg?.message?.text?.trim();
     if (idText) {
       await guardAgainstCommandInterrupt(ctx, idText);
     }
     if (isCancelInput(idText)) {
-      await ctx.reply('🛑 Add user cancelled.', {
+      await ctx.reply(cancelledMessage('Add user', 'Use /users to continue user management.'), {
+        parse_mode: 'Markdown',
         reply_markup: buildUsersResultKeyboard(ctx)
       });
       return;
@@ -121,14 +128,20 @@ async function addUserFlow(conversation, ctx) {
       return;
     }
 
-    await ctx.reply('🔠 Enter username (or type cancel):');
+    await ctx.reply(setupStepMessage('Add User', [
+      'Enter the username (without @).',
+      'Type `cancel` to stop.'
+    ]), {
+      parse_mode: 'Markdown'
+    });
     const usernameMsg = await conversation.wait();
     const usernameText = usernameMsg?.message?.text?.trim();
     if (usernameText) {
       await guardAgainstCommandInterrupt(ctx, usernameText);
     }
     if (isCancelInput(usernameText)) {
-      await ctx.reply('🛑 Add user cancelled.', {
+      await ctx.reply(cancelledMessage('Add user', 'Use /users to continue user management.'), {
+        parse_mode: 'Markdown',
         reply_markup: buildUsersResultKeyboard(ctx)
       });
       return;
@@ -174,14 +187,20 @@ async function addUserFlow(conversation, ctx) {
 // ------------------------- Promote User Flow -------------------------
 async function promoteFlow(conversation, ctx) {
   try {
-    await ctx.reply('🆔 Enter Telegram ID to promote (or type cancel):');
+    await ctx.reply(setupStepMessage('Promote User', [
+      'Enter the Telegram numeric ID to promote.',
+      'Type `cancel` to stop.'
+    ]), {
+      parse_mode: 'Markdown'
+    });
     const idMsg = await conversation.wait();
     const idText = idMsg?.message?.text?.trim();
     if (idText) {
       await guardAgainstCommandInterrupt(ctx, idText);
     }
     if (isCancelInput(idText)) {
-      await ctx.reply('🛑 Promote user cancelled.', {
+      await ctx.reply(cancelledMessage('Promote user', 'Use /users to continue user management.'), {
+        parse_mode: 'Markdown',
         reply_markup: buildUsersResultKeyboard(ctx)
       });
       return;
@@ -227,14 +246,20 @@ async function promoteFlow(conversation, ctx) {
 // ------------------------- Remove User Flow -------------------------
 async function removeUserFlow(conversation, ctx) {
   try {
-    await ctx.reply('🆔 Enter Telegram ID to remove (or type cancel):');
+    await ctx.reply(setupStepMessage('Remove User', [
+      'Enter the Telegram numeric ID to remove.',
+      'Type `cancel` to stop.'
+    ]), {
+      parse_mode: 'Markdown'
+    });
     const idMsg = await conversation.wait();
     const idText = idMsg?.message?.text?.trim();
     if (idText) {
       await guardAgainstCommandInterrupt(ctx, idText);
     }
     if (isCancelInput(idText)) {
-      await ctx.reply('🛑 Remove user cancelled.', {
+      await ctx.reply(cancelledMessage('Remove user', 'Use /users to continue user management.'), {
+        parse_mode: 'Markdown',
         reply_markup: buildUsersResultKeyboard(ctx)
       });
       return;

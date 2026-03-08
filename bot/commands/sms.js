@@ -27,6 +27,7 @@ const {
 const { section: formatSection, buildLine, tipLine, renderMenu, escapeMarkdown, sendEphemeral } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 const { getAccessProfile } = require('../utils/capabilities');
+const { cancelledMessage, setupStepMessage } = require('../utils/flowMessages');
 
 async function smsAlert(ctx, text) {
     await ctx.reply(formatSection('⚠️ SMS Alert', [text]));
@@ -37,8 +38,33 @@ async function replyApiError(ctx, error, fallback) {
     await ctx.reply(message);
 }
 
-function buildBackToMenuKeyboard(ctx, action = 'SMS', label = '⬅️ Back to SMS Menu') {
-    return new InlineKeyboard().text(label, buildCallbackData(ctx, action));
+function buildBackToMenuKeyboard(ctx, action = 'SMS', label = '⬅️ Back to SMS Center') {
+    return new InlineKeyboard()
+        .text(label, buildCallbackData(ctx, action))
+        .row()
+        .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+}
+
+async function ensureAuthorizedUser(ctx) {
+    const user = await new Promise((resolve) => getUser(ctx.from?.id, resolve));
+    if (!user) {
+        await ctx.reply('❌ Access denied. Your account is not authorized for this action.');
+        return false;
+    }
+    return true;
+}
+
+async function ensureAuthorizedAdmin(ctx) {
+    const userAllowed = await ensureAuthorizedUser(ctx);
+    if (!userAllowed) {
+        return false;
+    }
+    const adminStatus = await new Promise((resolve) => isAdmin(ctx.from?.id, resolve));
+    if (!adminStatus) {
+        await ctx.reply('❌ Access denied. This action is available to administrators only.');
+        return false;
+    }
+    return true;
 }
 
 async function maybeSendSmsAliasTip(ctx) {
@@ -108,6 +134,10 @@ async function renderSmsMenu(ctx) {
 
 async function sendSmsStatusBySid(ctx, messageSid) {
     try {
+        const allowed = await ensureAuthorizedUser(ctx);
+        if (!allowed) {
+            return;
+        }
         const response = await httpClient.get(null, `${config.apiUrl}/api/sms/status/${messageSid}`, {
             timeout: 10000
         });
@@ -130,10 +160,12 @@ async function smsStatusFlow(conversation, ctx) {
         const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
         ensureActive();
         if (!user) {
-            await ctx.reply('❌ You are not authorized to use this bot.');
+            await ctx.reply('❌ Access denied. Your account is not authorized for this action.');
             return;
         }
-        await ctx.reply('📬 Enter the SMS message SID:');
+        await ctx.reply(setupStepMessage('SMS delivery status', [
+            'Enter the SMS message SID to check delivery status.'
+        ]), { parse_mode: 'Markdown' });
         const update = await conversation.wait();
         ensureActive();
         const messageSid = update?.message?.text?.trim();
@@ -156,7 +188,7 @@ async function smsConversationFlow(conversation, ctx) {
         const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
         ensureActive();
         if (!user || !adminStatus) {
-            await ctx.reply('❌ This command is for administrators only.');
+            await ctx.reply('❌ Access denied. This action is available to administrators only.');
             return;
         }
         await ctx.reply('📱 Enter the phone number (E.164 format):');
@@ -177,6 +209,10 @@ async function smsConversationFlow(conversation, ctx) {
 
 async function sendRecentSms(ctx, limit = 10) {
     try {
+        const allowed = await ensureAuthorizedAdmin(ctx);
+        if (!allowed) {
+            return;
+        }
         const response = await httpClient.get(null, `${config.apiUrl}/api/sms/messages/recent`, {
             params: { limit },
             timeout: 10000
@@ -212,14 +248,17 @@ async function recentSmsFlow(conversation, ctx) {
         const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
         ensureActive();
         if (!user || !adminStatus) {
-            await ctx.reply('❌ This command is for administrators only.');
+            await ctx.reply('❌ Access denied. This action is available to administrators only.');
             return;
         }
         await ctx.reply('🕒 Enter number of messages to fetch (max 20).');
         const update = await conversation.wait();
         ensureActive();
         const raw = update?.message?.text?.trim();
-        const limit = Math.min(Number(raw) || 10, 20);
+        const parsedLimit = Number(raw);
+        const limit = Number.isFinite(parsedLimit)
+            ? Math.max(1, Math.min(parsedLimit, 20))
+            : 10;
         await sendEphemeral(ctx, `📱 Fetching last ${limit} SMS messages...`);
         await sendRecentSms(ctx, limit);
     } catch (error) {
@@ -236,7 +275,7 @@ async function smsStatsFlow(conversation, ctx) {
         const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
         ensureActive();
         if (!user || !adminStatus) {
-            await ctx.reply('❌ SMS statistics are for administrators only.');
+            await ctx.reply('❌ Access denied. This action is available to administrators only.');
             return;
         }
         await sendEphemeral(ctx, '📊 Fetching SMS statistics...');
@@ -315,7 +354,7 @@ async function bulkSmsStatusFlow(conversation, ctx) {
         const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
         ensureActive();
         if (!user || !adminStatus) {
-            await ctx.reply('❌ Bulk SMS status is for administrators only.');
+            await ctx.reply('❌ Access denied. This action is available to administrators only.');
             return;
         }
         await ctx.reply('🆔 Enter the bulk SMS job ID:');
@@ -348,17 +387,19 @@ function buildBulkSmsMenuKeyboard(ctx) {
         .text('🧾 Job Status', buildCallbackData(ctx, 'BULK_SMS_STATUS'))
         .text('📊 Bulk Stats', buildCallbackData(ctx, 'BULK_SMS_STATS'))
         .row()
+        .text('⬅️ Back to SMS Center', buildCallbackData(ctx, 'SMS'))
+        .row()
         .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
 }
 
 async function renderBulkSmsMenu(ctx) {
     const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
     if (!user) {
-        return ctx.reply('❌ You are not authorized to use this bot.');
+        return ctx.reply('❌ Access denied. Your account is not authorized for this action.');
     }
     const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
     if (!adminStatus) {
-        return ctx.reply('❌ Bulk SMS is for administrators only.');
+        return ctx.reply('❌ Access denied. This action is available to administrators only.');
     }
     startOperation(ctx, 'bulk-sms-menu');
     const keyboard = buildBulkSmsMenuKeyboard(ctx);
@@ -464,7 +505,7 @@ async function smsFlow(conversation, ctx) {
         const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
         ensureActive();
         if (!user) {
-            await ctx.reply(formatSection('❌ Authorization', ['You are not authorized to use this bot.']));
+            await ctx.reply(formatSection('❌ Authorization', ['Access denied. Your account is not authorized for this action.']));
             return;
         }
 
@@ -479,7 +520,10 @@ async function smsFlow(conversation, ctx) {
                 delete ctx.session.meta.prefill;
             }
         } else {
-            await ctx.reply(formatSection('📱 Enter phone number', ['Use E.164 format, e.g., +1234567890']));
+            await ctx.reply(setupStepMessage('SMS setup', [
+                'Enter phone number in E.164 format.',
+                'Example: +1234567890'
+            ]), { parse_mode: 'Markdown' });
             const numMsg = await waitForMessage();
             number = numMsg?.message?.text?.trim();
 
@@ -513,7 +557,8 @@ Choose the business profile for this message.`,
         );
 
         if (!selectedBusiness || selectedBusiness.id === 'cancel') {
-            await ctx.reply('🛑 SMS cancelled.', {
+            await ctx.reply(cancelledMessage('SMS flow', 'Use /sms to start again.'), {
+                parse_mode: 'Markdown',
                 reply_markup: buildBackToMenuKeyboard(ctx, 'SMS')
             });
             return;
@@ -668,7 +713,8 @@ Tap an option below to continue.`;
         );
 
         if (!scriptSelection || scriptSelection.id === 'cancel') {
-            await ctx.reply('🛑 SMS cancelled.', {
+            await ctx.reply(cancelledMessage('SMS flow', 'Use /sms to start again.'), {
+                parse_mode: 'Markdown',
                 reply_markup: buildBackToMenuKeyboard(ctx, 'SMS')
             });
             return;
@@ -782,7 +828,10 @@ Tap an option below to continue.`;
             );
 
             if (!previewAction || previewAction.id === 'cancel') {
-                await ctx.reply('🛑 SMS cancelled.');
+                await ctx.reply(cancelledMessage('SMS flow', 'Use /sms to start again.'), {
+                    parse_mode: 'Markdown',
+                    reply_markup: buildBackToMenuKeyboard(ctx, 'SMS')
+                });
                 return;
             }
 
@@ -870,18 +919,21 @@ async function bulkSmsFlow(conversation, ctx) {
         const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
         ensureActive();
         if (!user) {
-            await ctx.reply('❌ You are not authorized to use this bot.');
+            await ctx.reply('❌ Access denied. Your account is not authorized for this action.');
             return;
         }
 
         const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
         ensureActive();
         if (!adminStatus) {
-            await ctx.reply('❌ Bulk SMS is for administrators only.');
+            await ctx.reply('❌ Access denied. This action is available to administrators only.');
             return;
         }
 
-        await ctx.reply('📱 Enter phone numbers separated by commas or newlines (max 100):');
+        await ctx.reply(setupStepMessage('Bulk SMS setup', [
+            'Enter phone numbers separated by commas or new lines.',
+            'Maximum recipients: 100'
+        ]), { parse_mode: 'Markdown' });
 
         const numbersMsg = await waitForMessage();
         const numbersText = numbersMsg?.message?.text?.trim();
@@ -903,7 +955,10 @@ async function bulkSmsFlow(conversation, ctx) {
             );
         }
 
-        await ctx.reply(`💬 Enter the message to send to ${numbers.length} recipients (max 1600 chars):`);
+        await ctx.reply(setupStepMessage('Bulk SMS message', [
+            `Enter the message for ${numbers.length} recipient(s).`,
+            'Maximum length: 1600 characters'
+        ]), { parse_mode: 'Markdown' });
         const msgContent = await waitForMessage();
         let message = msgContent?.message?.text?.trim();
 
@@ -940,7 +995,8 @@ async function bulkSmsFlow(conversation, ctx) {
             );
 
             if (!previewAction || previewAction.id === 'cancel') {
-                await ctx.reply('🛑 Bulk SMS cancelled.', {
+                await ctx.reply(cancelledMessage('Bulk SMS flow', 'Use /smssender to start again.'), {
+                    parse_mode: 'Markdown',
                     reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_SMS', '⬅️ Back to SMS Sender')
                 });
                 return;
@@ -1062,7 +1118,7 @@ async function scheduleSmsFlow(conversation, ctx) {
         const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
         ensureActive();
         if (!user) {
-            await ctx.reply('❌ You are not authorized to use this bot.');
+            await ctx.reply('❌ Access denied. Your account is not authorized for this action.');
             return;
         }
 
@@ -1075,7 +1131,10 @@ async function scheduleSmsFlow(conversation, ctx) {
                 delete ctx.session.meta.prefill;
             }
         } else {
-            await ctx.reply('📱 Enter phone number (E.164 format):');
+            await ctx.reply(setupStepMessage('Schedule SMS', [
+                'Enter phone number in E.164 format.',
+                'Example: +1234567890'
+            ]), { parse_mode: 'Markdown' });
             const numMsg = await waitForMessage();
             number = numMsg?.message?.text?.trim();
 
@@ -1084,7 +1143,9 @@ async function scheduleSmsFlow(conversation, ctx) {
             }
         }
 
-        await ctx.reply('💬 Enter the message:');
+        await ctx.reply(setupStepMessage('Schedule SMS', [
+            'Enter the message to schedule.'
+        ]), { parse_mode: 'Markdown' });
         const msgContent = await waitForMessage();
         const message = msgContent?.message?.text?.trim();
         if (!message) return smsAlert(ctx, 'Please provide a message.');
@@ -1335,7 +1396,7 @@ async function getSmsStats(ctx) {
         try {
             const basicResponse = await httpClient.get(null, `${config.apiUrl}/api/sms/database-stats`, { timeout: 5000 });
             if (basicResponse.data.success) {
-                const stats = basicResponse.data.statistics;
+                const stats = basicResponse.data.statistics || basicResponse.data || {};
                 const basicStatsText = 
                     `📊 *Basic SMS Statistics*\n\n` +
                     `💬 Active Conversations: ${stats.active_conversations || 0}\n` +

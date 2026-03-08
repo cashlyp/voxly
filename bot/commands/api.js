@@ -22,7 +22,7 @@ async function handleStatusCommand(ctx) {
         const adminStatus = await new Promise(r => isAdmin(ctx.from.id, r));
 
         if (!user || !adminStatus) {
-            return ctx.reply('❌ This command is for administrators only.');
+            return ctx.reply('❌ Access denied. This action is available to administrators only.');
         }
 
         await sendEphemeral(ctx, '🔍 Checking system status...');
@@ -76,7 +76,7 @@ async function handleStatusCommand(ctx) {
 
         message += `*📊 Call Statistics:*\n`;
         message += `${buildLine('📞', 'Active Calls', health.active_calls || 0)}\n`;
-        message += `✨ Keeping the console lively with ${health.active_calls || 0} active connections.\n`;
+        message += `${buildLine('📈', 'Live Connections', health.active_calls || 0)}\n`;
 
         const audit = getDeniedAuditSummary();
         if (audit.total > 0) {
@@ -147,7 +147,7 @@ async function handleHealthCommand(ctx) {
     try {
         const user = await new Promise(r => getUser(ctx.from.id, r));
         if (!user) {
-            return ctx.reply('❌ You are not authorized to use this bot.');
+            return ctx.reply('❌ Access denied. Your account is not authorized for this action.');
         }
 
         const startTime = Date.now();
