@@ -3,6 +3,7 @@ const EventEmitter = require('events');
 const crypto = require('crypto');
 const OpenAI = require('openai');
 const PersonalityEngine = require('../functions/PersonalityEngine');
+const { sanitizeVoiceOutputText } = require('../utils/voiceOutputGuard');
 const config = require('../config');
 
 function estimateTokenCount(value = '') {
@@ -82,12 +83,18 @@ class EnhancedGptService extends EventEmitter {
       toolFailureRate: Number(config.openRouter?.slo?.toolFailureRate || 0.3)
     };
     this.brevityHint = 'Keep spoken replies concise: max 2 sentences, ~200 characters, and avoid rambling.';
+    this.voiceStyleHint = 'Voice output rules: use plain spoken language only. Do not use emojis, markdown, bullet symbols, or chat-channel references such as text, DM, WhatsApp, or Instagram.';
     this.executionContext = {
       traceId: String(options.traceId || ''),
       requestId: String(options.requestId || ''),
       channel: String(options.channel || 'voice'),
       provider: String(options.provider || ''),
       startedAt: new Date().toISOString()
+    };
+    this.voiceOutputGuard = {
+      enabled: options.voiceOutputGuard !== false,
+      maxChars: Number(config.openRouter?.voiceOutputMaxChars || 260),
+      fallbackText: String(options.voiceOutputFallback || 'Let me help you with that.')
     };
     this.responsePolicyGate = typeof options.responsePolicyGate === 'function'
       ? options.responsePolicyGate
@@ -115,7 +122,7 @@ class EnhancedGptService extends EventEmitter {
     this.dynamicTools = [];
     this.availableFunctions = {};
     
-    const defaultPrompt = 'You are an intelligent AI assistant capable of adapting to different business contexts and customer needs. Be professional, helpful, and responsive to customer communication styles. You must add a \'•\' symbol every 5 to 10 words at natural pauses where your response can be split for text to speech.';
+    const defaultPrompt = 'You are an intelligent AI assistant capable of adapting to different business contexts and customer needs. Be professional, helpful, and responsive to customer communication styles for live voice calls.';
     const defaultFirstMessage = 'Hello! How can I assist you today?';
 
     // Use custom prompt if provided, otherwise use default
@@ -182,7 +189,10 @@ class EnhancedGptService extends EventEmitter {
       }
     };
     this.systemPrompt = this.composeSystemPrompt();
-    const firstMessage = customFirstMessage || defaultFirstMessage;
+    const firstMessage = this.applyVoiceOutputGuard(
+      customFirstMessage || defaultFirstMessage,
+      { stage: 'initial_first_message' },
+    ).text;
 
     this.currentPhase = 'greeting';
     this.phaseWindows = {
@@ -205,7 +215,6 @@ class EnhancedGptService extends EventEmitter {
     this.conversationHistory = []; // Track full conversation for personality analysis
 
     // Store prompts for debugging/logging
-    this.systemPrompt = this.composeSystemPrompt();
     this.firstMessage = firstMessage;
     this.isCustomConfiguration = !!(customPrompt || customFirstMessage);
 
@@ -254,6 +263,7 @@ class EnhancedGptService extends EventEmitter {
       this.currentProfilePrompt,
       personaDslPrompt,
       toneDirective,
+      this.voiceStyleHint,
       this.brevityHint
     ].filter(Boolean).join('\n');
   }
@@ -302,37 +312,57 @@ class EnhancedGptService extends EventEmitter {
 
   applyResponsePolicy(text = '', metadata = {}) {
     const rawText = String(text || '');
-    if (!rawText || typeof this.responsePolicyGate !== 'function') {
+    const voiceGuard = this.applyVoiceOutputGuard(rawText, metadata);
+    const guardedText = String(voiceGuard.text || '');
+    if (!guardedText || typeof this.responsePolicyGate !== 'function') {
       return {
-        text: rawText,
+        text: guardedText,
         replaced: false,
         blocked: [],
         risk_level: 'none',
         action: 'allow',
-        findings: []
+        findings: [],
+        voice_sanitized: voiceGuard.changed,
+        voice_sanitization_reasons: voiceGuard.reasons || []
       };
     }
     try {
-      const result = this.responsePolicyGate(rawText, metadata);
+      const result = this.responsePolicyGate(guardedText, metadata);
       if (result && typeof result === 'object') {
-        const nextText = String(result.text ?? rawText);
+        const nextText = String(result.text ?? guardedText);
+        const finalVoiceGuard = this.applyVoiceOutputGuard(nextText, metadata);
         return {
-          text: nextText,
-          replaced: result.replaced === true && nextText !== rawText,
+          text: finalVoiceGuard.text,
+          replaced: result.replaced === true && nextText !== guardedText,
           blocked: Array.isArray(result.blocked) ? result.blocked : [],
           risk_level: String(result.risk_level || '').trim() || 'none',
           action: String(result.action || '').trim() || 'allow',
-          findings: Array.isArray(result.findings) ? result.findings : []
+          findings: Array.isArray(result.findings) ? result.findings : [],
+          voice_sanitized: voiceGuard.changed || finalVoiceGuard.changed,
+          voice_sanitization_reasons: Array.from(
+            new Set([
+              ...(Array.isArray(voiceGuard.reasons) ? voiceGuard.reasons : []),
+              ...(Array.isArray(finalVoiceGuard.reasons) ? finalVoiceGuard.reasons : []),
+            ])
+          ),
         };
       }
       if (typeof result === 'string') {
+        const finalVoiceGuard = this.applyVoiceOutputGuard(result, metadata);
         return {
-          text: result,
-          replaced: result !== rawText,
+          text: finalVoiceGuard.text,
+          replaced: result !== guardedText,
           blocked: [],
-          risk_level: result !== rawText ? 'high' : 'none',
-          action: result !== rawText ? 'fallback' : 'allow',
-          findings: []
+          risk_level: result !== guardedText ? 'high' : 'none',
+          action: result !== guardedText ? 'fallback' : 'allow',
+          findings: [],
+          voice_sanitized: voiceGuard.changed || finalVoiceGuard.changed,
+          voice_sanitization_reasons: Array.from(
+            new Set([
+              ...(Array.isArray(voiceGuard.reasons) ? voiceGuard.reasons : []),
+              ...(Array.isArray(finalVoiceGuard.reasons) ? finalVoiceGuard.reasons : []),
+            ])
+          ),
         };
       }
     } catch (error) {
@@ -341,12 +371,14 @@ class EnhancedGptService extends EventEmitter {
       });
     }
     return {
-      text: rawText,
+      text: guardedText,
       replaced: false,
       blocked: [],
       risk_level: 'none',
       action: 'allow',
-      findings: []
+      findings: [],
+      voice_sanitized: voiceGuard.changed,
+      voice_sanitization_reasons: voiceGuard.reasons || []
     };
   }
 
@@ -532,6 +564,41 @@ class EnhancedGptService extends EventEmitter {
       ...this.executionContext,
       ...context
     };
+  }
+
+  applyVoiceOutputGuard(text = '', metadata = {}) {
+    const rawText = String(text || '');
+    if (!rawText) {
+      return {
+        text: rawText,
+        changed: false,
+        reasons: []
+      };
+    }
+    const channel = String(
+      metadata?.channel ||
+      this.executionContext?.channel ||
+      'voice'
+    ).toLowerCase();
+    const isVoiceChannel = ['voice', 'call', 'telephony'].includes(channel);
+    if (!this.voiceOutputGuard.enabled || !isVoiceChannel) {
+      return {
+        text: rawText,
+        changed: false,
+        reasons: []
+      };
+    }
+    const sanitized = sanitizeVoiceOutputText(rawText, {
+      maxChars: this.voiceOutputGuard.maxChars,
+      fallbackText: this.voiceOutputGuard.fallbackText,
+    });
+    if (sanitized.changed) {
+      this.logEvent('voice_output_sanitized', {
+        stage: String(metadata?.stage || 'unknown'),
+        reasons: Array.isArray(sanitized.reasons) ? sanitized.reasons : [],
+      });
+    }
+    return sanitized;
   }
 
   setTraceId(traceId) {
@@ -1866,7 +1933,10 @@ class EnhancedGptService extends EventEmitter {
       });
       this.emit('gpterror', err);
 
-      const fallbackResponse = 'I am having trouble replying right now • please give me a moment or try again.';
+      const fallbackResponse = this.applyVoiceOutputGuard(
+        'I am having trouble replying right now. Please give me a moment or try again.',
+        { stage: 'fallback', phase: this.currentPhase, profile: this.currentProfileName },
+      ).text;
       const fallbackReply = {
         partialResponseIndex: this.partialResponseIndex,
         partialResponse: fallbackResponse,
@@ -2052,7 +2122,13 @@ class EnhancedGptService extends EventEmitter {
             this.addToPhaseWindow(toolCallMessage);
 
             const toolData = this.dynamicTools.find(tool => tool.function.name === planned.name);
-            const say = toolData?.function?.say || 'One moment please...';
+            const sayRaw = toolData?.function?.say || 'One moment please.';
+            const say = this.applyVoiceOutputGuard(sayRaw, {
+              interactionCount,
+              stage: 'tool_say',
+              phase: this.currentPhase,
+              profile: this.currentProfileName
+            }).text;
             this.emit('gptreply', {
               partialResponseIndex: null,
               partialResponse: say,

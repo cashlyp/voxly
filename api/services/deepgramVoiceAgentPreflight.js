@@ -3,6 +3,12 @@
 const VOICE_AGENT_THINK_MODELS_ENDPOINT =
   "https://agent.deepgram.com/v1/agent/settings/think/models";
 const ACTIVE_VOICE_AGENT_MODES = new Set(["hybrid", "voice_agent"]);
+const THINK_PROVIDER_ALIASES = Object.freeze({
+  openai: "open_ai",
+  "open-ai": "open_ai",
+  "open ai": "open_ai",
+  open_ai: "open_ai",
+});
 
 function normalizeText(value, fallback = "") {
   if (value === undefined || value === null) return fallback;
@@ -15,11 +21,15 @@ function normalizeMode(mode) {
   return ACTIVE_VOICE_AGENT_MODES.has(normalized) ? normalized : "legacy";
 }
 
+function normalizeThinkProvider(provider, fallback = "open_ai") {
+  const normalized = normalizeText(provider, fallback).toLowerCase();
+  return THINK_PROVIDER_ALIASES[normalized] || normalized;
+}
+
 function shouldRunDeepgramVoiceAgentPreflight(options = {}) {
   const enabled = options.enabled === true;
   if (!enabled) return false;
-  const mode = normalizeMode(options.mode);
-  return ACTIVE_VOICE_AGENT_MODES.has(mode);
+  return normalizeMode(options.mode) !== "legacy";
 }
 
 function createPreflightError(code, message, extra = {}) {
@@ -32,11 +42,21 @@ function createPreflightError(code, message, extra = {}) {
 }
 
 function normalizeThinkModelsResponse(payload) {
-  const rows = Array.isArray(payload?.models) ? payload.models : [];
+  const rows = Array.isArray(payload?.models)
+    ? payload.models
+    : Array.isArray(payload?.result?.models)
+      ? payload.result.models
+      : Array.isArray(payload)
+        ? payload
+        : [];
   return rows
     .map((entry) => {
-      const provider = normalizeText(entry?.provider).toLowerCase();
-      const id = normalizeText(entry?.id);
+      const providerSource =
+        typeof entry?.provider === "string"
+          ? entry.provider
+          : entry?.provider?.type || entry?.provider?.id;
+      const provider = normalizeThinkProvider(providerSource, "");
+      const id = normalizeText(entry?.id || entry?.model || entry?.name);
       if (!provider || !id) return null;
       return {
         provider,
@@ -47,13 +67,30 @@ function normalizeThinkModelsResponse(payload) {
     .filter(Boolean);
 }
 
+function normalizeModelIdentifier(modelId = "") {
+  return normalizeText(modelId).toLowerCase();
+}
+
+function modelMatchesTarget(modelId = "", targetModel = "") {
+  const normalizedCandidate = normalizeModelIdentifier(modelId);
+  const normalizedTarget = normalizeModelIdentifier(targetModel);
+  if (!normalizedCandidate || !normalizedTarget) return false;
+  if (normalizedCandidate === normalizedTarget) return true;
+  return (
+    normalizedCandidate.endsWith(`/${normalizedTarget}`) ||
+    normalizedCandidate.endsWith(`:${normalizedTarget}`)
+  );
+}
+
 function evaluateThinkModelCompatibility(models = [], options = {}) {
-  const provider = normalizeText(options.provider, "open_ai").toLowerCase();
+  const provider = normalizeThinkProvider(options.provider, "open_ai");
   const model = normalizeText(options.model, "gpt-4o-mini");
   const providerModels = models
     .filter((entry) => entry.provider === provider)
     .map((entry) => entry.id);
-  const isSupported = providerModels.includes(model);
+  const isSupported = providerModels.some((candidate) =>
+    modelMatchesTarget(candidate, model),
+  );
 
   return {
     provider,

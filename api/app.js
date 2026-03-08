@@ -96,6 +96,7 @@ const {
 const { v4: uuidv4 } = require("uuid");
 const { WaveFile } = require("wavefile");
 const { runWithTimeout: runOperationWithTimeout } = require("./utils/asyncControl");
+const { sanitizeVoiceOutputText } = require("./utils/voiceOutputGuard");
 const {
   executeDeepgramVoiceAgentThinkPreflight,
   shouldRunDeepgramVoiceAgentPreflight,
@@ -133,8 +134,10 @@ const twilio = require("twilio");
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
 const DEFAULT_INBOUND_PROMPT =
-  "You are an intelligent AI assistant capable of adapting to different business contexts and customer needs. Be professional, helpful, and responsive to customer communication styles. You must add a '•' symbol every 5 to 10 words at natural pauses where your response can be split for text to speech.";
+  "You are an intelligent AI assistant capable of adapting to different business contexts and customer needs. Be professional, helpful, and responsive to customer communication styles for live voice calls.";
 const DEFAULT_INBOUND_FIRST_MESSAGE = "Hello! How can I assist you today?";
+const VOICE_OUTPUT_GUARD_DIRECTIVE =
+  "Voice output rules: use plain spoken language only. Do not use emojis, markdown, bullet symbols, or chat-channel references such as text, DM, WhatsApp, or Instagram.";
 const INBOUND_DEFAULT_SETTING_KEY = "inbound_default_script_id";
 const INBOUND_DEFAULT_CACHE_MS = 15000;
 let inboundDefaultScriptId = null;
@@ -4661,37 +4664,6 @@ function estimateAudioLevelFromBase64(base64 = "") {
   return Math.max(0, Math.min(1, level));
 }
 
-function estimateAudioLevelFromBuffer(buffer, options = {}) {
-  if (!Buffer.isBuffer(buffer) || !buffer.length) return null;
-  const encoding = String(options.encoding || "").toLowerCase();
-  if (["pcm", "linear", "linear16", "l16"].includes(encoding)) {
-    const minStep = 2;
-    let step = Math.max(minStep, Math.floor(buffer.length / 800));
-    if (step % 2 !== 0) {
-      step += 1;
-    }
-    let sum = 0;
-    let count = 0;
-    for (let i = 0; i + 1 < buffer.length; i += step) {
-      sum += Math.abs(buffer.readInt16LE(i));
-      count += 1;
-    }
-    if (!count) return null;
-    const level = sum / (count * 32768);
-    return Math.max(0, Math.min(1, level));
-  }
-  const step = Math.max(1, Math.floor(buffer.length / 800));
-  let sum = 0;
-  let count = 0;
-  for (let i = 0; i < buffer.length; i += step) {
-    sum += Math.abs(buffer[i] - 128);
-    count += 1;
-  }
-  if (!count) return null;
-  const level = sum / (count * 128);
-  return Math.max(0, Math.min(1, level));
-}
-
 function clampLevel(level) {
   if (!Number.isFinite(level)) return null;
   return Math.max(0, Math.min(1, level));
@@ -6008,28 +5980,6 @@ function sanitizeTelemetryValue(value) {
   }
   if (typeof value === "boolean") return value;
   return null;
-}
-
-function sanitizeTelemetryData(data = {}) {
-  const filtered = {};
-  const blockedKeys = [
-    "phone",
-    "otp",
-    "token",
-    "secret",
-    "init",
-    "authorization",
-    "sid",
-  ];
-  Object.entries(data || {}).forEach(([key, value]) => {
-    const lower = key.toLowerCase();
-    if (blockedKeys.some((blocked) => lower.includes(blocked))) return;
-    const sanitized = sanitizeTelemetryValue(value);
-    if (sanitized !== null) {
-      filtered[key] = sanitized;
-    }
-  });
-  return filtered;
 }
 
 app.use((req, res, next) => {
@@ -8627,24 +8577,6 @@ function getProviderOrder(preferred) {
   return order;
 }
 
-function selectOutboundProvider(preferred) {
-  const readiness = getProviderReadiness();
-  const failoverEnabled = config.providerFailover?.enabled !== false;
-  const plan = resolveProviderExecutionOrder({
-    channel: PROVIDER_CHANNELS.CALL,
-    preferredProvider: preferred,
-    providers: SUPPORTED_PROVIDERS,
-    readiness,
-    requestedFlow: "outbound_voice",
-    context: {
-      vonageDtmfWebhookEnabled: config.vonage?.dtmfWebhookEnabled === true,
-    },
-    failoverEnabled,
-    isProviderDegraded,
-  });
-  return plan.selected_provider || null;
-}
-
 let warnedMachineDetection = false;
 let warnedVonageWebhookValidation = false;
 function isMachineDetectionEnabled() {
@@ -10045,13 +9977,21 @@ app.ws("/connection", (ws, req) => {
             const voiceAgentConfig = getEffectiveVoiceAgentRuntimeConfig();
             const voiceAgentFunctions =
               buildVoiceAgentFunctionDefinitions(functionSystem);
+            const rawGreeting = String(
+              callConfig?.first_message || DEFAULT_INBOUND_FIRST_MESSAGE,
+            );
             const greetingText =
               callConfig?.initial_prompt_played === true
                 ? ""
-                : String(
-                    callConfig?.first_message || DEFAULT_INBOUND_FIRST_MESSAGE,
-                  );
-            const promptText = [callConfig?.prompt || DEFAULT_INBOUND_PROMPT, intentLine]
+                : sanitizeVoiceOutputText(rawGreeting, {
+                    maxChars: 260,
+                    fallbackText: DEFAULT_INBOUND_FIRST_MESSAGE,
+                  }).text;
+            const promptText = [
+              callConfig?.prompt || DEFAULT_INBOUND_PROMPT,
+              intentLine,
+              VOICE_OUTPUT_GUARD_DIRECTIVE,
+            ]
               .filter(Boolean)
               .join("\n");
             const toolTimeoutMs =
@@ -10139,6 +10079,12 @@ app.ws("/connection", (ws, req) => {
                 if (!isUser && !isAgent) {
                   return;
                 }
+                const safeContent = isAgent
+                  ? sanitizeVoiceOutputText(content, {
+                      maxChars: 260,
+                      fallbackText: "Let me help you with that.",
+                    }).text
+                  : String(content || "");
                 try {
                   if (isUser) {
                     webhookService
@@ -10147,18 +10093,18 @@ app.ws("/connection", (ws, req) => {
                     await db.addTranscript({
                       call_sid: callSid,
                       speaker: "user",
-                      message: content,
+                      message: safeContent,
                       interaction_count: interactionCount,
                     });
                     await db.updateCallState(callSid, "user_spoke", {
-                      message: content,
+                      message: safeContent,
                       interaction_count: interactionCount,
                       runtime: "voice_agent",
                     });
-                    webhookService.recordTranscriptTurn(callSid, "user", content);
+                    webhookService.recordTranscriptTurn(callSid, "user", safeContent);
                     if (
                       config.deepgram?.voiceAgent?.parityCloseOnGoodbye !== false &&
-                      shouldCloseConversation(content) &&
+                      shouldCloseConversation(safeContent) &&
                       interactionCount >= 1
                     ) {
                       await speakAndEndCall(
@@ -10197,16 +10143,16 @@ app.ws("/connection", (ws, req) => {
                   await db.addTranscript({
                     call_sid: callSid,
                     speaker: "ai",
-                    message: content,
+                    message: safeContent,
                     interaction_count: interactionCount,
                     personality_used: "voice_agent",
                   });
                   await db.updateCallState(callSid, "ai_responded", {
-                    message: content,
+                    message: safeContent,
                     interaction_count: interactionCount,
                     runtime: "voice_agent",
                   });
-                  webhookService.recordTranscriptTurn(callSid, "agent", content);
+                  webhookService.recordTranscriptTurn(callSid, "agent", safeContent);
                   scheduleSilenceTimer(callSid);
                 } catch (error) {
                   console.error("Voice agent transcript persistence error:", error);
@@ -15960,35 +15906,6 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
   };
 }
 
-function escapeCsvValue(value) {
-  if (value === null || value === undefined) return "";
-  const str = String(value);
-  if (/[",\n]/.test(str)) {
-    return `"${str.replace(/"/g, '""')}"`;
-  }
-  return str;
-}
-
-function callsToCsv(calls = []) {
-  const headers = [
-    "call_sid",
-    "status",
-    "direction",
-    "phone_number",
-    "created_at",
-    "duration",
-    "answered_by",
-    "error_code",
-    "error_message",
-  ];
-  const lines = [headers.join(",")];
-  for (const call of calls) {
-    const row = headers.map((key) => escapeCsvValue(call?.[key]));
-    lines.push(row.join(","));
-  }
-  return lines.join("\n");
-}
-
 function normalizeDateFilter(value, isEnd = false) {
   if (!value) return null;
   const raw = String(value).trim();
@@ -15997,229 +15914,6 @@ function normalizeDateFilter(value, isEnd = false) {
     return `${raw} ${isEnd ? "23:59:59" : "00:00:00"}`;
   }
   return raw;
-}
-
-async function handleInboundAdminDecision(callSid, action, adminId) {
-  if (!callSid) {
-    return { ok: false, error: "missing_call_sid" };
-  }
-  const callRecord = await db.getCall(callSid).catch(() => null);
-  if (!callRecord) {
-    return { ok: false, error: "call_not_found" };
-  }
-  const gate = webhookService.getInboundGate(callSid);
-  if (
-    gate?.status === "answered" ||
-    gate?.status === "declined" ||
-    gate?.status === "expired"
-  ) {
-    return { ok: false, error: "already_handled", status: gate?.status };
-  }
-  if (action === "answer") {
-    webhookService.setInboundGate(callSid, "answered", { chatId: adminId });
-    webhookService.setConsoleCompact(callSid, false);
-    webhookService.addLiveEvent(callSid, "✅ Admin answered", { force: true });
-    await db
-      .updateCallState(callSid, "admin_answered", {
-        at: new Date().toISOString(),
-        by: adminId,
-      })
-      .catch(() => {});
-    await connectInboundCall(callSid);
-    return { ok: true, status: "answered" };
-  }
-  if (action === "decline") {
-    webhookService.setInboundGate(callSid, "declined", { chatId: adminId });
-    webhookService.addLiveEvent(callSid, "❌ Declined by admin", {
-      force: true,
-    });
-    await db
-      .updateCallState(callSid, "admin_declined", {
-        at: new Date().toISOString(),
-        by: adminId,
-      })
-      .catch(() => {});
-    await endCallForProvider(callSid);
-    await webhookService.setLiveCallPhase(callSid, "ended").catch(() => {});
-    return { ok: true, status: "declined" };
-  }
-  return { ok: false, error: "invalid_action" };
-}
-
-function truncatePrompt(value, limit = 800) {
-  const text = String(value || "").trim();
-  if (!text) return "";
-  if (text.length <= limit) return text;
-  return `${text.slice(0, limit)}...`;
-}
-
-async function applyScriptInjection(callSid, scriptId, userId) {
-  if (!callSid || !scriptId) return { ok: false, error: "missing_script" };
-  if (!db) return { ok: false, error: "db_unavailable" };
-  const script = normalizeScriptTemplateRecord(
-    await db.getCallTemplateById(scriptId),
-  );
-  if (!script) return { ok: false, error: "script_not_found" };
-  const callConfig = callConfigurations.get(callSid);
-  if (!callConfig) return { ok: false, error: "call_not_active" };
-  callConfig.script = script.name || callConfig.script;
-  callConfig.script_id = script.id || callConfig.script_id;
-  callConfig.script_version = script.version || callConfig.script_version || 1;
-  callConfig.payment_policy = script.payment_policy || null;
-  const basePrompt = script.prompt || callConfig.prompt || DEFAULT_INBOUND_PROMPT;
-  const baseFirstMessage =
-    script.first_message || callConfig.first_message || DEFAULT_INBOUND_FIRST_MESSAGE;
-  const profileSelection = resolveConversationProfileSelection({
-    purpose:
-      callConfig.conversation_profile ||
-      callConfig.purpose ||
-      script.purpose ||
-      script.default_profile,
-    callProfile:
-      callConfig.call_profile ||
-      callConfig.conversation_profile ||
-      script.flow_type ||
-      script.default_profile,
-    conversation_profile:
-      callConfig.conversation_profile || script.flow_type || script.default_profile,
-    conversation_profile_lock:
-      callConfig.conversation_profile_lock ??
-      callConfig.profile_lock ??
-      callConfig.conversation_profile_locked,
-    profile_confidence_gate:
-      callConfig.profile_confidence_gate ||
-      callConfig.conversation_profile_confidence_gate,
-    scriptTemplate: script,
-    prompt: basePrompt,
-    firstMessage: baseFirstMessage,
-  });
-  const conversationProfile = profileSelection.conversation_profile;
-  const profilePrompt = applyConversationProfilePrompt(
-    conversationProfile,
-    basePrompt,
-    baseFirstMessage,
-  );
-  callConfig.prompt = profilePrompt.prompt || basePrompt;
-  callConfig.first_message = profilePrompt.firstMessage || baseFirstMessage;
-  callConfig.call_profile = conversationProfile;
-  callConfig.conversation_profile = conversationProfile;
-  callConfig.conversation_profile_lock =
-    profileSelection.conversation_profile_locked;
-  callConfig.profile_confidence_gate =
-    profileSelection.conversation_profile_confidence_gate;
-  callConfig.conversation_profile_source =
-    profileSelection.conversation_profile_source;
-  callConfig.conversation_profile_confidence =
-    profileSelection.conversation_profile_confidence;
-  callConfig.conversation_profile_signals =
-    profileSelection.conversation_profile_signals;
-  callConfig.conversation_profile_ambiguous =
-    profileSelection.conversation_profile_ambiguous;
-  callConfig.conversation_profile_locked =
-    profileSelection.conversation_profile_locked;
-  callConfig.conversation_profile_lock_reason =
-    profileSelection.conversation_profile_lock_reason;
-  callConfig.conversation_profile_confidence_gate =
-    profileSelection.conversation_profile_confidence_gate;
-  callConfig.conversation_profile_gate_fallback_applied =
-    profileSelection.conversation_profile_gate_fallback_applied;
-  if (!callConfig.purpose) {
-    callConfig.purpose = getProfilePurpose(conversationProfile);
-  }
-  callConfig.dating_profile_applied = profilePrompt.applied === true;
-  callConfig.profile_pack_version =
-    resolveProfilePackMetadata(profilePrompt).profile_pack_version;
-  callConfig.profile_pack_checksum =
-    resolveProfilePackMetadata(profilePrompt).profile_pack_checksum;
-  const functionSystem = functionEngine.generateAdaptiveFunctionSystem(
-    callConfig.prompt,
-    callConfig.first_message,
-  );
-  callConfig.function_count = functionSystem.functions.length;
-  callConfig.business_context = functionSystem.context;
-  callFunctionSystems.set(callSid, functionSystem);
-  callConfigurations.set(callSid, callConfig);
-  queuePersistCallRuntimeState(callSid, {
-    snapshot: {
-      source: "script_injection",
-      conversation_profile: conversationProfile,
-      conversation_profile_source: profileSelection.conversation_profile_source,
-      conversation_profile_confidence:
-        profileSelection.conversation_profile_confidence,
-      conversation_profile_signals: profileSelection.conversation_profile_signals,
-      conversation_profile_ambiguous:
-        profileSelection.conversation_profile_ambiguous,
-      conversation_profile_locked:
-        profileSelection.conversation_profile_locked,
-      conversation_profile_lock_reason:
-        profileSelection.conversation_profile_lock_reason,
-      conversation_profile_confidence_gate:
-        profileSelection.conversation_profile_confidence_gate,
-      conversation_profile_gate_fallback_applied:
-        profileSelection.conversation_profile_gate_fallback_applied,
-      purpose: callConfig.purpose || null,
-      dating_profile_applied: profilePrompt.applied === true,
-      ...resolveProfilePackMetadata(profilePrompt),
-    },
-  });
-
-  const session = activeCalls.get(callSid);
-  if (session?.gptService) {
-    session.functionSystem = functionSystem;
-    if (typeof session.gptService.updateSystemPromptWithPersonality === "function") {
-      session.gptService.updateSystemPromptWithPersonality(callConfig.prompt);
-    }
-    session.gptService.setCallProfile(conversationProfile);
-    session.gptService.setPersonaContext({
-      domain: conversationProfile || "general",
-      channel: "voice",
-      urgency: callConfig?.urgency || "normal",
-    });
-    const promptPreview = truncatePrompt(callConfig.prompt || "");
-    const intentLine = `Injected script: ${script.name || "custom"} | profile: ${conversationProfile || "general"}. ${promptPreview}`;
-    session.gptService.setCallIntent(intentLine);
-  }
-  refreshActiveCallTools(callSid);
-
-  await db
-    .updateCallState(callSid, "script_injected", {
-      script_id: script.id,
-      script_name: script.name || null,
-      script_version: script.version || null,
-      payment_policy: script.payment_policy || null,
-      call_profile: callConfig.call_profile || null,
-      conversation_profile_lock:
-        callConfig.conversation_profile_lock ?? null,
-      profile_confidence_gate:
-        callConfig.profile_confidence_gate || null,
-      conversation_profile: conversationProfile,
-      conversation_profile_source: profileSelection.conversation_profile_source,
-      conversation_profile_confidence:
-        profileSelection.conversation_profile_confidence,
-      conversation_profile_signals: profileSelection.conversation_profile_signals,
-      conversation_profile_ambiguous:
-        profileSelection.conversation_profile_ambiguous,
-      conversation_profile_locked:
-        profileSelection.conversation_profile_locked,
-      conversation_profile_lock_reason:
-        profileSelection.conversation_profile_lock_reason,
-      conversation_profile_confidence_gate:
-        profileSelection.conversation_profile_confidence_gate,
-      conversation_profile_gate_fallback_applied:
-        profileSelection.conversation_profile_gate_fallback_applied,
-      purpose: callConfig.purpose || null,
-      dating_profile_applied: profilePrompt.applied === true,
-      ...resolveProfilePackMetadata(profilePrompt),
-      business_context: functionSystem.context,
-      generated_functions: functionSystem.functions
-        .map((tool) => tool?.function?.name)
-        .filter(Boolean),
-      user_id: userId || null,
-      at: new Date().toISOString(),
-    })
-    .catch(() => {});
-
-  return { ok: true, script };
 }
 
 function getInboundHealthContext() {
