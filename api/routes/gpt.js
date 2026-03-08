@@ -94,6 +94,9 @@ class EnhancedGptService extends EventEmitter {
     this.voiceOutputGuard = {
       enabled: options.voiceOutputGuard !== false,
       maxChars: Number(config.openRouter?.voiceOutputMaxChars || 260),
+      firstMessageMaxChars: Number(
+        config.openRouter?.voiceOutputFirstMessageMaxChars || 1000,
+      ),
       fallbackText: String(options.voiceOutputFallback || 'Let me help you with that.')
     };
     this.responsePolicyGate = typeof options.responsePolicyGate === 'function'
@@ -588,8 +591,16 @@ class EnhancedGptService extends EventEmitter {
         reasons: []
       };
     }
+    const stage = String(metadata?.stage || '').trim().toLowerCase();
+    const useFirstMessageLimit = stage === 'initial_first_message';
+    const safeMaxChars = useFirstMessageLimit
+      ? Math.max(
+        Number(this.voiceOutputGuard.maxChars || 260),
+        Number(this.voiceOutputGuard.firstMessageMaxChars || 1000),
+      )
+      : Number(this.voiceOutputGuard.maxChars || 260);
     const sanitized = sanitizeVoiceOutputText(rawText, {
-      maxChars: this.voiceOutputGuard.maxChars,
+      maxChars: safeMaxChars,
       fallbackText: this.voiceOutputGuard.fallbackText,
     });
     if (sanitized.changed) {
