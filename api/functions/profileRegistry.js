@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 const DEFAULT_PROFILE_TYPE = "general";
 
@@ -48,13 +49,156 @@ function readProfilePack(profileId, fallbackText) {
   }
 }
 
+function getProfilesDirectory() {
+  return path.join(__dirname, "profiles");
+}
+
+function listProfilePackFiles() {
+  const dirPath = getProfilesDirectory();
+  try {
+    return fs
+      .readdirSync(dirPath)
+      .filter((entry) => entry.toLowerCase().endsWith(".md"))
+      .sort();
+  } catch (_) {
+    return [];
+  }
+}
+
+function validateProfilePackText(fileName, rawText, options = {}) {
+  const text = String(rawText || "").trim();
+  const errors = [];
+  const warnings = [];
+  const isRequired = options.isRequired === true;
+
+  if (!text) {
+    errors.push("Profile pack is empty.");
+    return { file: fileName, ok: false, errors, warnings };
+  }
+
+  const firstLine = String(text.split("\n")[0] || "").trim();
+  if (!firstLine.startsWith("# ")) {
+    errors.push("First line must be a markdown H1 heading.");
+  }
+
+  const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
+  if (lines.length < 3) {
+    warnings.push("Profile pack is very short; consider adding richer guidance.");
+  }
+
+  if (isRequired && text.length < 80) {
+    warnings.push("Required profile pack is unusually short.");
+  }
+
+  const normalized = text.toLowerCase();
+  const hasSafetySignal =
+    normalized.includes("safe") ||
+    normalized.includes("safety") ||
+    normalized.includes("policy") ||
+    normalized.includes("boundary") ||
+    normalized.includes("avoid") ||
+    normalized.includes("do not") ||
+    normalized.includes("never");
+  if (!hasSafetySignal) {
+    warnings.push(
+      "No explicit safety/policy language found. Consider adding guardrails.",
+    );
+  }
+
+  return { file: fileName, ok: errors.length === 0, errors, warnings };
+}
+
+function validateProfilePacks(options = {}) {
+  const strict = options.strict === true;
+  const failOnWarnings = options.failOnWarnings === true;
+  const includeAuxiliary = options.includeAuxiliary !== false;
+  const profileDir = getProfilesDirectory();
+  const files = listProfilePackFiles();
+  const fileSet = new Set(files);
+  const checks = [];
+  const errors = [];
+  const warnings = [];
+
+  for (const definition of Object.values(PROFILE_DEFINITIONS)) {
+    const fileName = `${definition.id}.md`;
+    const filePath = path.join(profileDir, fileName);
+    if (!fileSet.has(fileName)) {
+      const message = `Missing required profile pack: ${fileName}`;
+      checks.push({
+        file: fileName,
+        ok: false,
+        errors: [message],
+        warnings: [],
+      });
+      errors.push(message);
+      continue;
+    }
+    const content = fs.readFileSync(filePath, "utf8");
+    const result = validateProfilePackText(fileName, content, { isRequired: true });
+    checks.push(result);
+    errors.push(...result.errors.map((entry) => `${fileName}: ${entry}`));
+    warnings.push(...result.warnings.map((entry) => `${fileName}: ${entry}`));
+  }
+
+  if (includeAuxiliary) {
+    for (const fileName of files) {
+      const knownRequired = Object.values(PROFILE_DEFINITIONS).some(
+        (definition) => `${definition.id}.md` === fileName,
+      );
+      if (knownRequired) continue;
+      const filePath = path.join(profileDir, fileName);
+      const content = fs.readFileSync(filePath, "utf8");
+      const result = validateProfilePackText(fileName, content, { isRequired: false });
+      checks.push(result);
+      errors.push(...result.errors.map((entry) => `${fileName}: ${entry}`));
+      warnings.push(...result.warnings.map((entry) => `${fileName}: ${entry}`));
+    }
+  }
+
+  const ok = errors.length === 0 && (!strict || !failOnWarnings || warnings.length === 0);
+  return {
+    ok,
+    strict,
+    fail_on_warnings: failOnWarnings,
+    checked_files: checks.length,
+    required_profiles: Object.keys(PROFILE_DEFINITIONS).length,
+    errors,
+    warnings,
+    checks,
+  };
+}
+
+function deriveProfilePackVersion(definition = {}) {
+  const explicitVersion = String(definition?.packVersion || "").trim();
+  if (explicitVersion) {
+    return explicitVersion.toLowerCase().startsWith("v")
+      ? explicitVersion
+      : `v${explicitVersion}`;
+  }
+  const marker = String(definition?.marker || "");
+  const markerMatch = marker.match(/_v([0-9][a-z0-9._-]*)\]/i);
+  if (markerMatch?.[1]) {
+    return `v${markerMatch[1]}`;
+  }
+  return "v1";
+}
+
+function computeProfilePackChecksum(definition = {}, profilePack = "") {
+  const payload = [
+    String(definition?.id || ""),
+    String(definition?.marker || ""),
+    String(profilePack || ""),
+  ].join("|");
+  return crypto.createHash("sha256").update(payload).digest("hex").slice(0, 16);
+}
+
 const PROFILE_DEFINITIONS = Object.freeze({
   dating: {
     id: "dating",
     flowType: "dating",
     objectiveTag: "dating_engagement",
     marker: "[profile_dating_v2]",
-    defaultFirstMessage: "Hi, this is your assistant. I wanted a quick check-in.",
+    defaultFirstMessage: "Hi babe, how are you doing?",
     contextKey: "relationship_profile_context",
     stageEnum: ["talking", "situationship", "dating", "exclusive", "complicated"],
     vibeEnum: ["sweet", "flirty", "dry", "stressed", "bold", "neutral"],
@@ -281,8 +425,14 @@ function buildProfilePromptBundle(profileType, options = {}) {
       firstMessage,
       applied: false,
       profileType: DEFAULT_PROFILE_TYPE,
+      profilePackVersion: null,
+      profilePackChecksum: null,
     };
   }
+
+  const profilePack = getProfilePack(definition.id);
+  const profilePackVersion = deriveProfilePackVersion(definition);
+  const profilePackChecksum = computeProfilePackChecksum(definition, profilePack);
 
   if (basePrompt.includes(definition.marker)) {
     return {
@@ -290,6 +440,8 @@ function buildProfilePromptBundle(profileType, options = {}) {
       firstMessage: firstMessage || definition.defaultFirstMessage,
       applied: false,
       profileType: definition.id,
+      profilePackVersion,
+      profilePackChecksum,
     };
   }
 
@@ -297,7 +449,7 @@ function buildProfilePromptBundle(profileType, options = {}) {
     basePrompt,
     definition.marker,
     `Relationship profile type: ${definition.id}`,
-    getProfilePack(definition.id),
+    profilePack,
     buildPlatformToneDialBlock(),
     "Policy gates: anti-impersonation, anti-harassment, anti-coercion, anti-money-pressure. If triggered, return a safe fallback response.",
   ]
@@ -309,6 +461,8 @@ function buildProfilePromptBundle(profileType, options = {}) {
     firstMessage: firstMessage || definition.defaultFirstMessage,
     applied: true,
     profileType: definition.id,
+    profilePackVersion,
+    profilePackChecksum,
   };
 }
 
@@ -354,67 +508,266 @@ function getProfilePolicy(profileType) {
   return definition?.policy || null;
 }
 
+function normalizeToolName(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, "_");
+}
+
+function toToolSet(value) {
+  if (!Array.isArray(value)) return new Set();
+  return new Set(value.map((entry) => normalizeToolName(entry)).filter(Boolean));
+}
+
+function pickToolPolicyConfig(context = {}) {
+  const runtimeConfig =
+    context?.callConfig && typeof context.callConfig === "object"
+      ? context.callConfig
+      : {};
+  const candidates = [
+    context?.toolPolicy,
+    runtimeConfig?.tool_policy,
+    runtimeConfig?.relationship_profile?.tool_policy,
+    runtimeConfig?.script_policy?.tool_policy,
+  ];
+  for (const candidate of candidates) {
+    if (
+      candidate &&
+      typeof candidate === "object" &&
+      !Array.isArray(candidate)
+    ) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function evaluateProfileToolPolicy(
+  profileType,
+  toolRequest = {},
+  context = {},
+) {
+  const normalizedProfile = normalizeProfileType(profileType, DEFAULT_PROFILE_TYPE);
+  const definition =
+    getProfileDefinition(normalizedProfile, DEFAULT_PROFILE_TYPE) ||
+    getProfileDefinition(DEFAULT_PROFILE_TYPE, DEFAULT_PROFILE_TYPE);
+  const toolName = normalizeToolName(
+    toolRequest.toolName ||
+      toolRequest.tool_name ||
+      toolRequest.name ||
+      toolRequest.functionName ||
+      "",
+  );
+  const args =
+    toolRequest.args && typeof toolRequest.args === "object"
+      ? toolRequest.args
+      : {};
+  const configPolicy = pickToolPolicyConfig(context);
+  const blockedTools = toToolSet(configPolicy?.blocked_tools);
+  const allowedTools = toToolSet(configPolicy?.allowed_tools);
+
+  const deny = (reason, message, extras = {}) => ({
+    allowed: false,
+    action: "deny",
+    code: "tool_policy_blocked",
+    reason,
+    message,
+    profile_type: definition?.id || normalizedProfile || DEFAULT_PROFILE_TYPE,
+    blocked: [reason],
+    metadata: {
+      source: "profile_registry",
+      tool: toolName || null,
+      ...extras,
+    },
+  });
+
+  if (!toolName) {
+    return {
+      allowed: true,
+      action: "allow",
+      code: "ok",
+      reason: "missing_tool_name",
+      message: null,
+      profile_type: definition?.id || normalizedProfile || DEFAULT_PROFILE_TYPE,
+      blocked: [],
+      metadata: { source: "profile_registry" },
+    };
+  }
+
+  if (allowedTools.size > 0 && !allowedTools.has(toolName)) {
+    return deny(
+      "tool_not_in_allow_list",
+      `Tool ${toolName} is not allowed for this profile context.`,
+      { allow_list_enforced: true },
+    );
+  }
+
+  if (blockedTools.has(toolName)) {
+    return deny(
+      "tool_in_block_list",
+      `Tool ${toolName} is blocked for this profile context.`,
+      { block_list_enforced: true },
+    );
+  }
+
+  const moneyTensionActive =
+    context?.callConfig?.money_tension_active === true ||
+    context?.callConfig?.relationship_profile?.money_tension_active === true;
+  if (
+    definition?.policy?.antiMoneyPressure &&
+    toolName === "start_payment" &&
+    moneyTensionActive
+  ) {
+    return deny(
+      "money_pressure_guard",
+      "Payment actions are blocked while money tension is active in this profile.",
+    );
+  }
+
+  if (
+    definition?.policy?.antiCoercion &&
+    (args.force_now === true || args.force === true || args.require_now === true)
+  ) {
+    return deny(
+      "coercion_guard",
+      "Forced actions are blocked by profile safety policy.",
+    );
+  }
+
+  return {
+    allowed: true,
+    action: "allow",
+    code: "ok",
+    reason: "allowed",
+    message: null,
+    profile_type: definition?.id || normalizedProfile || DEFAULT_PROFILE_TYPE,
+    blocked: [],
+    metadata: {
+      source: "profile_registry",
+      tool: toolName,
+      policy_present: configPolicy != null,
+    },
+  };
+}
+
 function applyProfilePolicyGates(rawText = "", profileType = DEFAULT_PROFILE_TYPE) {
   const text = String(rawText || "").trim();
   if (!text) {
-    return { text: "", replaced: false, blocked: [] };
+    return {
+      text: "",
+      replaced: false,
+      blocked: [],
+      risk_level: "none",
+      action: "allow",
+      findings: [],
+    };
   }
 
   const definition = getProfileDefinition(profileType);
   if (!definition) {
-    return { text, replaced: false, blocked: [] };
+    return {
+      text,
+      replaced: false,
+      blocked: [],
+      risk_level: "none",
+      action: "allow",
+      findings: [],
+    };
   }
 
   const lower = text.toLowerCase();
-  const blocked = [];
+  const findings = [];
+  const addFinding = (rule, signal) => {
+    findings.push({ rule, signal });
+  };
 
   if (definition.policy?.antiImpersonation) {
-    if (
-      /\b(i am|this is)\s+(the\s+)?(real\s+)?(celebrity|artist|influencer|creator)\b/i.test(
-        text,
-      ) ||
-      /\bthis is personally\b/i.test(text)
-    ) {
-      blocked.push("anti_impersonation");
+    const impersonationPatterns = [
+      /\b(i am|i'm|this is)\s+(the\s+)?(real\s+)?(celebrity|artist|influencer|creator)\b/i,
+      /\bthis is personally\b/i,
+      /\bi('?m| am)\s+the\s+artist\b/i,
+      /\bit('?s| is)\s+me,\s*(the\s+)?(celebrity|artist)\b/i,
+      /\bofficially\s+me\b/i,
+    ];
+    if (impersonationPatterns.some((pattern) => pattern.test(text))) {
+      addFinding("anti_impersonation", "impersonation_phrase");
     }
   }
 
   if (definition.policy?.antiHarassment) {
     const harassmentTerms = ["idiot", "stupid", "loser", "worthless", "shut up", "moron"];
     if (harassmentTerms.some((term) => lower.includes(term))) {
-      blocked.push("anti_harassment");
+      addFinding("anti_harassment", "abusive_language");
     }
   }
 
   if (definition.policy?.antiCoercion) {
-    const coercionTerms = ["or else", "you must", "no choice", "if you do not", "do it now"];
+    const coercionTerms = [
+      "or else",
+      "you must",
+      "no choice",
+      "if you do not",
+      "do it now",
+      "you better",
+      "last warning",
+      "don't make me",
+      "or there will be consequences",
+    ];
     if (coercionTerms.some((term) => lower.includes(term))) {
-      blocked.push("anti_coercion");
+      addFinding("anti_coercion", "coercive_phrase");
     }
   }
 
   if (definition.policy?.antiMoneyPressure) {
-    const moneyPressureTerms = [
-      "send money now",
-      "wire me",
-      "cashapp me",
-      "gift card",
-      "crypto transfer",
-      "pay immediately",
+    const moneyPressurePatterns = [
+      /\b(send|wire|transfer|pay)\s+(me\s+)?(money|funds)\s*(now|immediately|right now)?\b/i,
+      /\b(cashapp|venmo|zelle|paypal)\s+(me|now)\b/i,
+      /\b(pay|send)\s+(by\s+)?gift\s*card(s)?\b/i,
+      /\b(crypto|bitcoin|btc|usdt|eth)\s+(transfer|payment|now)\b/i,
+      /\bpay\s+immediately\b/i,
     ];
-    if (moneyPressureTerms.some((term) => lower.includes(term))) {
-      blocked.push("anti_money_pressure");
+    if (moneyPressurePatterns.some((pattern) => pattern.test(text))) {
+      addFinding("anti_money_pressure", "money_pressure_phrase");
     }
   }
 
+  const blocked = Array.from(new Set(findings.map((entry) => entry.rule)));
+  const riskWeights = {
+    anti_impersonation: 3,
+    anti_coercion: 3,
+    anti_money_pressure: 2,
+    anti_harassment: 2,
+  };
+  const riskScore = blocked.reduce(
+    (total, rule) => total + Number(riskWeights[rule] || 1),
+    0,
+  );
+  const riskLevel = blocked.length
+    ? riskScore >= 3
+      ? "high"
+      : "medium"
+    : "none";
+  const action = blocked.length ? "fallback" : "allow";
+
   if (!blocked.length) {
-    return { text, replaced: false, blocked };
+    return {
+      text,
+      replaced: false,
+      blocked,
+      risk_level: riskLevel,
+      action,
+      findings,
+    };
   }
 
   return {
     text: definition.safeFallback,
     replaced: true,
     blocked,
+    risk_level: riskLevel,
+    action,
+    findings,
   };
 }
 
@@ -430,8 +783,11 @@ module.exports = {
   getRelationshipObjectiveTags,
   getRelationshipFlowTypes,
   getProfilePack,
+  listProfilePackFiles,
+  validateProfilePacks,
   buildProfilePromptBundle,
   buildRelationshipContext,
   getProfilePolicy,
+  evaluateProfileToolPolicy,
   applyProfilePolicyGates,
 };

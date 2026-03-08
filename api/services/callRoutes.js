@@ -59,6 +59,15 @@ function createOutboundCallHandler(ctx = {}) {
         script: req.body?.script,
         script_id: req.body?.script_id,
         script_version: req.body?.script_version,
+        call_profile:
+          req.body?.call_profile ||
+          req.body?.conversation_profile ||
+          req.body?.profile,
+        conversation_profile: req.body?.conversation_profile,
+        conversation_profile_lock:
+          req.body?.conversation_profile_lock ?? req.body?.profile_lock,
+        profile_confidence_gate:
+          req.body?.profile_confidence_gate,
         purpose: req.body?.purpose || req.body?.call_profile || req.body?.profile,
         emotion: req.body?.emotion,
         urgency: req.body?.urgency,

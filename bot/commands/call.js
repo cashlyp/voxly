@@ -369,6 +369,8 @@ async function selectCallScript(conversation, ctx, ensureActive) {
   };
   if (relationshipFlow) {
     payloadUpdates.call_profile = relationshipFlow;
+    payloadUpdates.conversation_profile = relationshipFlow;
+    payloadUpdates.conversation_profile_lock = true;
     payloadUpdates.purpose = relationshipFlow;
   }
 
@@ -547,6 +549,8 @@ async function buildCustomCallConfig(conversation, ctx, ensureActive, businessOp
 
     if (isRelationshipFlowType(selectedFlow.id)) {
       payloadUpdates.call_profile = selectedFlow.id;
+      payloadUpdates.conversation_profile = selectedFlow.id;
+      payloadUpdates.conversation_profile_lock = true;
       payloadUpdates.purpose = selectedFlow.id;
       summary.push(`Flow: ${CALL_SCRIPT_FLOW_LABELS[selectedFlow.id] || selectedFlow.id}`);
     } else {

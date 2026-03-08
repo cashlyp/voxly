@@ -10,7 +10,9 @@ const {
   getRelationshipFlowTypes,
   buildProfilePromptBundle,
   buildRelationshipContext,
+  evaluateProfileToolPolicy,
   applyProfilePolicyGates,
+  validateProfilePacks,
 } = require("./profileRegistry");
 
 const DATING_OBJECTIVE_TAG = PROFILE_DEFINITIONS.dating.objectiveTag;
@@ -115,19 +117,87 @@ function isCelebrityPurpose(value) {
   return normalizeRelationshipProfileType(value) === "celebrity";
 }
 
-function inferProfileFromText(...texts) {
+function inferProfileFromTextWithSignals(...texts) {
+  const merged = texts
+    .map((entry) => normalizeLower(entry))
+    .filter(Boolean)
+    .join(" ");
+  if (!merged) {
+    return {
+      profileType: "",
+      matchedSignals: [],
+      score: 0,
+      ambiguous: false,
+    };
+  }
+
+  const scored = [];
+  for (const [profileType, signals] of Object.entries(PROFILE_TEXT_SIGNALS)) {
+    const hits = [];
+    let score = 0;
+    for (const token of signals) {
+      const normalizedToken = normalizeLower(token);
+      if (!normalizedToken || !merged.includes(normalizedToken)) continue;
+      hits.push(normalizedToken);
+      // Multi-word hits are stronger intent signals than generic single words.
+      score += normalizedToken.includes(" ") ? 2 : 1;
+    }
+    if (score > 0) {
+      scored.push({ profileType, score, matchedSignals: hits });
+    }
+  }
+
+  if (!scored.length) {
+    return {
+      profileType: "",
+      matchedSignals: [],
+      score: 0,
+      ambiguous: false,
+    };
+  }
+
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (b.matchedSignals.length !== a.matchedSignals.length) {
+      return b.matchedSignals.length - a.matchedSignals.length;
+    }
+    return a.profileType.localeCompare(b.profileType);
+  });
+
+  const best = scored[0];
+  const tied = scored.filter((entry) => entry.score === best.score);
+  if (tied.length > 1) {
+    return {
+      profileType: "",
+      matchedSignals: [],
+      score: best.score,
+      ambiguous: true,
+    };
+  }
+
+  return {
+    profileType: best.profileType,
+    matchedSignals: best.matchedSignals.slice(0, 6),
+    score: best.score,
+    ambiguous: false,
+  };
+}
+
+function detectProfileFromMarkers(...texts) {
   const merged = texts
     .map((entry) => normalizeLower(entry))
     .filter(Boolean)
     .join(" ");
   if (!merged) return "";
 
-  for (const [profileType, signals] of Object.entries(PROFILE_TEXT_SIGNALS)) {
-    if (signals.some((token) => merged.includes(token))) {
-      return profileType;
+  for (const profileType of RELATIONSHIP_PROFILE_TYPES) {
+    const definition = getProfileDefinition(profileType);
+    const marker = normalizeLower(definition?.marker);
+    if (!marker) continue;
+    if (merged.includes(marker)) {
+      return definition.id;
     }
   }
-
   return "";
 }
 
@@ -176,22 +246,62 @@ function isCelebrityScriptTemplate(template = {}) {
 }
 
 function deriveConversationProfile(input = {}) {
+  return deriveConversationProfileDecision(input).profile_type;
+}
+
+function deriveConversationProfileDecision(input = {}) {
+  const fallback = normalizeRelationshipProfileType(input.fallback, DEFAULT_PROFILE_TYPE);
   const explicitProfile = normalizeRelationshipProfileType(input.purpose, "");
   if (explicitProfile && explicitProfile !== DEFAULT_PROFILE_TYPE) {
-    return explicitProfile;
+    return {
+      profile_type: explicitProfile,
+      source: "purpose",
+      confidence: "high",
+      matched_signals: [],
+      ambiguous: false,
+    };
   }
 
   const templateProfile = detectProfileFromScriptTemplate(input.scriptTemplate || {});
   if (templateProfile) {
-    return templateProfile;
+    return {
+      profile_type: templateProfile,
+      source: "script_template",
+      confidence: "high",
+      matched_signals: [],
+      ambiguous: false,
+    };
   }
 
-  const inferredProfile = inferProfileFromText(input.prompt, input.firstMessage);
-  if (inferredProfile) {
-    return inferredProfile;
+  const markerProfile = detectProfileFromMarkers(input.prompt, input.firstMessage);
+  if (markerProfile) {
+    return {
+      profile_type: markerProfile,
+      source: "prompt_marker",
+      confidence: "high",
+      matched_signals: [],
+      ambiguous: false,
+    };
   }
 
-  return normalizeRelationshipProfileType(input.fallback, DEFAULT_PROFILE_TYPE);
+  const inferred = inferProfileFromTextWithSignals(input.prompt, input.firstMessage);
+  if (inferred.profileType) {
+    return {
+      profile_type: inferred.profileType,
+      source: "text_signals",
+      confidence: inferred.score >= 3 ? "high" : "medium",
+      matched_signals: inferred.matchedSignals,
+      ambiguous: false,
+    };
+  }
+
+  return {
+    profile_type: fallback,
+    source: inferred.ambiguous ? "fallback_ambiguous" : "fallback_default",
+    confidence: "low",
+    matched_signals: [],
+    ambiguous: inferred.ambiguous === true,
+  };
 }
 
 function buildConversationProfilePromptBundle(profileType, options = {}) {
@@ -395,6 +505,10 @@ function createConversationProfileToolkit(profileType, options = {}) {
   return createProfileContextToolkit(profileType, options);
 }
 
+function validateRelationshipProfilePacks(options = {}) {
+  return validateProfilePacks(options);
+}
+
 function createDatingFunctionToolkit(options = {}) {
   return createProfileContextToolkit("dating", {
     ...options,
@@ -432,11 +546,14 @@ module.exports = {
   isDatingScriptTemplate,
   isCelebrityScriptTemplate,
   deriveConversationProfile,
+  deriveConversationProfileDecision,
   buildDatingPromptBundle,
   buildCelebrityPromptBundle,
   buildConversationProfilePromptBundle,
   createDatingFunctionToolkit,
   createCelebrityFunctionToolkit,
   createConversationProfileToolkit,
+  validateRelationshipProfilePacks,
+  evaluateConversationProfileToolPolicy: evaluateProfileToolPolicy,
   applyConversationPolicyGates: applyProfilePolicyGates,
 };

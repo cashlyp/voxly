@@ -1118,6 +1118,8 @@ async function previewCallScript(conversation, ctx, script, ensureActive) {
   }
   if (RELATIONSHIP_FLOW_TYPE_SET.has(primaryFlow)) {
     payload.call_profile = primaryFlow;
+    payload.conversation_profile = primaryFlow;
+    payload.conversation_profile_lock = true;
     payload.purpose = primaryFlow;
   }
 

@@ -30,15 +30,26 @@ const DynamicFunctionEngine = require("./functions/DynamicFunctionEngine");
 const { createDigitCollectionService } = require("./functions/Digit");
 const { formatDigitCaptureLabel } = require("./functions/Labels");
 const {
+  attachConnectorMetadataToTools,
+  routeToolsByIntent,
+  evaluateConnectorApprovalPolicy,
+} = require("./functions/connectorRegistry");
+const {
+  connectorPackTools,
+  buildConnectorPackImplementations,
+} = require("./functions/connectorPacks");
+const {
   RELATIONSHIP_PROFILE_TYPES,
   RELATIONSHIP_FLOW_TYPES,
   RELATIONSHIP_PROFILE_OBJECTIVE_MAP,
   RELATIONSHIP_PROFILE_FLOW_MAP,
   normalizeRelationshipProfileType,
-  deriveConversationProfile,
+  deriveConversationProfileDecision,
   buildConversationProfilePromptBundle,
   createConversationProfileToolkit,
+  evaluateConversationProfileToolPolicy,
   applyConversationPolicyGates,
+  validateRelationshipProfilePacks,
 } = require("./functions/Dating");
 const {
   CALL_OBJECTIVE_IDS,
@@ -1480,13 +1491,167 @@ function normalizeScriptTemplateRecord(template = null) {
 }
 
 function resolveConversationProfile(input = {}) {
-  return deriveConversationProfile({
+  return deriveConversationProfileDecision({
+    purpose: input.purpose,
+    scriptTemplate: input.scriptTemplate,
+    prompt: input.prompt,
+    firstMessage: input.firstMessage,
+    fallback: "general",
+  }).profile_type;
+}
+
+const PROFILE_CONFIDENCE_RANK = Object.freeze({
+  low: 1,
+  medium: 2,
+  high: 3,
+});
+
+function normalizeConversationProfileLockFlag(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (value === 1) return true;
+    if (value === 0) return false;
+  }
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (!normalized) return null;
+  if (["1", "true", "yes", "on", "lock", "locked", "force"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off", "unlock", "unlocked", "auto"].includes(normalized)) {
+    return false;
+  }
+  return null;
+}
+
+function normalizeProfileConfidence(value, fallback = "low") {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (normalized === "low" || normalized === "medium" || normalized === "high") {
+    return normalized;
+  }
+  return fallback;
+}
+
+function isProfileConfidenceAtLeast(actual, threshold) {
+  const actualRank = PROFILE_CONFIDENCE_RANK[normalizeProfileConfidence(actual, "low")] || 1;
+  const thresholdRank = PROFILE_CONFIDENCE_RANK[normalizeProfileConfidence(threshold, "low")] || 1;
+  return actualRank >= thresholdRank;
+}
+
+function normalizeRelationshipProfileCandidate(value) {
+  const normalized = normalizeRelationshipProfileType(value, "");
+  if (!normalized || !RELATIONSHIP_PROFILE_SET.has(normalized)) {
+    return "";
+  }
+  return normalized;
+}
+
+function resolveConversationProfileSelection(input = {}) {
+  const selection = deriveConversationProfileDecision({
     purpose: input.purpose,
     scriptTemplate: input.scriptTemplate,
     prompt: input.prompt,
     firstMessage: input.firstMessage,
     fallback: "general",
   });
+  let conversationProfile = String(selection?.profile_type || "").trim() || "general";
+  let conversationProfileSource =
+    String(selection?.source || "").trim() || "fallback_default";
+  let conversationProfileConfidence =
+    String(selection?.confidence || "").trim() || "low";
+  let conversationProfileSignals = Array.isArray(selection?.matched_signals)
+    ? selection.matched_signals
+        .map((entry) => String(entry || "").trim())
+        .filter(Boolean)
+        .slice(0, 6)
+    : [];
+  let conversationProfileAmbiguous = selection?.ambiguous === true;
+
+  const explicitProfile = normalizeRelationshipProfileCandidate(
+    input.conversationProfile ||
+      input.conversation_profile ||
+      input.callProfile ||
+      input.call_profile ||
+      input.purpose,
+  );
+  const lockFlag = normalizeConversationProfileLockFlag(
+    input.profileLock ??
+      input.profile_lock ??
+      input.conversationProfileLock ??
+      input.conversation_profile_lock,
+  );
+  const profileConfidenceGate = normalizeProfileConfidence(
+    input.profileConfidenceGate ||
+      input.profile_confidence_gate ||
+      process.env.CONVERSATION_PROFILE_CONFIDENCE_GATE ||
+      "medium",
+    "medium",
+  );
+
+  let conversationProfileLocked = false;
+  let conversationProfileLockReason = null;
+  let gateFallbackApplied = false;
+
+  if (lockFlag === false) {
+    conversationProfileLocked = false;
+    conversationProfileLockReason = "explicit_unlock";
+  } else {
+    let lockCandidate = "";
+    if (explicitProfile) {
+      lockCandidate = explicitProfile;
+      conversationProfileLockReason = "explicit_profile";
+    } else if (
+      RELATIONSHIP_PROFILE_SET.has(conversationProfile) &&
+      conversationProfileSource === "script_template"
+    ) {
+      lockCandidate = conversationProfile;
+      conversationProfileLockReason = "script_template";
+    } else if (lockFlag === true && RELATIONSHIP_PROFILE_SET.has(conversationProfile)) {
+      lockCandidate = conversationProfile;
+      conversationProfileLockReason = "explicit_lock_flag";
+    }
+
+    if (lockCandidate) {
+      conversationProfile = lockCandidate;
+      conversationProfileSource = `${conversationProfileSource}_locked`;
+      conversationProfileConfidence = "high";
+      conversationProfileAmbiguous = false;
+      conversationProfileLocked = true;
+    } else if (lockFlag === true) {
+      conversationProfileLockReason = "lock_requested_without_relationship_profile";
+    }
+  }
+
+  if (
+    !conversationProfileLocked &&
+    conversationProfileSource === "text_signals" &&
+    !isProfileConfidenceAtLeast(conversationProfileConfidence, profileConfidenceGate)
+  ) {
+    conversationProfile = "general";
+    conversationProfileSource = "fallback_confidence_gate";
+    conversationProfileConfidence = "low";
+    conversationProfileSignals = [];
+    conversationProfileAmbiguous = false;
+    gateFallbackApplied = true;
+  }
+
+  return {
+    conversation_profile: conversationProfile,
+    conversation_profile_source: conversationProfileSource,
+    conversation_profile_confidence: conversationProfileConfidence,
+    conversation_profile_signals: conversationProfileSignals,
+    conversation_profile_ambiguous: conversationProfileAmbiguous,
+    conversation_profile_locked: conversationProfileLocked,
+    conversation_profile_lock_reason: conversationProfileLockReason,
+    conversation_profile_confidence_gate: profileConfidenceGate,
+    conversation_profile_gate_fallback_applied: gateFallbackApplied,
+  };
 }
 
 function applyConversationProfilePrompt(profile, prompt, firstMessage) {
@@ -1494,6 +1659,47 @@ function applyConversationProfilePrompt(profile, prompt, firstMessage) {
     basePrompt: String(prompt || "").trim(),
     firstMessage: String(firstMessage || "").trim(),
   });
+}
+
+function resolveProfilePackMetadata(profilePrompt = null) {
+  if (!profilePrompt || typeof profilePrompt !== "object") {
+    return {
+      profile_pack_version: null,
+      profile_pack_checksum: null,
+    };
+  }
+  return {
+    profile_pack_version: String(profilePrompt.profilePackVersion || "").trim() || null,
+    profile_pack_checksum: String(profilePrompt.profilePackChecksum || "").trim() || null,
+  };
+}
+
+function validateProfilePacksAtStartup() {
+  const strict =
+    String(process.env.PROFILE_PACK_VALIDATION_STRICT || "").trim().toLowerCase() ===
+      "true" || isProduction;
+  const failOnWarnings =
+    String(process.env.PROFILE_PACK_VALIDATION_FAIL_ON_WARNINGS || "")
+      .trim()
+      .toLowerCase() === "true";
+  const result = validateRelationshipProfilePacks({
+    strict,
+    failOnWarnings,
+    includeAuxiliary: true,
+  });
+  const summary = `checked=${result.checked_files}, required=${result.required_profiles}, warnings=${result.warnings.length}, errors=${result.errors.length}`;
+  if (!result.ok) {
+    const detail = result.errors.slice(0, 10).join(" | ");
+    throw new Error(`Profile pack validation failed (${summary})${detail ? `: ${detail}` : ""}`);
+  }
+  if (result.warnings.length) {
+    console.warn(`Profile pack validation warnings (${summary})`);
+    result.warnings.slice(0, 10).forEach((entry) => {
+      console.warn(`- ${entry}`);
+    });
+  } else {
+    console.log(`✅ Profile pack validation passed (${summary})`);
+  }
 }
 
 function getProfilePurpose(profile) {
@@ -1504,8 +1710,122 @@ function getProfilePurpose(profile) {
   return normalized;
 }
 
+function normalizePolicyRiskLevel(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (["none", "low", "medium", "high"].includes(normalized)) {
+    return normalized;
+  }
+  return "none";
+}
+
+function recordCallPolicyDecisionTelemetry(
+  callSid,
+  seedConfig = null,
+  policyResult = {},
+  metadata = {},
+) {
+  if (!callSid) return;
+  const callConfig =
+    (callSid ? callConfigurations.get(callSid) : null) ||
+    (seedConfig && typeof seedConfig === "object" ? seedConfig : null);
+  if (!callConfig || typeof callConfig !== "object") return;
+
+  const blocked = Array.isArray(policyResult?.blocked)
+    ? Array.from(new Set(policyResult.blocked.map((entry) => String(entry || "").trim()).filter(Boolean)))
+    : [];
+  const replaced = policyResult?.replaced === true;
+  const riskLevel = normalizePolicyRiskLevel(policyResult?.risk_level);
+  const action = String(policyResult?.action || "allow").trim() || "allow";
+  const stage = String(metadata?.stage || "").trim() || null;
+  const nowIso = new Date().toISOString();
+
+  const summary =
+    callConfig.policy_gate_summary &&
+    typeof callConfig.policy_gate_summary === "object" &&
+    !Array.isArray(callConfig.policy_gate_summary)
+      ? { ...callConfig.policy_gate_summary }
+      : {
+          total: 0,
+          blocked: 0,
+          by_rule: {},
+          by_risk: { none: 0, low: 0, medium: 0, high: 0 },
+        };
+  summary.total = Number.isFinite(Number(summary.total))
+    ? Number(summary.total) + 1
+    : 1;
+  if (replaced || blocked.length > 0) {
+    summary.blocked = Number.isFinite(Number(summary.blocked))
+      ? Number(summary.blocked) + 1
+      : 1;
+  } else if (!Number.isFinite(Number(summary.blocked))) {
+    summary.blocked = 0;
+  }
+  const riskCounter =
+    summary.by_risk && typeof summary.by_risk === "object" ? { ...summary.by_risk } : {};
+  riskCounter.none = Number.isFinite(Number(riskCounter.none)) ? Number(riskCounter.none) : 0;
+  riskCounter.low = Number.isFinite(Number(riskCounter.low)) ? Number(riskCounter.low) : 0;
+  riskCounter.medium = Number.isFinite(Number(riskCounter.medium)) ? Number(riskCounter.medium) : 0;
+  riskCounter.high = Number.isFinite(Number(riskCounter.high)) ? Number(riskCounter.high) : 0;
+  riskCounter[riskLevel] += 1;
+  summary.by_risk = riskCounter;
+
+  const ruleCounter =
+    summary.by_rule && typeof summary.by_rule === "object" ? { ...summary.by_rule } : {};
+  blocked.forEach((rule) => {
+    ruleCounter[rule] = Number.isFinite(Number(ruleCounter[rule]))
+      ? Number(ruleCounter[rule]) + 1
+      : 1;
+  });
+  summary.by_rule = ruleCounter;
+  summary.last_stage = stage;
+  summary.last_action = action;
+  summary.last_risk_level = riskLevel;
+  summary.last_blocked = blocked;
+  summary.last_replaced = replaced;
+  summary.last_updated_at = nowIso;
+
+  callConfig.policy_gate_summary = summary;
+
+  const shouldAppendEvent = replaced || blocked.length > 0 || riskLevel !== "none";
+  let latestEvent = null;
+  if (shouldAppendEvent) {
+    const events = Array.isArray(callConfig.policy_gate_events)
+      ? [...callConfig.policy_gate_events]
+      : [];
+    latestEvent = {
+      at: nowIso,
+      stage,
+      action,
+      risk_level: riskLevel,
+      replaced,
+      blocked,
+      interaction_count: Number.isFinite(Number(metadata?.interactionCount))
+        ? Math.max(0, Math.floor(Number(metadata.interactionCount)))
+        : null,
+    };
+    events.push(latestEvent);
+    if (events.length > 25) {
+      events.splice(0, events.length - 25);
+    }
+    callConfig.policy_gate_events = events;
+  }
+
+  callConfigurations.set(callSid, callConfig);
+  if (shouldAppendEvent || stage === "final") {
+    queuePersistCallRuntimeState(callSid, {
+      snapshot: {
+        policy_gate_summary: callConfig.policy_gate_summary || null,
+        policy_gate_events: Array.isArray(callConfig.policy_gate_events)
+          ? callConfig.policy_gate_events.slice(-8)
+          : [],
+        policy_gate_last_event: latestEvent,
+      },
+    });
+  }
+}
+
 function buildCallResponsePolicyGate(callSid, seedConfig = null) {
-  return (rawText = "") => {
+  return (rawText = "", metadata = {}) => {
     const runtimeConfig =
       (callSid ? callConfigurations.get(callSid) : null) || seedConfig || {};
     const conversationProfile = resolveConversationProfile({
@@ -1517,7 +1837,202 @@ function buildCallResponsePolicyGate(callSid, seedConfig = null) {
       prompt: runtimeConfig?.prompt,
       firstMessage: runtimeConfig?.first_message,
     });
-    return applyConversationPolicyGates(rawText, conversationProfile || "general");
+    const result = applyConversationPolicyGates(
+      rawText,
+      conversationProfile || "general",
+    );
+    recordCallPolicyDecisionTelemetry(callSid, runtimeConfig, result, metadata);
+    return result;
+  };
+}
+
+function recordCallToolPolicyDecisionTelemetry(
+  callSid,
+  seedConfig = null,
+  decision = {},
+  metadata = {},
+) {
+  if (!callSid) return;
+  const callConfig =
+    (callSid ? callConfigurations.get(callSid) : null) || seedConfig || {};
+  if (!callConfig || typeof callConfig !== "object") return;
+
+  const nowIso = new Date().toISOString();
+  const toolName = String(
+    metadata?.toolName || metadata?.tool_name || "unknown_tool",
+  )
+    .trim()
+    .toLowerCase();
+  const profileType = String(
+    metadata?.profileType ||
+      decision?.profile_type ||
+      callConfig?.conversation_profile ||
+      "general",
+  )
+    .trim()
+    .toLowerCase();
+  const allowed = decision?.allowed !== false;
+  const action = String(decision?.action || (allowed ? "allow" : "deny"))
+    .trim()
+    .toLowerCase();
+  const reason = String(
+    decision?.reason || (allowed ? "allowed" : "tool_policy_denied"),
+  )
+    .trim()
+    .toLowerCase();
+
+  const summary =
+    callConfig.tool_policy_gate_summary &&
+    typeof callConfig.tool_policy_gate_summary === "object"
+      ? { ...callConfig.tool_policy_gate_summary }
+      : {
+          total: 0,
+          allowed: 0,
+          blocked: 0,
+          by_tool: {},
+          by_profile: {},
+        };
+  summary.total = Number.isFinite(Number(summary.total))
+    ? Number(summary.total) + 1
+    : 1;
+  if (allowed) {
+    summary.allowed = Number.isFinite(Number(summary.allowed))
+      ? Number(summary.allowed) + 1
+      : 1;
+  } else {
+    summary.blocked = Number.isFinite(Number(summary.blocked))
+      ? Number(summary.blocked) + 1
+      : 1;
+  }
+  const byTool =
+    summary.by_tool && typeof summary.by_tool === "object"
+      ? { ...summary.by_tool }
+      : {};
+  byTool[toolName] = Number.isFinite(Number(byTool[toolName]))
+    ? Number(byTool[toolName]) + 1
+    : 1;
+  summary.by_tool = byTool;
+  const byProfile =
+    summary.by_profile && typeof summary.by_profile === "object"
+      ? { ...summary.by_profile }
+      : {};
+  byProfile[profileType] = Number.isFinite(Number(byProfile[profileType]))
+    ? Number(byProfile[profileType]) + 1
+    : 1;
+  summary.by_profile = byProfile;
+  summary.last_action = action;
+  summary.last_reason = reason;
+  summary.last_tool = toolName;
+  summary.last_profile = profileType;
+  summary.last_updated_at = nowIso;
+  callConfig.tool_policy_gate_summary = summary;
+
+  const shouldAppendEvent = !allowed || action !== "allow";
+  let latestEvent = null;
+  if (shouldAppendEvent) {
+    const events = Array.isArray(callConfig.tool_policy_gate_events)
+      ? [...callConfig.tool_policy_gate_events]
+      : [];
+    latestEvent = {
+      at: nowIso,
+      tool: toolName,
+      profile: profileType,
+      action,
+      reason,
+      allowed,
+      blocked: Array.isArray(decision?.blocked) ? decision.blocked : [],
+      interaction_count: Number.isFinite(Number(metadata?.interactionCount))
+        ? Math.max(0, Math.floor(Number(metadata.interactionCount)))
+        : null,
+    };
+    events.push(latestEvent);
+    if (events.length > 25) {
+      events.splice(0, events.length - 25);
+    }
+    callConfig.tool_policy_gate_events = events;
+  }
+
+  callConfigurations.set(callSid, callConfig);
+  if (shouldAppendEvent) {
+    queuePersistCallRuntimeState(callSid, {
+      snapshot: {
+        tool_policy_gate_summary: callConfig.tool_policy_gate_summary || null,
+        tool_policy_gate_events: Array.isArray(callConfig.tool_policy_gate_events)
+          ? callConfig.tool_policy_gate_events.slice(-8)
+          : [],
+        tool_policy_gate_last_event: latestEvent,
+      },
+    });
+    webhookService.addLiveEvent(
+      callSid,
+      `🛡️ Tool policy blocked ${toolName} (${reason})`,
+      { force: false },
+    );
+  }
+}
+
+function buildCallToolPolicyGate(callSid, seedConfig = null) {
+  return (request = {}) => {
+    const runtimeConfig =
+      (callSid ? callConfigurations.get(callSid) : null) || seedConfig || {};
+    const toolName = String(request?.toolName || request?.tool_name || "")
+      .trim()
+      .toLowerCase();
+    const conversationProfile = resolveConversationProfile({
+      purpose:
+        runtimeConfig?.conversation_profile ||
+        runtimeConfig?.purpose ||
+        runtimeConfig?.business_context?.purpose,
+      scriptTemplate: runtimeConfig?.script_policy || null,
+      prompt: runtimeConfig?.prompt,
+      firstMessage: runtimeConfig?.first_message,
+    });
+    const profilePolicyResult = evaluateConversationProfileToolPolicy(
+      conversationProfile || "general",
+      request,
+      {
+        callSid,
+        callConfig: runtimeConfig,
+      },
+    );
+    if (profilePolicyResult?.allowed === false) {
+      recordCallToolPolicyDecisionTelemetry(callSid, runtimeConfig, profilePolicyResult, {
+        toolName,
+        profileType: conversationProfile || "general",
+        interactionCount: request?.interactionCount,
+      });
+      return profilePolicyResult;
+    }
+
+    const approvalPolicyResult = evaluateConnectorApprovalPolicy(request, {
+      callSid,
+      callConfig: runtimeConfig,
+      profileType: conversationProfile || "general",
+    });
+    const result =
+      approvalPolicyResult?.allowed === false
+        ? approvalPolicyResult
+        : {
+            ...(profilePolicyResult || {}),
+            ...(approvalPolicyResult || {}),
+            allowed: true,
+            action: "allow",
+            reason:
+              String(approvalPolicyResult?.reason || "").trim() ||
+              String(profilePolicyResult?.reason || "").trim() ||
+              "allowed",
+            blocked: [],
+            metadata: {
+              ...((profilePolicyResult && profilePolicyResult.metadata) || {}),
+              ...((approvalPolicyResult && approvalPolicyResult.metadata) || {}),
+            },
+          };
+    recordCallToolPolicyDecisionTelemetry(callSid, runtimeConfig, result, {
+      toolName,
+      profileType: conversationProfile || "general",
+      interactionCount: request?.interactionCount,
+    });
+    return result;
   };
 }
 
@@ -1822,12 +2337,42 @@ function buildRuntimeSnapshotPayload(callSid, patch = {}) {
     digit_intent_mode: callConfig?.digit_intent?.mode || null,
     tool_in_progress: callConfig?.tool_in_progress || null,
     conversation_profile: callConfig?.conversation_profile || null,
+    conversation_profile_source:
+      callConfig?.conversation_profile_source || null,
+    conversation_profile_confidence:
+      callConfig?.conversation_profile_confidence || null,
+    conversation_profile_signals: Array.isArray(
+      callConfig?.conversation_profile_signals,
+    )
+      ? callConfig.conversation_profile_signals.slice(0, 6)
+      : [],
+    conversation_profile_ambiguous:
+      callConfig?.conversation_profile_ambiguous === true,
+    conversation_profile_locked:
+      callConfig?.conversation_profile_locked === true,
+    conversation_profile_lock_reason:
+      callConfig?.conversation_profile_lock_reason || null,
+    conversation_profile_confidence_gate:
+      callConfig?.conversation_profile_confidence_gate || null,
+    conversation_profile_gate_fallback_applied:
+      callConfig?.conversation_profile_gate_fallback_applied === true,
     purpose: callConfig?.purpose || null,
     relationship_profile:
       callConfig?.relationship_profile &&
       typeof callConfig.relationship_profile === "object"
         ? callConfig.relationship_profile
         : null,
+    profile_pack_version: callConfig?.profile_pack_version || null,
+    profile_pack_checksum: callConfig?.profile_pack_checksum || null,
+    policy_gate_summary:
+      callConfig?.policy_gate_summary &&
+      typeof callConfig.policy_gate_summary === "object" &&
+      !Array.isArray(callConfig.policy_gate_summary)
+        ? callConfig.policy_gate_summary
+        : null,
+    policy_gate_events: Array.isArray(callConfig?.policy_gate_events)
+      ? callConfig.policy_gate_events.slice(-8)
+      : [],
     relationship_contexts:
       Object.keys(relationshipContexts).length > 0 ? relationshipContexts : null,
     dating_context:
@@ -1922,6 +2467,45 @@ async function restoreCallRuntimeState(callSid, callConfig = null) {
         targetConfig.conversation_profile = String(
           snapshot.conversation_profile || "",
         ).trim();
+      }
+      if (snapshot?.conversation_profile_source) {
+        targetConfig.conversation_profile_source = String(
+          snapshot.conversation_profile_source || "",
+        ).trim();
+      }
+      if (snapshot?.conversation_profile_confidence) {
+        targetConfig.conversation_profile_confidence = String(
+          snapshot.conversation_profile_confidence || "",
+        ).trim();
+      }
+      if (Array.isArray(snapshot?.conversation_profile_signals)) {
+        targetConfig.conversation_profile_signals =
+          snapshot.conversation_profile_signals
+            .map((entry) => String(entry || "").trim())
+            .filter(Boolean)
+            .slice(0, 6);
+      }
+      if (snapshot?.conversation_profile_ambiguous !== undefined) {
+        targetConfig.conversation_profile_ambiguous =
+          snapshot.conversation_profile_ambiguous === true;
+      }
+      if (snapshot?.conversation_profile_locked !== undefined) {
+        targetConfig.conversation_profile_locked =
+          snapshot.conversation_profile_locked === true;
+      }
+      if (snapshot?.conversation_profile_lock_reason) {
+        targetConfig.conversation_profile_lock_reason = String(
+          snapshot.conversation_profile_lock_reason || "",
+        ).trim();
+      }
+      if (snapshot?.conversation_profile_confidence_gate) {
+        targetConfig.conversation_profile_confidence_gate = String(
+          snapshot.conversation_profile_confidence_gate || "",
+        ).trim();
+      }
+      if (snapshot?.conversation_profile_gate_fallback_applied !== undefined) {
+        targetConfig.conversation_profile_gate_fallback_applied =
+          snapshot.conversation_profile_gate_fallback_applied === true;
       }
       if (!targetConfig.purpose && snapshot?.purpose) {
         targetConfig.purpose = String(snapshot.purpose || "").trim() || null;
@@ -2305,8 +2889,13 @@ function buildInboundCallConfig(callSid, payload = {}, options = {}) {
     route.prompt || route.first_message || route.firstMessage,
   );
   const fallbackScript = !hasRoutePrompt ? inboundDefaultScript : null;
-  const conversationProfile = resolveConversationProfile({
-    purpose: route.purpose,
+  const profileSelection = resolveConversationProfileSelection({
+    purpose: route.call_profile || route.conversation_profile || route.purpose,
+    callProfile: route.call_profile || route.conversation_profile,
+    conversation_profile: route.conversation_profile,
+    conversation_profile_lock:
+      route.conversation_profile_lock ?? route.profile_lock,
+    profile_confidence_gate: route.profile_confidence_gate,
     scriptTemplate:
       (route &&
       typeof route === "object" &&
@@ -2318,6 +2907,7 @@ function buildInboundCallConfig(callSid, payload = {}, options = {}) {
     prompt,
     firstMessage,
   });
+  const conversationProfile = profileSelection.conversation_profile;
   const profilePrompt = applyConversationProfilePrompt(
     conversationProfile,
     prompt,
@@ -2351,9 +2941,32 @@ function buildInboundCallConfig(callSid, payload = {}, options = {}) {
     provider_metadata: null,
     business_context: route.business_context || functionSystem.context,
     function_count: functionSystem.functions.length,
+    call_profile: route.call_profile || route.conversation_profile || null,
+    conversation_profile_lock: normalizeConversationProfileLockFlag(
+      route.conversation_profile_lock ?? route.profile_lock,
+    ),
+    profile_confidence_gate: normalizeProfileConfidence(
+      route.profile_confidence_gate,
+      "medium",
+    ),
     purpose: resolvedPurpose,
     conversation_profile: conversationProfile,
+    conversation_profile_source: profileSelection.conversation_profile_source,
+    conversation_profile_confidence:
+      profileSelection.conversation_profile_confidence,
+    conversation_profile_signals: profileSelection.conversation_profile_signals,
+    conversation_profile_ambiguous:
+      profileSelection.conversation_profile_ambiguous,
+    conversation_profile_locked:
+      profileSelection.conversation_profile_locked,
+    conversation_profile_lock_reason:
+      profileSelection.conversation_profile_lock_reason,
+    conversation_profile_confidence_gate:
+      profileSelection.conversation_profile_confidence_gate,
+    conversation_profile_gate_fallback_applied:
+      profileSelection.conversation_profile_gate_fallback_applied,
     dating_profile_applied: profilePrompt.applied === true,
+    ...resolveProfilePackMetadata(profilePrompt),
     business_id: route.business_id || null,
     route_label: routeLabel,
     script: route.script || fallbackScript?.name || null,
@@ -2540,8 +3153,32 @@ async function ensureCallRecord(
       script: callConfig.script || null,
       script_id: callConfig.script_id || null,
       script_version: callConfig.script_version || null,
+      call_profile: callConfig.call_profile || null,
+      conversation_profile_lock:
+        callConfig.conversation_profile_lock ?? null,
+      profile_confidence_gate:
+        callConfig.profile_confidence_gate || null,
       purpose: callConfig.purpose || null,
       conversation_profile: callConfig.conversation_profile || null,
+      conversation_profile_source:
+        callConfig.conversation_profile_source || null,
+      conversation_profile_confidence:
+        callConfig.conversation_profile_confidence || null,
+      conversation_profile_signals: Array.isArray(
+        callConfig.conversation_profile_signals,
+      )
+        ? callConfig.conversation_profile_signals
+        : [],
+      conversation_profile_ambiguous:
+        callConfig.conversation_profile_ambiguous === true,
+      conversation_profile_locked:
+        callConfig.conversation_profile_locked === true,
+      conversation_profile_lock_reason:
+        callConfig.conversation_profile_lock_reason || null,
+      conversation_profile_confidence_gate:
+        callConfig.conversation_profile_confidence_gate || null,
+      conversation_profile_gate_fallback_applied:
+        callConfig.conversation_profile_gate_fallback_applied === true,
       dating_profile_applied: callConfig.dating_profile_applied === true,
       voice_model: callConfig.voice_model || null,
       flow_state: callConfig.flow_state || "normal",
@@ -2592,12 +3229,20 @@ async function hydrateCallConfigFromDb(callSid) {
   }
   let prompt = call.prompt || DEFAULT_INBOUND_PROMPT;
   let firstMessage = call.first_message || DEFAULT_INBOUND_FIRST_MESSAGE;
-  const conversationProfile = resolveConversationProfile({
-    purpose: state?.conversation_profile || state?.purpose,
+  const profileSelection = resolveConversationProfileSelection({
+    purpose:
+      state?.call_profile || state?.conversation_profile || state?.purpose,
+    callProfile:
+      state?.call_profile || state?.conversation_profile || null,
+    conversation_profile: state?.conversation_profile || null,
+    conversation_profile_lock:
+      state?.conversation_profile_lock ?? state?.profile_lock,
+    profile_confidence_gate: state?.profile_confidence_gate || null,
     scriptTemplate: state,
     prompt,
     firstMessage,
   });
+  const conversationProfile = profileSelection.conversation_profile;
   const profilePrompt = applyConversationProfilePrompt(
     conversationProfile,
     prompt,
@@ -2624,10 +3269,52 @@ async function hydrateCallConfigFromDb(callSid) {
     business_context:
       state?.business_context || parsedContext || functionSystem.context,
     function_count: functionSystem.functions.length,
+    call_profile:
+      state?.call_profile || state?.conversation_profile || null,
+    conversation_profile_lock: normalizeConversationProfileLockFlag(
+      state?.conversation_profile_lock ?? state?.profile_lock,
+    ),
+    profile_confidence_gate: normalizeProfileConfidence(
+      state?.profile_confidence_gate,
+      "medium",
+    ),
     purpose: resolvedPurpose,
     conversation_profile: conversationProfile,
+    conversation_profile_source:
+      String(state?.conversation_profile_source || "").trim() ||
+      profileSelection.conversation_profile_source,
+    conversation_profile_confidence:
+      String(state?.conversation_profile_confidence || "").trim() ||
+      profileSelection.conversation_profile_confidence,
+    conversation_profile_signals: Array.isArray(state?.conversation_profile_signals)
+      ? state.conversation_profile_signals
+      : profileSelection.conversation_profile_signals,
+    conversation_profile_ambiguous:
+      state?.conversation_profile_ambiguous !== undefined
+        ? state.conversation_profile_ambiguous === true
+        : profileSelection.conversation_profile_ambiguous,
+    conversation_profile_locked:
+      state?.conversation_profile_locked !== undefined
+        ? state.conversation_profile_locked === true
+        : profileSelection.conversation_profile_locked,
+    conversation_profile_lock_reason:
+      String(state?.conversation_profile_lock_reason || "").trim() ||
+      profileSelection.conversation_profile_lock_reason,
+    conversation_profile_confidence_gate:
+      String(state?.conversation_profile_confidence_gate || "").trim() ||
+      profileSelection.conversation_profile_confidence_gate,
+    conversation_profile_gate_fallback_applied:
+      state?.conversation_profile_gate_fallback_applied !== undefined
+        ? state.conversation_profile_gate_fallback_applied === true
+        : profileSelection.conversation_profile_gate_fallback_applied,
     dating_profile_applied:
       state?.dating_profile_applied === true || profilePrompt.applied === true,
+    profile_pack_version:
+      String(state?.profile_pack_version || "").trim() ||
+      resolveProfilePackMetadata(profilePrompt).profile_pack_version,
+    profile_pack_checksum:
+      String(state?.profile_pack_checksum || "").trim() ||
+      resolveProfilePackMetadata(profilePrompt).profile_pack_checksum,
     business_id: state?.business_id || null,
     script: state?.script || null,
     script_id: state?.script_id || null,
@@ -6249,6 +6936,13 @@ function applyTelephonyTools(
   baseImpl = {},
   options = {},
 ) {
+  const callConfig =
+    options?.callConfig && typeof options.callConfig === "object"
+      ? options.callConfig
+      : {};
+  const connectorPacksEnabled =
+    callConfig?.connector_runtime_enabled !== false &&
+    callConfig?.script_policy?.connector_runtime_enabled !== false;
   const allowTransfer = options.allowTransfer !== false;
   const allowDigitCollection = options.allowDigitCollection !== false;
   const allowPayment = options.allowPayment === true;
@@ -6288,10 +6982,43 @@ function applyTelephonyTools(
     return true;
   });
 
-  const combinedTools = [...filteredBaseTools, ...filteredTelephonyTools];
+  const filteredConnectorTools = connectorPacksEnabled
+    ? connectorPackTools.filter((tool) => {
+        const name = normalizedName(tool);
+        if (!name) return false;
+        if (!allowPayment && (name === "payment_link_generate" || name === "invoice_create" || name === "payment_intent_status" || name === "refund_request_initiate")) {
+          return false;
+        }
+        return true;
+      })
+    : [];
+
+  const combinedTools = [
+    ...filteredBaseTools,
+    ...filteredTelephonyTools,
+    ...filteredConnectorTools,
+  ];
+  const connectorImplementations = connectorPacksEnabled
+    ? buildConnectorPackImplementations({
+        callSid,
+        getCallConfig: () => callConfigurations.get(callSid) || callConfig || {},
+        setCallConfig: (nextConfig) => {
+          if (nextConfig && typeof nextConfig === "object") {
+            callConfigurations.set(callSid, nextConfig);
+          }
+        },
+        db,
+        webhookService,
+        getPaymentFeatureConfig,
+        isPaymentFeatureEnabledForProvider,
+        getCurrentProvider: () => currentProvider,
+        fetchFn: fetch,
+      })
+    : {};
   const combinedImpl = {
     ...baseImpl,
     ...buildTelephonyImplementations(callSid, gptService),
+    ...connectorImplementations,
   };
   if (!allowTransfer) {
     delete combinedImpl.route_to_agent;
@@ -6304,8 +7031,34 @@ function applyTelephonyTools(
   }
   if (!allowPayment) {
     delete combinedImpl.start_payment;
+    delete combinedImpl.payment_link_generate;
+    delete combinedImpl.invoice_create;
+    delete combinedImpl.payment_intent_status;
+    delete combinedImpl.refund_request_initiate;
   }
-  gptService.setDynamicFunctions(combinedTools, combinedImpl);
+
+  const connectorReadyTools = attachConnectorMetadataToTools(combinedTools);
+  const routed = routeToolsByIntent(connectorReadyTools, callConfig, {
+    conversationProfile: options?.conversationProfile || null,
+  });
+  const toolsForRuntime =
+    Array.isArray(routed?.tools) && routed.tools.length > 0
+      ? routed.tools
+      : connectorReadyTools;
+  gptService.setDynamicFunctions(toolsForRuntime, combinedImpl);
+
+  if (callConfig && typeof callConfig === "object") {
+    callConfig.connector_router = {
+      ...(routed?.decision || {}),
+      tool_count: toolsForRuntime.length,
+      selected_tools: toolsForRuntime
+        .map((tool) => String(tool?.function?.name || "").trim())
+        .filter(Boolean)
+        .slice(0, 40),
+      updated_at: new Date().toISOString(),
+    };
+    callConfigurations.set(callSid, callConfig);
+  }
 }
 
 function getCallToolOptions(callSid, callConfig = {}) {
@@ -6357,17 +7110,62 @@ function configureCallTools(gptService, callSid, callConfig, functionSystem) {
   if (!gptService) return;
   const baseTools = functionSystem?.functions || [];
   const baseImpl = functionSystem?.implementations || {};
-  const conversationProfile = resolveConversationProfile({
+  const profileSelection = resolveConversationProfileSelection({
     purpose:
       callConfig?.conversation_profile ||
       callConfig?.purpose ||
       callConfig?.business_context?.purpose,
+    callProfile:
+      callConfig?.call_profile || callConfig?.conversation_profile || null,
+    conversation_profile: callConfig?.conversation_profile || null,
+    conversation_profile_lock:
+      callConfig?.conversation_profile_lock ??
+      callConfig?.profile_lock ??
+      callConfig?.conversation_profile_locked,
+    profile_confidence_gate:
+      callConfig?.profile_confidence_gate ||
+      callConfig?.conversation_profile_confidence_gate,
     scriptTemplate: callConfig?.script_policy || null,
     prompt: callConfig?.prompt,
     firstMessage: callConfig?.first_message,
   });
-  if (callConfig && !callConfig.conversation_profile) {
-    callConfig.conversation_profile = conversationProfile;
+  const conversationProfile = profileSelection.conversation_profile;
+  if (callConfig) {
+    if (!callConfig.conversation_profile) {
+      callConfig.conversation_profile = conversationProfile;
+    }
+    if (!callConfig.conversation_profile_source) {
+      callConfig.conversation_profile_source =
+        profileSelection.conversation_profile_source;
+    }
+    if (!callConfig.conversation_profile_confidence) {
+      callConfig.conversation_profile_confidence =
+        profileSelection.conversation_profile_confidence;
+    }
+    if (!Array.isArray(callConfig.conversation_profile_signals)) {
+      callConfig.conversation_profile_signals =
+        profileSelection.conversation_profile_signals;
+    }
+    if (callConfig.conversation_profile_ambiguous === undefined) {
+      callConfig.conversation_profile_ambiguous =
+        profileSelection.conversation_profile_ambiguous;
+    }
+    if (callConfig.conversation_profile_locked === undefined) {
+      callConfig.conversation_profile_locked =
+        profileSelection.conversation_profile_locked;
+    }
+    if (!callConfig.conversation_profile_lock_reason) {
+      callConfig.conversation_profile_lock_reason =
+        profileSelection.conversation_profile_lock_reason;
+    }
+    if (!callConfig.conversation_profile_confidence_gate) {
+      callConfig.conversation_profile_confidence_gate =
+        profileSelection.conversation_profile_confidence_gate;
+    }
+    if (callConfig.conversation_profile_gate_fallback_applied === undefined) {
+      callConfig.conversation_profile_gate_fallback_applied =
+        profileSelection.conversation_profile_gate_fallback_applied;
+    }
     if (!callConfig.purpose) {
       callConfig.purpose = getProfilePurpose(conversationProfile);
     }
@@ -6408,7 +7206,12 @@ function configureCallTools(gptService, callSid, callConfig, functionSystem) {
     }
   }
   const options = getCallToolOptions(callSid, callConfig);
-  applyTelephonyTools(gptService, callSid, tools, implementations, options);
+  applyTelephonyTools(gptService, callSid, tools, implementations, {
+    ...options,
+    callConfig,
+    conversationProfile: normalizedProfile || conversationProfile || "general",
+  });
+  gptService.setToolPolicyGate(buildCallToolPolicyGate(callSid, callConfig));
   if (
     !options.policyAllowsTransfer &&
     callConfig &&
@@ -8586,6 +9389,7 @@ async function startServer(options = {}) {
     console.log("🚀 Initializing Adaptive AI Call System...");
     warnIfMachineDetectionDisabled("startup");
     assertEmailWebhookAuthConfiguration();
+    validateProfilePacksAtStartup();
 
     // Initialize database first
     console.log("Initializing enhanced database...");
@@ -9538,7 +10342,7 @@ app.ws("/connection", (ws, req) => {
               }
               webhookService.addLiveEvent(
                 callSid,
-                "🧠 Voice runtime: Deepgram Voice Agent (managed think)",
+                "🧠 Voice runtime:  Voicednut Agent (managed think)",
                 { force: true },
               );
               console.log(
@@ -12238,6 +13042,125 @@ function getActiveVoiceRuntimeSessionCounts() {
   };
 }
 
+function normalizeVoiceRuntimeLabel(value) {
+  const runtime = String(value || "").trim().toLowerCase();
+  if (runtime === "voice_agent") return "voice_agent";
+  if (runtime === "legacy" || runtime === "hybrid") return "legacy";
+  return "unknown";
+}
+
+function buildProfileRuntimeCallEntry(callSid, callConfig = null, session = null) {
+  const cfg = callConfig && typeof callConfig === "object" ? callConfig : {};
+  const runtime =
+    normalizeVoiceRuntimeLabel(session?.voiceRuntime) !== "unknown"
+      ? normalizeVoiceRuntimeLabel(session?.voiceRuntime)
+      : normalizeVoiceRuntimeLabel(cfg?.voice_runtime || cfg?.runtime_mode || "legacy");
+
+  return {
+    call_sid: callSid,
+    provider: cfg.provider || currentProvider || null,
+    runtime,
+    has_active_session: Boolean(session),
+    call_profile: cfg.call_profile || null,
+    conversation_profile_lock: cfg.conversation_profile_lock ?? null,
+    profile_confidence_gate_config:
+      cfg.profile_confidence_gate || null,
+    conversation_profile: cfg.conversation_profile || null,
+    conversation_profile_source: cfg.conversation_profile_source || null,
+    conversation_profile_confidence:
+      cfg.conversation_profile_confidence || null,
+    conversation_profile_signals: Array.isArray(
+      cfg.conversation_profile_signals,
+    )
+      ? cfg.conversation_profile_signals.slice(0, 6)
+      : [],
+    conversation_profile_ambiguous:
+      cfg.conversation_profile_ambiguous === true,
+    conversation_profile_locked:
+      cfg.conversation_profile_locked === true,
+    conversation_profile_lock_reason:
+      cfg.conversation_profile_lock_reason || null,
+    conversation_profile_confidence_gate:
+      cfg.conversation_profile_confidence_gate || null,
+    conversation_profile_gate_fallback_applied:
+      cfg.conversation_profile_gate_fallback_applied === true,
+    purpose: cfg.purpose || null,
+    profile_pack_version: cfg.profile_pack_version || null,
+    profile_pack_checksum: cfg.profile_pack_checksum || null,
+    policy_gate_summary:
+      cfg.policy_gate_summary &&
+      typeof cfg.policy_gate_summary === "object" &&
+      !Array.isArray(cfg.policy_gate_summary)
+        ? cfg.policy_gate_summary
+        : null,
+    policy_gate_events: Array.isArray(cfg.policy_gate_events)
+      ? cfg.policy_gate_events.slice(-5)
+      : [],
+    script: cfg.script || null,
+    script_id: cfg.script_id || null,
+    script_version: cfg.script_version || null,
+    flow_state: cfg.flow_state || null,
+    call_mode: cfg.call_mode || null,
+    created_at: cfg.created_at || null,
+  };
+}
+
+function getProfileRuntimeStatus(options = {}) {
+  const requestedCallSid = String(options.callSid || "").trim();
+  const callSids = new Set([
+    ...Array.from(callConfigurations.keys()),
+    ...Array.from(activeCalls.keys()),
+  ]);
+
+  const calls = [];
+  for (const callSid of callSids) {
+    if (!callSid) continue;
+    if (requestedCallSid && callSid !== requestedCallSid) continue;
+    const callConfig = callConfigurations.get(callSid) || null;
+    const session = activeCalls.get(callSid) || null;
+    calls.push(buildProfileRuntimeCallEntry(callSid, callConfig, session));
+  }
+
+  calls.sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+  const runtimeCounts = calls.reduce(
+    (acc, call) => {
+      const runtime = normalizeVoiceRuntimeLabel(call.runtime);
+      if (runtime === "voice_agent") acc.voice_agent += 1;
+      else if (runtime === "legacy") acc.legacy += 1;
+      else acc.unknown += 1;
+      return acc;
+    },
+    { legacy: 0, voice_agent: 0, unknown: 0 },
+  );
+  const profileSourceCounts = calls.reduce((acc, call) => {
+    const source = String(call?.conversation_profile_source || "unknown")
+      .trim()
+      .toLowerCase();
+    const key = source || "unknown";
+    acc[key] = Number.isFinite(Number(acc[key])) ? Number(acc[key]) + 1 : 1;
+    return acc;
+  }, {});
+  const profileLockCounts = calls.reduce(
+    (acc, call) => {
+      if (call?.conversation_profile_locked === true) {
+        acc.locked += 1;
+      } else {
+        acc.unlocked += 1;
+      }
+      return acc;
+    },
+    { locked: 0, unlocked: 0 },
+  );
+
+  return {
+    total: calls.length,
+    runtimes: runtimeCounts,
+    profile_sources: profileSourceCounts,
+    profile_locks: profileLockCounts,
+    calls,
+  };
+}
+
 app.get("/admin/voice-runtime", requireAdminToken, async (req, res) => {
   try {
     return res.json({
@@ -12250,6 +13173,23 @@ app.get("/admin/voice-runtime", requireAdminToken, async (req, res) => {
     return res.status(500).json({
       success: false,
       error: "Failed to fetch voice runtime status",
+    });
+  }
+});
+
+app.get("/admin/profile-runtime", requireAdminToken, async (req, res) => {
+  try {
+    const callSid = String(req.query?.call_sid || req.query?.callSid || "").trim();
+    return res.json({
+      success: true,
+      profile_runtime: getProfileRuntimeStatus({ callSid }),
+      voice_runtime: getActiveVoiceRuntimeSessionCounts(),
+    });
+  } catch (error) {
+    console.error("Failed to fetch profile runtime status:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch profile runtime status",
     });
   }
 });
@@ -13982,6 +14922,10 @@ async function placeOutboundCall(payload, hostOverride = null) {
     script_version,
     call_profile,
     purpose,
+    conversation_profile,
+    conversation_profile_lock,
+    profile_lock,
+    profile_confidence_gate,
     emotion,
     urgency,
     technical_level,
@@ -14093,12 +15037,18 @@ async function placeOutboundCall(payload, hostOverride = null) {
     );
   }
 
-  const conversationProfile = resolveConversationProfile({
-    purpose: call_profile || purpose,
+  const profileSelection = resolveConversationProfileSelection({
+    purpose: call_profile || purpose || conversation_profile,
+    callProfile: call_profile || conversation_profile,
+    conversation_profile,
+    conversation_profile_lock,
+    profile_lock,
+    profile_confidence_gate,
     scriptTemplate: resolvedScriptTemplate,
     prompt: resolvedPrompt,
     firstMessage: resolvedFirstMessage,
   });
+  const conversationProfile = profileSelection.conversation_profile;
   const profilePrompt = applyConversationProfilePrompt(
     conversationProfile,
     resolvedPrompt,
@@ -14459,9 +15409,33 @@ async function placeOutboundCall(payload, hostOverride = null) {
     provider_metadata: providerMetadata,
     business_context: functionSystem.context,
     function_count: functionSystem.functions.length,
+    call_profile:
+      call_profile || conversation_profile || conversationProfile || null,
+    conversation_profile_lock: normalizeConversationProfileLockFlag(
+      conversation_profile_lock ?? profile_lock,
+    ),
+    profile_confidence_gate: normalizeProfileConfidence(
+      profile_confidence_gate,
+      "medium",
+    ),
     purpose: resolvedPurpose,
     conversation_profile: conversationProfile,
+    conversation_profile_source: profileSelection.conversation_profile_source,
+    conversation_profile_confidence:
+      profileSelection.conversation_profile_confidence,
+    conversation_profile_signals: profileSelection.conversation_profile_signals,
+    conversation_profile_ambiguous:
+      profileSelection.conversation_profile_ambiguous,
+    conversation_profile_locked:
+      profileSelection.conversation_profile_locked,
+    conversation_profile_lock_reason:
+      profileSelection.conversation_profile_lock_reason,
+    conversation_profile_confidence_gate:
+      profileSelection.conversation_profile_confidence_gate,
+    conversation_profile_gate_fallback_applied:
+      profileSelection.conversation_profile_gate_fallback_applied,
     dating_profile_applied: profilePrompt.applied === true,
+    ...resolveProfilePackMetadata(profilePrompt),
     business_id: business_id || null,
     script: script || null,
     script_id: normalizedScriptId || null,
@@ -14523,8 +15497,23 @@ async function placeOutboundCall(payload, hostOverride = null) {
     snapshot: {
       source: "placeOutboundCall",
       conversation_profile: conversationProfile,
+      conversation_profile_source: profileSelection.conversation_profile_source,
+      conversation_profile_confidence:
+        profileSelection.conversation_profile_confidence,
+      conversation_profile_signals: profileSelection.conversation_profile_signals,
+      conversation_profile_ambiguous:
+        profileSelection.conversation_profile_ambiguous,
+      conversation_profile_locked:
+        profileSelection.conversation_profile_locked,
+      conversation_profile_lock_reason:
+        profileSelection.conversation_profile_lock_reason,
+      conversation_profile_confidence_gate:
+        profileSelection.conversation_profile_confidence_gate,
+      conversation_profile_gate_fallback_applied:
+        profileSelection.conversation_profile_gate_fallback_applied,
       purpose: resolvedPurpose,
       dating_profile_applied: profilePrompt.applied === true,
+      ...resolveProfilePackMetadata(profilePrompt),
     },
   });
 
@@ -14547,9 +15536,29 @@ async function placeOutboundCall(payload, hostOverride = null) {
       script: script || null,
       script_id: normalizedScriptId || null,
       script_version: resolvedScriptVersion || null,
+      call_profile: callConfig.call_profile || null,
+      conversation_profile_lock:
+        callConfig.conversation_profile_lock ?? null,
+      profile_confidence_gate:
+        callConfig.profile_confidence_gate || null,
       purpose: resolvedPurpose,
       conversation_profile: conversationProfile,
+      conversation_profile_source: profileSelection.conversation_profile_source,
+      conversation_profile_confidence:
+        profileSelection.conversation_profile_confidence,
+      conversation_profile_signals: profileSelection.conversation_profile_signals,
+      conversation_profile_ambiguous:
+        profileSelection.conversation_profile_ambiguous,
+      conversation_profile_locked:
+        profileSelection.conversation_profile_locked,
+      conversation_profile_lock_reason:
+        profileSelection.conversation_profile_lock_reason,
+      conversation_profile_confidence_gate:
+        profileSelection.conversation_profile_confidence_gate,
+      conversation_profile_gate_fallback_applied:
+        profileSelection.conversation_profile_gate_fallback_applied,
       dating_profile_applied: profilePrompt.applied === true,
+      ...resolveProfilePackMetadata(profilePrompt),
       emotion: emotion || null,
       urgency: urgency || null,
       technical_level: technical_level || null,
@@ -15060,16 +16069,31 @@ async function applyScriptInjection(callSid, scriptId, userId) {
   const basePrompt = script.prompt || callConfig.prompt || DEFAULT_INBOUND_PROMPT;
   const baseFirstMessage =
     script.first_message || callConfig.first_message || DEFAULT_INBOUND_FIRST_MESSAGE;
-  const conversationProfile = resolveConversationProfile({
+  const profileSelection = resolveConversationProfileSelection({
     purpose:
       callConfig.conversation_profile ||
       callConfig.purpose ||
       script.purpose ||
       script.default_profile,
+    callProfile:
+      callConfig.call_profile ||
+      callConfig.conversation_profile ||
+      script.flow_type ||
+      script.default_profile,
+    conversation_profile:
+      callConfig.conversation_profile || script.flow_type || script.default_profile,
+    conversation_profile_lock:
+      callConfig.conversation_profile_lock ??
+      callConfig.profile_lock ??
+      callConfig.conversation_profile_locked,
+    profile_confidence_gate:
+      callConfig.profile_confidence_gate ||
+      callConfig.conversation_profile_confidence_gate,
     scriptTemplate: script,
     prompt: basePrompt,
     firstMessage: baseFirstMessage,
   });
+  const conversationProfile = profileSelection.conversation_profile;
   const profilePrompt = applyConversationProfilePrompt(
     conversationProfile,
     basePrompt,
@@ -15077,11 +16101,36 @@ async function applyScriptInjection(callSid, scriptId, userId) {
   );
   callConfig.prompt = profilePrompt.prompt || basePrompt;
   callConfig.first_message = profilePrompt.firstMessage || baseFirstMessage;
+  callConfig.call_profile = conversationProfile;
   callConfig.conversation_profile = conversationProfile;
+  callConfig.conversation_profile_lock =
+    profileSelection.conversation_profile_locked;
+  callConfig.profile_confidence_gate =
+    profileSelection.conversation_profile_confidence_gate;
+  callConfig.conversation_profile_source =
+    profileSelection.conversation_profile_source;
+  callConfig.conversation_profile_confidence =
+    profileSelection.conversation_profile_confidence;
+  callConfig.conversation_profile_signals =
+    profileSelection.conversation_profile_signals;
+  callConfig.conversation_profile_ambiguous =
+    profileSelection.conversation_profile_ambiguous;
+  callConfig.conversation_profile_locked =
+    profileSelection.conversation_profile_locked;
+  callConfig.conversation_profile_lock_reason =
+    profileSelection.conversation_profile_lock_reason;
+  callConfig.conversation_profile_confidence_gate =
+    profileSelection.conversation_profile_confidence_gate;
+  callConfig.conversation_profile_gate_fallback_applied =
+    profileSelection.conversation_profile_gate_fallback_applied;
   if (!callConfig.purpose) {
     callConfig.purpose = getProfilePurpose(conversationProfile);
   }
   callConfig.dating_profile_applied = profilePrompt.applied === true;
+  callConfig.profile_pack_version =
+    resolveProfilePackMetadata(profilePrompt).profile_pack_version;
+  callConfig.profile_pack_checksum =
+    resolveProfilePackMetadata(profilePrompt).profile_pack_checksum;
   const functionSystem = functionEngine.generateAdaptiveFunctionSystem(
     callConfig.prompt,
     callConfig.first_message,
@@ -15094,8 +16143,23 @@ async function applyScriptInjection(callSid, scriptId, userId) {
     snapshot: {
       source: "script_injection",
       conversation_profile: conversationProfile,
+      conversation_profile_source: profileSelection.conversation_profile_source,
+      conversation_profile_confidence:
+        profileSelection.conversation_profile_confidence,
+      conversation_profile_signals: profileSelection.conversation_profile_signals,
+      conversation_profile_ambiguous:
+        profileSelection.conversation_profile_ambiguous,
+      conversation_profile_locked:
+        profileSelection.conversation_profile_locked,
+      conversation_profile_lock_reason:
+        profileSelection.conversation_profile_lock_reason,
+      conversation_profile_confidence_gate:
+        profileSelection.conversation_profile_confidence_gate,
+      conversation_profile_gate_fallback_applied:
+        profileSelection.conversation_profile_gate_fallback_applied,
       purpose: callConfig.purpose || null,
       dating_profile_applied: profilePrompt.applied === true,
+      ...resolveProfilePackMetadata(profilePrompt),
     },
   });
 
@@ -15123,9 +16187,29 @@ async function applyScriptInjection(callSid, scriptId, userId) {
       script_name: script.name || null,
       script_version: script.version || null,
       payment_policy: script.payment_policy || null,
+      call_profile: callConfig.call_profile || null,
+      conversation_profile_lock:
+        callConfig.conversation_profile_lock ?? null,
+      profile_confidence_gate:
+        callConfig.profile_confidence_gate || null,
       conversation_profile: conversationProfile,
+      conversation_profile_source: profileSelection.conversation_profile_source,
+      conversation_profile_confidence:
+        profileSelection.conversation_profile_confidence,
+      conversation_profile_signals: profileSelection.conversation_profile_signals,
+      conversation_profile_ambiguous:
+        profileSelection.conversation_profile_ambiguous,
+      conversation_profile_locked:
+        profileSelection.conversation_profile_locked,
+      conversation_profile_lock_reason:
+        profileSelection.conversation_profile_lock_reason,
+      conversation_profile_confidence_gate:
+        profileSelection.conversation_profile_confidence_gate,
+      conversation_profile_gate_fallback_applied:
+        profileSelection.conversation_profile_gate_fallback_applied,
       purpose: callConfig.purpose || null,
       dating_profile_applied: profilePrompt.applied === true,
+      ...resolveProfilePackMetadata(profilePrompt),
       business_context: functionSystem.context,
       generated_functions: functionSystem.functions
         .map((tool) => tool?.function?.name)

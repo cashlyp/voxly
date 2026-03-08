@@ -92,6 +92,9 @@ class EnhancedGptService extends EventEmitter {
     this.responsePolicyGate = typeof options.responsePolicyGate === 'function'
       ? options.responsePolicyGate
       : null;
+    this.toolPolicyGate = typeof options.toolPolicyGate === 'function'
+      ? options.toolPolicyGate
+      : null;
     this.db = options.db || null;
     this.webhookService = options.webhookService || null;
     this.memoryLoaded = false;
@@ -293,10 +296,21 @@ class EnhancedGptService extends EventEmitter {
     this.responsePolicyGate = typeof policyGate === 'function' ? policyGate : null;
   }
 
+  setToolPolicyGate(policyGate = null) {
+    this.toolPolicyGate = typeof policyGate === 'function' ? policyGate : null;
+  }
+
   applyResponsePolicy(text = '', metadata = {}) {
     const rawText = String(text || '');
     if (!rawText || typeof this.responsePolicyGate !== 'function') {
-      return { text: rawText, replaced: false, blocked: [] };
+      return {
+        text: rawText,
+        replaced: false,
+        blocked: [],
+        risk_level: 'none',
+        action: 'allow',
+        findings: []
+      };
     }
     try {
       const result = this.responsePolicyGate(rawText, metadata);
@@ -305,14 +319,20 @@ class EnhancedGptService extends EventEmitter {
         return {
           text: nextText,
           replaced: result.replaced === true && nextText !== rawText,
-          blocked: Array.isArray(result.blocked) ? result.blocked : []
+          blocked: Array.isArray(result.blocked) ? result.blocked : [],
+          risk_level: String(result.risk_level || '').trim() || 'none',
+          action: String(result.action || '').trim() || 'allow',
+          findings: Array.isArray(result.findings) ? result.findings : []
         };
       }
       if (typeof result === 'string') {
         return {
           text: result,
           replaced: result !== rawText,
-          blocked: []
+          blocked: [],
+          risk_level: result !== rawText ? 'high' : 'none',
+          action: result !== rawText ? 'fallback' : 'allow',
+          findings: []
         };
       }
     } catch (error) {
@@ -320,7 +340,14 @@ class EnhancedGptService extends EventEmitter {
         error: error?.message || 'unknown_policy_gate_error'
       });
     }
-    return { text: rawText, replaced: false, blocked: [] };
+    return {
+      text: rawText,
+      replaced: false,
+      blocked: [],
+      risk_level: 'none',
+      action: 'allow',
+      findings: []
+    };
   }
 
   // Set dynamic functions for this conversation
@@ -356,6 +383,48 @@ class EnhancedGptService extends EventEmitter {
     });
   }
 
+  normalizeConnectorClass(connectorClass = '', sideEffect = false) {
+    const normalized = String(connectorClass || '').trim().toLowerCase();
+    if (['capture', 'capture_digits'].includes(normalized)) return 'capture';
+    if (['side_effect', 'sideeffect', 'write', 'action'].includes(normalized)) return 'side_effect';
+    if (['read', 'query', 'lookup'].includes(normalized)) return 'read';
+    return sideEffect ? 'side_effect' : 'read';
+  }
+
+  normalizeConnectorMetadata(toolName = '', connectorInput = {}, permission = 'read', sideEffect = false) {
+    const connector = connectorInput && typeof connectorInput === 'object' && !Array.isArray(connectorInput)
+      ? connectorInput
+      : {};
+    const normalizedName = String(toolName || '').trim().toLowerCase();
+    const timeoutMsRaw = Number(connector.timeout_ms ?? connector.timeoutMs);
+    const retryLimitRaw = Number(connector.retry_limit ?? connector.retryLimit);
+    const permissionBasedSideEffect = String(permission || '').toLowerCase() !== 'read';
+    const className = this.normalizeConnectorClass(
+      connector.class || connector.type,
+      sideEffect || permissionBasedSideEffect
+    );
+    const connectorId = String(connector.id || connector.name || normalizedName || 'runtime').trim().toLowerCase();
+    const circuitGroup = String(connector.circuit_group || connector.circuitGroup || connectorId || normalizedName || 'runtime')
+      .trim()
+      .toLowerCase();
+    const provider = String(connector.provider || connector.vendor || this.executionContext.provider || '')
+      .trim()
+      .toLowerCase() || null;
+
+    return {
+      id: connectorId,
+      class: className,
+      provider,
+      circuitGroup,
+      timeoutMs: Number.isFinite(timeoutMsRaw) && timeoutMsRaw > 0
+        ? Math.max(1000, Math.floor(timeoutMsRaw))
+        : null,
+      retryLimit: Number.isFinite(retryLimitRaw) && retryLimitRaw >= 0
+        ? Math.max(0, Math.floor(retryLimitRaw))
+        : null
+    };
+  }
+
   registerToolDefinition(tool) {
     if (!tool || tool.type !== 'function' || !tool.function?.name) {
       return { ok: false, error: 'invalid_tool_shape' };
@@ -376,6 +445,12 @@ class EnhancedGptService extends EventEmitter {
     const permission = String(fn.permission || fn.permissions || this.inferToolPermission(fn.name)).toLowerCase();
     const sideEffect = fn.side_effect === true || permission !== 'read' || this.isLikelySideEffectTool(fn.name);
     const fallback = fn.fallback_function || this.getDefaultToolFallback(fn.name);
+    const connectorInput = (fn.connector && typeof fn.connector === 'object' && !Array.isArray(fn.connector))
+      ? fn.connector
+      : (tool.connector && typeof tool.connector === 'object' && !Array.isArray(tool.connector))
+        ? tool.connector
+        : {};
+    const connector = this.normalizeConnectorMetadata(fn.name, connectorInput, permission, sideEffect);
     return {
       ok: true,
       tool: {
@@ -393,7 +468,8 @@ class EnhancedGptService extends EventEmitter {
         permission,
         sideEffect,
         fallback,
-        schema: fn.parameters
+        schema: fn.parameters,
+        connector
       }
     };
   }
@@ -756,10 +832,113 @@ class EnhancedGptService extends EventEmitter {
     });
   }
 
+  async applyToolPolicyGate(toolName = '', args = {}, registryEntry = {}, plan = {}) {
+    if (typeof this.toolPolicyGate !== 'function') {
+      return {
+        allowed: true,
+        action: 'allow',
+        reason: 'tool_policy_gate_disabled',
+        message: null,
+        blocked: [],
+        metadata: {}
+      };
+    }
+
+    const request = {
+      toolName,
+      args: args && typeof args === 'object' ? args : {},
+      registryEntry: registryEntry && typeof registryEntry === 'object' ? registryEntry : {},
+      planMetadata: plan?.metadata || {},
+      interactionCount: Number.isFinite(Number(plan?.interactionCount))
+        ? Number(plan.interactionCount)
+        : null,
+      idempotencyKey: String(plan?.idempotencyKey || ''),
+      callSid: this.callSid || null,
+      executionContext: { ...this.executionContext }
+    };
+
+    try {
+      const result = await this.toolPolicyGate(request);
+      if (result === false) {
+        return {
+          allowed: false,
+          action: 'deny',
+          reason: 'tool_policy_denied',
+          message: `Tool ${toolName} blocked by policy.`,
+          blocked: ['tool_policy_denied'],
+          metadata: {}
+        };
+      }
+      if (result === true || result == null) {
+        return {
+          allowed: true,
+          action: 'allow',
+          reason: 'allowed',
+          message: null,
+          blocked: [],
+          metadata: {}
+        };
+      }
+      if (typeof result === 'string') {
+        return {
+          allowed: false,
+          action: 'deny',
+          reason: 'tool_policy_denied',
+          message: result,
+          blocked: ['tool_policy_denied'],
+          metadata: {}
+        };
+      }
+      if (typeof result === 'object') {
+        const allowed = !(result.allowed === false || result.blocked === true || String(result.action || '').toLowerCase() === 'deny');
+        return {
+          allowed,
+          action: String(result.action || (allowed ? 'allow' : 'deny')).toLowerCase(),
+          reason: String(result.reason || (allowed ? 'allowed' : 'tool_policy_denied')),
+          code: String(result.code || '').trim() || null,
+          message: result.message ? String(result.message) : null,
+          blocked: Array.isArray(result.blocked) ? result.blocked : [],
+          metadata: result.metadata && typeof result.metadata === 'object' ? result.metadata : {},
+          profile_type: result.profile_type ? String(result.profile_type) : null
+        };
+      }
+    } catch (error) {
+      this.logEvent('tool_policy_gate_failed', {
+        tool: toolName,
+        error: error?.message || 'unknown_tool_policy_error'
+      });
+      return {
+        allowed: true,
+        action: 'allow',
+        reason: 'tool_policy_gate_error_allow',
+        message: null,
+        blocked: [],
+        metadata: {
+          gate_error: error?.message || 'unknown_tool_policy_error'
+        }
+      };
+    }
+
+    return {
+      allowed: true,
+      action: 'allow',
+      reason: 'allowed',
+      message: null,
+      blocked: [],
+      metadata: {}
+    };
+  }
+
   getToolExecutionPolicy(toolName = '', registryEntry = null) {
     const lowerName = String(toolName || '').toLowerCase();
     const provider = String(this.executionContext?.provider || '').toLowerCase();
-    const isSideEffect = registryEntry?.sideEffect === true || this.isLikelySideEffectTool(lowerName);
+    const connectorClass = String(registryEntry?.connector?.class || '').toLowerCase();
+    const isCaptureTool = connectorClass === 'capture'
+      || lowerName === 'collect_digits'
+      || lowerName === 'collect_multiple_digits';
+    const isSideEffect = connectorClass === 'side_effect'
+      || registryEntry?.sideEffect === true
+      || this.isLikelySideEffectTool(lowerName);
     const policy = {
       class: 'read',
       timeoutMs: Math.max(2000, Number(this.toolExecutionTimeoutMs) || 12000),
@@ -769,7 +948,7 @@ class EnhancedGptService extends EventEmitter {
       jitterMs: 80
     };
 
-    if (lowerName === 'collect_digits' || lowerName === 'collect_multiple_digits') {
+    if (isCaptureTool) {
       policy.class = 'capture';
       policy.retryLimit = 0;
       policy.timeoutMs = Math.min(policy.timeoutMs, 7000);
@@ -797,6 +976,18 @@ class EnhancedGptService extends EventEmitter {
       policy.jitterMs += 20;
     } else if (provider === 'twilio') {
       policy.timeoutMs = Math.min(16000, policy.timeoutMs + 500);
+    }
+
+    const connectorTimeoutMs = Number(registryEntry?.connector?.timeoutMs);
+    if (Number.isFinite(connectorTimeoutMs) && connectorTimeoutMs > 0) {
+      policy.timeoutMs = Math.max(1500, Math.min(30000, Math.floor(connectorTimeoutMs)));
+    }
+    const connectorRetryLimit = Number(registryEntry?.connector?.retryLimit);
+    if (Number.isFinite(connectorRetryLimit) && connectorRetryLimit >= 0) {
+      policy.retryLimit = Math.max(0, Math.min(5, Math.floor(connectorRetryLimit)));
+    }
+    if (connectorClass === 'capture' || connectorClass === 'side_effect' || connectorClass === 'read') {
+      policy.class = connectorClass;
     }
 
     return policy;
@@ -1037,6 +1228,57 @@ class EnhancedGptService extends EventEmitter {
     this.toolExecutionLocks.set(plan.idempotencyKey, lockPromise);
 
     try {
+      const initialPolicyDecision = await this.applyToolPolicyGate(
+        plan.functionName,
+        plan.validatedArgs,
+        registryEntry,
+        plan
+      );
+      if (!initialPolicyDecision.allowed) {
+        const blockedMessage = initialPolicyDecision.message
+          || `Tool ${plan.functionName} blocked by policy.`;
+        const blockedPayload = {
+          error: 'tool_policy_blocked',
+          message: blockedMessage,
+          tool: plan.functionName,
+          reason: initialPolicyDecision.reason || 'tool_policy_denied'
+        };
+        this.toolExecutionStats.total += 1;
+        await this.db?.addGptToolAudit?.({
+          call_sid: this.callSid || null,
+          trace_id: this.executionContext.traceId || null,
+          tool_name: plan.functionName,
+          idempotency_key: plan.idempotencyKey,
+          input_hash: plan.metadata?.inputHash || null,
+          request_payload: plan.validatedArgs,
+          response_payload: blockedPayload,
+          status: 'failed',
+          error_message: 'tool_policy_blocked',
+          metadata: {
+            action: initialPolicyDecision.action || 'deny',
+            reason: initialPolicyDecision.reason || 'tool_policy_denied',
+            blocked: Array.isArray(initialPolicyDecision.blocked)
+              ? initialPolicyDecision.blocked
+              : [],
+            profile_type: initialPolicyDecision.profile_type || null,
+            ...(initialPolicyDecision.metadata || {})
+          }
+        }).catch(() => {});
+        return {
+          responseText: JSON.stringify(blockedPayload),
+          metadata: {
+            ...plan.metadata,
+            idempotencyKey: plan.idempotencyKey,
+            failed: true,
+            error: 'tool_policy_blocked',
+            blocked: true,
+            tool: plan.functionName,
+            policy_action: initialPolicyDecision.action || 'deny',
+            policy_reason: initialPolicyDecision.reason || 'tool_policy_denied'
+          }
+        };
+      }
+
       const now = Date.now();
       let idempotencyReserved = false;
       const duplicate = this.toolIdempotency.get(plan.idempotencyKey);
@@ -1237,8 +1479,75 @@ class EnhancedGptService extends EventEmitter {
         }
       }
 
+      const selectedRegistryEntry = selectedToolName === plan.functionName
+        ? registryEntry
+        : this.toolRegistry.get(selectedToolName) || registryEntry;
+      const selectedPolicyDecision = await this.applyToolPolicyGate(
+        selectedToolName,
+        plan.validatedArgs,
+        selectedRegistryEntry,
+        plan
+      );
+      if (!selectedPolicyDecision.allowed) {
+        if (idempotencyReserved) {
+          await this.db?.completeGptToolIdempotency?.({
+            idempotency_key: plan.idempotencyKey,
+            call_sid: this.callSid || null,
+            trace_id: this.executionContext.traceId || null,
+            tool_name: selectedToolName,
+            input_hash: plan.metadata?.inputHash || null,
+            status: 'failed',
+            error_message: 'tool_policy_blocked'
+          }).catch(() => {});
+        }
+        const blockedMessage = selectedPolicyDecision.message
+          || `Tool ${selectedToolName} blocked by policy.`;
+        const blockedPayload = {
+          error: 'tool_policy_blocked',
+          message: blockedMessage,
+          tool: selectedToolName,
+          reason: selectedPolicyDecision.reason || 'tool_policy_denied'
+        };
+        this.toolExecutionStats.total += 1;
+        await this.db?.addGptToolAudit?.({
+          call_sid: this.callSid || null,
+          trace_id: this.executionContext.traceId || null,
+          tool_name: selectedToolName,
+          idempotency_key: plan.idempotencyKey,
+          input_hash: plan.metadata?.inputHash || null,
+          request_payload: plan.validatedArgs,
+          response_payload: blockedPayload,
+          status: 'failed',
+          error_message: 'tool_policy_blocked',
+          metadata: {
+            action: selectedPolicyDecision.action || 'deny',
+            reason: selectedPolicyDecision.reason || 'tool_policy_denied',
+            blocked: Array.isArray(selectedPolicyDecision.blocked)
+              ? selectedPolicyDecision.blocked
+              : [],
+            profile_type: selectedPolicyDecision.profile_type || null,
+            budget_remaining: budget.remaining,
+            ...(selectedPolicyDecision.metadata || {})
+          }
+        }).catch(() => {});
+        return {
+          responseText: JSON.stringify(blockedPayload),
+          metadata: {
+            ...plan.metadata,
+            idempotencyKey: plan.idempotencyKey,
+            failed: true,
+            error: 'tool_policy_blocked',
+            blocked: true,
+            tool: selectedToolName,
+            budget_remaining: budget.remaining,
+            policy_action: selectedPolicyDecision.action || 'deny',
+            policy_reason: selectedPolicyDecision.reason || 'tool_policy_denied'
+          }
+        };
+      }
+
       const functionToCall = this.availableFunctions[selectedToolName];
-      const policy = this.getToolExecutionPolicy(selectedToolName, registryEntry);
+      const policy = this.getToolExecutionPolicy(selectedToolName, selectedRegistryEntry);
       const maxAttempts = Math.max(1, Number(policy.retryLimit || 0) + 1);
       let lastError = null;
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -1261,7 +1570,10 @@ class EnhancedGptService extends EventEmitter {
             budget_remaining: budget.remaining,
             duration_ms: durationMs,
             policy_class: policy.class,
-            provider: this.executionContext.provider || null
+            provider: this.executionContext.provider || null,
+            connector_id: selectedRegistryEntry?.connector?.id || null,
+            connector_class: selectedRegistryEntry?.connector?.class || null,
+            connector_group: selectedRegistryEntry?.connector?.circuitGroup || null
           };
           this.toolIdempotency.set(plan.idempotencyKey, { at: Date.now(), responseText });
           this.toolExecutionStats.total += 1;
@@ -1327,7 +1639,10 @@ class EnhancedGptService extends EventEmitter {
           retry_limit: Number(policy.retryLimit || 0),
           timeout_ms: policy.timeoutMs,
           policy_class: policy.class,
-          provider: this.executionContext.provider || null
+          provider: this.executionContext.provider || null,
+          connector_id: selectedRegistryEntry?.connector?.id || null,
+          connector_class: selectedRegistryEntry?.connector?.class || null,
+          connector_group: selectedRegistryEntry?.connector?.circuitGroup || null
         }
       }).catch(() => {});
       return {
@@ -1341,7 +1656,9 @@ class EnhancedGptService extends EventEmitter {
           budget_remaining: budget.remaining,
           failed: true,
           error: lastError?.message || 'unknown_error',
-          policy_class: policy.class
+          policy_class: policy.class,
+          connector_id: selectedRegistryEntry?.connector?.id || null,
+          connector_class: selectedRegistryEntry?.connector?.class || null
         }
       };
     } finally {
@@ -1822,7 +2139,9 @@ class EnhancedGptService extends EventEmitter {
               policyFallbackText = policyResult.text;
               this.logEvent('policy_gate_blocked', {
                 stage: 'partial',
-                blocked: policyResult.blocked
+                blocked: policyResult.blocked,
+                risk_level: policyResult.risk_level || 'unknown',
+                action: policyResult.action || 'fallback'
               });
             }
             const gptReply = { 
@@ -1873,7 +2192,9 @@ class EnhancedGptService extends EventEmitter {
         policyFallbackText = policyResult.text;
         this.logEvent('policy_gate_blocked', {
           stage: 'partial_tail',
-          blocked: policyResult.blocked
+          blocked: policyResult.blocked,
+          risk_level: policyResult.risk_level || 'unknown',
+          action: policyResult.action || 'fallback'
         });
       }
       this.emit('gptreply', {
@@ -1904,7 +2225,14 @@ class EnhancedGptService extends EventEmitter {
     // Store AI response in conversation history
     const correctedComplete = this.applyPersonaConsistency(completeResponse);
     const finalPolicyResult = policyBlocked
-      ? { text: correctedComplete.text, replaced: true, blocked: ['policy_gate'] }
+      ? {
+          text: correctedComplete.text,
+          replaced: true,
+          blocked: ['policy_gate'],
+          risk_level: 'high',
+          action: 'fallback',
+          findings: [{ rule: 'policy_gate', signal: 'stream_stage_block' }]
+        }
       : this.applyResponsePolicy(correctedComplete.text, {
           interactionCount,
           stage: 'final',
@@ -1914,7 +2242,9 @@ class EnhancedGptService extends EventEmitter {
     if (finalPolicyResult.replaced) {
       this.logEvent('policy_gate_blocked', {
         stage: 'final',
-        blocked: finalPolicyResult.blocked
+        blocked: finalPolicyResult.blocked,
+        risk_level: finalPolicyResult.risk_level || 'unknown',
+        action: finalPolicyResult.action || 'fallback'
       });
     }
     const finalAssistantText = finalPolicyResult.text;
