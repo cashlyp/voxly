@@ -98,9 +98,15 @@ const { WaveFile } = require("wavefile");
 const { runWithTimeout: runOperationWithTimeout } = require("./utils/asyncControl");
 const { sanitizeVoiceOutputText } = require("./utils/voiceOutputGuard");
 const {
-  executeDeepgramVoiceAgentThinkPreflight,
+  executeDeepgramVoiceAgentRuntimePreflight,
   shouldRunDeepgramVoiceAgentPreflight,
 } = require("./services/deepgramVoiceAgentPreflight");
+const {
+  normalizeVoiceProfileKey,
+  selectDeepgramVoiceModel,
+  fetchDeepgramTtsModels,
+  buildDeepgramVoiceModelCatalog,
+} = require("./services/deepgramVoiceModels");
 const {
   VOICE_RUNTIME_CONTROL_SETTING_KEY,
   clampCanaryPercent: clampVoiceRuntimeCanaryPercent,
@@ -138,6 +144,39 @@ const DEFAULT_INBOUND_PROMPT =
 const DEFAULT_INBOUND_FIRST_MESSAGE = "Hello! How can I assist you today?";
 const VOICE_OUTPUT_GUARD_DIRECTIVE =
   "Voice output rules: use plain spoken language only. Do not use emojis, markdown, bullet symbols, or chat-channel references such as text, DM, WhatsApp, or Instagram.";
+const VOICE_TURN_TAKING_DIRECTIVE =
+  "Turn-taking rules: speak in short bursts, one idea per turn, ask at most one question, and pause naturally with commas instead of long monologues.";
+const VOICE_FLOW_STYLE_DIRECTIVES = Object.freeze({
+  general:
+    "Tone: clear, warm, and conversational. Avoid sounding scripted; use brief natural phrasing.",
+  sales:
+    "Tone: upbeat and confident, but never pushy. Keep momentum with concise next-step language.",
+  support:
+    "Tone: calm and reassuring. Use short step-by-step phrases and acknowledge uncertainty clearly.",
+  collections:
+    "Tone: respectful and firm. Keep wording professional, direct, and measured.",
+  verification:
+    "Tone: precise and steady. Speak slowly for codes or numbers and confirm only what is necessary.",
+  identity_verification:
+    "Tone: precise and steady. Speak slowly for codes or numbers and confirm only what is necessary.",
+  dating:
+    "Tone: warm, playful, and natural. Keep pauses and phrasing human without over-performing.",
+  celebrity:
+    "Tone: energetic yet professional. Keep responses warm, concise, and transparent.",
+  fan: "Tone: friendly and supportive. Avoid hype; keep responses grounded and natural.",
+  creator:
+    "Tone: polished and collaborative. Keep language crisp, natural, and businesslike.",
+  friendship:
+    "Tone: caring and relaxed. Use gentle pacing and short empathetic responses.",
+  networking:
+    "Tone: concise and professional. Prioritize clarity and one concrete next action.",
+  community:
+    "Tone: inclusive and practical. Keep a steady cadence and avoid sounding transactional.",
+  marketplace_seller:
+    "Tone: trustworthy and clear. Keep product/payment language direct and easy to follow.",
+  real_estate_agent:
+    "Tone: professional and confident. Keep responses brief and action-oriented.",
+});
 const INBOUND_DEFAULT_SETTING_KEY = "inbound_default_script_id";
 const INBOUND_DEFAULT_CACHE_MS = 15000;
 let inboundDefaultScriptId = null;
@@ -205,6 +244,11 @@ const vonageWebhookJtiCache = new Map(); // jti -> expiresAtMs
 const callRuntimePersistTimers = new Map(); // callSid -> timeoutId
 const callRuntimePendingWrites = new Map(); // callSid -> patch
 const callToolInFlight = new Map(); // callSid -> { tool, startedAt }
+const deepgramVoiceModelCatalogCache = {
+  expiresAt: 0,
+  payload: null,
+  inflight: null,
+};
 let callJobProcessing = false;
 let paymentReconcileRunning = false;
 let backgroundWorkersStarted = false;
@@ -223,6 +267,7 @@ const CALL_PROVIDER_SETTING_KEY = "call_provider_v1";
 const SMS_PROVIDER_SETTING_KEY = "sms_provider_v1";
 const EMAIL_PROVIDER_SETTING_KEY = "email_provider_v1";
 const PAYMENT_FEATURE_SETTING_KEY = "payment_feature_config_v1";
+const DEEPGRAM_VOICE_MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 const voiceAgentCircuitEvents = []; // { kind, callSid, at, reason }
 const voiceAgentRuntimeEvents = []; // { kind, callSid, at, reason }
 let voiceAgentForcedLegacyUntilMs = 0;
@@ -477,6 +522,7 @@ function getVoiceAgentAutoCanaryStatus() {
     step_down_percent: cfg.stepDownPercent,
     max_error_rate: cfg.maxErrorRate,
     max_fallback_rate: cfg.maxFallbackRate,
+    max_no_audio_fallback_rate: cfg.maxNoAudioFallbackRate,
     fail_closed_on_breach: cfg.failClosedOnBreach !== false,
     cooldown_until_ms:
       voiceAgentAutoCanaryCooldownUntilMs > now
@@ -3490,7 +3536,15 @@ function resolveVoiceModel(callConfig) {
   return null;
 }
 
-function resolveDeepgramVoiceModel(callConfig) {
+function resolveVoiceProfileDirective(profile = "general") {
+  const key = normalizeVoiceProfileKey(profile) || "general";
+  return (
+    VOICE_FLOW_STYLE_DIRECTIVES[key] ||
+    VOICE_FLOW_STYLE_DIRECTIVES.general
+  );
+}
+
+function resolveDeepgramVoiceModel(callConfig, options = {}) {
   if (callConfig && typeof callConfig === "object") {
     const lockedModel = String(callConfig.deepgram_voice_model_locked || "").trim();
     if (lockedModel) {
@@ -3499,21 +3553,114 @@ function resolveDeepgramVoiceModel(callConfig) {
   }
 
   const candidateModel = callConfig?.voice_model;
-  let resolvedModel = config.deepgram?.voiceModel || "aura-asteria-en";
-  if (candidateModel && typeof candidateModel === "string") {
-    const normalized = candidateModel.toLowerCase();
-    if (
-      !["alice", "man", "woman"].includes(normalized) &&
-      !candidateModel.startsWith("Polly.")
-    ) {
-      resolvedModel = candidateModel;
-    }
-  }
+  const conversationProfile =
+    options.conversationProfile ||
+    callConfig?.conversation_profile ||
+    callConfig?.purpose ||
+    "general";
+  const profileVoiceMap =
+    config.deepgram?.voiceAgent?.profileVoiceMap &&
+    typeof config.deepgram.voiceAgent.profileVoiceMap === "object"
+      ? config.deepgram.voiceAgent.profileVoiceMap
+      : {};
+  const resolution = selectDeepgramVoiceModel({
+    candidateModel,
+    conversationProfile,
+    profileVoiceMap,
+    fallbackSpeakModel:
+      config.deepgram?.voiceAgent?.speakModel ||
+      config.deepgram?.voiceModel ||
+      "aura-2-andromeda-en",
+    callSid:
+      options.callSid ||
+      callConfig?.call_sid ||
+      callConfig?.callSid ||
+      null,
+    customerName: callConfig?.customer_name || null,
+    seed:
+      options.seed ||
+      options.callSid ||
+      callConfig?.call_sid ||
+      callConfig?.callSid ||
+      null,
+  });
+  const resolvedModel = resolution.model;
 
   if (callConfig && typeof callConfig === "object") {
     callConfig.deepgram_voice_model_locked = resolvedModel;
   }
   return resolvedModel;
+}
+
+async function getDeepgramVoiceModelCatalog(options = {}) {
+  const forceRefresh = options.forceRefresh === true;
+  const now = Date.now();
+  if (
+    !forceRefresh &&
+    deepgramVoiceModelCatalogCache.payload &&
+    deepgramVoiceModelCatalogCache.expiresAt > now
+  ) {
+    return deepgramVoiceModelCatalogCache.payload;
+  }
+  if (!forceRefresh && deepgramVoiceModelCatalogCache.inflight) {
+    return deepgramVoiceModelCatalogCache.inflight;
+  }
+
+  const request = (async () => {
+    const remote = await fetchDeepgramTtsModels({
+      fetchImpl: fetch,
+      apiKey: config.deepgram?.apiKey,
+      timeoutMs: 3500,
+    });
+    const catalog = buildDeepgramVoiceModelCatalog({
+      remoteModels: remote.models,
+    });
+    const payload = {
+      fetched_at: new Date().toISOString(),
+      source: remote.ok ? "deepgram_api" : "curated_fallback",
+      error: remote.ok ? null : remote.error || "catalog_lookup_failed",
+      models: catalog.models,
+      recommended_by_flow: catalog.recommendedByFlow,
+      defaults: {
+        runtime_voice_model:
+          config.deepgram?.voiceAgent?.speakModel ||
+          config.deepgram?.voiceModel ||
+          "aura-2-andromeda-en",
+      },
+    };
+    deepgramVoiceModelCatalogCache.payload = payload;
+    deepgramVoiceModelCatalogCache.expiresAt =
+      Date.now() + DEEPGRAM_VOICE_MODEL_CACHE_TTL_MS;
+    return payload;
+  })()
+    .catch((error) => {
+      const catalog = buildDeepgramVoiceModelCatalog({ remoteModels: [] });
+      const payload = {
+        fetched_at: new Date().toISOString(),
+        source: "curated_fallback",
+        error: error?.message || "catalog_lookup_failed",
+        models: catalog.models,
+        recommended_by_flow: catalog.recommendedByFlow,
+        defaults: {
+          runtime_voice_model:
+            config.deepgram?.voiceAgent?.speakModel ||
+            config.deepgram?.voiceModel ||
+            "aura-2-andromeda-en",
+        },
+      };
+      deepgramVoiceModelCatalogCache.payload = payload;
+      deepgramVoiceModelCatalogCache.expiresAt =
+        Date.now() + DEEPGRAM_VOICE_MODEL_CACHE_TTL_MS;
+      return payload;
+    })
+    .finally(() => {
+      if (deepgramVoiceModelCatalogCache.inflight === request) {
+        deepgramVoiceModelCatalogCache.inflight = null;
+      }
+    });
+
+  deepgramVoiceModelCatalogCache.inflight = request;
+  return request;
 }
 
 function shouldUseTwilioPlay(callConfig) {
@@ -3597,7 +3744,9 @@ async function getTwilioTtsAudioUrl(text, callConfig, options = {}) {
   const cacheOnly = options?.cacheOnly === true;
   const forceGenerate = options?.forceGenerate === true;
   if (!forceGenerate && !shouldUseTwilioPlay(callConfig)) return null;
-  const voiceModel = resolveDeepgramVoiceModel(callConfig);
+  const voiceModel = resolveDeepgramVoiceModel(callConfig, {
+    callSid: options?.callSid || callConfig?.call_sid || callConfig?.callSid,
+  });
   const key = buildTwilioTtsCacheKey(cleaned, voiceModel);
   const now = Date.now();
   const cached = twilioTtsCache.get(key);
@@ -3770,13 +3919,24 @@ async function runDeepgramVoiceAgentStartupPreflight() {
   const strictMode = mode === "voice_agent";
   const timeoutMs = Math.max(2000, Number(voiceAgentConfig.settingsTimeoutMs) || 8000);
   try {
-    const result = await executeDeepgramVoiceAgentThinkPreflight({
+    const result = await executeDeepgramVoiceAgentRuntimePreflight({
       fetchImpl: fetch,
       apiKey: config.deepgram?.apiKey,
       enabled,
       mode,
       thinkProvider: voiceAgentConfig.thinkProvider,
       thinkModel: voiceAgentConfig.thinkModel,
+      listenModel: voiceAgentConfig.listenModel,
+      speakModel: voiceAgentConfig.speakModel,
+      inputEncoding: "mulaw",
+      inputSampleRate: 8000,
+      outputEncoding: "mulaw",
+      outputSampleRate: 8000,
+      outputContainer: "none",
+      syntheticTurnText: voiceAgentConfig.syntheticProbeText,
+      ttsProbeEnabled: voiceAgentConfig.startupTtsProbeEnabled !== false,
+      ttsProbeTimeoutMs:
+        Number(voiceAgentConfig.startupTtsProbeTimeoutMs) || 5000,
       timeoutMs,
     });
     const payload = {
@@ -3785,9 +3945,31 @@ async function runDeepgramVoiceAgentStartupPreflight() {
       strict_mode: strictMode,
       provider: result.provider || null,
       model: result.model || null,
+      listen_model: result.listenModel || null,
+      speak_model: result.speakModel || null,
       provider_model_count: result.providerModelCount || 0,
       catalog_size: result.catalogSize || 0,
       provider_models_sample: result.providerModelsSample || [],
+      config_warnings: Array.isArray(result.configWarnings)
+        ? result.configWarnings
+        : [],
+      speak_probe:
+        result.speakProbe && typeof result.speakProbe === "object"
+          ? {
+              skipped: result.speakProbe.skipped === true,
+              bytes: Number(result.speakProbe.bytes) || 0,
+              output_encoding: result.speakProbe.outputEncoding || null,
+              output_sample_rate:
+                Number(result.speakProbe.outputSampleRate) || null,
+            }
+          : null,
+      synthetic_turn:
+        result.syntheticTurn && typeof result.syntheticTurn === "object"
+          ? {
+              ok: result.syntheticTurn.ok === true,
+              text_length: Number(result.syntheticTurn.textLength) || 0,
+            }
+          : null,
     };
     console.log(
       JSON.stringify({
@@ -3812,6 +3994,9 @@ async function runDeepgramVoiceAgentStartupPreflight() {
       error: error?.message || "voice_agent_preflight_failed",
       provider: error?.provider || String(voiceAgentConfig.thinkProvider || "open_ai"),
       model: error?.model || String(voiceAgentConfig.thinkModel || "gpt-4o-mini"),
+      listen_model: String(voiceAgentConfig.listenModel || "nova-2"),
+      speak_model:
+        error?.speakModel || String(voiceAgentConfig.speakModel || "aura-2-andromeda-en"),
       provider_model_count: Number(error?.providerModelCount) || 0,
       provider_models_sample: Array.isArray(error?.providerModelsSample)
         ? error.providerModelsSample
@@ -9641,6 +9826,7 @@ app.ws("/connection", (ws, req) => {
     let voiceAgentNoAudioTimer = null;
     let voiceAgentLastAudioAt = 0;
     let voiceAgentLastUserSpeechAt = 0;
+    let voiceAgentLastBargeClearAt = 0;
     let voiceAgentRuntimeFallbackInProgress = false;
     const streamService = new StreamService(ws, {
       audioTickIntervalMs: liveConsoleAudioTickMs,
@@ -9731,6 +9917,36 @@ app.ws("/connection", (ws, req) => {
       ) {
         voiceAgentNoAudioTimer.unref();
       }
+    };
+    const clearOutgoingAudioForBargeIn = (reason = "voice_agent_user_barge_in") => {
+      const now = Date.now();
+      if (now - voiceAgentLastBargeClearAt < 250) {
+        return false;
+      }
+      voiceAgentLastBargeClearAt = now;
+      marks = [];
+      try {
+        streamService.flush();
+      } catch {}
+      try {
+        ws.send(
+          JSON.stringify({
+            streamSid,
+            event: "clear",
+          }),
+        );
+      } catch (error) {
+        console.error("WebSocket clear event send error:", error);
+        return false;
+      }
+      if (callSid) {
+        recordVoiceAgentRuntimeEvent("barge_in_clear", callSid, reason);
+        db.updateCallState(callSid, "voice_agent_barge_in_clear", {
+          reason,
+          at: new Date(now).toISOString(),
+        }).catch(() => {});
+      }
+      return true;
     };
 
     const handleSttFailure = async (tag, error) => {
@@ -9981,11 +10197,6 @@ app.ws("/connection", (ws, req) => {
           } catch (dbError) {
             console.error("Database error on call start:", dbError);
           }
-          // Get call configuration and function system
-          const resolvedVoiceModel = resolveVoiceModel(callConfig);
-          if (resolvedVoiceModel) {
-            ttsService.voiceModel = resolvedVoiceModel;
-          }
           const sessionProfile = resolveConversationProfile({
             purpose:
               callConfig?.conversation_profile ||
@@ -9994,12 +10205,25 @@ app.ws("/connection", (ws, req) => {
             prompt: callConfig?.prompt,
             firstMessage: callConfig?.first_message,
           });
+          const resolvedDeepgramVoiceModel = resolveDeepgramVoiceModel(callConfig, {
+            conversationProfile: sessionProfile,
+            callSid,
+          });
+          if (resolvedDeepgramVoiceModel) {
+            ttsService.voiceModel = resolvedDeepgramVoiceModel;
+          }
           const intentLine = `Call intent: ${callConfig?.script || "general"} | profile: ${sessionProfile || "general"} | purpose: ${callConfig?.purpose || sessionProfile || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`;
+          const voiceStyleLine = resolveVoiceProfileDirective(sessionProfile);
+          const flowStateLine = `Flow state: ${normalizeFlowStateKey(callConfig?.flow_state || "normal")}. Keep pacing calm and natural for voice output.`;
           const runtimeDecision = selectTwilioVoiceRuntime(callSid, callConfig);
           voiceRuntimeMode = runtimeDecision.mode;
 
           if (runtimeDecision.useVoiceAgent) {
             const voiceAgentConfig = getEffectiveVoiceAgentRuntimeConfig();
+            const voiceAgentSpeakModel = resolveDeepgramVoiceModel(callConfig, {
+              conversationProfile: sessionProfile,
+              callSid,
+            });
             const voiceAgentFunctions =
               buildVoiceAgentFunctionDefinitions(functionSystem);
             const rawGreeting = String(
@@ -10009,12 +10233,15 @@ app.ws("/connection", (ws, req) => {
               callConfig?.initial_prompt_played === true
                 ? ""
                 : sanitizeVoiceOutputText(rawGreeting, {
-                    maxChars: 260,
+                    maxChars: 220,
                     fallbackText: DEFAULT_INBOUND_FIRST_MESSAGE,
                   }).text;
             const promptText = [
               callConfig?.prompt || DEFAULT_INBOUND_PROMPT,
               intentLine,
+              flowStateLine,
+              voiceStyleLine,
+              VOICE_TURN_TAKING_DIRECTIVE,
               VOICE_OUTPUT_GUARD_DIRECTIVE,
             ]
               .filter(Boolean)
@@ -10050,14 +10277,19 @@ app.ws("/connection", (ws, req) => {
                   listen: {
                     provider: {
                       model: voiceAgentConfig.listenModel || "nova-2",
+                      smart_format: voiceAgentConfig.listenSmartFormat !== false,
+                      keyterms: Array.isArray(voiceAgentConfig.listenKeyterms)
+                        ? voiceAgentConfig.listenKeyterms
+                        : [],
                     },
                   },
                   speak: {
                     provider: {
                       model:
+                        voiceAgentSpeakModel ||
                         voiceAgentConfig.speakModel ||
                         config.deepgram?.voiceModel ||
-                        "aura-asteria-en",
+                        "aura-2-andromeda-en",
                     },
                   },
                   think: {
@@ -10187,6 +10419,7 @@ app.ws("/connection", (ws, req) => {
               voiceAgentBridge.on("userStartedSpeaking", () => {
                 clearSilenceTimer(callSid);
                 voiceAgentLastUserSpeechAt = Date.now();
+                clearOutgoingAudioForBargeIn("voice_agent_user_started_speaking");
                 scheduleVoiceAgentNoAudioWatchdog();
                 webhookService
                   .setLiveCallPhase(callSid, "user_speaking")
@@ -11189,16 +11422,7 @@ app.ws("/connection", (ws, req) => {
       }
       if (marks.length > 0 && text?.length > 5) {
         console.log("Interruption detected, clearing stream".red);
-        try {
-          ws.send(
-            JSON.stringify({
-              streamSid,
-              event: "clear",
-            }),
-          );
-        } catch (error) {
-          console.error("WebSocket clear event send error:", error);
-        }
+        clearOutgoingAudioForBargeIn("legacy_stt_interruption");
       }
     });
 
@@ -13315,6 +13539,26 @@ app.get("/admin/provider", requireAdminToken, async (req, res) => {
     },
     compatibility: getProviderCompatibilityReport(),
   });
+});
+
+app.get("/admin/voice-models", requireAdminToken, async (req, res) => {
+  const forceRefresh =
+    String(req.query?.refresh || req.query?.force || "0").toLowerCase() === "1";
+  try {
+    const catalog = await getDeepgramVoiceModelCatalog({ forceRefresh });
+    return res.json({
+      success: true,
+      ...catalog,
+      count: Array.isArray(catalog.models) ? catalog.models.length : 0,
+    });
+  } catch (error) {
+    console.error("Failed to load Deepgram voice model catalog:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to load Deepgram voice model catalog",
+      details: error?.message || "unknown_error",
+    });
+  }
 });
 
 app.get("/admin/provider/preflight", requireAdminToken, async (req, res) => {

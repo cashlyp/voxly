@@ -24,10 +24,6 @@ logs
 **/build
 **/dist-ssr
 
-# Documentation directories
-docs/
-**/docs/
-
 # Test directories
 test/
 tests/

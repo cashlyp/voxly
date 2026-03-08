@@ -91,7 +91,7 @@ const SECTIONS = [
     comments: ['# Deepgram configuration'],
     fields: [
       { key: 'DEEPGRAM_API_KEY', prompt: 'Deepgram API Key' },
-      { key: 'VOICE_MODEL', prompt: 'Deepgram Voice Model', defaultValue: 'aura-asteria-en' },
+      { key: 'VOICE_MODEL', prompt: 'Deepgram Voice Model', defaultValue: 'aura-2-andromeda-en' },
     ],
   },
   {
@@ -181,6 +181,7 @@ async function main() {
   await fs.promises.writeFile(targetPath, content, 'utf8');
   console.log(`✅ Created ${targetPath}`);
   console.log('   Update any remaining blanks before starting the API.');
+  console.log('   Optional advanced settings reference: api/.env.advanced.example');
 }
 
 main().catch((error) => {
