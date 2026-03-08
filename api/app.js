@@ -15,19 +15,48 @@ const { EnhancedGptService } = require("./routes/gpt");
 const { StreamService } = require("./routes/stream");
 const { TranscriptionService } = require("./routes/transcription");
 const { TextToSpeechService } = require("./routes/tts");
+const { VoiceAgentBridge } = require("./routes/voiceAgentBridge");
 const { recordingService } = require("./routes/recording");
 const { EnhancedSmsService } = require("./routes/sms.js");
 const { EmailService } = require("./routes/email");
 const { createTwilioGatherHandler } = require("./routes/gather");
-const { registerCallRoutes } = require("./controllers/callRoutes");
-const { registerStatusRoutes } = require("./controllers/statusRoutes");
-const { registerWebhookRoutes } = require("./controllers/webhookRoutes");
+const { registerCallRoutes } = require("./services/callRoutes");
+const { registerStatusRoutes } = require("./services/statusRoutes");
+const { registerWebhookRoutes } = require("./services/webhookRoutes");
 const Database = require("./db/db");
 const { webhookService } = require("./routes/status");
 const twilioSignature = require("./middleware/twilioSignature");
 const DynamicFunctionEngine = require("./functions/DynamicFunctionEngine");
 const { createDigitCollectionService } = require("./functions/Digit");
 const { formatDigitCaptureLabel } = require("./functions/Labels");
+const {
+  attachConnectorMetadataToTools,
+  routeToolsByIntent,
+  evaluateConnectorApprovalPolicy,
+} = require("./functions/connectorRegistry");
+const {
+  connectorPackTools,
+  buildConnectorPackImplementations,
+} = require("./functions/connectorPacks");
+const {
+  RELATIONSHIP_PROFILE_TYPES,
+  RELATIONSHIP_FLOW_TYPES,
+  RELATIONSHIP_PROFILE_OBJECTIVE_MAP,
+  RELATIONSHIP_PROFILE_FLOW_MAP,
+  normalizeRelationshipProfileType,
+  deriveConversationProfileDecision,
+  buildConversationProfilePromptBundle,
+  createConversationProfileToolkit,
+  evaluateConversationProfileToolPolicy,
+  applyConversationPolicyGates,
+  validateRelationshipProfilePacks,
+} = require("./functions/Dating");
+const {
+  CALL_OBJECTIVE_IDS,
+  CALL_SCRIPT_FLOW_TYPES,
+  normalizeCallScriptFlowType: normalizeCallScriptFlowTypeShared,
+  normalizeObjectiveTag: normalizeObjectiveTagShared,
+} = require("./functions/relationshipFlowMetadata");
 const config = require("./config");
 const {
   PROVIDER_CHANNELS,
@@ -67,6 +96,24 @@ const {
 const { v4: uuidv4 } = require("uuid");
 const { WaveFile } = require("wavefile");
 const { runWithTimeout: runOperationWithTimeout } = require("./utils/asyncControl");
+const { sanitizeVoiceOutputText } = require("./utils/voiceOutputGuard");
+const {
+  executeDeepgramVoiceAgentThinkPreflight,
+  shouldRunDeepgramVoiceAgentPreflight,
+} = require("./services/deepgramVoiceAgentPreflight");
+const {
+  VOICE_RUNTIME_CONTROL_SETTING_KEY,
+  clampCanaryPercent: clampVoiceRuntimeCanaryPercent,
+  normalizeVoiceRuntimeMode: normalizeVoiceRuntimeModeShared,
+  normalizeVoiceAgentAutoCanaryConfig,
+  sanitizePersistedVoiceRuntimeControls,
+  buildPersistedVoiceRuntimeControlsPayload,
+  shouldFallbackVoiceAgentOnDtmf,
+  pruneVoiceAgentAutoCanaryEvents,
+  summarizeVoiceAgentAutoCanaryEvents,
+  evaluateVoiceAgentAutoCanaryDecision,
+  applyVoiceRuntimeControlMutation,
+} = require("./services/voiceRuntimeControl");
 
 const isProduction = process.env.NODE_ENV === "production";
 const appVersion = (() => {
@@ -87,8 +134,10 @@ const twilio = require("twilio");
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
 const DEFAULT_INBOUND_PROMPT =
-  "You are an intelligent AI assistant capable of adapting to different business contexts and customer needs. Be professional, helpful, and responsive to customer communication styles. You must add a '•' symbol every 5 to 10 words at natural pauses where your response can be split for text to speech.";
+  "You are an intelligent AI assistant capable of adapting to different business contexts and customer needs. Be professional, helpful, and responsive to customer communication styles for live voice calls.";
 const DEFAULT_INBOUND_FIRST_MESSAGE = "Hello! How can I assist you today?";
+const VOICE_OUTPUT_GUARD_DIRECTIVE =
+  "Voice output rules: use plain spoken language only. Do not use emojis, markdown, bullet symbols, or chat-channel references such as text, DM, WhatsApp, or Instagram.";
 const INBOUND_DEFAULT_SETTING_KEY = "inbound_default_script_id";
 const INBOUND_DEFAULT_CACHE_MS = 15000;
 let inboundDefaultScriptId = null;
@@ -174,6 +223,15 @@ const CALL_PROVIDER_SETTING_KEY = "call_provider_v1";
 const SMS_PROVIDER_SETTING_KEY = "sms_provider_v1";
 const EMAIL_PROVIDER_SETTING_KEY = "email_provider_v1";
 const PAYMENT_FEATURE_SETTING_KEY = "payment_feature_config_v1";
+const voiceAgentCircuitEvents = []; // { kind, callSid, at, reason }
+const voiceAgentRuntimeEvents = []; // { kind, callSid, at, reason }
+let voiceAgentForcedLegacyUntilMs = 0;
+let voiceRuntimeModeOverride = null;
+let voiceRuntimeCanaryPercentOverride = null;
+let voiceRuntimeCanaryPercentOverrideSource = null;
+let voiceRuntimeOverrideUpdatedAtMs = 0;
+let voiceAgentAutoCanaryCooldownUntilMs = 0;
+let voiceAgentAutoCanaryLastEvalAtMs = 0;
 
 const defaultPaymentFeatureConfig = Object.freeze({
   enabled: config.payment?.enabled !== false,
@@ -258,6 +316,495 @@ function normalizeBooleanFlag(value, fallback = false) {
   if (value === true || value === 1) return true;
   const normalized = String(value).trim().toLowerCase();
   return ["1", "true", "yes", "on"].includes(normalized);
+}
+
+function clampCanaryPercent(value, fallback = 0) {
+  return clampVoiceRuntimeCanaryPercent(value, fallback);
+}
+
+function getVoiceAgentCircuitConfig() {
+  const cfg = config.deepgram?.voiceAgent?.circuitBreaker || {};
+  return {
+    enabled: cfg.enabled !== false,
+    failureThreshold: Math.max(1, Number(cfg.failureThreshold) || 3),
+    windowMs: Math.max(1000, Number(cfg.windowMs) || 120000),
+    cooldownMs: Math.max(5000, Number(cfg.cooldownMs) || 180000),
+  };
+}
+
+function isVoiceAgentCircuitOpen(nowMs = Date.now()) {
+  return Number(voiceAgentForcedLegacyUntilMs || 0) > Number(nowMs || Date.now());
+}
+
+function pruneVoiceAgentCircuitEvents(nowMs = Date.now()) {
+  const cfg = getVoiceAgentCircuitConfig();
+  const keepAfter = Number(nowMs || Date.now()) - cfg.windowMs;
+  while (voiceAgentCircuitEvents.length > 0 && voiceAgentCircuitEvents[0].at < keepAfter) {
+    voiceAgentCircuitEvents.shift();
+  }
+  return voiceAgentCircuitEvents.length;
+}
+
+function recordVoiceAgentCircuitEvent(kind, callSid, reason = "unknown") {
+  const cfg = getVoiceAgentCircuitConfig();
+  if (!cfg.enabled) return;
+  const now = Date.now();
+  voiceAgentCircuitEvents.push({
+    kind: String(kind || "runtime_error"),
+    callSid: String(callSid || "unknown"),
+    reason: String(reason || "unknown"),
+    at: now,
+  });
+  const recentFailures = pruneVoiceAgentCircuitEvents(now);
+  if (recentFailures < cfg.failureThreshold) return;
+  const nextUntil = now + cfg.cooldownMs;
+  if (nextUntil <= voiceAgentForcedLegacyUntilMs) return;
+  voiceAgentForcedLegacyUntilMs = nextUntil;
+  const payload = {
+    type: "voice_agent_circuit_opened",
+    timestamp: new Date(now).toISOString(),
+    recent_failures: recentFailures,
+    failure_threshold: cfg.failureThreshold,
+    window_ms: cfg.windowMs,
+    cooldown_ms: cfg.cooldownMs,
+    forced_legacy_until: new Date(voiceAgentForcedLegacyUntilMs).toISOString(),
+  };
+  console.warn(JSON.stringify(payload));
+  db?.logServiceHealth?.("voice_agent_runtime", "circuit_opened", payload).catch(
+    () => {},
+  );
+  persistVoiceRuntimeControlSettings("circuit_opened").catch(() => {});
+}
+
+function normalizeVoiceRuntimeMode(value) {
+  return normalizeVoiceRuntimeModeShared(value);
+}
+
+function getEffectiveVoiceAgentRuntimeConfig() {
+  const runtimeConfig = config.deepgram?.voiceAgent || {};
+  const effective = { ...runtimeConfig };
+  if (voiceRuntimeModeOverride) {
+    effective.mode = voiceRuntimeModeOverride;
+  }
+  if (Number.isFinite(voiceRuntimeCanaryPercentOverride)) {
+    effective.canaryPercent = clampCanaryPercent(voiceRuntimeCanaryPercentOverride, 0);
+  }
+  return effective;
+}
+
+function getVoiceAgentCircuitStatus() {
+  const now = Date.now();
+  const cfg = getVoiceAgentCircuitConfig();
+  const recentFailures = pruneVoiceAgentCircuitEvents(now);
+  const activeUntil = Number(voiceAgentForcedLegacyUntilMs || 0);
+  return {
+    enabled: cfg.enabled,
+    is_open: activeUntil > now,
+    forced_legacy_until_ms: activeUntil || null,
+    forced_legacy_until:
+      activeUntil > 0 ? new Date(activeUntil).toISOString() : null,
+    recent_failures: recentFailures,
+    failure_threshold: cfg.failureThreshold,
+    window_ms: cfg.windowMs,
+    cooldown_ms: cfg.cooldownMs,
+  };
+}
+
+function getVoiceAgentAutoCanaryConfig() {
+  return normalizeVoiceAgentAutoCanaryConfig(
+    config.deepgram?.voiceAgent?.autoCanary || {},
+  );
+}
+
+function pruneVoiceAgentRuntimeEvents(nowMs = Date.now()) {
+  const circuitCfg = getVoiceAgentCircuitConfig();
+  const autoCfg = getVoiceAgentAutoCanaryConfig();
+  const keepWindowMs = Math.max(circuitCfg.windowMs, autoCfg.windowMs);
+  return pruneVoiceAgentAutoCanaryEvents(
+    voiceAgentRuntimeEvents,
+    keepWindowMs,
+    Number(nowMs || Date.now()),
+    4000,
+  );
+}
+
+function mapVoiceAgentFallbackKind(reason = "") {
+  const normalizedReason = String(reason || "")
+    .trim()
+    .toLowerCase();
+  if (normalizedReason === "voice_agent_dtmf_detected") {
+    return "fallback_dtmf";
+  }
+  if (normalizedReason === "voice_agent_no_audio_timeout") {
+    return "fallback_no_audio";
+  }
+  if (normalizedReason.includes("runtime_error")) {
+    return "fallback_runtime";
+  }
+  return "fallback_other";
+}
+
+function recordVoiceAgentRuntimeEvent(kind, callSid, reason = "unknown") {
+  const now = Date.now();
+  voiceAgentRuntimeEvents.push({
+    kind: String(kind || "unknown"),
+    callSid: String(callSid || "unknown"),
+    reason: String(reason || "unknown"),
+    at: now,
+  });
+  pruneVoiceAgentRuntimeEvents(now);
+}
+
+function getVoiceAgentAutoCanaryStatus() {
+  const cfg = getVoiceAgentAutoCanaryConfig();
+  const now = Date.now();
+  pruneVoiceAgentRuntimeEvents(now);
+  const summary = summarizeVoiceAgentAutoCanaryEvents(
+    voiceAgentRuntimeEvents,
+    cfg.windowMs,
+    now,
+    voiceAgentAutoCanaryLastEvalAtMs,
+  );
+  return {
+    enabled: cfg.enabled === true,
+    interval_ms: cfg.intervalMs,
+    window_ms: cfg.windowMs,
+    cooldown_ms: cfg.cooldownMs,
+    min_samples: cfg.minSamples,
+    min_percent: cfg.minPercent,
+    max_percent: cfg.maxPercent,
+    step_up_percent: cfg.stepUpPercent,
+    step_down_percent: cfg.stepDownPercent,
+    max_error_rate: cfg.maxErrorRate,
+    max_fallback_rate: cfg.maxFallbackRate,
+    fail_closed_on_breach: cfg.failClosedOnBreach !== false,
+    cooldown_until_ms:
+      voiceAgentAutoCanaryCooldownUntilMs > now
+        ? voiceAgentAutoCanaryCooldownUntilMs
+        : 0,
+    cooldown_until:
+      voiceAgentAutoCanaryCooldownUntilMs > now
+        ? new Date(voiceAgentAutoCanaryCooldownUntilMs).toISOString()
+        : null,
+    last_eval_at:
+      voiceAgentAutoCanaryLastEvalAtMs > 0
+        ? new Date(voiceAgentAutoCanaryLastEvalAtMs).toISOString()
+        : null,
+    summary,
+  };
+}
+
+function getVoiceRuntimeAdminStatus() {
+  const runtimeConfig = config.deepgram?.voiceAgent || {};
+  const effectiveRuntimeConfig = getEffectiveVoiceAgentRuntimeConfig();
+  return {
+    enabled: effectiveRuntimeConfig.enabled === true,
+    configured_mode: normalizeVoiceRuntimeMode(runtimeConfig.mode),
+    effective_mode: normalizeVoiceRuntimeMode(effectiveRuntimeConfig.mode),
+    mode_override: voiceRuntimeModeOverride,
+    configured_canary_percent: clampCanaryPercent(runtimeConfig.canaryPercent, 0),
+    effective_canary_percent: clampCanaryPercent(
+      effectiveRuntimeConfig.canaryPercent,
+      0,
+    ),
+    canary_percent_override:
+      Number.isFinite(voiceRuntimeCanaryPercentOverride)
+        ? clampCanaryPercent(voiceRuntimeCanaryPercentOverride, 0)
+        : null,
+    canary_percent_override_source:
+      Number.isFinite(voiceRuntimeCanaryPercentOverride) &&
+      voiceRuntimeCanaryPercentOverrideSource
+        ? voiceRuntimeCanaryPercentOverrideSource
+        : null,
+    canary_seed:
+      String(effectiveRuntimeConfig.canarySeed || "voice_agent").trim() ||
+      "voice_agent",
+    managed_think_only: effectiveRuntimeConfig.managedThinkOnly !== false,
+    override_updated_at:
+      voiceRuntimeOverrideUpdatedAtMs > 0
+        ? new Date(voiceRuntimeOverrideUpdatedAtMs).toISOString()
+        : null,
+    circuit: getVoiceAgentCircuitStatus(),
+    auto_canary: getVoiceAgentAutoCanaryStatus(),
+  };
+}
+
+async function loadVoiceRuntimeControlSettings() {
+  voiceRuntimeModeOverride = null;
+  voiceRuntimeCanaryPercentOverride = null;
+  voiceRuntimeCanaryPercentOverrideSource = null;
+  voiceAgentAutoCanaryCooldownUntilMs = 0;
+  voiceAgentAutoCanaryLastEvalAtMs = 0;
+  voiceAgentForcedLegacyUntilMs = 0;
+  voiceRuntimeOverrideUpdatedAtMs = 0;
+  if (!db?.getSetting) {
+    return getVoiceRuntimeAdminStatus();
+  }
+  try {
+    const raw = await db.getSetting(VOICE_RUNTIME_CONTROL_SETTING_KEY);
+    if (!raw) {
+      return getVoiceRuntimeAdminStatus();
+    }
+    const parsed = JSON.parse(raw);
+    const controls = sanitizePersistedVoiceRuntimeControls(parsed, Date.now());
+    voiceRuntimeModeOverride = controls.modeOverride;
+    voiceRuntimeCanaryPercentOverride = controls.canaryPercentOverride;
+    voiceRuntimeCanaryPercentOverrideSource =
+      controls.canaryPercentOverrideSource || null;
+    voiceAgentForcedLegacyUntilMs = controls.forcedLegacyUntilMs;
+    voiceAgentAutoCanaryCooldownUntilMs = controls.autoCanaryCooldownUntilMs;
+    voiceAgentAutoCanaryLastEvalAtMs = controls.autoCanaryLastEvalAtMs;
+    voiceRuntimeOverrideUpdatedAtMs = controls.updatedAt
+      ? new Date(controls.updatedAt).getTime()
+      : 0;
+  } catch (error) {
+    console.error("Failed to load voice runtime control settings:", error);
+  }
+  return getVoiceRuntimeAdminStatus();
+}
+
+async function persistVoiceRuntimeControlSettings(source = "runtime_update") {
+  if (!db?.setSetting) return;
+  try {
+    const payload = buildPersistedVoiceRuntimeControlsPayload(
+      {
+        modeOverride: voiceRuntimeModeOverride,
+        canaryPercentOverride: voiceRuntimeCanaryPercentOverride,
+        canaryPercentOverrideSource: voiceRuntimeCanaryPercentOverrideSource,
+        forcedLegacyUntilMs: voiceAgentForcedLegacyUntilMs,
+        autoCanaryCooldownUntilMs: voiceAgentAutoCanaryCooldownUntilMs,
+        autoCanaryLastEvalAtMs: voiceAgentAutoCanaryLastEvalAtMs,
+      },
+      Date.now(),
+    );
+    payload.source = String(source || "runtime_update");
+    await db.setSetting(
+      VOICE_RUNTIME_CONTROL_SETTING_KEY,
+      JSON.stringify(payload),
+    );
+  } catch (error) {
+    console.error("Failed to persist voice runtime control settings:", error);
+  }
+}
+
+async function evaluateVoiceAgentAutoCanary(options = {}) {
+  const now = Date.now();
+  const runtimeCfg = config.deepgram?.voiceAgent || {};
+  const autoCfg = getVoiceAgentAutoCanaryConfig();
+  if (!autoCfg.enabled) {
+    voiceAgentAutoCanaryLastEvalAtMs = now;
+    return { applied: false, reason: "disabled" };
+  }
+
+  pruneVoiceAgentRuntimeEvents(now);
+  const summary = summarizeVoiceAgentAutoCanaryEvents(
+    voiceAgentRuntimeEvents,
+    autoCfg.windowMs,
+    now,
+    voiceAgentAutoCanaryLastEvalAtMs,
+  );
+  const effectiveMode = normalizeVoiceRuntimeMode(
+    voiceRuntimeModeOverride || runtimeCfg.mode,
+  );
+  const manualCanaryOverrideActive =
+    Number.isFinite(voiceRuntimeCanaryPercentOverride) &&
+    voiceRuntimeCanaryPercentOverrideSource !== "auto_canary";
+  const currentCanaryPercent = Number.isFinite(voiceRuntimeCanaryPercentOverride)
+    ? clampCanaryPercent(voiceRuntimeCanaryPercentOverride, 0)
+    : clampCanaryPercent(runtimeCfg.canaryPercent, 0);
+  const decision = evaluateVoiceAgentAutoCanaryDecision({
+    config: autoCfg,
+    mode: effectiveMode,
+    manualCanaryOverride: manualCanaryOverrideActive,
+    currentCanaryPercent,
+    configuredCanaryPercent: clampCanaryPercent(runtimeCfg.canaryPercent, 0),
+    summary,
+    circuitOpen: isVoiceAgentCircuitOpen(now),
+    cooldownUntilMs: voiceAgentAutoCanaryCooldownUntilMs,
+    nowMs: now,
+  });
+  voiceAgentAutoCanaryLastEvalAtMs = now;
+
+  if (decision.action !== "set_canary") {
+    if (decision.reason === "manual_override_active") {
+      // Keep auto-controller from overriding explicit admin canary selections.
+      voiceAgentAutoCanaryCooldownUntilMs = Math.max(
+        voiceAgentAutoCanaryCooldownUntilMs,
+        now + autoCfg.cooldownMs,
+      );
+    }
+    return { applied: false, ...decision };
+  }
+
+  const nextCanaryPercent = clampCanaryPercent(decision.nextCanaryPercent, 0);
+  const nextCooldownUntilMs = Number.isFinite(Number(decision.nextCooldownUntilMs))
+    ? Math.max(0, Math.floor(Number(decision.nextCooldownUntilMs)))
+    : 0;
+  const changedCanary =
+    !Number.isFinite(voiceRuntimeCanaryPercentOverride) ||
+    clampCanaryPercent(voiceRuntimeCanaryPercentOverride, 0) !== nextCanaryPercent ||
+    voiceRuntimeCanaryPercentOverrideSource !== "auto_canary";
+  const changedCooldown =
+    nextCooldownUntilMs > 0 && nextCooldownUntilMs !== voiceAgentAutoCanaryCooldownUntilMs;
+  if (!changedCanary && !changedCooldown) {
+    return { applied: false, ...decision };
+  }
+
+  voiceRuntimeCanaryPercentOverride = nextCanaryPercent;
+  voiceRuntimeCanaryPercentOverrideSource = "auto_canary";
+  voiceRuntimeOverrideUpdatedAtMs = now;
+  if (nextCooldownUntilMs > 0) {
+    voiceAgentAutoCanaryCooldownUntilMs = nextCooldownUntilMs;
+  }
+
+  const payload = {
+    type: "voice_agent_auto_canary_update",
+    reason: decision.reason,
+    source: String(options.source || "interval"),
+    now: new Date(now).toISOString(),
+    current_canary_percent: currentCanaryPercent,
+    next_canary_percent: nextCanaryPercent,
+    configured_canary_percent: clampCanaryPercent(runtimeCfg.canaryPercent, 0),
+    cooldown_until:
+      voiceAgentAutoCanaryCooldownUntilMs > 0
+        ? new Date(voiceAgentAutoCanaryCooldownUntilMs).toISOString()
+        : null,
+    summary,
+  };
+  console.warn(JSON.stringify(payload));
+  db?.logServiceHealth?.("voice_agent_runtime", "auto_canary_update", payload).catch(
+    () => {},
+  );
+  await persistVoiceRuntimeControlSettings(
+    `auto_canary_${String(decision.reason || "update")}`,
+  );
+  return { applied: true, ...decision, summary };
+}
+
+function stableVoiceRuntimeBucket(callSid, seed = "voice_agent") {
+  const raw = `${String(seed || "voice_agent")}::${String(callSid || "unknown")}`;
+  const hash = crypto.createHash("sha1").update(raw).digest("hex").slice(0, 8);
+  const parsed = Number.parseInt(hash, 16);
+  if (!Number.isFinite(parsed)) return 0;
+  return parsed % 100;
+}
+
+function buildVoiceAgentFunctionDefinitions(functionSystem) {
+  const toolDefs = Array.isArray(functionSystem?.tools) ? functionSystem.tools : [];
+  return toolDefs
+    .map((tool) => (tool && typeof tool === "object" ? tool.function || tool : null))
+    .filter(Boolean)
+    .map((fn) => {
+      const name = String(fn.name || "").trim();
+      if (!name) return null;
+      return {
+        name,
+        description: String(fn.description || "").trim() || undefined,
+        parameters:
+          fn.parameters && typeof fn.parameters === "object"
+            ? fn.parameters
+            : { type: "object", properties: {}, required: [] },
+      };
+    })
+    .filter(Boolean);
+}
+
+function extractVoiceAgentFunctionRequests(payload) {
+  if (Array.isArray(payload?.functions) && payload.functions.length > 0) {
+    return payload.functions;
+  }
+  if (payload && typeof payload === "object") {
+    const name = String(payload.name || payload.function_name || "").trim();
+    if (!name) return [];
+    return [
+      {
+        id:
+          payload.id ||
+          payload.function_id ||
+          payload.call_id ||
+          `${name}:${Date.now()}`,
+        name,
+        arguments:
+          payload.arguments !== undefined
+            ? payload.arguments
+            : payload.input !== undefined
+              ? payload.input
+              : payload.params !== undefined
+                ? payload.params
+                : "{}",
+      },
+    ];
+  }
+  return [];
+}
+
+function selectTwilioVoiceRuntime(callSid, callConfig) {
+  const runtimeConfig = getEffectiveVoiceAgentRuntimeConfig();
+  const mode = normalizeVoiceRuntimeMode(runtimeConfig.mode);
+  const enabled = runtimeConfig.enabled === true;
+  if (!enabled || mode === "legacy") {
+    return {
+      mode: "legacy",
+      useVoiceAgent: false,
+      reason: enabled ? "mode_legacy" : "voice_agent_disabled",
+    };
+  }
+
+  if (isVoiceAgentCircuitOpen()) {
+    return {
+      mode: "legacy",
+      useVoiceAgent: false,
+      reason: "voice_agent_circuit_open",
+      forcedLegacyUntilMs: voiceAgentForcedLegacyUntilMs,
+    };
+  }
+
+  const provider = String(callConfig?.provider || "twilio")
+    .trim()
+    .toLowerCase();
+  if (provider !== "twilio") {
+    return {
+      mode: "legacy",
+      useVoiceAgent: false,
+      reason: "provider_not_supported",
+    };
+  }
+
+  const captureActive = isCaptureActiveConfig(callConfig);
+  if (captureActive || digitService?.hasPlan?.(callSid) || digitService?.hasExpectation?.(callSid)) {
+    return {
+      mode: "legacy",
+      useVoiceAgent: false,
+      reason: "digit_capture_active",
+    };
+  }
+
+  if (mode === "voice_agent") {
+    return {
+      mode: "voice_agent",
+      useVoiceAgent: true,
+      reason: "forced_voice_agent_mode",
+    };
+  }
+
+  const canaryPercent = clampCanaryPercent(runtimeConfig.canaryPercent, 0);
+  if (canaryPercent <= 0) {
+    return {
+      mode: "legacy",
+      useVoiceAgent: false,
+      reason: "canary_zero",
+    };
+  }
+
+  const bucket = stableVoiceRuntimeBucket(callSid, runtimeConfig.canarySeed);
+  const selected = bucket < canaryPercent;
+  return {
+    mode: selected ? "voice_agent" : "legacy",
+    useVoiceAgent: selected,
+    reason: selected ? "canary_selected" : "canary_skipped",
+    canaryBucket: bucket,
+    canaryPercent,
+  };
 }
 
 function sanitizePaymentFeatureConfig(raw = {}, previous = {}) {
@@ -698,59 +1245,9 @@ function parsePaymentPolicy(value) {
   }
 }
 
-const CALL_OBJECTIVE_IDS = Object.freeze([
-  "collect_payment",
-  "verify_identity",
-  "appointment_confirm",
-  "service_recovery",
-  "general_outreach",
-]);
-
-const CALL_SCRIPT_FLOW_TYPES = Object.freeze([
-  "payment_collection",
-  "identity_verification",
-  "appointment_confirmation",
-  "service_recovery",
-  "general_outreach",
-  "general",
-]);
-
-const CALL_SCRIPT_FLOW_TYPE_ALIASES = Object.freeze({
-  payment_collection: "payment_collection",
-  "payment-collection": "payment_collection",
-  payment_flow: "payment_collection",
-  payment: "payment_collection",
-  collect_payment: "payment_collection",
-  "collect-payment": "payment_collection",
-  identity_verification: "identity_verification",
-  "identity-verification": "identity_verification",
-  identity: "identity_verification",
-  verify_identity: "identity_verification",
-  "verify-identity": "identity_verification",
-  otp: "identity_verification",
-  digit_capture: "identity_verification",
-  "digit-capture": "identity_verification",
-  appointment_confirmation: "appointment_confirmation",
-  "appointment-confirmation": "appointment_confirmation",
-  appointment_confirm: "appointment_confirmation",
-  "appointment-confirm": "appointment_confirmation",
-  appointment: "appointment_confirmation",
-  service_recovery: "service_recovery",
-  "service-recovery": "service_recovery",
-  recovery: "service_recovery",
-  general_outreach: "general_outreach",
-  "general-outreach": "general_outreach",
-  outreach: "general_outreach",
-  general: "general",
-  default: "general",
-});
-
-function normalizeCallScriptFlowType(value) {
-  if (value === undefined || value === null) return null;
-  const raw = String(value).trim().toLowerCase();
-  if (!raw) return null;
-  return CALL_SCRIPT_FLOW_TYPE_ALIASES[raw] || null;
-}
+const RELATIONSHIP_PROFILE_SET = new Set(RELATIONSHIP_PROFILE_TYPES);
+const normalizeCallScriptFlowType = normalizeCallScriptFlowTypeShared;
+const normalizeObjectiveTag = normalizeObjectiveTagShared;
 
 function parseCallScriptFlowFilter(value) {
   if (value === undefined || value === null) {
@@ -789,7 +1286,7 @@ function parseObjectiveTags(value) {
   if (value === undefined || value === null) return [];
   if (Array.isArray(value)) {
     return value
-      .map((entry) => String(entry || "").trim().toLowerCase())
+      .map((entry) => normalizeObjectiveTag(entry))
       .filter(Boolean);
   }
   const raw = String(value || "").trim();
@@ -799,7 +1296,7 @@ function parseObjectiveTags(value) {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
         return parsed
-          .map((entry) => String(entry || "").trim().toLowerCase())
+          .map((entry) => normalizeObjectiveTag(entry))
           .filter(Boolean);
       }
     } catch (_) {
@@ -809,7 +1306,7 @@ function parseObjectiveTags(value) {
   }
   return raw
     .split(",")
-    .map((entry) => String(entry || "").trim().toLowerCase())
+    .map((entry) => normalizeObjectiveTag(entry))
     .filter(Boolean);
 }
 
@@ -920,6 +1417,9 @@ function normalizeCallScriptObjectiveMetadata(input = {}, options = {}) {
 function normalizeScriptTemplateRecord(template = null) {
   if (!template || typeof template !== "object") return template;
   const normalized = { ...template };
+  const normalizedDefaultProfile = String(normalized.default_profile || "")
+    .trim()
+    .toLowerCase();
   const parsedVersion = Number(normalized.version);
   normalized.version =
     Number.isFinite(parsedVersion) && parsedVersion > 0
@@ -956,10 +1456,12 @@ function normalizeScriptTemplateRecord(template = null) {
     ) {
       add("payment_collection");
     }
+    const nonDigitProfiles = new Set(RELATIONSHIP_FLOW_TYPES);
     if (
       normalized.supports_digit_capture === true ||
       normalizeBooleanFlag(normalized.requires_otp, false) === true ||
-      Boolean(String(normalized.default_profile || "").trim()) ||
+      (Boolean(normalizedDefaultProfile) &&
+        !nonDigitProfiles.has(normalizedDefaultProfile)) ||
       tags.has("verify_identity")
     ) {
       add("identity_verification");
@@ -973,6 +1475,14 @@ function normalizeScriptTemplateRecord(template = null) {
     if (tags.has("general_outreach")) {
       add("general_outreach");
     }
+    for (const profileType of RELATIONSHIP_PROFILE_TYPES) {
+      const objectiveTag = RELATIONSHIP_PROFILE_OBJECTIVE_MAP[profileType];
+      if (!objectiveTag || !tags.has(objectiveTag)) continue;
+      const flowType = RELATIONSHIP_PROFILE_FLOW_MAP[profileType] || profileType;
+      if (flowType) {
+        add(flowType);
+      }
+    }
     if (!flows.length) {
       add("general");
     }
@@ -981,6 +1491,552 @@ function normalizeScriptTemplateRecord(template = null) {
   normalized.flow_types = flowTypes;
   normalized.flow_type = flowTypes[0] || "general";
   return normalized;
+}
+
+function resolveConversationProfile(input = {}) {
+  return deriveConversationProfileDecision({
+    purpose: input.purpose,
+    scriptTemplate: input.scriptTemplate,
+    prompt: input.prompt,
+    firstMessage: input.firstMessage,
+    fallback: "general",
+  }).profile_type;
+}
+
+const PROFILE_CONFIDENCE_RANK = Object.freeze({
+  low: 1,
+  medium: 2,
+  high: 3,
+});
+
+function normalizeConversationProfileLockFlag(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (value === 1) return true;
+    if (value === 0) return false;
+  }
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (!normalized) return null;
+  if (["1", "true", "yes", "on", "lock", "locked", "force"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off", "unlock", "unlocked", "auto"].includes(normalized)) {
+    return false;
+  }
+  return null;
+}
+
+function normalizeProfileConfidence(value, fallback = "low") {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (normalized === "low" || normalized === "medium" || normalized === "high") {
+    return normalized;
+  }
+  return fallback;
+}
+
+function isProfileConfidenceAtLeast(actual, threshold) {
+  const actualRank = PROFILE_CONFIDENCE_RANK[normalizeProfileConfidence(actual, "low")] || 1;
+  const thresholdRank = PROFILE_CONFIDENCE_RANK[normalizeProfileConfidence(threshold, "low")] || 1;
+  return actualRank >= thresholdRank;
+}
+
+function normalizeRelationshipProfileCandidate(value) {
+  const normalized = normalizeRelationshipProfileType(value, "");
+  if (!normalized || !RELATIONSHIP_PROFILE_SET.has(normalized)) {
+    return "";
+  }
+  return normalized;
+}
+
+function resolveConversationProfileSelection(input = {}) {
+  const selection = deriveConversationProfileDecision({
+    purpose: input.purpose,
+    scriptTemplate: input.scriptTemplate,
+    prompt: input.prompt,
+    firstMessage: input.firstMessage,
+    fallback: "general",
+  });
+  let conversationProfile = String(selection?.profile_type || "").trim() || "general";
+  let conversationProfileSource =
+    String(selection?.source || "").trim() || "fallback_default";
+  let conversationProfileConfidence =
+    String(selection?.confidence || "").trim() || "low";
+  let conversationProfileSignals = Array.isArray(selection?.matched_signals)
+    ? selection.matched_signals
+        .map((entry) => String(entry || "").trim())
+        .filter(Boolean)
+        .slice(0, 6)
+    : [];
+  let conversationProfileAmbiguous = selection?.ambiguous === true;
+
+  const explicitProfile = normalizeRelationshipProfileCandidate(
+    input.conversationProfile ||
+      input.conversation_profile ||
+      input.callProfile ||
+      input.call_profile ||
+      input.purpose,
+  );
+  const lockFlag = normalizeConversationProfileLockFlag(
+    input.profileLock ??
+      input.profile_lock ??
+      input.conversationProfileLock ??
+      input.conversation_profile_lock,
+  );
+  const profileConfidenceGate = normalizeProfileConfidence(
+    input.profileConfidenceGate ||
+      input.profile_confidence_gate ||
+      process.env.CONVERSATION_PROFILE_CONFIDENCE_GATE ||
+      "medium",
+    "medium",
+  );
+
+  let conversationProfileLocked = false;
+  let conversationProfileLockReason = null;
+  let gateFallbackApplied = false;
+
+  if (lockFlag === false) {
+    conversationProfileLocked = false;
+    conversationProfileLockReason = "explicit_unlock";
+  } else {
+    let lockCandidate = "";
+    if (explicitProfile) {
+      lockCandidate = explicitProfile;
+      conversationProfileLockReason = "explicit_profile";
+    } else if (
+      RELATIONSHIP_PROFILE_SET.has(conversationProfile) &&
+      conversationProfileSource === "script_template"
+    ) {
+      lockCandidate = conversationProfile;
+      conversationProfileLockReason = "script_template";
+    } else if (lockFlag === true && RELATIONSHIP_PROFILE_SET.has(conversationProfile)) {
+      lockCandidate = conversationProfile;
+      conversationProfileLockReason = "explicit_lock_flag";
+    }
+
+    if (lockCandidate) {
+      conversationProfile = lockCandidate;
+      conversationProfileSource = `${conversationProfileSource}_locked`;
+      conversationProfileConfidence = "high";
+      conversationProfileAmbiguous = false;
+      conversationProfileLocked = true;
+    } else if (lockFlag === true) {
+      conversationProfileLockReason = "lock_requested_without_relationship_profile";
+    }
+  }
+
+  if (
+    !conversationProfileLocked &&
+    conversationProfileSource === "text_signals" &&
+    !isProfileConfidenceAtLeast(conversationProfileConfidence, profileConfidenceGate)
+  ) {
+    conversationProfile = "general";
+    conversationProfileSource = "fallback_confidence_gate";
+    conversationProfileConfidence = "low";
+    conversationProfileSignals = [];
+    conversationProfileAmbiguous = false;
+    gateFallbackApplied = true;
+  }
+
+  return {
+    conversation_profile: conversationProfile,
+    conversation_profile_source: conversationProfileSource,
+    conversation_profile_confidence: conversationProfileConfidence,
+    conversation_profile_signals: conversationProfileSignals,
+    conversation_profile_ambiguous: conversationProfileAmbiguous,
+    conversation_profile_locked: conversationProfileLocked,
+    conversation_profile_lock_reason: conversationProfileLockReason,
+    conversation_profile_confidence_gate: profileConfidenceGate,
+    conversation_profile_gate_fallback_applied: gateFallbackApplied,
+  };
+}
+
+function applyConversationProfilePrompt(profile, prompt, firstMessage) {
+  return buildConversationProfilePromptBundle(profile, {
+    basePrompt: String(prompt || "").trim(),
+    firstMessage: String(firstMessage || "").trim(),
+  });
+}
+
+function resolveProfilePackMetadata(profilePrompt = null) {
+  if (!profilePrompt || typeof profilePrompt !== "object") {
+    return {
+      profile_pack_version: null,
+      profile_pack_checksum: null,
+    };
+  }
+  return {
+    profile_pack_version: String(profilePrompt.profilePackVersion || "").trim() || null,
+    profile_pack_checksum: String(profilePrompt.profilePackChecksum || "").trim() || null,
+  };
+}
+
+function validateProfilePacksAtStartup() {
+  const strict =
+    String(process.env.PROFILE_PACK_VALIDATION_STRICT || "").trim().toLowerCase() ===
+      "true" || isProduction;
+  const failOnWarnings =
+    String(process.env.PROFILE_PACK_VALIDATION_FAIL_ON_WARNINGS || "")
+      .trim()
+      .toLowerCase() === "true";
+  const result = validateRelationshipProfilePacks({
+    strict,
+    failOnWarnings,
+    includeAuxiliary: true,
+  });
+  const summary = `checked=${result.checked_files}, required=${result.required_profiles}, warnings=${result.warnings.length}, errors=${result.errors.length}`;
+  if (!result.ok) {
+    const detail = result.errors.slice(0, 10).join(" | ");
+    throw new Error(`Profile pack validation failed (${summary})${detail ? `: ${detail}` : ""}`);
+  }
+  if (result.warnings.length) {
+    console.warn(`Profile pack validation warnings (${summary})`);
+    result.warnings.slice(0, 10).forEach((entry) => {
+      console.warn(`- ${entry}`);
+    });
+  } else {
+    console.log(`✅ Profile pack validation passed (${summary})`);
+  }
+}
+
+function getProfilePurpose(profile) {
+  const normalized = normalizeRelationshipProfileType(profile, "");
+  if (!normalized || !RELATIONSHIP_PROFILE_SET.has(normalized)) {
+    return null;
+  }
+  return normalized;
+}
+
+function normalizePolicyRiskLevel(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (["none", "low", "medium", "high"].includes(normalized)) {
+    return normalized;
+  }
+  return "none";
+}
+
+function recordCallPolicyDecisionTelemetry(
+  callSid,
+  seedConfig = null,
+  policyResult = {},
+  metadata = {},
+) {
+  if (!callSid) return;
+  const callConfig =
+    (callSid ? callConfigurations.get(callSid) : null) ||
+    (seedConfig && typeof seedConfig === "object" ? seedConfig : null);
+  if (!callConfig || typeof callConfig !== "object") return;
+
+  const blocked = Array.isArray(policyResult?.blocked)
+    ? Array.from(new Set(policyResult.blocked.map((entry) => String(entry || "").trim()).filter(Boolean)))
+    : [];
+  const replaced = policyResult?.replaced === true;
+  const riskLevel = normalizePolicyRiskLevel(policyResult?.risk_level);
+  const action = String(policyResult?.action || "allow").trim() || "allow";
+  const stage = String(metadata?.stage || "").trim() || null;
+  const nowIso = new Date().toISOString();
+
+  const summary =
+    callConfig.policy_gate_summary &&
+    typeof callConfig.policy_gate_summary === "object" &&
+    !Array.isArray(callConfig.policy_gate_summary)
+      ? { ...callConfig.policy_gate_summary }
+      : {
+          total: 0,
+          blocked: 0,
+          by_rule: {},
+          by_risk: { none: 0, low: 0, medium: 0, high: 0 },
+        };
+  summary.total = Number.isFinite(Number(summary.total))
+    ? Number(summary.total) + 1
+    : 1;
+  if (replaced || blocked.length > 0) {
+    summary.blocked = Number.isFinite(Number(summary.blocked))
+      ? Number(summary.blocked) + 1
+      : 1;
+  } else if (!Number.isFinite(Number(summary.blocked))) {
+    summary.blocked = 0;
+  }
+  const riskCounter =
+    summary.by_risk && typeof summary.by_risk === "object" ? { ...summary.by_risk } : {};
+  riskCounter.none = Number.isFinite(Number(riskCounter.none)) ? Number(riskCounter.none) : 0;
+  riskCounter.low = Number.isFinite(Number(riskCounter.low)) ? Number(riskCounter.low) : 0;
+  riskCounter.medium = Number.isFinite(Number(riskCounter.medium)) ? Number(riskCounter.medium) : 0;
+  riskCounter.high = Number.isFinite(Number(riskCounter.high)) ? Number(riskCounter.high) : 0;
+  riskCounter[riskLevel] += 1;
+  summary.by_risk = riskCounter;
+
+  const ruleCounter =
+    summary.by_rule && typeof summary.by_rule === "object" ? { ...summary.by_rule } : {};
+  blocked.forEach((rule) => {
+    ruleCounter[rule] = Number.isFinite(Number(ruleCounter[rule]))
+      ? Number(ruleCounter[rule]) + 1
+      : 1;
+  });
+  summary.by_rule = ruleCounter;
+  summary.last_stage = stage;
+  summary.last_action = action;
+  summary.last_risk_level = riskLevel;
+  summary.last_blocked = blocked;
+  summary.last_replaced = replaced;
+  summary.last_updated_at = nowIso;
+
+  callConfig.policy_gate_summary = summary;
+
+  const shouldAppendEvent = replaced || blocked.length > 0 || riskLevel !== "none";
+  let latestEvent = null;
+  if (shouldAppendEvent) {
+    const events = Array.isArray(callConfig.policy_gate_events)
+      ? [...callConfig.policy_gate_events]
+      : [];
+    latestEvent = {
+      at: nowIso,
+      stage,
+      action,
+      risk_level: riskLevel,
+      replaced,
+      blocked,
+      interaction_count: Number.isFinite(Number(metadata?.interactionCount))
+        ? Math.max(0, Math.floor(Number(metadata.interactionCount)))
+        : null,
+    };
+    events.push(latestEvent);
+    if (events.length > 25) {
+      events.splice(0, events.length - 25);
+    }
+    callConfig.policy_gate_events = events;
+  }
+
+  callConfigurations.set(callSid, callConfig);
+  if (shouldAppendEvent || stage === "final") {
+    queuePersistCallRuntimeState(callSid, {
+      snapshot: {
+        policy_gate_summary: callConfig.policy_gate_summary || null,
+        policy_gate_events: Array.isArray(callConfig.policy_gate_events)
+          ? callConfig.policy_gate_events.slice(-8)
+          : [],
+        policy_gate_last_event: latestEvent,
+      },
+    });
+  }
+}
+
+function buildCallResponsePolicyGate(callSid, seedConfig = null) {
+  return (rawText = "", metadata = {}) => {
+    const runtimeConfig =
+      (callSid ? callConfigurations.get(callSid) : null) || seedConfig || {};
+    const conversationProfile = resolveConversationProfile({
+      purpose:
+        runtimeConfig?.conversation_profile ||
+        runtimeConfig?.purpose ||
+        runtimeConfig?.business_context?.purpose,
+      scriptTemplate: runtimeConfig?.script_policy || null,
+      prompt: runtimeConfig?.prompt,
+      firstMessage: runtimeConfig?.first_message,
+    });
+    const result = applyConversationPolicyGates(
+      rawText,
+      conversationProfile || "general",
+    );
+    recordCallPolicyDecisionTelemetry(callSid, runtimeConfig, result, metadata);
+    return result;
+  };
+}
+
+function recordCallToolPolicyDecisionTelemetry(
+  callSid,
+  seedConfig = null,
+  decision = {},
+  metadata = {},
+) {
+  if (!callSid) return;
+  const callConfig =
+    (callSid ? callConfigurations.get(callSid) : null) || seedConfig || {};
+  if (!callConfig || typeof callConfig !== "object") return;
+
+  const nowIso = new Date().toISOString();
+  const toolName = String(
+    metadata?.toolName || metadata?.tool_name || "unknown_tool",
+  )
+    .trim()
+    .toLowerCase();
+  const profileType = String(
+    metadata?.profileType ||
+      decision?.profile_type ||
+      callConfig?.conversation_profile ||
+      "general",
+  )
+    .trim()
+    .toLowerCase();
+  const allowed = decision?.allowed !== false;
+  const action = String(decision?.action || (allowed ? "allow" : "deny"))
+    .trim()
+    .toLowerCase();
+  const reason = String(
+    decision?.reason || (allowed ? "allowed" : "tool_policy_denied"),
+  )
+    .trim()
+    .toLowerCase();
+
+  const summary =
+    callConfig.tool_policy_gate_summary &&
+    typeof callConfig.tool_policy_gate_summary === "object"
+      ? { ...callConfig.tool_policy_gate_summary }
+      : {
+          total: 0,
+          allowed: 0,
+          blocked: 0,
+          by_tool: {},
+          by_profile: {},
+        };
+  summary.total = Number.isFinite(Number(summary.total))
+    ? Number(summary.total) + 1
+    : 1;
+  if (allowed) {
+    summary.allowed = Number.isFinite(Number(summary.allowed))
+      ? Number(summary.allowed) + 1
+      : 1;
+  } else {
+    summary.blocked = Number.isFinite(Number(summary.blocked))
+      ? Number(summary.blocked) + 1
+      : 1;
+  }
+  const byTool =
+    summary.by_tool && typeof summary.by_tool === "object"
+      ? { ...summary.by_tool }
+      : {};
+  byTool[toolName] = Number.isFinite(Number(byTool[toolName]))
+    ? Number(byTool[toolName]) + 1
+    : 1;
+  summary.by_tool = byTool;
+  const byProfile =
+    summary.by_profile && typeof summary.by_profile === "object"
+      ? { ...summary.by_profile }
+      : {};
+  byProfile[profileType] = Number.isFinite(Number(byProfile[profileType]))
+    ? Number(byProfile[profileType]) + 1
+    : 1;
+  summary.by_profile = byProfile;
+  summary.last_action = action;
+  summary.last_reason = reason;
+  summary.last_tool = toolName;
+  summary.last_profile = profileType;
+  summary.last_updated_at = nowIso;
+  callConfig.tool_policy_gate_summary = summary;
+
+  const shouldAppendEvent = !allowed || action !== "allow";
+  let latestEvent = null;
+  if (shouldAppendEvent) {
+    const events = Array.isArray(callConfig.tool_policy_gate_events)
+      ? [...callConfig.tool_policy_gate_events]
+      : [];
+    latestEvent = {
+      at: nowIso,
+      tool: toolName,
+      profile: profileType,
+      action,
+      reason,
+      allowed,
+      blocked: Array.isArray(decision?.blocked) ? decision.blocked : [],
+      interaction_count: Number.isFinite(Number(metadata?.interactionCount))
+        ? Math.max(0, Math.floor(Number(metadata.interactionCount)))
+        : null,
+    };
+    events.push(latestEvent);
+    if (events.length > 25) {
+      events.splice(0, events.length - 25);
+    }
+    callConfig.tool_policy_gate_events = events;
+  }
+
+  callConfigurations.set(callSid, callConfig);
+  if (shouldAppendEvent) {
+    queuePersistCallRuntimeState(callSid, {
+      snapshot: {
+        tool_policy_gate_summary: callConfig.tool_policy_gate_summary || null,
+        tool_policy_gate_events: Array.isArray(callConfig.tool_policy_gate_events)
+          ? callConfig.tool_policy_gate_events.slice(-8)
+          : [],
+        tool_policy_gate_last_event: latestEvent,
+      },
+    });
+    webhookService.addLiveEvent(
+      callSid,
+      `🛡️ Tool policy blocked ${toolName} (${reason})`,
+      { force: false },
+    );
+  }
+}
+
+function buildCallToolPolicyGate(callSid, seedConfig = null) {
+  return (request = {}) => {
+    const runtimeConfig =
+      (callSid ? callConfigurations.get(callSid) : null) || seedConfig || {};
+    const toolName = String(request?.toolName || request?.tool_name || "")
+      .trim()
+      .toLowerCase();
+    const conversationProfile = resolveConversationProfile({
+      purpose:
+        runtimeConfig?.conversation_profile ||
+        runtimeConfig?.purpose ||
+        runtimeConfig?.business_context?.purpose,
+      scriptTemplate: runtimeConfig?.script_policy || null,
+      prompt: runtimeConfig?.prompt,
+      firstMessage: runtimeConfig?.first_message,
+    });
+    const profilePolicyResult = evaluateConversationProfileToolPolicy(
+      conversationProfile || "general",
+      request,
+      {
+        callSid,
+        callConfig: runtimeConfig,
+      },
+    );
+    if (profilePolicyResult?.allowed === false) {
+      recordCallToolPolicyDecisionTelemetry(callSid, runtimeConfig, profilePolicyResult, {
+        toolName,
+        profileType: conversationProfile || "general",
+        interactionCount: request?.interactionCount,
+      });
+      return profilePolicyResult;
+    }
+
+    const approvalPolicyResult = evaluateConnectorApprovalPolicy(request, {
+      callSid,
+      callConfig: runtimeConfig,
+      profileType: conversationProfile || "general",
+    });
+    const result =
+      approvalPolicyResult?.allowed === false
+        ? approvalPolicyResult
+        : {
+            ...(profilePolicyResult || {}),
+            ...(approvalPolicyResult || {}),
+            allowed: true,
+            action: "allow",
+            reason:
+              String(approvalPolicyResult?.reason || "").trim() ||
+              String(profilePolicyResult?.reason || "").trim() ||
+              "allowed",
+            blocked: [],
+            metadata: {
+              ...((profilePolicyResult && profilePolicyResult.metadata) || {}),
+              ...((approvalPolicyResult && approvalPolicyResult.metadata) || {}),
+            },
+          };
+    recordCallToolPolicyDecisionTelemetry(callSid, runtimeConfig, result, {
+      toolName,
+      profileType: conversationProfile || "general",
+      interactionCount: request?.interactionCount,
+    });
+    return result;
+  };
 }
 
 const SCRIPT_BOUND_PAYMENT_OPTION_FIELDS = Object.freeze([
@@ -1233,6 +2289,18 @@ function buildProviderEventFingerprint(source, dedupePayload = {}) {
   };
 }
 
+function collectRelationshipContextSnapshot(callConfig = {}) {
+  const payload = {};
+  for (const profileType of RELATIONSHIP_PROFILE_TYPES) {
+    const key = `${profileType}_context`;
+    const value = callConfig?.[key];
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      payload[key] = value;
+    }
+  }
+  return payload;
+}
+
 function buildRuntimeSnapshotPayload(callSid, patch = {}) {
   if (!callSid) return null;
   const callConfig = callConfigurations.get(callSid) || {};
@@ -1266,10 +2334,59 @@ function buildRuntimeSnapshotPayload(callSid, patch = {}) {
     patch.snapshot && typeof patch.snapshot === "object"
       ? patch.snapshot
       : {};
+  const relationshipContexts = collectRelationshipContextSnapshot(callConfig);
   payload.snapshot = {
     flow_state_reason: callConfig.flow_state_reason || null,
     digit_intent_mode: callConfig?.digit_intent?.mode || null,
     tool_in_progress: callConfig?.tool_in_progress || null,
+    conversation_profile: callConfig?.conversation_profile || null,
+    conversation_profile_source:
+      callConfig?.conversation_profile_source || null,
+    conversation_profile_confidence:
+      callConfig?.conversation_profile_confidence || null,
+    conversation_profile_signals: Array.isArray(
+      callConfig?.conversation_profile_signals,
+    )
+      ? callConfig.conversation_profile_signals.slice(0, 6)
+      : [],
+    conversation_profile_ambiguous:
+      callConfig?.conversation_profile_ambiguous === true,
+    conversation_profile_locked:
+      callConfig?.conversation_profile_locked === true,
+    conversation_profile_lock_reason:
+      callConfig?.conversation_profile_lock_reason || null,
+    conversation_profile_confidence_gate:
+      callConfig?.conversation_profile_confidence_gate || null,
+    conversation_profile_gate_fallback_applied:
+      callConfig?.conversation_profile_gate_fallback_applied === true,
+    purpose: callConfig?.purpose || null,
+    relationship_profile:
+      callConfig?.relationship_profile &&
+      typeof callConfig.relationship_profile === "object"
+        ? callConfig.relationship_profile
+        : null,
+    profile_pack_version: callConfig?.profile_pack_version || null,
+    profile_pack_checksum: callConfig?.profile_pack_checksum || null,
+    policy_gate_summary:
+      callConfig?.policy_gate_summary &&
+      typeof callConfig.policy_gate_summary === "object" &&
+      !Array.isArray(callConfig.policy_gate_summary)
+        ? callConfig.policy_gate_summary
+        : null,
+    policy_gate_events: Array.isArray(callConfig?.policy_gate_events)
+      ? callConfig.policy_gate_events.slice(-8)
+      : [],
+    relationship_contexts:
+      Object.keys(relationshipContexts).length > 0 ? relationshipContexts : null,
+    dating_context:
+      callConfig?.dating_context && typeof callConfig.dating_context === "object"
+        ? callConfig.dating_context
+        : null,
+    celebrity_context:
+      callConfig?.celebrity_context &&
+      typeof callConfig.celebrity_context === "object"
+        ? callConfig.celebrity_context
+        : null,
     updated_at: new Date().toISOString(),
     ...baseSnapshot,
   };
@@ -1322,6 +2439,7 @@ async function restoreCallRuntimeState(callSid, callConfig = null) {
   try {
     const row = await db.getCallRuntimeState(callSid);
     if (!row) return { restored: false, interactionCount: 0 };
+    const snapshot = safeJsonParse(row.snapshot, {}) || {};
     const updatedAt = row.updated_at ? Date.parse(row.updated_at) : NaN;
     if (
       Number.isFinite(updatedAt) &&
@@ -1348,9 +2466,91 @@ async function restoreCallRuntimeState(callSid, callConfig = null) {
         },
         { callConfig: targetConfig, skipToolRefresh: true, skipPersist: true },
       );
+      if (snapshot?.conversation_profile) {
+        targetConfig.conversation_profile = String(
+          snapshot.conversation_profile || "",
+        ).trim();
+      }
+      if (snapshot?.conversation_profile_source) {
+        targetConfig.conversation_profile_source = String(
+          snapshot.conversation_profile_source || "",
+        ).trim();
+      }
+      if (snapshot?.conversation_profile_confidence) {
+        targetConfig.conversation_profile_confidence = String(
+          snapshot.conversation_profile_confidence || "",
+        ).trim();
+      }
+      if (Array.isArray(snapshot?.conversation_profile_signals)) {
+        targetConfig.conversation_profile_signals =
+          snapshot.conversation_profile_signals
+            .map((entry) => String(entry || "").trim())
+            .filter(Boolean)
+            .slice(0, 6);
+      }
+      if (snapshot?.conversation_profile_ambiguous !== undefined) {
+        targetConfig.conversation_profile_ambiguous =
+          snapshot.conversation_profile_ambiguous === true;
+      }
+      if (snapshot?.conversation_profile_locked !== undefined) {
+        targetConfig.conversation_profile_locked =
+          snapshot.conversation_profile_locked === true;
+      }
+      if (snapshot?.conversation_profile_lock_reason) {
+        targetConfig.conversation_profile_lock_reason = String(
+          snapshot.conversation_profile_lock_reason || "",
+        ).trim();
+      }
+      if (snapshot?.conversation_profile_confidence_gate) {
+        targetConfig.conversation_profile_confidence_gate = String(
+          snapshot.conversation_profile_confidence_gate || "",
+        ).trim();
+      }
+      if (snapshot?.conversation_profile_gate_fallback_applied !== undefined) {
+        targetConfig.conversation_profile_gate_fallback_applied =
+          snapshot.conversation_profile_gate_fallback_applied === true;
+      }
+      if (!targetConfig.purpose && snapshot?.purpose) {
+        targetConfig.purpose = String(snapshot.purpose || "").trim() || null;
+      }
+      if (
+        snapshot?.relationship_profile &&
+        typeof snapshot.relationship_profile === "object" &&
+        !Array.isArray(snapshot.relationship_profile)
+      ) {
+        targetConfig.relationship_profile = { ...snapshot.relationship_profile };
+      }
+      if (
+        snapshot?.relationship_contexts &&
+        typeof snapshot.relationship_contexts === "object" &&
+        !Array.isArray(snapshot.relationship_contexts)
+      ) {
+        Object.entries(snapshot.relationship_contexts).forEach(([key, value]) => {
+          const normalizedKey = String(key || "").trim().toLowerCase();
+          if (!normalizedKey.endsWith("_context")) return;
+          const profileType = normalizedKey.slice(0, -"_context".length);
+          if (!RELATIONSHIP_PROFILE_SET.has(profileType)) return;
+          if (!value || typeof value !== "object" || Array.isArray(value)) return;
+          targetConfig[normalizedKey] = { ...value };
+        });
+      }
+      if (
+        snapshot?.dating_context &&
+        typeof snapshot.dating_context === "object" &&
+        !Array.isArray(snapshot.dating_context)
+      ) {
+        targetConfig.dating_context = { ...snapshot.dating_context };
+      }
+      if (
+        snapshot?.celebrity_context &&
+        typeof snapshot.celebrity_context === "object" &&
+        !Array.isArray(snapshot.celebrity_context)
+      ) {
+        targetConfig.celebrity_context = { ...snapshot.celebrity_context };
+      }
+      callConfigurations.set(callSid, targetConfig);
     }
     const restoredInteraction = Number(row.interaction_count);
-    const snapshot = safeJsonParse(row.snapshot, {}) || {};
     return {
       restored: true,
       interactionCount: Number.isFinite(restoredInteraction)
@@ -1535,7 +2735,10 @@ async function shouldProcessProviderEventAsync(
     return reserved?.reserved !== false;
   } catch (error) {
     console.error("Provider event idempotency persistence failed:", error);
-    return true;
+    const dedupeError = new Error("provider_event_idempotency_unavailable");
+    dedupeError.code = "provider_event_idempotency_unavailable";
+    dedupeError.cause = error;
+    throw dedupeError;
   }
 }
 
@@ -1684,15 +2887,44 @@ function buildInboundCallConfig(callSid, payload = {}, options = {}) {
     ) || {};
   const routeLabel = route.label || route.name || route.route_label || null;
   const { prompt, firstMessage } = buildInboundDefaults(route);
-  const functionSystem = functionEngine.generateAdaptiveFunctionSystem(
-    prompt,
-    firstMessage,
-  );
   const createdAt = new Date().toISOString();
   const hasRoutePrompt = Boolean(
     route.prompt || route.first_message || route.firstMessage,
   );
   const fallbackScript = !hasRoutePrompt ? inboundDefaultScript : null;
+  const profileSelection = resolveConversationProfileSelection({
+    purpose: route.call_profile || route.conversation_profile || route.purpose,
+    callProfile: route.call_profile || route.conversation_profile,
+    conversation_profile: route.conversation_profile,
+    conversation_profile_lock:
+      route.conversation_profile_lock ?? route.profile_lock,
+    profile_confidence_gate: route.profile_confidence_gate,
+    scriptTemplate:
+      (route &&
+      typeof route === "object" &&
+      !Array.isArray(route) &&
+      Object.keys(route).length
+        ? route
+        : null) ||
+      fallbackScript,
+    prompt,
+    firstMessage,
+  });
+  const conversationProfile = profileSelection.conversation_profile;
+  const profilePrompt = applyConversationProfilePrompt(
+    conversationProfile,
+    prompt,
+    firstMessage,
+  );
+  const effectivePrompt = profilePrompt.prompt || prompt;
+  const effectiveFirstMessage = profilePrompt.firstMessage || firstMessage;
+  const functionSystem = functionEngine.generateAdaptiveFunctionSystem(
+    effectivePrompt,
+    effectiveFirstMessage,
+  );
+  const resolvedPurpose =
+    String(route.purpose || "").trim() ||
+    getProfilePurpose(conversationProfile);
   const routePaymentPolicy = parsePaymentPolicy(route.payment_policy);
   const effectivePaymentPolicy =
     routePaymentPolicy || fallbackScript?.payment_policy || null;
@@ -1703,8 +2935,8 @@ function buildInboundCallConfig(callSid, payload = {}, options = {}) {
     enforceFeatureGate: true,
   }).normalized;
   const callConfig = {
-    prompt,
-    first_message: firstMessage,
+    prompt: effectivePrompt,
+    first_message: effectiveFirstMessage,
     created_at: createdAt,
     user_chat_id: config.telegram?.adminChatId || route.user_chat_id || null,
     customer_name: route.customer_name || null,
@@ -1712,7 +2944,32 @@ function buildInboundCallConfig(callSid, payload = {}, options = {}) {
     provider_metadata: null,
     business_context: route.business_context || functionSystem.context,
     function_count: functionSystem.functions.length,
-    purpose: route.purpose || null,
+    call_profile: route.call_profile || route.conversation_profile || null,
+    conversation_profile_lock: normalizeConversationProfileLockFlag(
+      route.conversation_profile_lock ?? route.profile_lock,
+    ),
+    profile_confidence_gate: normalizeProfileConfidence(
+      route.profile_confidence_gate,
+      "medium",
+    ),
+    purpose: resolvedPurpose,
+    conversation_profile: conversationProfile,
+    conversation_profile_source: profileSelection.conversation_profile_source,
+    conversation_profile_confidence:
+      profileSelection.conversation_profile_confidence,
+    conversation_profile_signals: profileSelection.conversation_profile_signals,
+    conversation_profile_ambiguous:
+      profileSelection.conversation_profile_ambiguous,
+    conversation_profile_locked:
+      profileSelection.conversation_profile_locked,
+    conversation_profile_lock_reason:
+      profileSelection.conversation_profile_lock_reason,
+    conversation_profile_confidence_gate:
+      profileSelection.conversation_profile_confidence_gate,
+    conversation_profile_gate_fallback_applied:
+      profileSelection.conversation_profile_gate_fallback_applied,
+    dating_profile_applied: profilePrompt.applied === true,
+    ...resolveProfilePackMetadata(profilePrompt),
     business_id: route.business_id || null,
     route_label: routeLabel,
     script: route.script || fallbackScript?.name || null,
@@ -1899,7 +3156,33 @@ async function ensureCallRecord(
       script: callConfig.script || null,
       script_id: callConfig.script_id || null,
       script_version: callConfig.script_version || null,
+      call_profile: callConfig.call_profile || null,
+      conversation_profile_lock:
+        callConfig.conversation_profile_lock ?? null,
+      profile_confidence_gate:
+        callConfig.profile_confidence_gate || null,
       purpose: callConfig.purpose || null,
+      conversation_profile: callConfig.conversation_profile || null,
+      conversation_profile_source:
+        callConfig.conversation_profile_source || null,
+      conversation_profile_confidence:
+        callConfig.conversation_profile_confidence || null,
+      conversation_profile_signals: Array.isArray(
+        callConfig.conversation_profile_signals,
+      )
+        ? callConfig.conversation_profile_signals
+        : [],
+      conversation_profile_ambiguous:
+        callConfig.conversation_profile_ambiguous === true,
+      conversation_profile_locked:
+        callConfig.conversation_profile_locked === true,
+      conversation_profile_lock_reason:
+        callConfig.conversation_profile_lock_reason || null,
+      conversation_profile_confidence_gate:
+        callConfig.conversation_profile_confidence_gate || null,
+      conversation_profile_gate_fallback_applied:
+        callConfig.conversation_profile_gate_fallback_applied === true,
+      dating_profile_applied: callConfig.dating_profile_applied === true,
       voice_model: callConfig.voice_model || null,
       flow_state: callConfig.flow_state || "normal",
       flow_state_reason: callConfig.flow_state_reason || "call_created",
@@ -1947,8 +3230,32 @@ async function hydrateCallConfigFromDb(callSid) {
       parsedContext = null;
     }
   }
-  const prompt = call.prompt || DEFAULT_INBOUND_PROMPT;
-  const firstMessage = call.first_message || DEFAULT_INBOUND_FIRST_MESSAGE;
+  let prompt = call.prompt || DEFAULT_INBOUND_PROMPT;
+  let firstMessage = call.first_message || DEFAULT_INBOUND_FIRST_MESSAGE;
+  const profileSelection = resolveConversationProfileSelection({
+    purpose:
+      state?.call_profile || state?.conversation_profile || state?.purpose,
+    callProfile:
+      state?.call_profile || state?.conversation_profile || null,
+    conversation_profile: state?.conversation_profile || null,
+    conversation_profile_lock:
+      state?.conversation_profile_lock ?? state?.profile_lock,
+    profile_confidence_gate: state?.profile_confidence_gate || null,
+    scriptTemplate: state,
+    prompt,
+    firstMessage,
+  });
+  const conversationProfile = profileSelection.conversation_profile;
+  const profilePrompt = applyConversationProfilePrompt(
+    conversationProfile,
+    prompt,
+    firstMessage,
+  );
+  prompt = profilePrompt.prompt || prompt;
+  firstMessage = profilePrompt.firstMessage || firstMessage;
+  const resolvedPurpose =
+    String(state?.purpose || "").trim() ||
+    getProfilePurpose(conversationProfile);
   const functionSystem = functionEngine.generateAdaptiveFunctionSystem(
     prompt,
     firstMessage,
@@ -1965,7 +3272,52 @@ async function hydrateCallConfigFromDb(callSid) {
     business_context:
       state?.business_context || parsedContext || functionSystem.context,
     function_count: functionSystem.functions.length,
-    purpose: state?.purpose || null,
+    call_profile:
+      state?.call_profile || state?.conversation_profile || null,
+    conversation_profile_lock: normalizeConversationProfileLockFlag(
+      state?.conversation_profile_lock ?? state?.profile_lock,
+    ),
+    profile_confidence_gate: normalizeProfileConfidence(
+      state?.profile_confidence_gate,
+      "medium",
+    ),
+    purpose: resolvedPurpose,
+    conversation_profile: conversationProfile,
+    conversation_profile_source:
+      String(state?.conversation_profile_source || "").trim() ||
+      profileSelection.conversation_profile_source,
+    conversation_profile_confidence:
+      String(state?.conversation_profile_confidence || "").trim() ||
+      profileSelection.conversation_profile_confidence,
+    conversation_profile_signals: Array.isArray(state?.conversation_profile_signals)
+      ? state.conversation_profile_signals
+      : profileSelection.conversation_profile_signals,
+    conversation_profile_ambiguous:
+      state?.conversation_profile_ambiguous !== undefined
+        ? state.conversation_profile_ambiguous === true
+        : profileSelection.conversation_profile_ambiguous,
+    conversation_profile_locked:
+      state?.conversation_profile_locked !== undefined
+        ? state.conversation_profile_locked === true
+        : profileSelection.conversation_profile_locked,
+    conversation_profile_lock_reason:
+      String(state?.conversation_profile_lock_reason || "").trim() ||
+      profileSelection.conversation_profile_lock_reason,
+    conversation_profile_confidence_gate:
+      String(state?.conversation_profile_confidence_gate || "").trim() ||
+      profileSelection.conversation_profile_confidence_gate,
+    conversation_profile_gate_fallback_applied:
+      state?.conversation_profile_gate_fallback_applied !== undefined
+        ? state.conversation_profile_gate_fallback_applied === true
+        : profileSelection.conversation_profile_gate_fallback_applied,
+    dating_profile_applied:
+      state?.dating_profile_applied === true || profilePrompt.applied === true,
+    profile_pack_version:
+      String(state?.profile_pack_version || "").trim() ||
+      resolveProfilePackMetadata(profilePrompt).profile_pack_version,
+    profile_pack_checksum:
+      String(state?.profile_pack_checksum || "").trim() ||
+      resolveProfilePackMetadata(profilePrompt).profile_pack_checksum,
     business_id: state?.business_id || null,
     script: state?.script || null,
     script_id: state?.script_id || null,
@@ -2346,6 +3698,110 @@ async function getTwilioTtsAudioUrlSafe(
   } catch (error) {
     console.error("Twilio TTS timeout fallback:", error);
     return null;
+  }
+}
+
+async function runDeepgramVoiceAgentStartupPreflight() {
+  const voiceAgentConfig = config.deepgram?.voiceAgent || {};
+  const mode = String(voiceAgentConfig.mode || "legacy")
+    .trim()
+    .toLowerCase();
+  const enabled = voiceAgentConfig.enabled === true;
+  const shouldRun = shouldRunDeepgramVoiceAgentPreflight({ enabled, mode });
+
+  if (!shouldRun) {
+    const skippedPayload = {
+      mode,
+      enabled,
+      skipped: true,
+      reason: "voice_agent_runtime_not_active",
+    };
+    console.log(
+      JSON.stringify({
+        type: "voice_agent_startup_preflight",
+        status: "skipped",
+        ...skippedPayload,
+      }),
+    );
+    return {
+      ok: true,
+      ...skippedPayload,
+    };
+  }
+
+  const strictMode = mode === "voice_agent";
+  const timeoutMs = Math.max(2000, Number(voiceAgentConfig.settingsTimeoutMs) || 8000);
+  try {
+    const result = await executeDeepgramVoiceAgentThinkPreflight({
+      fetchImpl: fetch,
+      apiKey: config.deepgram?.apiKey,
+      enabled,
+      mode,
+      thinkProvider: voiceAgentConfig.thinkProvider,
+      thinkModel: voiceAgentConfig.thinkModel,
+      timeoutMs,
+    });
+    const payload = {
+      mode,
+      enabled,
+      strict_mode: strictMode,
+      provider: result.provider || null,
+      model: result.model || null,
+      provider_model_count: result.providerModelCount || 0,
+      catalog_size: result.catalogSize || 0,
+      provider_models_sample: result.providerModelsSample || [],
+    };
+    console.log(
+      JSON.stringify({
+        type: "voice_agent_startup_preflight",
+        status: "ok",
+        ...payload,
+      }),
+    );
+    db?.logServiceHealth?.("voice_agent_runtime", "startup_preflight_ok", payload).catch(
+      () => {},
+    );
+    return {
+      ok: true,
+      ...payload,
+    };
+  } catch (error) {
+    const payload = {
+      mode,
+      enabled,
+      strict_mode: strictMode,
+      error_code: error?.code || "voice_agent_preflight_failed",
+      error: error?.message || "voice_agent_preflight_failed",
+      provider: error?.provider || String(voiceAgentConfig.thinkProvider || "open_ai"),
+      model: error?.model || String(voiceAgentConfig.thinkModel || "gpt-4o-mini"),
+      provider_model_count: Number(error?.providerModelCount) || 0,
+      provider_models_sample: Array.isArray(error?.providerModelsSample)
+        ? error.providerModelsSample
+        : [],
+      http_status: Number(error?.httpStatus) || null,
+      timeout_ms: Number(error?.timeoutMs) || null,
+    };
+    console.error(
+      "Voice Agent startup preflight failed:",
+      JSON.stringify({
+        type: "voice_agent_startup_preflight",
+        status: "failed",
+        ...payload,
+      }),
+    );
+    db?.logServiceHealth?.("voice_agent_runtime", "startup_preflight_failed", payload).catch(
+      () => {},
+    );
+    if (strictMode) {
+      throw error;
+    }
+    console.warn(
+      "Voice Agent preflight failed in hybrid mode; continuing with legacy fallback availability.",
+    );
+    return {
+      ok: false,
+      ...payload,
+    };
   }
 }
 
@@ -3196,37 +4652,6 @@ function estimateAudioLevelFromBase64(base64 = "") {
     return null;
   }
   if (!buffer.length) return null;
-  const step = Math.max(1, Math.floor(buffer.length / 800));
-  let sum = 0;
-  let count = 0;
-  for (let i = 0; i < buffer.length; i += step) {
-    sum += Math.abs(buffer[i] - 128);
-    count += 1;
-  }
-  if (!count) return null;
-  const level = sum / (count * 128);
-  return Math.max(0, Math.min(1, level));
-}
-
-function estimateAudioLevelFromBuffer(buffer, options = {}) {
-  if (!Buffer.isBuffer(buffer) || !buffer.length) return null;
-  const encoding = String(options.encoding || "").toLowerCase();
-  if (["pcm", "linear", "linear16", "l16"].includes(encoding)) {
-    const minStep = 2;
-    let step = Math.max(minStep, Math.floor(buffer.length / 800));
-    if (step % 2 !== 0) {
-      step += 1;
-    }
-    let sum = 0;
-    let count = 0;
-    for (let i = 0; i + 1 < buffer.length; i += step) {
-      sum += Math.abs(buffer.readInt16LE(i));
-      count += 1;
-    }
-    if (!count) return null;
-    const level = sum / (count * 32768);
-    return Math.max(0, Math.min(1, level));
-  }
   const step = Math.max(1, Math.floor(buffer.length / 800));
   let sum = 0;
   let count = 0;
@@ -4478,6 +5903,7 @@ app.use(
     crossOriginEmbedderPolicy: false,
   }),
 );
+app.disable("x-powered-by");
 app.use(
   cors({
     origin: (origin, callback) => {
@@ -4554,28 +5980,6 @@ function sanitizeTelemetryValue(value) {
   }
   if (typeof value === "boolean") return value;
   return null;
-}
-
-function sanitizeTelemetryData(data = {}) {
-  const filtered = {};
-  const blockedKeys = [
-    "phone",
-    "otp",
-    "token",
-    "secret",
-    "init",
-    "authorization",
-    "sid",
-  ];
-  Object.entries(data || {}).forEach(([key, value]) => {
-    const lower = key.toLowerCase();
-    if (blockedKeys.some((blocked) => lower.includes(blocked))) return;
-    const sanitized = sanitizeTelemetryValue(value);
-    if (sanitized !== null) {
-      filtered[key] = sanitized;
-    }
-  });
-  return filtered;
 }
 
 app.use((req, res, next) => {
@@ -5482,6 +6886,13 @@ function applyTelephonyTools(
   baseImpl = {},
   options = {},
 ) {
+  const callConfig =
+    options?.callConfig && typeof options.callConfig === "object"
+      ? options.callConfig
+      : {};
+  const connectorPacksEnabled =
+    callConfig?.connector_runtime_enabled !== false &&
+    callConfig?.script_policy?.connector_runtime_enabled !== false;
   const allowTransfer = options.allowTransfer !== false;
   const allowDigitCollection = options.allowDigitCollection !== false;
   const allowPayment = options.allowPayment === true;
@@ -5521,10 +6932,43 @@ function applyTelephonyTools(
     return true;
   });
 
-  const combinedTools = [...filteredBaseTools, ...filteredTelephonyTools];
+  const filteredConnectorTools = connectorPacksEnabled
+    ? connectorPackTools.filter((tool) => {
+        const name = normalizedName(tool);
+        if (!name) return false;
+        if (!allowPayment && (name === "payment_link_generate" || name === "invoice_create" || name === "payment_intent_status" || name === "refund_request_initiate")) {
+          return false;
+        }
+        return true;
+      })
+    : [];
+
+  const combinedTools = [
+    ...filteredBaseTools,
+    ...filteredTelephonyTools,
+    ...filteredConnectorTools,
+  ];
+  const connectorImplementations = connectorPacksEnabled
+    ? buildConnectorPackImplementations({
+        callSid,
+        getCallConfig: () => callConfigurations.get(callSid) || callConfig || {},
+        setCallConfig: (nextConfig) => {
+          if (nextConfig && typeof nextConfig === "object") {
+            callConfigurations.set(callSid, nextConfig);
+          }
+        },
+        db,
+        webhookService,
+        getPaymentFeatureConfig,
+        isPaymentFeatureEnabledForProvider,
+        getCurrentProvider: () => currentProvider,
+        fetchFn: fetch,
+      })
+    : {};
   const combinedImpl = {
     ...baseImpl,
     ...buildTelephonyImplementations(callSid, gptService),
+    ...connectorImplementations,
   };
   if (!allowTransfer) {
     delete combinedImpl.route_to_agent;
@@ -5537,8 +6981,34 @@ function applyTelephonyTools(
   }
   if (!allowPayment) {
     delete combinedImpl.start_payment;
+    delete combinedImpl.payment_link_generate;
+    delete combinedImpl.invoice_create;
+    delete combinedImpl.payment_intent_status;
+    delete combinedImpl.refund_request_initiate;
   }
-  gptService.setDynamicFunctions(combinedTools, combinedImpl);
+
+  const connectorReadyTools = attachConnectorMetadataToTools(combinedTools);
+  const routed = routeToolsByIntent(connectorReadyTools, callConfig, {
+    conversationProfile: options?.conversationProfile || null,
+  });
+  const toolsForRuntime =
+    Array.isArray(routed?.tools) && routed.tools.length > 0
+      ? routed.tools
+      : connectorReadyTools;
+  gptService.setDynamicFunctions(toolsForRuntime, combinedImpl);
+
+  if (callConfig && typeof callConfig === "object") {
+    callConfig.connector_router = {
+      ...(routed?.decision || {}),
+      tool_count: toolsForRuntime.length,
+      selected_tools: toolsForRuntime
+        .map((tool) => String(tool?.function?.name || "").trim())
+        .filter(Boolean)
+        .slice(0, 40),
+      updated_at: new Date().toISOString(),
+    };
+    callConfigurations.set(callSid, callConfig);
+  }
 }
 
 function getCallToolOptions(callSid, callConfig = {}) {
@@ -5590,8 +7060,108 @@ function configureCallTools(gptService, callSid, callConfig, functionSystem) {
   if (!gptService) return;
   const baseTools = functionSystem?.functions || [];
   const baseImpl = functionSystem?.implementations || {};
+  const profileSelection = resolveConversationProfileSelection({
+    purpose:
+      callConfig?.conversation_profile ||
+      callConfig?.purpose ||
+      callConfig?.business_context?.purpose,
+    callProfile:
+      callConfig?.call_profile || callConfig?.conversation_profile || null,
+    conversation_profile: callConfig?.conversation_profile || null,
+    conversation_profile_lock:
+      callConfig?.conversation_profile_lock ??
+      callConfig?.profile_lock ??
+      callConfig?.conversation_profile_locked,
+    profile_confidence_gate:
+      callConfig?.profile_confidence_gate ||
+      callConfig?.conversation_profile_confidence_gate,
+    scriptTemplate: callConfig?.script_policy || null,
+    prompt: callConfig?.prompt,
+    firstMessage: callConfig?.first_message,
+  });
+  const conversationProfile = profileSelection.conversation_profile;
+  if (callConfig) {
+    if (!callConfig.conversation_profile) {
+      callConfig.conversation_profile = conversationProfile;
+    }
+    if (!callConfig.conversation_profile_source) {
+      callConfig.conversation_profile_source =
+        profileSelection.conversation_profile_source;
+    }
+    if (!callConfig.conversation_profile_confidence) {
+      callConfig.conversation_profile_confidence =
+        profileSelection.conversation_profile_confidence;
+    }
+    if (!Array.isArray(callConfig.conversation_profile_signals)) {
+      callConfig.conversation_profile_signals =
+        profileSelection.conversation_profile_signals;
+    }
+    if (callConfig.conversation_profile_ambiguous === undefined) {
+      callConfig.conversation_profile_ambiguous =
+        profileSelection.conversation_profile_ambiguous;
+    }
+    if (callConfig.conversation_profile_locked === undefined) {
+      callConfig.conversation_profile_locked =
+        profileSelection.conversation_profile_locked;
+    }
+    if (!callConfig.conversation_profile_lock_reason) {
+      callConfig.conversation_profile_lock_reason =
+        profileSelection.conversation_profile_lock_reason;
+    }
+    if (!callConfig.conversation_profile_confidence_gate) {
+      callConfig.conversation_profile_confidence_gate =
+        profileSelection.conversation_profile_confidence_gate;
+    }
+    if (callConfig.conversation_profile_gate_fallback_applied === undefined) {
+      callConfig.conversation_profile_gate_fallback_applied =
+        profileSelection.conversation_profile_gate_fallback_applied;
+    }
+    if (!callConfig.purpose) {
+      callConfig.purpose = getProfilePurpose(conversationProfile);
+    }
+    callConfigurations.set(callSid, callConfig);
+  }
+
+  let tools = baseTools;
+  let implementations = baseImpl;
+  const sharedToolkitOptions = {
+    callSid,
+    getCallConfig: () => callConfigurations.get(callSid) || callConfig || {},
+    setCallConfig: (nextConfig) => {
+      if (nextConfig && typeof nextConfig === "object") {
+        callConfigurations.set(callSid, nextConfig);
+      }
+    },
+    queueRuntimePersist: queuePersistCallRuntimeState,
+    updateCallState: (sid, status, payload) =>
+      db?.updateCallState?.(sid, status, payload),
+    addLiveEvent: (sid, message, options = {}) =>
+      webhookService?.addLiveEvent?.(sid, message, options),
+  };
+  const normalizedProfile = normalizeRelationshipProfileType(
+    conversationProfile,
+    "",
+  );
+  if (normalizedProfile && RELATIONSHIP_PROFILE_SET.has(normalizedProfile)) {
+    const profileToolkit = createConversationProfileToolkit(
+      normalizedProfile,
+      sharedToolkitOptions,
+    );
+    if (Array.isArray(profileToolkit.tools) && profileToolkit.tools.length) {
+      tools = [...baseTools, ...profileToolkit.tools];
+      implementations = {
+        ...baseImpl,
+        ...(profileToolkit.implementations || {}),
+      };
+    }
+  }
   const options = getCallToolOptions(callSid, callConfig);
-  applyTelephonyTools(gptService, callSid, baseTools, baseImpl, options);
+  applyTelephonyTools(gptService, callSid, tools, implementations, {
+    ...options,
+    callConfig,
+    conversationProfile: normalizedProfile || conversationProfile || "general",
+  });
+  gptService.setToolPolicyGate(buildCallToolPolicyGate(callSid, callConfig));
   if (
     !options.policyAllowsTransfer &&
     callConfig &&
@@ -6251,7 +7821,7 @@ function requireAdminToken(req, res, next) {
       .json({ success: false, error: "Admin token not configured" });
   }
   const provided = req.headers[ADMIN_HEADER_NAME];
-  if (!provided || provided !== token) {
+  if (!safeCompareSecret(provided, token)) {
     return res
       .status(403)
       .json({ success: false, error: "Admin token required" });
@@ -6263,7 +7833,7 @@ function hasAdminToken(req) {
   const token = config.admin?.apiToken;
   if (!token) return false;
   const provided = req.headers[ADMIN_HEADER_NAME];
-  return Boolean(provided && provided === token);
+  return safeCompareSecret(provided, token);
 }
 
 function requireOutboundAuthorization(req, res, next) {
@@ -7007,24 +8577,6 @@ function getProviderOrder(preferred) {
   return order;
 }
 
-function selectOutboundProvider(preferred) {
-  const readiness = getProviderReadiness();
-  const failoverEnabled = config.providerFailover?.enabled !== false;
-  const plan = resolveProviderExecutionOrder({
-    channel: PROVIDER_CHANNELS.CALL,
-    preferredProvider: preferred,
-    providers: SUPPORTED_PROVIDERS,
-    readiness,
-    requestedFlow: "outbound_voice",
-    context: {
-      vonageDtmfWebhookEnabled: config.vonage?.dtmfWebhookEnabled === true,
-    },
-    failoverEnabled,
-    isProviderDegraded,
-  });
-  return plan.selected_provider || null;
-}
-
 let warnedMachineDetection = false;
 let warnedVonageWebhookValidation = false;
 function isMachineDetectionEnabled() {
@@ -7044,6 +8596,17 @@ function warnIfMachineDetectionDisabled(context = "") {
     `⚠️ Twilio AMD is not enabled${suffix}. Voicemail detection may be unreliable. Set TWILIO_MACHINE_DETECTION=Enable.`,
   );
   warnedMachineDetection = true;
+}
+
+function assertEmailWebhookAuthConfiguration() {
+  const mode = String(config.email?.webhookValidation || "warn").toLowerCase();
+  if (mode !== "strict") return;
+  const hasEmailSecret = Boolean(String(config.email?.webhookSecret || "").trim());
+  const hasHmacSecret = Boolean(String(config.apiAuth?.hmacSecret || "").trim());
+  if (hasEmailSecret || hasHmacSecret) return;
+  throw new Error(
+    "EMAIL_WEBHOOK_VALIDATION is strict but no email webhook auth secret is configured. Set EMAIL_WEBHOOK_SECRET or API_SECRET/API_HMAC_SECRET.",
+  );
 }
 
 function getAwsConnectAdapter() {
@@ -7300,6 +8863,22 @@ function startBackgroundWorkers() {
     },
     60 * 60 * 1000,
   );
+
+  const autoCanaryConfig = getVoiceAgentAutoCanaryConfig();
+  if (autoCanaryConfig.enabled) {
+    setInterval(() => {
+      evaluateVoiceAgentAutoCanary({
+        source: "background_interval",
+      }).catch((error) => {
+        console.error("❌ Voice auto-canary worker error:", error);
+      });
+    }, autoCanaryConfig.intervalMs);
+    evaluateVoiceAgentAutoCanary({
+      source: "background_startup",
+    }).catch((error) => {
+      console.error("❌ Voice auto-canary startup run failed:", error);
+    });
+  }
 }
 
 async function speakAndEndCall(callSid, message, reason = "completed") {
@@ -7532,6 +9111,7 @@ async function ensureAwsSession(callSid) {
         channel: "voice",
         provider: callConfig?.provider || getCurrentProvider(),
         traceId: `call:${callSid}`,
+        responsePolicyGate: buildCallResponsePolicyGate(callSid, callConfig),
       },
     );
   } else {
@@ -7544,6 +9124,7 @@ async function ensureAwsSession(callSid) {
         channel: "voice",
         provider: callConfig?.provider || getCurrentProvider(),
         traceId: `call:${callSid}`,
+        responsePolicyGate: buildCallResponsePolicyGate(callSid, callConfig),
       },
     );
   }
@@ -7554,18 +9135,24 @@ async function ensureAwsSession(callSid) {
     channel: "voice",
     provider: callConfig?.provider || getCurrentProvider(),
   });
+  const conversationProfile = resolveConversationProfile({
+    purpose:
+      callConfig?.conversation_profile ||
+      callConfig?.purpose ||
+      callConfig?.business_context?.purpose,
+    prompt: callConfig?.prompt,
+    firstMessage: callConfig?.first_message,
+  });
   gptService.setCustomerName(
     callConfig?.customer_name || callConfig?.victim_name,
   );
-  gptService.setCallProfile(
-    callConfig?.purpose || callConfig?.business_context?.purpose,
-  );
+  gptService.setCallProfile(conversationProfile);
   gptService.setPersonaContext({
-    domain: callConfig?.purpose || callConfig?.business_context?.purpose || "general",
+    domain: conversationProfile || "general",
     channel: "voice",
     urgency: callConfig?.urgency || "normal",
   });
-  const intentLine = `Call intent: ${callConfig?.script || "general"} | purpose: ${callConfig?.purpose || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`;
+  const intentLine = `Call intent: ${callConfig?.script || "general"} | profile: ${conversationProfile || "general"} | purpose: ${callConfig?.purpose || conversationProfile || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`;
   gptService.setCallIntent(intentLine);
   const restoredCount = Number(runtimeRestore?.interactionCount || 0);
   await applyInitialDigitIntent(callSid, callConfig, gptService, restoredCount);
@@ -7733,6 +9320,8 @@ async function startServer(options = {}) {
   try {
     console.log("🚀 Initializing Adaptive AI Call System...");
     warnIfMachineDetectionDisabled("startup");
+    assertEmailWebhookAuthConfiguration();
+    validateProfilePacksAtStartup();
 
     // Initialize database first
     console.log("Initializing enhanced database...");
@@ -7774,6 +9363,7 @@ async function startServer(options = {}) {
     await loadStoredSmsProvider();
     await loadStoredEmailProvider();
     await loadPaymentFeatureConfig();
+    await loadVoiceRuntimeControlSettings();
     await refreshInboundDefaultScript(true);
     await loadKeypadProviderOverrides();
     logStartupRuntimeProfile();
@@ -7787,7 +9377,11 @@ async function startServer(options = {}) {
     console.log(
       `📧 Default email provider: ${String(storedEmailProvider || currentEmailProvider || "sendgrid").toUpperCase()} (active: ${String(currentEmailProvider || "sendgrid").toUpperCase()})`,
     );
-    console.log("🤖 Voice runtime mode: legacy STT+GPT+TTS");
+    const runtimeStatus = getVoiceRuntimeAdminStatus();
+    console.log(
+      `🤖 Voice runtime mode: ${runtimeStatus.effective_mode} (configured=${runtimeStatus.configured_mode}, canary=${runtimeStatus.effective_canary_percent}%)`,
+    );
+    await runDeepgramVoiceAgentStartupPreflight();
 
     // Start webhook service after database is ready
     console.log("Starting enhanced webhook service...");
@@ -7842,6 +9436,47 @@ async function startServer(options = {}) {
           `📞 Twilio Media Stream track mode: ${TWILIO_STREAM_TRACK}`,
         );
       });
+      const configuredRequestTimeoutMs = Number(config.server?.requestTimeoutMs);
+      if (
+        Number.isFinite(configuredRequestTimeoutMs) &&
+        configuredRequestTimeoutMs > 0
+      ) {
+        server.requestTimeout = configuredRequestTimeoutMs;
+      }
+      const configuredKeepAliveTimeoutMs = Number(config.server?.keepAliveTimeoutMs);
+      if (
+        Number.isFinite(configuredKeepAliveTimeoutMs) &&
+        configuredKeepAliveTimeoutMs > 0
+      ) {
+        server.keepAliveTimeout = configuredKeepAliveTimeoutMs;
+      }
+      const configuredHeadersTimeoutMs = Number(config.server?.headersTimeoutMs);
+      if (
+        Number.isFinite(configuredHeadersTimeoutMs) &&
+        configuredHeadersTimeoutMs > 0
+      ) {
+        // Node requires headers timeout to be larger than keep-alive timeout.
+        const minHeadersTimeout = (server.keepAliveTimeout || 0) + 1000;
+        server.headersTimeout = Math.max(
+          configuredHeadersTimeoutMs,
+          minHeadersTimeout,
+        );
+      }
+      const configuredMaxRequestsPerSocket = Number(
+        config.server?.maxRequestsPerSocket,
+      );
+      if (
+        Number.isFinite(configuredMaxRequestsPerSocket) &&
+        configuredMaxRequestsPerSocket >= 0
+      ) {
+        server.maxRequestsPerSocket = Math.floor(configuredMaxRequestsPerSocket);
+      }
+      console.log("HTTP timeout profile", {
+        request_timeout_ms: server.requestTimeout,
+        headers_timeout_ms: server.headersTimeout,
+        keep_alive_timeout_ms: server.keepAliveTimeout,
+        max_requests_per_socket: server.maxRequestsPerSocket,
+      });
       server.on("error", (error) => {
         console.error("❌ API listen error:", error);
         if (error?.code === "EADDRINUSE") {
@@ -7865,6 +9500,7 @@ function logStartupRuntimeProfile() {
   ).toLowerCase();
   const envEmailProvider = String(config.email?.provider || "sendgrid").toLowerCase();
 
+  const runtimeStatus = getVoiceRuntimeAdminStatus();
   const payload = {
     type: "startup_runtime_profile",
     timestamp: new Date().toISOString(),
@@ -7899,7 +9535,11 @@ function logStartupRuntimeProfile() {
       },
     },
     voice_runtime: {
-      mode: "legacy_stt_gpt_tts",
+      mode: runtimeStatus.effective_mode,
+      configured_mode: runtimeStatus.configured_mode,
+      canary_percent: runtimeStatus.effective_canary_percent,
+      canary_override_source: runtimeStatus.canary_percent_override_source,
+      managed_think_only: runtimeStatus.managed_think_only,
     },
   };
 
@@ -7950,7 +9590,7 @@ app.ws("/connection", (ws, req) => {
   const ua = req?.headers?.["user-agent"] || "unknown-ua";
   const host = req?.headers?.host || "unknown-host";
   console.log(`New WebSocket connection established (host=${host}, ua=${ua})`);
-  console.log("Using legacy STT+GPT+TTS pipeline");
+  console.log("Voice runtime selector active (legacy/hybrid/voice_agent)");
 
   try {
     ws.on("error", (error) => {
@@ -7970,6 +9610,13 @@ app.ws("/connection", (ws, req) => {
 
     let gptErrorCount = 0;
     let gptService;
+    let voiceAgentBridge = null;
+    let voiceRuntimeMode = "legacy";
+    let voiceAgentRuntimeErrorCount = 0;
+    let voiceAgentNoAudioTimer = null;
+    let voiceAgentLastAudioAt = 0;
+    let voiceAgentLastUserSpeechAt = 0;
+    let voiceAgentRuntimeFallbackInProgress = false;
     const streamService = new StreamService(ws, {
       audioTickIntervalMs: liveConsoleAudioTickMs,
     });
@@ -7991,9 +9638,89 @@ app.ws("/connection", (ws, req) => {
     let interactionCount = 0;
     let isInitialized = false;
     let streamAuthOk = false;
+    const clearVoiceAgentNoAudioTimer = () => {
+      if (voiceAgentNoAudioTimer) {
+        clearTimeout(voiceAgentNoAudioTimer);
+        voiceAgentNoAudioTimer = null;
+      }
+    };
+    const switchVoiceAgentToLegacy = async (reason = "voice_agent_runtime_fallback") => {
+      if (voiceRuntimeMode !== "voice_agent") return;
+      if (voiceAgentRuntimeFallbackInProgress) return;
+      voiceAgentRuntimeFallbackInProgress = true;
+      clearVoiceAgentNoAudioTimer();
+      try {
+        recordVoiceAgentCircuitEvent("runtime_fallback", callSid, reason);
+        recordVoiceAgentRuntimeEvent(
+          mapVoiceAgentFallbackKind(reason),
+          callSid,
+          reason,
+        );
+        try {
+          voiceAgentBridge?.close();
+        } catch {}
+        voiceAgentBridge = null;
+        voiceRuntimeMode = "legacy";
+        const session = activeCalls.get(callSid);
+        if (session) {
+          session.voiceRuntime = "legacy";
+          session.voiceAgentBridge = null;
+        }
+        await db
+          .updateCallState(callSid, "voice_runtime_fallback", {
+            from: "voice_agent",
+            to: "legacy",
+            reason,
+            at: new Date().toISOString(),
+          })
+          .catch(() => {});
+        webhookService.addLiveEvent(
+          callSid,
+          `⚠️ Voice Agent degraded (${reason}); switched to legacy runtime`,
+          { force: true },
+        );
+      } finally {
+        voiceAgentRuntimeFallbackInProgress = false;
+      }
+    };
+    const scheduleVoiceAgentNoAudioWatchdog = () => {
+      if (voiceRuntimeMode !== "voice_agent") return;
+      const noAudioFallbackMs =
+        Number(config.deepgram?.voiceAgent?.noAudioFallbackMs) || 15000;
+      clearVoiceAgentNoAudioTimer();
+      voiceAgentNoAudioTimer = setTimeout(() => {
+        if (voiceRuntimeMode !== "voice_agent") return;
+        const lastAudio = Number(voiceAgentLastAudioAt || 0);
+        const lastUser = Number(voiceAgentLastUserSpeechAt || 0);
+        const now = Date.now();
+        const silentForAudio = lastAudio > 0 ? now - lastAudio : Number.POSITIVE_INFINITY;
+        const silentForUser = lastUser > 0 ? now - lastUser : Number.POSITIVE_INFINITY;
+        if (silentForAudio < noAudioFallbackMs || silentForUser < noAudioFallbackMs) {
+          return;
+        }
+        void switchVoiceAgentToLegacy("voice_agent_no_audio_timeout");
+      }, noAudioFallbackMs);
+      if (
+        voiceAgentNoAudioTimer &&
+        typeof voiceAgentNoAudioTimer.unref === "function"
+      ) {
+        voiceAgentNoAudioTimer.unref();
+      }
+    };
 
     const handleSttFailure = async (tag, error) => {
       if (!callSid) return;
+      if (voiceRuntimeMode === "voice_agent") {
+        const message = error?.message || error?.reason || error || "";
+        console.warn(
+          `Ignoring STT failure (${tag}) while voice agent runtime is active for ${callSid}`,
+          message,
+        );
+        db?.addCallMetric?.(callSid, "stt_failure_ignored_voice_agent", 1, { tag }).catch(
+          () => {},
+        );
+        return;
+      }
       console.error(
         `STT failure (${tag}) for ${callSid}`,
         error?.message || error || "",
@@ -8031,8 +9758,8 @@ app.ws("/connection", (ws, req) => {
         console.error("STT fallback activation error:", sttFailureError);
       });
     });
-    transcriptionService.on("close", () => {
-      void handleSttFailure("stt_closed").catch((sttFailureError) => {
+    transcriptionService.on("close", (closeEvent) => {
+      void handleSttFailure("stt_closed", closeEvent).catch((sttFailureError) => {
         console.error("STT fallback activation error:", sttFailureError);
       });
     });
@@ -8234,6 +9961,378 @@ app.ws("/connection", (ws, req) => {
           if (resolvedVoiceModel) {
             ttsService.voiceModel = resolvedVoiceModel;
           }
+          const sessionProfile = resolveConversationProfile({
+            purpose:
+              callConfig?.conversation_profile ||
+              callConfig?.purpose ||
+              callConfig?.business_context?.purpose,
+            prompt: callConfig?.prompt,
+            firstMessage: callConfig?.first_message,
+          });
+          const intentLine = `Call intent: ${callConfig?.script || "general"} | profile: ${sessionProfile || "general"} | purpose: ${callConfig?.purpose || sessionProfile || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`;
+          const runtimeDecision = selectTwilioVoiceRuntime(callSid, callConfig);
+          voiceRuntimeMode = runtimeDecision.mode;
+
+          if (runtimeDecision.useVoiceAgent) {
+            const voiceAgentConfig = getEffectiveVoiceAgentRuntimeConfig();
+            const voiceAgentFunctions =
+              buildVoiceAgentFunctionDefinitions(functionSystem);
+            const rawGreeting = String(
+              callConfig?.first_message || DEFAULT_INBOUND_FIRST_MESSAGE,
+            );
+            const greetingText =
+              callConfig?.initial_prompt_played === true
+                ? ""
+                : sanitizeVoiceOutputText(rawGreeting, {
+                    maxChars: 260,
+                    fallbackText: DEFAULT_INBOUND_FIRST_MESSAGE,
+                  }).text;
+            const promptText = [
+              callConfig?.prompt || DEFAULT_INBOUND_PROMPT,
+              intentLine,
+              VOICE_OUTPUT_GUARD_DIRECTIVE,
+            ]
+              .filter(Boolean)
+              .join("\n");
+            const toolTimeoutMs =
+              Number(config.openRouter?.toolExecutionTimeoutMs) || 12000;
+
+            try {
+              voiceAgentBridge = new VoiceAgentBridge({
+                apiKey: config.deepgram?.apiKey,
+                logPrefix: `voice-agent:${callSid}`,
+                managedThinkOnly: voiceAgentConfig.managedThinkOnly !== false,
+                openTimeoutMs:
+                  Number(voiceAgentConfig.openTimeoutMs) || 8000,
+                settingsTimeoutMs:
+                  Number(voiceAgentConfig.settingsTimeoutMs) || 8000,
+                keepAliveMs:
+                  Number(voiceAgentConfig.keepAliveMs) || 8000,
+                audio: {
+                  input: {
+                    encoding: "mulaw",
+                    sample_rate: 8000,
+                  },
+                  output: {
+                    encoding: "mulaw",
+                    sample_rate: 8000,
+                    container: "none",
+                  },
+                },
+                greeting: greetingText || undefined,
+                agent: {
+                  language: voiceAgentConfig.language || "en",
+                  listen: {
+                    provider: {
+                      model: voiceAgentConfig.listenModel || "nova-2",
+                    },
+                  },
+                  speak: {
+                    provider: {
+                      model:
+                        voiceAgentConfig.speakModel ||
+                        config.deepgram?.voiceModel ||
+                        "aura-asteria-en",
+                    },
+                  },
+                  think: {
+                    provider: {
+                      type: voiceAgentConfig.thinkProvider || "open_ai",
+                      model: voiceAgentConfig.thinkModel || "gpt-4o-mini",
+                      temperature: Number.isFinite(
+                        Number(voiceAgentConfig.thinkTemperature),
+                      )
+                        ? Number(voiceAgentConfig.thinkTemperature)
+                        : undefined,
+                    },
+                    prompt: promptText,
+                    functions: voiceAgentFunctions,
+                  },
+                },
+              });
+
+              voiceAgentBridge.on("audio", ({ base64, bytes }) => {
+                clearVoiceAgentNoAudioTimer();
+                voiceAgentLastAudioAt = Date.now();
+                const level = estimateAudioLevelFromBase64(base64);
+                webhookService
+                  .setLiveCallPhase(callSid, "agent_speaking", {
+                    level,
+                    logEvent: false,
+                  })
+                  .catch(() => {});
+                scheduleSpeechTicksFromAudio(callSid, "agent_speaking", base64);
+                if (callSid) {
+                  db.updateCallState(callSid, "voice_agent_audio_ready", {
+                    bytes: Number(bytes) || null,
+                    runtime: "voice_agent",
+                  }).catch(() => {});
+                }
+                streamService.buffer(null, base64);
+              });
+
+              voiceAgentBridge.on("conversationText", async ({ role, content }) => {
+                const normalizedRole = String(role || "").toLowerCase();
+                const isUser = normalizedRole === "user";
+                const isAgent =
+                  normalizedRole === "assistant" || normalizedRole === "agent";
+                if (!isUser && !isAgent) {
+                  return;
+                }
+                const safeContent = isAgent
+                  ? sanitizeVoiceOutputText(content, {
+                      maxChars: 260,
+                      fallbackText: "Let me help you with that.",
+                    }).text
+                  : String(content || "");
+                try {
+                  if (isUser) {
+                    webhookService
+                      .setLiveCallPhase(callSid, "user_speaking")
+                      .catch(() => {});
+                    await db.addTranscript({
+                      call_sid: callSid,
+                      speaker: "user",
+                      message: safeContent,
+                      interaction_count: interactionCount,
+                    });
+                    await db.updateCallState(callSid, "user_spoke", {
+                      message: safeContent,
+                      interaction_count: interactionCount,
+                      runtime: "voice_agent",
+                    });
+                    webhookService.recordTranscriptTurn(callSid, "user", safeContent);
+                    if (
+                      config.deepgram?.voiceAgent?.parityCloseOnGoodbye !== false &&
+                      shouldCloseConversation(safeContent) &&
+                      interactionCount >= 1
+                    ) {
+                      await speakAndEndCall(
+                        callSid,
+                        CALL_END_MESSAGES.user_goodbye,
+                        "user_goodbye",
+                      );
+                      interactionCount += 1;
+                      const goodbyeSession = activeCalls.get(callSid);
+                      if (goodbyeSession) {
+                        goodbyeSession.interactionCount = interactionCount;
+                      }
+                      queuePersistCallRuntimeState(callSid, {
+                        interaction_count: interactionCount,
+                        snapshot: {
+                          source: "voice_agent_user_goodbye",
+                          runtime: "voice_agent",
+                        },
+                      });
+                      return;
+                    }
+                    interactionCount += 1;
+                    const activeSession = activeCalls.get(callSid);
+                    if (activeSession) {
+                      activeSession.interactionCount = interactionCount;
+                    }
+                    queuePersistCallRuntimeState(callSid, {
+                      interaction_count: interactionCount,
+                    });
+                    return;
+                  }
+
+                  webhookService
+                    .setLiveCallPhase(callSid, "agent_responding")
+                    .catch(() => {});
+                  await db.addTranscript({
+                    call_sid: callSid,
+                    speaker: "ai",
+                    message: safeContent,
+                    interaction_count: interactionCount,
+                    personality_used: "voice_agent",
+                  });
+                  await db.updateCallState(callSid, "ai_responded", {
+                    message: safeContent,
+                    interaction_count: interactionCount,
+                    runtime: "voice_agent",
+                  });
+                  webhookService.recordTranscriptTurn(callSid, "agent", safeContent);
+                  scheduleSilenceTimer(callSid);
+                } catch (error) {
+                  console.error("Voice agent transcript persistence error:", error);
+                }
+              });
+
+              voiceAgentBridge.on("userStartedSpeaking", () => {
+                clearSilenceTimer(callSid);
+                voiceAgentLastUserSpeechAt = Date.now();
+                scheduleVoiceAgentNoAudioWatchdog();
+                webhookService
+                  .setLiveCallPhase(callSid, "user_speaking")
+                  .catch(() => {});
+              });
+
+              voiceAgentBridge.on("agentThinking", () => {
+                webhookService
+                  .setLiveCallPhase(callSid, "agent_responding")
+                  .catch(() => {});
+              });
+
+              voiceAgentBridge.on("agentStartedSpeaking", () => {
+                clearSilenceTimer(callSid);
+                webhookService
+                  .setLiveCallPhase(callSid, "agent_speaking")
+                  .catch(() => {});
+              });
+
+              voiceAgentBridge.on("functionCallRequest", async (payload) => {
+                const requests = extractVoiceAgentFunctionRequests(payload);
+                if (!requests.length) return;
+                for (const request of requests) {
+                  const name = String(request?.name || "").trim();
+                  const requestId =
+                    String(request?.id || `${name}:${Date.now()}`).trim();
+                  if (!name || !requestId) continue;
+                  const implementation = functionSystem?.implementations?.[name];
+                  if (typeof implementation !== "function") {
+                    voiceAgentBridge.respondFunctionCall({
+                      id: requestId,
+                      name,
+                      content: JSON.stringify({
+                        ok: false,
+                        error: "function_not_available",
+                      }),
+                    });
+                    continue;
+                  }
+
+                  let parsedArgs = {};
+                  const rawArgs = request?.arguments;
+                  if (typeof rawArgs === "string" && rawArgs.trim().length > 0) {
+                    try {
+                      parsedArgs = JSON.parse(rawArgs);
+                    } catch {
+                      parsedArgs = { raw: rawArgs };
+                    }
+                  } else if (rawArgs && typeof rawArgs === "object") {
+                    parsedArgs = rawArgs;
+                  }
+
+                  try {
+                    const result = await runOperationWithTimeout(
+                      Promise.resolve().then(() => implementation(parsedArgs)),
+                      toolTimeoutMs,
+                      `voice_agent_function_timeout:${name}`,
+                    );
+                    voiceAgentBridge.respondFunctionCall({
+                      id: requestId,
+                      name,
+                      content:
+                        typeof result === "string"
+                          ? result
+                          : JSON.stringify(result ?? { ok: true }),
+                    });
+                  } catch (error) {
+                    voiceAgentBridge.respondFunctionCall({
+                      id: requestId,
+                      name,
+                      content: JSON.stringify({
+                        ok: false,
+                        error: error?.message || "function_execution_failed",
+                      }),
+                    });
+                  }
+                }
+              });
+
+              voiceAgentBridge.on("error", (error) => {
+                console.error("Voice agent runtime error:", error);
+                voiceAgentRuntimeErrorCount += 1;
+                recordVoiceAgentRuntimeEvent(
+                  "runtime_error",
+                  callSid,
+                  error?.message || "runtime_error",
+                );
+                webhookService.addLiveEvent(
+                  callSid,
+                  `⚠️ Voice agent error: ${error?.message || "runtime_error"}`,
+                  { force: true },
+                );
+                const cfg = getVoiceAgentCircuitConfig();
+                if (cfg.enabled) {
+                  recordVoiceAgentCircuitEvent(
+                    "runtime_error",
+                    callSid,
+                    error?.message || "runtime_error",
+                  );
+                  if (voiceAgentRuntimeErrorCount >= cfg.failureThreshold) {
+                    void switchVoiceAgentToLegacy("voice_agent_runtime_error_threshold");
+                  }
+                }
+              });
+
+              await voiceAgentBridge.connect();
+              voiceAgentRuntimeErrorCount = 0;
+              voiceAgentLastAudioAt = 0;
+              voiceAgentLastUserSpeechAt = 0;
+              await db.updateCallState(callSid, "voice_runtime_selected", {
+                mode: "voice_agent",
+                reason: runtimeDecision.reason,
+                canary_bucket: runtimeDecision.canaryBucket ?? null,
+                canary_percent: runtimeDecision.canaryPercent ?? null,
+              });
+              recordVoiceAgentRuntimeEvent(
+                "selected",
+                callSid,
+                runtimeDecision.reason,
+              );
+              if (greetingText && callConfig) {
+                callConfig.initial_prompt_played = true;
+                callConfigurations.set(callSid, callConfig);
+              }
+              webhookService.addLiveEvent(
+                callSid,
+                "🧠 Voice runtime:  Voicednut Agent (managed think)",
+                { force: true },
+              );
+              console.log(
+                `Voice runtime selected: deepgram_voice_agent (${runtimeDecision.reason})`,
+              );
+            } catch (voiceAgentError) {
+              console.error("Voice agent setup failed:", voiceAgentError);
+              recordVoiceAgentRuntimeEvent(
+                "settings_failure",
+                callSid,
+                voiceAgentError?.message || "setup_failed",
+              );
+              recordVoiceAgentCircuitEvent(
+                "settings_failure",
+                callSid,
+                voiceAgentError?.message || "setup_failed",
+              );
+              try {
+                voiceAgentBridge?.close();
+              } catch {}
+              voiceAgentBridge = null;
+              const failoverToLegacy = voiceAgentConfig.failoverToLegacy !== false;
+              await db.updateCallState(callSid, "voice_agent_setup_failed", {
+                error: voiceAgentError?.message || "unknown_error",
+                reason: runtimeDecision.reason,
+                failover_to_legacy: failoverToLegacy,
+              });
+              if (!failoverToLegacy) {
+                await speakAndEndCall(
+                  callSid,
+                  CALL_END_MESSAGES.error,
+                  "voice_agent_setup_failed",
+                );
+                isInitialized = true;
+                return;
+              }
+              voiceRuntimeMode = "legacy";
+              webhookService.addLiveEvent(
+                callSid,
+                "⚠️ Voice Agent unavailable, falling back to legacy runtime",
+                { force: true },
+              );
+            }
+          }
 
           if (callConfig && functionSystem) {
             console.log(
@@ -8251,6 +10350,7 @@ app.ws("/connection", (ws, req) => {
                 channel: "voice",
                 provider: callConfig?.provider || getCurrentProvider(),
                 traceId: `call:${callSid}`,
+                responsePolicyGate: buildCallResponsePolicyGate(callSid, callConfig),
               },
             );
           } else {
@@ -8264,6 +10364,7 @@ app.ws("/connection", (ws, req) => {
                 channel: "voice",
                 provider: callConfig?.provider || getCurrentProvider(),
                 traceId: `call:${callSid}`,
+                responsePolicyGate: buildCallResponsePolicyGate(callSid, callConfig),
               },
             );
           }
@@ -8274,20 +10375,26 @@ app.ws("/connection", (ws, req) => {
             channel: "voice",
             provider: callConfig?.provider || getCurrentProvider(),
           });
+          const conversationProfile = resolveConversationProfile({
+            purpose:
+              callConfig?.conversation_profile ||
+              callConfig?.purpose ||
+              callConfig?.business_context?.purpose,
+            prompt: callConfig?.prompt,
+            firstMessage: callConfig?.first_message,
+          });
           gptService.setCustomerName(
             callConfig?.customer_name || callConfig?.victim_name,
           );
-          gptService.setCallProfile(
-            callConfig?.purpose || callConfig?.business_context?.purpose,
-          );
+          gptService.setCallProfile(conversationProfile);
           gptService.setPersonaContext({
-            domain:
-              callConfig?.purpose || callConfig?.business_context?.purpose || "general",
+            domain: conversationProfile || "general",
             channel: "voice",
             urgency: callConfig?.urgency || "normal",
           });
-          const intentLine = `Call intent: ${callConfig?.script || "general"} | purpose: ${callConfig?.purpose || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`;
-          gptService.setCallIntent(intentLine);
+          gptService.setCallIntent(
+            `Call intent: ${callConfig?.script || "general"} | profile: ${conversationProfile || "general"} | purpose: ${callConfig?.purpose || conversationProfile || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`,
+          );
           if (callConfig) {
             await applyInitialDigitIntent(
               callSid,
@@ -8419,10 +10526,15 @@ app.ws("/connection", (ws, req) => {
             personalityChanges: [],
             ttsService,
             interactionCount,
+            voiceRuntime: voiceRuntimeMode,
+            voiceAgentBridge: voiceRuntimeMode === "voice_agent" ? voiceAgentBridge : null,
           });
           queuePersistCallRuntimeState(callSid, {
             interaction_count: interactionCount,
-            snapshot: { source: "twilio_stream_start" },
+            snapshot: {
+              source: "twilio_stream_start",
+              runtime: voiceRuntimeMode,
+            },
           });
 
           const pendingDigitActions = popPendingDigitActions(callSid);
@@ -8434,6 +10546,18 @@ app.ws("/connection", (ws, req) => {
           try {
             if (skipGreeting) {
               isInitialized = true;
+              if (voiceRuntimeMode === "voice_agent") {
+                await db
+                  .updateCallState(callSid, "voice_agent_active_legacy_standby", {
+                    at: new Date().toISOString(),
+                    runtime: voiceRuntimeMode,
+                  })
+                  .catch(() => {});
+                console.log(
+                  `Voice agent active for ${callSid}; legacy runtime ready for failover`,
+                );
+                return;
+              }
               console.log(
                 `Stream reconnected for ${callSid} (skipping greeting)`,
               );
@@ -8774,7 +10898,7 @@ app.ws("/connection", (ws, req) => {
           if (!streamAuthOk) {
             return;
           }
-          if (isInitialized && transcriptionService) {
+          if (isInitialized) {
             const now = Date.now();
             streamLastMediaAt.set(callSid, now);
             if (shouldSampleUserAudioLevel(callSid, now)) {
@@ -8784,7 +10908,17 @@ app.ws("/connection", (ws, req) => {
               updateUserAudioLevel(callSid, level, now);
             }
             markStreamMediaSeen(callSid);
-            transcriptionService.send(msg.media.payload);
+            if (voiceRuntimeMode === "voice_agent" && voiceAgentBridge) {
+              const sent = voiceAgentBridge.sendAudioBase64(msg.media.payload);
+              if (sent) {
+                voiceAgentLastUserSpeechAt = Date.now();
+                scheduleVoiceAgentNoAudioWatchdog();
+              }
+              return;
+            }
+            if (transcriptionService) {
+              transcriptionService.send(msg.media.payload);
+            }
           }
         } else if (event === "mark") {
           const label = msg.mark.name;
@@ -8792,6 +10926,14 @@ app.ws("/connection", (ws, req) => {
         } else if (event === "dtmf") {
           const digits = msg?.dtmf?.digits || msg?.dtmf?.digit || "";
           if (digits) {
+            if (shouldFallbackVoiceAgentOnDtmf(voiceRuntimeMode)) {
+              webhookService.addLiveEvent(
+                callSid,
+                `🔢 Keypad: ${digits} (voice agent -> legacy fallback)`,
+                { force: true },
+              );
+              await switchVoiceAgentToLegacy("voice_agent_dtmf_detected");
+            }
             clearSilenceTimer(callSid);
             markStreamMediaSeen(callSid);
             streamLastMediaAt.set(callSid, Date.now());
@@ -8896,6 +11038,13 @@ app.ws("/connection", (ws, req) => {
           if (streamStopSeen.has(stopKey)) {
             console.log(`Duplicate stream stop ignored for ${stopKey}`);
             return;
+          }
+          clearVoiceAgentNoAudioTimer();
+          if (voiceAgentBridge) {
+            try {
+              voiceAgentBridge.close();
+            } catch {}
+            voiceAgentBridge = null;
           }
           streamStopSeen.add(stopKey);
           clearFirstMediaWatchdog(callSid);
@@ -9211,6 +11360,13 @@ app.ws("/connection", (ws, req) => {
       console.log(
         `WebSocket connection closed for adaptive call: ${callSid || "unknown"}`,
       );
+      clearVoiceAgentNoAudioTimer();
+      if (voiceAgentBridge) {
+        try {
+          voiceAgentBridge.close();
+        } catch {}
+        voiceAgentBridge = null;
+      }
       transcriptionService.close();
       streamService.close();
       if (digitService) {
@@ -9415,6 +11571,7 @@ app.ws("/vonage/stream", async (ws, req) => {
           channel: "voice",
           provider: callConfig?.provider || getCurrentProvider(),
           traceId: `call:${callSid}`,
+          responsePolicyGate: buildCallResponsePolicyGate(callSid, callConfig),
         },
       );
     } else {
@@ -9427,6 +11584,7 @@ app.ws("/vonage/stream", async (ws, req) => {
           channel: "voice",
           provider: callConfig?.provider || getCurrentProvider(),
           traceId: `call:${callSid}`,
+          responsePolicyGate: buildCallResponsePolicyGate(callSid, callConfig),
         },
       );
     }
@@ -9437,18 +11595,24 @@ app.ws("/vonage/stream", async (ws, req) => {
       channel: "voice",
       provider: callConfig?.provider || getCurrentProvider(),
     });
+    const conversationProfile = resolveConversationProfile({
+      purpose:
+        callConfig?.conversation_profile ||
+        callConfig?.purpose ||
+        callConfig?.business_context?.purpose,
+      prompt: callConfig?.prompt,
+      firstMessage: callConfig?.first_message,
+    });
     gptService.setCustomerName(
       callConfig?.customer_name || callConfig?.victim_name,
     );
-    gptService.setCallProfile(
-      callConfig?.purpose || callConfig?.business_context?.purpose,
-    );
+    gptService.setCallProfile(conversationProfile);
     gptService.setPersonaContext({
-      domain: callConfig?.purpose || callConfig?.business_context?.purpose || "general",
+      domain: conversationProfile || "general",
       channel: "voice",
       urgency: callConfig?.urgency || "normal",
     });
-    const intentLine = `Call intent: ${callConfig?.script || "general"} | purpose: ${callConfig?.purpose || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`;
+    const intentLine = `Call intent: ${callConfig?.script || "general"} | profile: ${conversationProfile || "general"} | purpose: ${callConfig?.purpose || conversationProfile || "general"} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || "unspecified"}. Keep replies concise and on-task.`;
     gptService.setCallIntent(intentLine);
     await applyInitialDigitIntent(
       callSid,
@@ -10797,6 +12961,241 @@ function getProviderStateByChannel(channel, stateSnapshot = null) {
   if (channel === PROVIDER_CHANNELS.EMAIL) return snapshot.emailState;
   return null;
 }
+
+function getActiveVoiceRuntimeSessionCounts() {
+  let legacy = 0;
+  let voiceAgent = 0;
+  let unknown = 0;
+  for (const session of activeCalls.values()) {
+    const runtime = String(session?.voiceRuntime || "legacy")
+      .trim()
+      .toLowerCase();
+    if (runtime === "voice_agent") {
+      voiceAgent += 1;
+      continue;
+    }
+    if (runtime === "legacy" || runtime === "hybrid") {
+      legacy += 1;
+      continue;
+    }
+    unknown += 1;
+  }
+  return {
+    total: activeCalls.size,
+    legacy,
+    voice_agent: voiceAgent,
+    unknown,
+  };
+}
+
+function normalizeVoiceRuntimeLabel(value) {
+  const runtime = String(value || "").trim().toLowerCase();
+  if (runtime === "voice_agent") return "voice_agent";
+  if (runtime === "legacy" || runtime === "hybrid") return "legacy";
+  return "unknown";
+}
+
+function buildProfileRuntimeCallEntry(callSid, callConfig = null, session = null) {
+  const cfg = callConfig && typeof callConfig === "object" ? callConfig : {};
+  const runtime =
+    normalizeVoiceRuntimeLabel(session?.voiceRuntime) !== "unknown"
+      ? normalizeVoiceRuntimeLabel(session?.voiceRuntime)
+      : normalizeVoiceRuntimeLabel(cfg?.voice_runtime || cfg?.runtime_mode || "legacy");
+
+  return {
+    call_sid: callSid,
+    provider: cfg.provider || currentProvider || null,
+    runtime,
+    has_active_session: Boolean(session),
+    call_profile: cfg.call_profile || null,
+    conversation_profile_lock: cfg.conversation_profile_lock ?? null,
+    profile_confidence_gate_config:
+      cfg.profile_confidence_gate || null,
+    conversation_profile: cfg.conversation_profile || null,
+    conversation_profile_source: cfg.conversation_profile_source || null,
+    conversation_profile_confidence:
+      cfg.conversation_profile_confidence || null,
+    conversation_profile_signals: Array.isArray(
+      cfg.conversation_profile_signals,
+    )
+      ? cfg.conversation_profile_signals.slice(0, 6)
+      : [],
+    conversation_profile_ambiguous:
+      cfg.conversation_profile_ambiguous === true,
+    conversation_profile_locked:
+      cfg.conversation_profile_locked === true,
+    conversation_profile_lock_reason:
+      cfg.conversation_profile_lock_reason || null,
+    conversation_profile_confidence_gate:
+      cfg.conversation_profile_confidence_gate || null,
+    conversation_profile_gate_fallback_applied:
+      cfg.conversation_profile_gate_fallback_applied === true,
+    purpose: cfg.purpose || null,
+    profile_pack_version: cfg.profile_pack_version || null,
+    profile_pack_checksum: cfg.profile_pack_checksum || null,
+    policy_gate_summary:
+      cfg.policy_gate_summary &&
+      typeof cfg.policy_gate_summary === "object" &&
+      !Array.isArray(cfg.policy_gate_summary)
+        ? cfg.policy_gate_summary
+        : null,
+    policy_gate_events: Array.isArray(cfg.policy_gate_events)
+      ? cfg.policy_gate_events.slice(-5)
+      : [],
+    script: cfg.script || null,
+    script_id: cfg.script_id || null,
+    script_version: cfg.script_version || null,
+    flow_state: cfg.flow_state || null,
+    call_mode: cfg.call_mode || null,
+    created_at: cfg.created_at || null,
+  };
+}
+
+function getProfileRuntimeStatus(options = {}) {
+  const requestedCallSid = String(options.callSid || "").trim();
+  const callSids = new Set([
+    ...Array.from(callConfigurations.keys()),
+    ...Array.from(activeCalls.keys()),
+  ]);
+
+  const calls = [];
+  for (const callSid of callSids) {
+    if (!callSid) continue;
+    if (requestedCallSid && callSid !== requestedCallSid) continue;
+    const callConfig = callConfigurations.get(callSid) || null;
+    const session = activeCalls.get(callSid) || null;
+    calls.push(buildProfileRuntimeCallEntry(callSid, callConfig, session));
+  }
+
+  calls.sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+  const runtimeCounts = calls.reduce(
+    (acc, call) => {
+      const runtime = normalizeVoiceRuntimeLabel(call.runtime);
+      if (runtime === "voice_agent") acc.voice_agent += 1;
+      else if (runtime === "legacy") acc.legacy += 1;
+      else acc.unknown += 1;
+      return acc;
+    },
+    { legacy: 0, voice_agent: 0, unknown: 0 },
+  );
+  const profileSourceCounts = calls.reduce((acc, call) => {
+    const source = String(call?.conversation_profile_source || "unknown")
+      .trim()
+      .toLowerCase();
+    const key = source || "unknown";
+    acc[key] = Number.isFinite(Number(acc[key])) ? Number(acc[key]) + 1 : 1;
+    return acc;
+  }, {});
+  const profileLockCounts = calls.reduce(
+    (acc, call) => {
+      if (call?.conversation_profile_locked === true) {
+        acc.locked += 1;
+      } else {
+        acc.unlocked += 1;
+      }
+      return acc;
+    },
+    { locked: 0, unlocked: 0 },
+  );
+
+  return {
+    total: calls.length,
+    runtimes: runtimeCounts,
+    profile_sources: profileSourceCounts,
+    profile_locks: profileLockCounts,
+    calls,
+  };
+}
+
+app.get("/admin/voice-runtime", requireAdminToken, async (req, res) => {
+  try {
+    return res.json({
+      success: true,
+      runtime: getVoiceRuntimeAdminStatus(),
+      active_calls: getActiveVoiceRuntimeSessionCounts(),
+    });
+  } catch (error) {
+    console.error("Failed to fetch voice runtime status:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch voice runtime status",
+    });
+  }
+});
+
+app.get("/admin/profile-runtime", requireAdminToken, async (req, res) => {
+  try {
+    const callSid = String(req.query?.call_sid || req.query?.callSid || "").trim();
+    return res.json({
+      success: true,
+      profile_runtime: getProfileRuntimeStatus({ callSid }),
+      voice_runtime: getActiveVoiceRuntimeSessionCounts(),
+    });
+  } catch (error) {
+    console.error("Failed to fetch profile runtime status:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch profile runtime status",
+    });
+  }
+});
+
+app.post("/admin/voice-runtime", requireAdminToken, async (req, res) => {
+  try {
+    const mutation = applyVoiceRuntimeControlMutation({
+      body: req.body && typeof req.body === "object" ? req.body : {},
+      nowMs: Date.now(),
+      circuitCooldownMs: getVoiceAgentCircuitConfig().cooldownMs,
+      state: {
+        modeOverride: voiceRuntimeModeOverride,
+        canaryPercentOverride: voiceRuntimeCanaryPercentOverride,
+        canaryPercentOverrideSource: voiceRuntimeCanaryPercentOverrideSource,
+        forcedLegacyUntilMs: voiceAgentForcedLegacyUntilMs,
+        autoCanaryCooldownUntilMs: voiceAgentAutoCanaryCooldownUntilMs,
+        autoCanaryLastEvalAtMs: voiceAgentAutoCanaryLastEvalAtMs,
+        runtimeOverrideUpdatedAtMs: voiceRuntimeOverrideUpdatedAtMs,
+      },
+    });
+    if (!mutation.ok) {
+      return res.status(400).json({
+        success: false,
+        error: mutation.error || "Invalid voice runtime control payload",
+      });
+    }
+
+    voiceRuntimeModeOverride = mutation.state.modeOverride;
+    voiceRuntimeCanaryPercentOverride = mutation.state.canaryPercentOverride;
+    voiceRuntimeCanaryPercentOverrideSource =
+      mutation.state.canaryPercentOverrideSource;
+    voiceAgentForcedLegacyUntilMs = mutation.state.forcedLegacyUntilMs;
+    voiceAgentAutoCanaryCooldownUntilMs =
+      mutation.state.autoCanaryCooldownUntilMs;
+    voiceAgentAutoCanaryLastEvalAtMs = mutation.state.autoCanaryLastEvalAtMs;
+    voiceRuntimeOverrideUpdatedAtMs = mutation.state.runtimeOverrideUpdatedAtMs;
+    if (mutation.resetCircuitRequested) {
+      voiceAgentCircuitEvents.length = 0;
+      voiceAgentRuntimeEvents.length = 0;
+    }
+
+    if (mutation.actions.length > 0) {
+      await persistVoiceRuntimeControlSettings("admin_endpoint");
+    }
+
+    return res.json({
+      success: true,
+      actions: mutation.actions,
+      applied: mutation.applied,
+      runtime: getVoiceRuntimeAdminStatus(),
+      active_calls: getActiveVoiceRuntimeSessionCounts(),
+    });
+  } catch (error) {
+    console.error("Failed to update voice runtime controls:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to update voice runtime controls",
+    });
+  }
+});
 
 app.get("/admin/provider", requireAdminToken, async (req, res) => {
   syncRuntimeProviderMirrors();
@@ -12459,15 +14858,20 @@ function buildTwilioOutboundCallPayload(options = {}) {
 async function placeOutboundCall(payload, hostOverride = null) {
   const {
     number,
-    prompt,
-    first_message,
+    prompt: rawPrompt,
+    first_message: rawFirstMessage,
     user_chat_id,
     customer_name,
     business_id,
     script,
     script_id,
     script_version,
+    call_profile,
     purpose,
+    conversation_profile,
+    conversation_profile_lock,
+    profile_lock,
+    profile_confidence_gate,
     emotion,
     urgency,
     technical_level,
@@ -12496,10 +14900,8 @@ async function placeOutboundCall(payload, hostOverride = null) {
   assertScriptBoundPayment(payloadObject, script_id);
   assertScriptBoundPaymentPolicy(payloadObject, script_id);
 
-  if (!number || !prompt || !first_message) {
-    throw new Error(
-      "Missing required fields: number, prompt, and first_message are required",
-    );
+  if (!number) {
+    throw new Error("Missing required field: number is required");
   }
 
   if (!number.match(/^\+[1-9]\d{1,14}$/)) {
@@ -12513,15 +14915,6 @@ async function placeOutboundCall(payload, hostOverride = null) {
     throw new Error("Server hostname not configured");
   }
 
-  console.log("Generating adaptive function system for call...".blue);
-  const functionSystem = functionEngine.generateAdaptiveFunctionSystem(
-    prompt,
-    first_message,
-  );
-  console.log(
-    `Generated ${functionSystem.functions.length} functions for ${functionSystem.context.industry} industry`,
-  );
-
   const callWarnings = [];
   const normalizedScriptId = normalizeScriptId(script_id);
   const requestedScriptVersion = Number(script_version);
@@ -12532,12 +14925,14 @@ async function placeOutboundCall(payload, hostOverride = null) {
   let scriptPolicy = {};
   let scriptPaymentDefaults = {};
   let scriptPaymentPolicy = null;
+  let resolvedScriptTemplate = null;
   if (normalizedScriptId) {
     try {
       const tpl = normalizeScriptTemplateRecord(
         await db.getCallTemplateById(Number(normalizedScriptId)),
       );
       if (tpl) {
+        resolvedScriptTemplate = tpl;
         const currentTemplateVersion =
           Number.isFinite(Number(tpl.version)) && Number(tpl.version) > 0
             ? Math.max(1, Math.floor(Number(tpl.version)))
@@ -12577,6 +14972,48 @@ async function placeOutboundCall(payload, hostOverride = null) {
       console.error("Script metadata load error:", err);
     }
   }
+
+  const resolvedPrompt = String(rawPrompt || resolvedScriptTemplate?.prompt || "").trim();
+  const resolvedFirstMessage = String(
+    rawFirstMessage || resolvedScriptTemplate?.first_message || "",
+  ).trim();
+  if (!resolvedPrompt || !resolvedFirstMessage) {
+    throw new Error(
+      "Missing required fields: number, prompt, and first_message are required",
+    );
+  }
+
+  const profileSelection = resolveConversationProfileSelection({
+    purpose: call_profile || purpose || conversation_profile,
+    callProfile: call_profile || conversation_profile,
+    conversation_profile,
+    conversation_profile_lock,
+    profile_lock,
+    profile_confidence_gate,
+    scriptTemplate: resolvedScriptTemplate,
+    prompt: resolvedPrompt,
+    firstMessage: resolvedFirstMessage,
+  });
+  const conversationProfile = profileSelection.conversation_profile;
+  const profilePrompt = applyConversationProfilePrompt(
+    conversationProfile,
+    resolvedPrompt,
+    resolvedFirstMessage,
+  );
+  const effectivePrompt = profilePrompt.prompt || resolvedPrompt;
+  const effectiveFirstMessage = profilePrompt.firstMessage || resolvedFirstMessage;
+  const resolvedPurpose =
+    String(call_profile || purpose || "").trim() ||
+    getProfilePurpose(conversationProfile);
+
+  console.log("Generating adaptive function system for call...".blue);
+  const functionSystem = functionEngine.generateAdaptiveFunctionSystem(
+    effectivePrompt,
+    effectiveFirstMessage,
+  );
+  console.log(
+    `Generated ${functionSystem.functions.length} functions for ${functionSystem.context.industry} industry`,
+  );
 
   let callId;
   let callStatus = "queued";
@@ -12716,7 +15153,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
           clientToken: callId,
           attributes: {
             CALL_SID: callId,
-            FIRST_MESSAGE: first_message,
+            FIRST_MESSAGE: effectiveFirstMessage,
           },
         });
         providerMetadata = { contact_id: response.ContactId };
@@ -12909,8 +15346,8 @@ async function placeOutboundCall(payload, hostOverride = null) {
   const normalizedPaymentAmount =
     normalizedPayment.normalized.payment_amount || null;
   const callConfig = {
-    prompt: prompt,
-    first_message: first_message,
+    prompt: effectivePrompt,
+    first_message: effectiveFirstMessage,
     created_at: createdAt,
     user_chat_id: user_chat_id,
     customer_name: customer_name || null,
@@ -12918,7 +15355,33 @@ async function placeOutboundCall(payload, hostOverride = null) {
     provider_metadata: providerMetadata,
     business_context: functionSystem.context,
     function_count: functionSystem.functions.length,
-    purpose: purpose || null,
+    call_profile:
+      call_profile || conversation_profile || conversationProfile || null,
+    conversation_profile_lock: normalizeConversationProfileLockFlag(
+      conversation_profile_lock ?? profile_lock,
+    ),
+    profile_confidence_gate: normalizeProfileConfidence(
+      profile_confidence_gate,
+      "medium",
+    ),
+    purpose: resolvedPurpose,
+    conversation_profile: conversationProfile,
+    conversation_profile_source: profileSelection.conversation_profile_source,
+    conversation_profile_confidence:
+      profileSelection.conversation_profile_confidence,
+    conversation_profile_signals: profileSelection.conversation_profile_signals,
+    conversation_profile_ambiguous:
+      profileSelection.conversation_profile_ambiguous,
+    conversation_profile_locked:
+      profileSelection.conversation_profile_locked,
+    conversation_profile_lock_reason:
+      profileSelection.conversation_profile_lock_reason,
+    conversation_profile_confidence_gate:
+      profileSelection.conversation_profile_confidence_gate,
+    conversation_profile_gate_fallback_applied:
+      profileSelection.conversation_profile_gate_fallback_applied,
+    dating_profile_applied: profilePrompt.applied === true,
+    ...resolveProfilePackMetadata(profilePrompt),
     business_id: business_id || null,
     script: script || null,
     script_id: normalizedScriptId || null,
@@ -12977,15 +15440,35 @@ async function placeOutboundCall(payload, hostOverride = null) {
     { callConfig, skipToolRefresh: true, source: "placeOutboundCall" },
   );
   queuePersistCallRuntimeState(callId, {
-    snapshot: { source: "placeOutboundCall" },
+    snapshot: {
+      source: "placeOutboundCall",
+      conversation_profile: conversationProfile,
+      conversation_profile_source: profileSelection.conversation_profile_source,
+      conversation_profile_confidence:
+        profileSelection.conversation_profile_confidence,
+      conversation_profile_signals: profileSelection.conversation_profile_signals,
+      conversation_profile_ambiguous:
+        profileSelection.conversation_profile_ambiguous,
+      conversation_profile_locked:
+        profileSelection.conversation_profile_locked,
+      conversation_profile_lock_reason:
+        profileSelection.conversation_profile_lock_reason,
+      conversation_profile_confidence_gate:
+        profileSelection.conversation_profile_confidence_gate,
+      conversation_profile_gate_fallback_applied:
+        profileSelection.conversation_profile_gate_fallback_applied,
+      purpose: resolvedPurpose,
+      dating_profile_applied: profilePrompt.applied === true,
+      ...resolveProfilePackMetadata(profilePrompt),
+    },
   });
 
   try {
     await db.createCall({
       call_sid: callId,
       phone_number: number,
-      prompt: prompt,
-      first_message: first_message,
+      prompt: effectivePrompt,
+      first_message: effectiveFirstMessage,
       user_chat_id: user_chat_id,
       business_context: JSON.stringify(functionSystem.context),
       generated_functions: JSON.stringify(
@@ -12999,7 +15482,29 @@ async function placeOutboundCall(payload, hostOverride = null) {
       script: script || null,
       script_id: normalizedScriptId || null,
       script_version: resolvedScriptVersion || null,
-      purpose: purpose || null,
+      call_profile: callConfig.call_profile || null,
+      conversation_profile_lock:
+        callConfig.conversation_profile_lock ?? null,
+      profile_confidence_gate:
+        callConfig.profile_confidence_gate || null,
+      purpose: resolvedPurpose,
+      conversation_profile: conversationProfile,
+      conversation_profile_source: profileSelection.conversation_profile_source,
+      conversation_profile_confidence:
+        profileSelection.conversation_profile_confidence,
+      conversation_profile_signals: profileSelection.conversation_profile_signals,
+      conversation_profile_ambiguous:
+        profileSelection.conversation_profile_ambiguous,
+      conversation_profile_locked:
+        profileSelection.conversation_profile_locked,
+      conversation_profile_lock_reason:
+        profileSelection.conversation_profile_lock_reason,
+      conversation_profile_confidence_gate:
+        profileSelection.conversation_profile_confidence_gate,
+      conversation_profile_gate_fallback_applied:
+        profileSelection.conversation_profile_gate_fallback_applied,
+      dating_profile_applied: profilePrompt.applied === true,
+      ...resolveProfilePackMetadata(profilePrompt),
       emotion: emotion || null,
       urgency: urgency || null,
       technical_level: technical_level || null,
@@ -13401,35 +15906,6 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
   };
 }
 
-function escapeCsvValue(value) {
-  if (value === null || value === undefined) return "";
-  const str = String(value);
-  if (/[",\n]/.test(str)) {
-    return `"${str.replace(/"/g, '""')}"`;
-  }
-  return str;
-}
-
-function callsToCsv(calls = []) {
-  const headers = [
-    "call_sid",
-    "status",
-    "direction",
-    "phone_number",
-    "created_at",
-    "duration",
-    "answered_by",
-    "error_code",
-    "error_message",
-  ];
-  const lines = [headers.join(",")];
-  for (const call of calls) {
-    const row = headers.map((key) => escapeCsvValue(call?.[key]));
-    lines.push(row.join(","));
-  }
-  return lines.join("\n");
-}
-
 function normalizeDateFilter(value, isEnd = false) {
   if (!value) return null;
   const raw = String(value).trim();
@@ -13438,102 +15914,6 @@ function normalizeDateFilter(value, isEnd = false) {
     return `${raw} ${isEnd ? "23:59:59" : "00:00:00"}`;
   }
   return raw;
-}
-
-async function handleInboundAdminDecision(callSid, action, adminId) {
-  if (!callSid) {
-    return { ok: false, error: "missing_call_sid" };
-  }
-  const callRecord = await db.getCall(callSid).catch(() => null);
-  if (!callRecord) {
-    return { ok: false, error: "call_not_found" };
-  }
-  const gate = webhookService.getInboundGate(callSid);
-  if (
-    gate?.status === "answered" ||
-    gate?.status === "declined" ||
-    gate?.status === "expired"
-  ) {
-    return { ok: false, error: "already_handled", status: gate?.status };
-  }
-  if (action === "answer") {
-    webhookService.setInboundGate(callSid, "answered", { chatId: adminId });
-    webhookService.setConsoleCompact(callSid, false);
-    webhookService.addLiveEvent(callSid, "✅ Admin answered", { force: true });
-    await db
-      .updateCallState(callSid, "admin_answered", {
-        at: new Date().toISOString(),
-        by: adminId,
-      })
-      .catch(() => {});
-    await connectInboundCall(callSid);
-    return { ok: true, status: "answered" };
-  }
-  if (action === "decline") {
-    webhookService.setInboundGate(callSid, "declined", { chatId: adminId });
-    webhookService.addLiveEvent(callSid, "❌ Declined by admin", {
-      force: true,
-    });
-    await db
-      .updateCallState(callSid, "admin_declined", {
-        at: new Date().toISOString(),
-        by: adminId,
-      })
-      .catch(() => {});
-    await endCallForProvider(callSid);
-    await webhookService.setLiveCallPhase(callSid, "ended").catch(() => {});
-    return { ok: true, status: "declined" };
-  }
-  return { ok: false, error: "invalid_action" };
-}
-
-function truncatePrompt(value, limit = 800) {
-  const text = String(value || "").trim();
-  if (!text) return "";
-  if (text.length <= limit) return text;
-  return `${text.slice(0, limit)}...`;
-}
-
-async function applyScriptInjection(callSid, scriptId, userId) {
-  if (!callSid || !scriptId) return { ok: false, error: "missing_script" };
-  if (!db) return { ok: false, error: "db_unavailable" };
-  const script = normalizeScriptTemplateRecord(
-    await db.getCallTemplateById(scriptId),
-  );
-  if (!script) return { ok: false, error: "script_not_found" };
-  const callConfig = callConfigurations.get(callSid);
-  if (!callConfig) return { ok: false, error: "call_not_active" };
-  callConfig.script = script.name || callConfig.script;
-  callConfig.script_id = script.id || callConfig.script_id;
-  callConfig.script_version = script.version || callConfig.script_version || 1;
-  callConfig.payment_policy = script.payment_policy || null;
-  if (script.prompt) {
-    callConfig.prompt = script.prompt;
-  }
-  if (script.first_message) {
-    callConfig.first_message = script.first_message;
-  }
-  callConfigurations.set(callSid, callConfig);
-
-  const session = activeCalls.get(callSid);
-  if (session?.gptService) {
-    const promptPreview = truncatePrompt(script.prompt || "");
-    const intentLine = `Injected script: ${script.name || "custom"}. ${promptPreview}`;
-    session.gptService.setCallIntent(intentLine);
-  }
-
-  await db
-    .updateCallState(callSid, "script_injected", {
-      script_id: script.id,
-      script_name: script.name || null,
-      script_version: script.version || null,
-      payment_policy: script.payment_policy || null,
-      user_id: userId || null,
-      at: new Date().toISOString(),
-    })
-    .catch(() => {});
-
-  return { ok: true, script };
 }
 
 function getInboundHealthContext() {
@@ -15927,6 +18307,16 @@ registerWebhookRoutes(app, {
   smsWebhookDedupeTtlMs: Number(config.sms?.webhookDedupeTtlMs) || null,
   getDigitService: () => digitService,
   getEmailService: () => emailService,
+  getTranscriptAudioUrl: (text, callConfig, options = {}) => {
+    const timeoutMs = Number(options?.timeoutMs);
+    const effectiveTimeoutMs =
+      Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 12000;
+    return getTwilioTtsAudioUrl(text, callConfig, effectiveTimeoutMs, {
+      forceGenerate: true,
+    });
+  },
+  transcriptAudioTimeoutMs: Number(config.api?.transcriptAudioTimeoutMs) || 12000,
+  transcriptAudioMaxChars: Number(config.api?.transcriptAudioMaxChars) || 2600,
 });
 
 // Get SMS statistics
@@ -16230,6 +18620,7 @@ module.exports = {
     failCallScriptMutationIdempotency,
     applyIdempotencyResponse,
     resetCallScriptMutationIdempotencyForTests,
+    runDeepgramVoiceAgentStartupPreflight,
   },
 };
 

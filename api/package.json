@@ -5,6 +5,7 @@
   "main": "app.js",
   "scripts": {
     "test": "jest --runInBand",
+    "validate:profiles": "node scripts/validate-profile-packs.js --strict",
     "parity:providers": "node scripts/provider-smoke.js",
     "preflight:provider": "node scripts/provider-preflight.js",
     "dev": "nodemon .",

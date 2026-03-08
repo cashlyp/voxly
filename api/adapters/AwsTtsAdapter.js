@@ -3,6 +3,7 @@ const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { streamCollector } = require('@aws-sdk/util-stream-node');
 const { v4: uuidv4 } = require('uuid');
 const { runWithTimeout } = require('../utils/asyncControl');
+const { sanitizeVoiceOutputText } = require('../utils/voiceOutputGuard');
 
 /**
  * AwsTtsAdapter wraps Amazon Polly to provide synthesized audio suitable for
@@ -47,13 +48,18 @@ class AwsTtsAdapter {
    * @param {string} [options.outputFormat] defaults to pcm
    */
   async synthesize(text, options = {}) {
-    if (!text || !text.trim()) {
+    const sanitized = sanitizeVoiceOutputText(text, {
+      maxChars: Number(options.maxChars || 260),
+      fallbackText: 'Let me help you with that.'
+    });
+    const speechText = String(sanitized.text || '').trim();
+    if (!speechText) {
       throw new Error('AwsTtsAdapter.synthesize requires non-empty text');
     }
 
     const params = {
       OutputFormat: options.outputFormat || 'pcm',
-      Text: text,
+      Text: speechText,
       VoiceId: options.voiceId || this.voiceId,
       Engine: options.engine || 'neural',
       SampleRate: options.sampleRate || '16000',

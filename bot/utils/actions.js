@@ -108,8 +108,11 @@ function extractLegacyOpToken(rawAction) {
     return null;
   }
   const candidate = parts[1];
-  if (/^[0-9a-fA-F-]{8,}$/.test(candidate)) {
-    return candidate.replace(/-/g, '').slice(0, 8);
+  if (/^[0-9a-fA-F]{8}$/.test(candidate)) {
+    return candidate.toLowerCase();
+  }
+  if (/^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/.test(candidate)) {
+    return candidate.replace(/-/g, '').slice(0, 8).toLowerCase();
   }
   return null;
 }

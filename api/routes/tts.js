@@ -3,6 +3,7 @@ const { Buffer } = require('node:buffer');
 const EventEmitter = require('events');
 const fetch = require('node-fetch');
 const config = require('../config');
+const { sanitizeVoiceOutputText } = require('../utils/voiceOutputGuard');
 
 const TTS_CACHE_TTL_MS = 15 * 60 * 1000;
 const TTS_CACHE_MAX_ITEMS = 200;
@@ -29,8 +30,6 @@ function pruneTtsCache() {
 class TextToSpeechService extends EventEmitter {
   constructor(options = {}) {
     super();
-    this.nextExpectedIndex = 0;
-    this.speechBuffer = {};
     this.voiceModel = options.voiceModel || null;
     this.encoding = String(options.encoding || 'mulaw')
       .toLowerCase()
@@ -105,7 +104,17 @@ class TextToSpeechService extends EventEmitter {
       return; 
     }
 
-    console.log(`🎵 TTS generating for: "${partialResponse.substring(0, 50)}..."`.cyan);
+    const sanitized = sanitizeVoiceOutputText(partialResponse, {
+      maxChars: Number(options.maxChars || config.openRouter?.voiceOutputMaxChars || 260),
+      fallbackText: 'Let me help you with that.'
+    });
+    const speechText = String(sanitized.text || '').trim();
+    if (!speechText) {
+      console.warn('⚠️ TTS: Sanitized response is empty');
+      return;
+    }
+
+    console.log(`🎵 TTS generating for: "${speechText.substring(0, 50)}..."`.cyan);
 
     try {
       const voiceModel = options.voiceModel || this.voiceModel || config.deepgram.voiceModel || 'aura-asteria-en';
@@ -114,12 +123,12 @@ class TextToSpeechService extends EventEmitter {
         sampleRate: options.sampleRate || this.sampleRate,
         container: options.container || this.container,
       };
-      const key = buildTtsCacheKey(partialResponse, voiceModel, audioSpec);
+      const key = buildTtsCacheKey(speechText, voiceModel, audioSpec);
       const cached = ttsCache.get(key);
       const now = Date.now();
       if (cached && now - cached.at < TTS_CACHE_TTL_MS) {
         if (!silent) {
-          this.emit('speech', partialResponseIndex, cached.audio, partialResponse, interactionCount);
+          this.emit('speech', partialResponseIndex, cached.audio, speechText, interactionCount);
         }
         return;
       }
@@ -130,7 +139,7 @@ class TextToSpeechService extends EventEmitter {
       if (ttsInflight.has(key)) {
         const sharedAudio = await ttsInflight.get(key);
         if (sharedAudio && !silent) {
-          this.emit('speech', partialResponseIndex, sharedAudio, partialResponse, interactionCount);
+          this.emit('speech', partialResponseIndex, sharedAudio, speechText, interactionCount);
         }
         return;
       }
@@ -138,7 +147,7 @@ class TextToSpeechService extends EventEmitter {
       const requestPromise = (async () => {
         try {
           const base64String = await this.fetchSpeechAudio(
-            partialResponse,
+            speechText,
             voiceModel,
             audioSpec,
           );
@@ -150,12 +159,12 @@ class TextToSpeechService extends EventEmitter {
           if (fallbackVoice && fallbackVoice !== voiceModel) {
             try {
               const base64String = await this.fetchSpeechAudio(
-                partialResponse,
+                speechText,
                 fallbackVoice,
                 audioSpec,
               );
               const fallbackKey = buildTtsCacheKey(
-                partialResponse,
+                speechText,
                 fallbackVoice,
                 audioSpec,
               );
@@ -176,7 +185,7 @@ class TextToSpeechService extends EventEmitter {
       });
       if (base64String && !silent) {
         console.log(`✅ TTS audio generated, size: ${base64String.length} chars`.green);
-        this.emit('speech', partialResponseIndex, base64String, partialResponse, interactionCount);
+        this.emit('speech', partialResponseIndex, base64String, speechText, interactionCount);
       }
     } catch (err) {
       console.error('❌ Error occurred in TextToSpeech service:', err.message);

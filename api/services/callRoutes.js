@@ -13,12 +13,18 @@ function createOutboundCallHandler(ctx = {}) {
       const number = String(req.body?.number || "").trim();
       const prompt = String(req.body?.prompt || "").trim();
       const firstMessage = String(req.body?.first_message || "").trim();
-      if (!number || !prompt || !firstMessage) {
+      const scriptId =
+        req.body?.script_id !== undefined && req.body?.script_id !== null
+          ? String(req.body.script_id).trim()
+          : "";
+      const hasInlineScript = Boolean(prompt && firstMessage);
+      const hasTemplateScript = Boolean(scriptId);
+      if (!number || (!hasInlineScript && !hasTemplateScript)) {
         return sendApiError(
           res,
           400,
           "validation_error",
-          "number, prompt, and first_message are required",
+          "number and either (prompt + first_message) or script_id are required",
           req.requestId || null,
         );
       }
@@ -31,7 +37,7 @@ function createOutboundCallHandler(ctx = {}) {
           req.requestId || null,
         );
       }
-      if (prompt.length > 12000 || firstMessage.length > 1000) {
+      if ((prompt && prompt.length > 12000) || (firstMessage && firstMessage.length > 1000)) {
         return sendApiError(
           res,
           400,
@@ -53,7 +59,16 @@ function createOutboundCallHandler(ctx = {}) {
         script: req.body?.script,
         script_id: req.body?.script_id,
         script_version: req.body?.script_version,
-        purpose: req.body?.purpose,
+        call_profile:
+          req.body?.call_profile ||
+          req.body?.conversation_profile ||
+          req.body?.profile,
+        conversation_profile: req.body?.conversation_profile,
+        conversation_profile_lock:
+          req.body?.conversation_profile_lock ?? req.body?.profile_lock,
+        profile_confidence_gate:
+          req.body?.profile_confidence_gate,
+        purpose: req.body?.purpose || req.body?.call_profile || req.body?.profile,
         emotion: req.body?.emotion,
         urgency: req.body?.urgency,
         technical_level: req.body?.technical_level,

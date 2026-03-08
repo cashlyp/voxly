@@ -84,13 +84,18 @@ class TranscriptionService extends EventEmitter {
     });
 
     this.dgConnection.on(LiveTranscriptionEvents.Metadata, (metadata) => {
-      console.error('STT -> deepgram metadata');
-      console.error(metadata);
+      console.log('STT -> deepgram metadata');
+      console.log(metadata);
     });
 
-    this.dgConnection.on(LiveTranscriptionEvents.Close, () => {
+    this.dgConnection.on(LiveTranscriptionEvents.Close, (event) => {
+      const closedByClient = this.closed === true;
+      this.closed = true;
       console.log('STT -> Deepgram connection closed'.yellow);
-      this.emit('close');
+      if (closedByClient) {
+        return;
+      }
+      this.emit('close', event);
     });
   }
 

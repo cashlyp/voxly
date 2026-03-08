@@ -25,7 +25,16 @@ class PersonalityEngine {
         sales: 'Domain: sales. Focus on value, discovery, and a single clear next step.',
         support: 'Domain: support. Prioritize diagnosis, clear steps, and confirmation of progress.',
         collections: 'Domain: collections. Be firm but respectful, and keep commitments explicit.',
-        verification: 'Domain: verification. Prioritize identity confirmation and sensitive-data safety.'
+        verification: 'Domain: verification. Prioritize identity confirmation and sensitive-data safety.',
+        dating: 'Domain: dating. Keep tone warm, respectful, and low-pressure. Prefer concise, natural conversation with healthy boundaries.',
+        celebrity: 'Domain: celebrity fan engagement. Keep tone energetic, transparent, and concise. Never imply direct celebrity impersonation.',
+        fan: 'Domain: fan engagement. Keep tone community-safe, transparent, and respectful.',
+        creator: 'Domain: creator collaboration. Keep communication concise, professional, and outcomes-focused.',
+        friendship: 'Domain: friendship check-in. Keep tone warm, supportive, and non-manipulative.',
+        networking: 'Domain: networking. Stay professional and concise with one clear next step.',
+        community: 'Domain: community engagement. Prioritize inclusivity, clarity, and policy compliance.',
+        marketplace_seller: 'Domain: marketplace seller. Emphasize trust, verification, and safe transactions.',
+        real_estate_agent: 'Domain: real-estate outreach. Keep communication clear, compliant, and practical.'
       },
       channels: {
         voice: 'Channel: voice. Prefer short utterances with clear pauses.',

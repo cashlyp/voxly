@@ -30,6 +30,17 @@ const {
 const { emailTemplatesFlow } = require('./email');
 const { section, buildLine, tipLine } = require('../utils/ui');
 const { attachHmacAuth } = require('../utils/apiAuth');
+const {
+  RELATIONSHIP_FLOW_TYPES,
+} = require('../../api/functions/Dating');
+const {
+  normalizeCallScriptFlowType: normalizeCallScriptFlowTypeShared,
+  normalizeObjectiveTag: normalizeObjectiveTagShared,
+  buildObjectiveTagsForFlow: buildObjectiveTagsForFlowShared,
+  getCallScriptFlowTypes: getCallScriptFlowTypesShared,
+  getPrimaryFlowType: getPrimaryFlowTypeShared,
+  getEffectiveObjectiveTags: getEffectiveObjectiveTagsShared,
+} = require('../../api/functions/relationshipFlowMetadata');
 
 const scriptsApi = axios.create({
   baseURL: config.scriptsApiUrl.replace(/\/+$/, ''),
@@ -146,7 +157,9 @@ function formatScriptsApiError(error, action) {
 }
 
 const CANCEL_KEYWORDS = new Set(['cancel', 'exit', 'quit']);
-const CALL_SCRIPT_FLOW_LABELS = Object.freeze({
+const RELATIONSHIP_FLOW_TYPE_SET = new Set(RELATIONSHIP_FLOW_TYPES);
+
+const CORE_FLOW_LABELS = Object.freeze({
   payment_collection: 'Payment collection',
   identity_verification: 'Identity verification',
   appointment_confirmation: 'Appointment confirmation',
@@ -155,13 +168,69 @@ const CALL_SCRIPT_FLOW_LABELS = Object.freeze({
   general: 'General'
 });
 
-const CALL_SCRIPT_FLOW_BADGES = Object.freeze({
+const CORE_FLOW_BADGES = Object.freeze({
   payment_collection: '💳 Payment',
   identity_verification: '🔐 Verification',
   appointment_confirmation: '📅 Appointment',
   service_recovery: '🛠️ Recovery',
   general_outreach: '📣 Outreach',
   general: '🧩 General'
+});
+
+const RELATIONSHIP_FLOW_LABEL_OVERRIDES = Object.freeze({
+  dating: 'Dating',
+  celebrity: 'Celebrity fan engagement',
+  fan: 'Fan engagement',
+  creator: 'Creator collaboration',
+  friendship: 'Friendship',
+  networking: 'Networking',
+  community: 'Community engagement',
+  marketplace_seller: 'Marketplace seller',
+  real_estate_agent: 'Real estate outreach'
+});
+
+const RELATIONSHIP_FLOW_BADGE_OVERRIDES = Object.freeze({
+  dating: '💕 Dating',
+  celebrity: '⭐ Celebrity',
+  fan: '🌟 Fan',
+  creator: '🎬 Creator',
+  friendship: '🤝 Friendship',
+  networking: '📇 Networking',
+  community: '👥 Community',
+  marketplace_seller: '🛍️ Marketplace',
+  real_estate_agent: '🏡 Real estate'
+});
+
+function toTitleCase(value = '') {
+  return String(value || '')
+    .split(/[_\s-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+const RELATIONSHIP_FLOW_LABELS = Object.freeze(
+  RELATIONSHIP_FLOW_TYPES.reduce((acc, flowType) => {
+    acc[flowType] = RELATIONSHIP_FLOW_LABEL_OVERRIDES[flowType] || toTitleCase(flowType);
+    return acc;
+  }, {})
+);
+
+const RELATIONSHIP_FLOW_BADGES = Object.freeze(
+  RELATIONSHIP_FLOW_TYPES.reduce((acc, flowType) => {
+    acc[flowType] = RELATIONSHIP_FLOW_BADGE_OVERRIDES[flowType] || `💬 ${toTitleCase(flowType)}`;
+    return acc;
+  }, {})
+);
+
+const CALL_SCRIPT_FLOW_LABELS = Object.freeze({
+  ...CORE_FLOW_LABELS,
+  ...RELATIONSHIP_FLOW_LABELS
+});
+
+const CALL_SCRIPT_FLOW_BADGES = Object.freeze({
+  ...CORE_FLOW_BADGES,
+  ...RELATIONSHIP_FLOW_BADGES
 });
 
 const CALL_SCRIPT_FLOW_FILTER_OPTIONS = Object.freeze([
@@ -171,6 +240,24 @@ const CALL_SCRIPT_FLOW_FILTER_OPTIONS = Object.freeze([
   { id: 'appointment_confirmation', label: '📅 Appointment confirmation' },
   { id: 'service_recovery', label: '🛠️ Service recovery' },
   { id: 'general_outreach', label: '📣 General outreach' },
+  ...RELATIONSHIP_FLOW_TYPES.map((flowType) => ({
+    id: flowType,
+    label: `${CALL_SCRIPT_FLOW_BADGES[flowType]}`
+  })),
+  { id: 'general', label: '🧩 General' }
+]);
+
+const CALL_SCRIPT_FLOW_CREATE_OPTIONS = Object.freeze([
+  { id: 'auto', label: '⚙️ Auto-detect flow' },
+  { id: 'payment_collection', label: '💳 Payment collection' },
+  { id: 'identity_verification', label: '🔐 Identity verification' },
+  { id: 'appointment_confirmation', label: '📅 Appointment confirmation' },
+  { id: 'service_recovery', label: '🛠️ Service recovery' },
+  { id: 'general_outreach', label: '📣 General outreach' },
+  ...RELATIONSHIP_FLOW_TYPES.map((flowType) => ({
+    id: flowType,
+    label: `${CALL_SCRIPT_FLOW_BADGES[flowType]}`
+  })),
   { id: 'general', label: '🧩 General' }
 ]);
 
@@ -187,81 +274,27 @@ function normalizeScriptName(name = '') {
 }
 
 function normalizeCallScriptFlowType(rawType) {
-  const value = String(rawType || '').trim().toLowerCase();
-  if (!value) return null;
-  const aliases = {
-    payment: 'payment_collection',
-    payment_flow: 'payment_collection',
-    collect_payment: 'payment_collection',
-    identity: 'identity_verification',
-    verify_identity: 'identity_verification',
-    otp: 'identity_verification',
-    digit_capture: 'identity_verification',
-    appointment: 'appointment_confirmation',
-    appointment_confirm: 'appointment_confirmation',
-    recovery: 'service_recovery',
-    outreach: 'general_outreach',
-    default: 'general'
-  };
-  if (CALL_SCRIPT_FLOW_LABELS[value]) return value;
-  return aliases[value] || null;
+  return normalizeCallScriptFlowTypeShared(rawType);
+}
+
+function normalizeObjectiveTag(entry) {
+  return normalizeObjectiveTagShared(entry);
+}
+
+function buildObjectiveTagsForFlow(flowType = null, existingTags = []) {
+  return buildObjectiveTagsForFlowShared(flowType, existingTags);
 }
 
 function getCallScriptFlowTypes(script = {}) {
-  const rawFlowTypes = Array.isArray(script.flow_types)
-    ? script.flow_types
-    : script.flow_type
-      ? [script.flow_type]
-      : [];
-  const normalized = [];
-  rawFlowTypes.forEach((entry) => {
-    const flowType = normalizeCallScriptFlowType(entry);
-    if (flowType && !normalized.includes(flowType)) {
-      normalized.push(flowType);
-    }
-  });
-  if (normalized.length) {
-    return normalized;
-  }
-
-  const objectiveTags = Array.isArray(script.objective_tags)
-    ? script.objective_tags.map((entry) => String(entry || '').trim().toLowerCase())
-    : [];
-  const fallback = [];
-  const add = (flowType) => {
-    if (!fallback.includes(flowType)) {
-      fallback.push(flowType);
-    }
-  };
-  if (script.supports_payment === true || objectiveTags.includes('collect_payment')) {
-    add('payment_collection');
-  }
-  if (
-    script.supports_digit_capture === true ||
-    script.requires_otp === true ||
-    (script.default_profile && String(script.default_profile).trim()) ||
-    objectiveTags.includes('verify_identity')
-  ) {
-    add('identity_verification');
-  }
-  if (objectiveTags.includes('appointment_confirm')) {
-    add('appointment_confirmation');
-  }
-  if (objectiveTags.includes('service_recovery')) {
-    add('service_recovery');
-  }
-  if (objectiveTags.includes('general_outreach')) {
-    add('general_outreach');
-  }
-  if (!fallback.length) {
-    add('general');
-  }
-  return fallback;
+  return getCallScriptFlowTypesShared(script);
 }
 
 function getCallScriptPrimaryFlowType(script = {}) {
-  const flowTypes = getCallScriptFlowTypes(script);
-  return flowTypes[0] || 'general';
+  return getPrimaryFlowTypeShared(script);
+}
+
+function getEffectiveObjectiveTags(script = {}) {
+  return getEffectiveObjectiveTagsShared(script);
 }
 
 function getCallScriptFlowLabel(flowType) {
@@ -271,6 +304,14 @@ function getCallScriptFlowLabel(flowType) {
 function getCallScriptFlowBadge(script = {}) {
   const flowType = getCallScriptPrimaryFlowType(script);
   return CALL_SCRIPT_FLOW_BADGES[flowType] || CALL_SCRIPT_FLOW_BADGES.general;
+}
+
+function buildRelationshipFlowNotice(flowType) {
+  const label = CALL_SCRIPT_FLOW_LABELS[flowType] || toTitleCase(flowType);
+  if (!RELATIONSHIP_FLOW_TYPE_SET.has(flowType)) {
+    return null;
+  }
+  return `${CALL_SCRIPT_FLOW_BADGES[flowType]} flow selected. Runtime will apply ${label.toLowerCase()} profile behavior and context tools.`;
 }
 
 function buildDigitCaptureSummary(script = {}) {
@@ -340,6 +381,10 @@ function buildCallScriptSnapshot(script = {}) {
     prompt: script.prompt ?? null,
     first_message: script.first_message ?? null,
     voice_model: script.voice_model ?? null,
+    flow_type: script.flow_type ?? getCallScriptPrimaryFlowType(script),
+    objective_tags: Array.isArray(script.objective_tags) ? script.objective_tags : null,
+    supports_payment: script.supports_payment ?? null,
+    supports_digit_capture: script.supports_digit_capture ?? null,
     requires_otp: !!script.requires_otp,
     default_profile: script.default_profile ?? null,
     expected_length: script.expected_length ?? null,
@@ -859,6 +904,34 @@ async function collectDigitCaptureConfig(conversation, ctx, defaults = {}, ensur
   return capture;
 }
 
+async function collectCallFlowType(conversation, ctx, defaults = {}, ensureActive) {
+  const safeEnsureActive = typeof ensureActive === 'function'
+    ? ensureActive
+    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  const currentFlow = normalizeCallScriptFlowType(
+    defaults.flow_type || getCallScriptPrimaryFlowType(defaults)
+  );
+  const currentLabel = currentFlow
+    ? getCallScriptFlowLabel(currentFlow)
+    : 'Auto-detect';
+
+  const selection = await askOptionWithButtons(
+    conversation,
+    ctx,
+    `🧭 Select call flow type for this script.\n_Current: ${currentLabel}_\n_This controls runtime behavior (for example, digit capture or relationship context tools)._`,
+    CALL_SCRIPT_FLOW_CREATE_OPTIONS,
+    { prefix: 'call-script-flow-type', columns: 1, ensureActive: safeEnsureActive }
+  );
+
+  if (!selection || !selection.id) {
+    return null;
+  }
+  if (selection.id === 'auto') {
+    return null;
+  }
+  return normalizeCallScriptFlowType(selection.id);
+}
+
 async function fetchCallScripts({ flowType = null } = {}) {
   const params = {};
   if (flowType && flowType !== 'all') {
@@ -918,11 +991,15 @@ async function cloneCallScript(id, payload) {
 function formatCallScriptSummary(script) {
   const summary = [];
   const flowTypes = getCallScriptFlowTypes(script);
+  const objectiveTags = getEffectiveObjectiveTags(script);
   summary.push(`📛 *${escapeMarkdown(script.name)}*`);
   summary.push(`🧭 Flow type: ${escapeMarkdown(getCallScriptFlowLabel(flowTypes[0] || 'general'))}`);
   if (flowTypes.length > 1) {
     summary.push(`🗂️ Flow coverage: ${flowTypes.slice(1).map((flow) => escapeMarkdown(getCallScriptFlowLabel(flow))).join(', ')}`);
   }
+  summary.push(
+    `🏷️ Objective tags: ${escapeMarkdown(objectiveTags.length ? objectiveTags.join(', ') : 'none')}`
+  );
   if (script.description) {
     summary.push(`📝 ${escapeMarkdown(script.description)}`);
   }
@@ -1010,6 +1087,9 @@ async function previewCallScript(conversation, ctx, script, ensureActive) {
     number: testNumber,
     user_chat_id: ctx.from.id.toString()
   };
+  const flowTypes = getCallScriptFlowTypes(script);
+  const primaryFlow = flowTypes[0] || 'general';
+  const objectiveTags = getEffectiveObjectiveTags(script);
 
   if (script.business_id) {
     payload.business_id = script.business_id;
@@ -1036,6 +1116,16 @@ async function previewCallScript(conversation, ctx, script, ensureActive) {
   if (persona.technical_level) {
     payload.technical_level = persona.technical_level;
   }
+  if (RELATIONSHIP_FLOW_TYPE_SET.has(primaryFlow)) {
+    payload.call_profile = primaryFlow;
+    payload.conversation_profile = primaryFlow;
+    payload.conversation_profile_lock = true;
+    payload.purpose = primaryFlow;
+  }
+
+  await ctx.reply(
+    `🧭 Preview flow: ${getCallScriptFlowLabel(primaryFlow)}\n🏷️ Objective tags: ${objectiveTags.length ? objectiveTags.join(', ') : 'none'}`
+  );
 
   try {
     await httpClient.post(null, `${config.apiUrl}/outbound-call`, payload, {
@@ -1098,11 +1188,45 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
     return;
   }
 
-  const captureConfig = await collectDigitCaptureConfig(conversation, ctx, {}, safeEnsureActive);
-  if (!captureConfig) {
-    await ctx.reply('❌ Script creation cancelled.');
-    return;
+  const flowType = await collectCallFlowType(conversation, ctx, {}, safeEnsureActive);
+  const isRelationshipFlow = RELATIONSHIP_FLOW_TYPE_SET.has(flowType);
+  const relationshipNotice = buildRelationshipFlowNotice(flowType);
+  if (relationshipNotice) {
+    await ctx.reply(relationshipNotice);
   }
+
+  let captureConfig = {
+    requires_otp: false,
+    default_profile: null,
+    expected_length: null,
+    allow_terminator: false,
+    terminator_char: null,
+    capture_group: null
+  };
+
+  if (isRelationshipFlow) {
+    const addCapture = await confirm(
+      conversation,
+      ctx,
+      'Add optional digit capture settings to this relationship profile script?',
+      safeEnsureActive
+    );
+    if (addCapture) {
+      const optionalCaptureConfig = await collectDigitCaptureConfig(conversation, ctx, {}, safeEnsureActive);
+      if (!optionalCaptureConfig) {
+        await ctx.reply('❌ Script creation cancelled.');
+        return;
+      }
+      captureConfig = optionalCaptureConfig;
+    }
+  } else {
+    captureConfig = await collectDigitCaptureConfig(conversation, ctx, {}, safeEnsureActive);
+    if (!captureConfig) {
+      await ctx.reply('❌ Script creation cancelled.');
+      return;
+    }
+  }
+
   if (captureConfig.capture_group) {
     await ctx.reply('ℹ️ Capture groups are guidance-only; the API still infers groups from the prompt text.');
   }
@@ -1120,8 +1244,17 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
     expected_length: captureConfig.expected_length || null,
     allow_terminator: captureConfig.allow_terminator || false,
     terminator_char: captureConfig.terminator_char || null,
-    capture_group: captureConfig.capture_group || null
+    capture_group: captureConfig.capture_group || null,
+    flow_type: flowType || null,
+    objective_tags: buildObjectiveTagsForFlow(flowType, []),
   };
+
+  if (RELATIONSHIP_FLOW_TYPE_SET.has(flowType) && scriptPayload.persona_config) {
+    scriptPayload.persona_config = {
+      ...scriptPayload.persona_config,
+      purpose: flowType
+    };
+  }
 
   const validation = validateCallScriptPayload(scriptPayload);
   if (validation.errors.length) {
@@ -1140,6 +1273,9 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
   try {
     const apiPayload = { ...scriptPayload };
     delete apiPayload.capture_group;
+    if (!apiPayload.flow_type) {
+      delete apiPayload.flow_type;
+    }
     const script = await createCallScript(apiPayload);
     const needsCaptureUpdate = scriptPayload.requires_otp
       || scriptPayload.default_profile
@@ -1255,6 +1391,27 @@ async function editCallScriptFlow(conversation, ctx, script, ensureActive) {
     updates.capture_group = captureConfig.capture_group || null;
   }
 
+  const adjustFlow = await confirm(conversation, ctx, 'Update flow type settings?', safeEnsureActive);
+  if (adjustFlow) {
+    const flowType = await collectCallFlowType(conversation, ctx, script, safeEnsureActive);
+    updates.flow_type = flowType || null;
+    updates.objective_tags = buildObjectiveTagsForFlow(
+      flowType,
+      Array.isArray(script.objective_tags) ? script.objective_tags : []
+    );
+
+    if (RELATIONSHIP_FLOW_TYPE_SET.has(flowType)) {
+      const flowNotice = buildRelationshipFlowNotice(flowType);
+      if (flowNotice) {
+        await ctx.reply(flowNotice);
+      }
+      updates.persona_config = {
+        ...(updates.persona_config || script.persona_config || {}),
+        purpose: flowType
+      };
+    }
+  }
+
   if (Object.keys(updates).length === 0) {
     await ctx.reply('ℹ️ No changes made.');
     return;
@@ -1279,6 +1436,9 @@ async function editCallScriptFlow(conversation, ctx, script, ensureActive) {
     await storeScriptVersionSnapshot(script, 'call', ctx);
     const apiUpdates = stripUndefined({ ...updates });
     delete apiUpdates.capture_group;
+    if (!apiUpdates.flow_type) {
+      delete apiUpdates.flow_type;
+    }
     const updated = await updateCallScript(script.id, apiUpdates);
     await ctx.reply(`✅ Script *${escapeMarkdown(updated.name)}* updated.`, { parse_mode: 'Markdown' });
   } catch (error) {

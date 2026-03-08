@@ -1102,6 +1102,10 @@ class EnhancedWebhookService {
     try {
       const callDetails = await this.db.getCall(call_sid);
       const transcripts = await this.db.getCallTranscripts(call_sid);
+      if (!callDetails) {
+        await this.sendTelegramMessage(telegram_chat_id, '📋 Call not found for transcript lookup.');
+        return true;
+      }
       const hasTranscriptText = (transcripts || []).some(
         (entry) => String(entry?.message || '').trim().length > 0,
       );
@@ -1113,24 +1117,27 @@ class EnhancedWebhookService {
         hasTranscriptAudio = Boolean(pickTranscriptAssetUrl(callDetails || {}, callStates));
       }
       
-      if (!callDetails || (!hasTranscriptText && !hasTranscriptAudio)) {
-        await this.sendTelegramMessage(telegram_chat_id, '📋 No transcript available for this call');
-        return true;
-      }
-
       const label =
         callDetails.customer_name ||
         callDetails.victim_name ||
         callDetails.phone_number ||
         'this call';
-      const message = `📋 Transcript ready for ${label}.\nChoose an option below.`;
-
       const replyMarkup = {
         inline_keyboard: [
           [{ text: '📄 View transcript', callback_data: `tr:${call_sid}` }],
           [{ text: '🎧 Transcript audio', callback_data: `rca:${call_sid}` }]
         ]
       };
+      if (!hasTranscriptText && !hasTranscriptAudio) {
+        const pendingMessage =
+          `📋 Transcript for ${label} is still processing.\nYou can check now using the options below.`;
+        await this.sendTelegramMessage(telegram_chat_id, pendingMessage, false, {
+          replyMarkup,
+        });
+        return true;
+      }
+
+      const message = `📋 Transcript ready for ${label}.\nChoose an option below.`;
 
       await this.sendTelegramMessage(telegram_chat_id, message, false, { replyMarkup });
 

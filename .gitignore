@@ -24,8 +24,21 @@ logs
 **/build
 **/dist-ssr
 
+# Documentation directories
+docs/
+**/docs/
+
+# Test directories
+test/
+tests/
+**/test/
+**/tests/
+**/__tests__/
+
 # Local overrides/secrets
 *.local
+.local/
+**/.local/
 *.pem
 .env*.local
 .vercel

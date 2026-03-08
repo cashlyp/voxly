@@ -20,6 +20,18 @@ const {
   safeReset,
   guardAgainstCommandInterrupt
 } = require('../utils/sessionState');
+const {
+  RELATIONSHIP_FLOW_TYPES,
+  deriveConversationProfile,
+} = require('../../api/functions/Dating');
+const {
+  normalizeCallScriptFlowType: normalizeCallScriptFlowTypeShared,
+  normalizeObjectiveTag: normalizeObjectiveTagShared,
+  getCallScriptFlowTypes: getCallScriptFlowTypesShared,
+  getPrimaryFlowType: getPrimaryFlowTypeShared,
+  getEffectiveObjectiveTags: getEffectiveObjectiveTagsShared,
+  isRelationshipFlowType,
+} = require('../../api/functions/relationshipFlowMetadata');
 function buildMainMenuReplyMarkup(ctx) {
   return {
     inline_keyboard: [[{ text: '⬅️ Main Menu', callback_data: buildCallbackData(ctx, 'MENU') }]]
@@ -37,7 +49,9 @@ const { buildCallbackData } = require('../utils/actions');
 
 const scriptsApiBase = config.scriptsApiUrl.replace(/\/+$/, '');
 const DEFAULT_FIRST_MESSAGE = 'Hello! This is an automated call. How can I help you today?';
-const CALL_SCRIPT_FLOW_LABELS = Object.freeze({
+const RELATIONSHIP_FLOW_TYPE_SET = new Set(RELATIONSHIP_FLOW_TYPES);
+
+const CORE_FLOW_LABELS = Object.freeze({
   payment_collection: 'Payment collection',
   identity_verification: 'Identity verification',
   appointment_confirmation: 'Appointment confirmation',
@@ -46,7 +60,7 @@ const CALL_SCRIPT_FLOW_LABELS = Object.freeze({
   general: 'General'
 });
 
-const CALL_SCRIPT_FLOW_BADGES = Object.freeze({
+const CORE_FLOW_BADGES = Object.freeze({
   payment_collection: '💳',
   identity_verification: '🔐',
   appointment_confirmation: '📅',
@@ -55,87 +69,85 @@ const CALL_SCRIPT_FLOW_BADGES = Object.freeze({
   general: '🧩'
 });
 
+const RELATIONSHIP_FLOW_LABEL_OVERRIDES = Object.freeze({
+  dating: 'Dating',
+  celebrity: 'Celebrity fan engagement',
+  fan: 'Fan engagement',
+  creator: 'Creator collaboration',
+  friendship: 'Friendship',
+  networking: 'Networking',
+  community: 'Community engagement',
+  marketplace_seller: 'Marketplace seller',
+  real_estate_agent: 'Real estate outreach'
+});
+
+const RELATIONSHIP_FLOW_BADGE_OVERRIDES = Object.freeze({
+  dating: '💕',
+  celebrity: '⭐',
+  fan: '🌟',
+  creator: '🎬',
+  friendship: '🤝',
+  networking: '📇',
+  community: '👥',
+  marketplace_seller: '🛍️',
+  real_estate_agent: '🏡'
+});
+
+function toTitleCase(value = '') {
+  return String(value || '')
+    .split(/[_\s-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+const RELATIONSHIP_FLOW_LABELS = Object.freeze(
+  RELATIONSHIP_FLOW_TYPES.reduce((acc, flowType) => {
+    acc[flowType] = RELATIONSHIP_FLOW_LABEL_OVERRIDES[flowType] || toTitleCase(flowType);
+    return acc;
+  }, {})
+);
+
+const RELATIONSHIP_FLOW_BADGES = Object.freeze(
+  RELATIONSHIP_FLOW_TYPES.reduce((acc, flowType) => {
+    acc[flowType] = RELATIONSHIP_FLOW_BADGE_OVERRIDES[flowType] || '💬';
+    return acc;
+  }, {})
+);
+
+const CALL_SCRIPT_FLOW_LABELS = Object.freeze({
+  ...CORE_FLOW_LABELS,
+  ...RELATIONSHIP_FLOW_LABELS
+});
+
+const CALL_SCRIPT_FLOW_BADGES = Object.freeze({
+  ...CORE_FLOW_BADGES,
+  ...RELATIONSHIP_FLOW_BADGES
+});
+
 function isValidPhoneNumber(number) {
   const e164Regex = /^\+[1-9]\d{1,14}$/;
   return e164Regex.test((number || '').trim());
 }
 
+function normalizeObjectiveTag(entry) {
+  return normalizeObjectiveTagShared(entry);
+}
+
 function normalizeCallScriptFlowType(rawType) {
-  const value = String(rawType || '').trim().toLowerCase();
-  if (!value) return null;
-  const aliases = {
-    payment: 'payment_collection',
-    payment_flow: 'payment_collection',
-    collect_payment: 'payment_collection',
-    identity: 'identity_verification',
-    verify_identity: 'identity_verification',
-    otp: 'identity_verification',
-    digit_capture: 'identity_verification',
-    appointment: 'appointment_confirmation',
-    appointment_confirm: 'appointment_confirmation',
-    recovery: 'service_recovery',
-    outreach: 'general_outreach',
-    default: 'general'
-  };
-  if (CALL_SCRIPT_FLOW_LABELS[value]) return value;
-  return aliases[value] || null;
+  return normalizeCallScriptFlowTypeShared(rawType);
 }
 
 function getCallScriptFlowTypes(script = {}) {
-  const rawFlowTypes = Array.isArray(script.flow_types)
-    ? script.flow_types
-    : script.flow_type
-      ? [script.flow_type]
-      : [];
-  const normalized = [];
-  rawFlowTypes.forEach((entry) => {
-    const flowType = normalizeCallScriptFlowType(entry);
-    if (flowType && !normalized.includes(flowType)) {
-      normalized.push(flowType);
-    }
-  });
-  if (normalized.length) {
-    return normalized;
-  }
-
-  const objectiveTags = Array.isArray(script.objective_tags)
-    ? script.objective_tags.map((entry) => String(entry || '').trim().toLowerCase())
-    : [];
-  const fallback = [];
-  const add = (flowType) => {
-    if (!fallback.includes(flowType)) {
-      fallback.push(flowType);
-    }
-  };
-  if (script.supports_payment === true || objectiveTags.includes('collect_payment')) {
-    add('payment_collection');
-  }
-  if (
-    script.supports_digit_capture === true ||
-    script.requires_otp === true ||
-    (script.default_profile && String(script.default_profile).trim()) ||
-    objectiveTags.includes('verify_identity')
-  ) {
-    add('identity_verification');
-  }
-  if (objectiveTags.includes('appointment_confirm')) {
-    add('appointment_confirmation');
-  }
-  if (objectiveTags.includes('service_recovery')) {
-    add('service_recovery');
-  }
-  if (objectiveTags.includes('general_outreach')) {
-    add('general_outreach');
-  }
-  if (!fallback.length) {
-    add('general');
-  }
-  return fallback;
+  return getCallScriptFlowTypesShared(script);
 }
 
 function getPrimaryCallScriptFlowType(script = {}) {
-  const flowTypes = getCallScriptFlowTypes(script);
-  return flowTypes[0] || 'general';
+  return getPrimaryFlowTypeShared(script);
+}
+
+function getEffectiveObjectiveTags(script = {}) {
+  return getEffectiveObjectiveTagsShared(script);
 }
 
 function getCallScriptFlowLabel(script = {}) {
@@ -299,6 +311,9 @@ async function selectCallScript(conversation, ctx, ensureActive) {
   }
 
   const scriptFlowTypes = getCallScriptFlowTypes(script);
+  const scriptObjectiveTags = getEffectiveObjectiveTags(script);
+  const relationshipFlow =
+    scriptFlowTypes.find((flowType) => RELATIONSHIP_FLOW_TYPE_SET.has(flowType)) || null;
   if (scriptFlowTypes.includes('payment_collection')) {
     let activeProvider = null;
     try {
@@ -352,8 +367,18 @@ async function selectCallScript(conversation, ctx, ensureActive) {
     script: script.name,
     script_id: script.id
   };
+  if (relationshipFlow) {
+    payloadUpdates.call_profile = relationshipFlow;
+    payloadUpdates.conversation_profile = relationshipFlow;
+    payloadUpdates.conversation_profile_lock = true;
+    payloadUpdates.purpose = relationshipFlow;
+  }
 
-  const summary = [`Script: ${script.name}`, `Flow: ${getCallScriptFlowLabel(script)}`];
+  const summary = [
+    `Script: ${script.name}`,
+    `Flow: ${getCallScriptFlowLabel(script)}`,
+    `Objective tags: ${scriptObjectiveTags.length ? scriptObjectiveTags.join(', ') : 'none'}`
+  ];
   if (script.description) {
     summary.push(`Description: ${script.description}`);
   }
@@ -404,7 +429,8 @@ async function selectCallScript(conversation, ctx, ensureActive) {
       scriptDescription: script.description || 'No description provided',
       personaLabel: businessOption?.label || script.business_id || 'Custom',
       scriptVoiceModel: script.voice_model || null,
-      scriptFlowLabel: getCallScriptFlowLabel(script)
+      scriptFlowLabel: getCallScriptFlowLabel(script),
+      scriptObjectiveTags
     }
   };
 }
@@ -486,7 +512,51 @@ async function buildCustomCallConfig(conversation, ctx, ensureActive, businessOp
     summary.push('Persona: Custom prompt');
     summary.push(`Prompt: ${prompt.substring(0, 120)}${prompt.length > 120 ? '...' : ''}`);
     summary.push(`First message: ${firstMessage.substring(0, 120)}${firstMessage.length > 120 ? '...' : ''}`);
-    payloadUpdates.purpose = 'custom';
+    const inferredProfile = deriveConversationProfile({
+      purpose: null,
+      prompt,
+      firstMessage,
+      fallback: 'general',
+    });
+
+    const customFlowOptions = [
+      { id: 'general', label: `🧩 ${CALL_SCRIPT_FLOW_LABELS.general || 'General'}` },
+      ...RELATIONSHIP_FLOW_TYPES.map((flowType) => ({
+        id: flowType,
+        label: CALL_SCRIPT_FLOW_BADGES[flowType]
+          ? `${CALL_SCRIPT_FLOW_BADGES[flowType]} ${CALL_SCRIPT_FLOW_LABELS[flowType] || flowType}`
+          : CALL_SCRIPT_FLOW_LABELS[flowType] || flowType
+      }))
+    ];
+
+    const recommendedLabel = CALL_SCRIPT_FLOW_LABELS[inferredProfile] || inferredProfile || 'General';
+    const selectedFlow = await askOptionWithButtons(
+      conversation,
+      ctx,
+      `🧭 *Select call flow for this custom prompt*\nRecommended from prompt text: *${recommendedLabel}*.\nThis will be applied explicitly during call setup.`,
+      customFlowOptions,
+      {
+        prefix: 'custom-flow',
+        columns: 1
+      }
+    );
+    ensureActive();
+
+    if (!selectedFlow?.id) {
+      await ctx.reply('❌ Flow selection is required for custom prompt mode.');
+      return null;
+    }
+
+    if (isRelationshipFlowType(selectedFlow.id)) {
+      payloadUpdates.call_profile = selectedFlow.id;
+      payloadUpdates.conversation_profile = selectedFlow.id;
+      payloadUpdates.conversation_profile_lock = true;
+      payloadUpdates.purpose = selectedFlow.id;
+      summary.push(`Flow: ${CALL_SCRIPT_FLOW_LABELS[selectedFlow.id] || selectedFlow.id}`);
+    } else {
+      payloadUpdates.purpose = 'general';
+      summary.push(`Flow: ${CALL_SCRIPT_FLOW_LABELS.general || 'General'}`);
+    }
   } else {
     const availablePurposes = selectedBusiness.purposes || [];
     let selectedPurpose = availablePurposes.find((p) => p.id === selectedBusiness.defaultPurpose) || availablePurposes[0];
@@ -739,6 +809,9 @@ async function callFlow(conversation, ctx) {
       'Custom';
     const scriptVoiceModel = configuration.meta?.scriptVoiceModel || null;
     const scriptFlowLabel = configuration.meta?.scriptFlowLabel || null;
+    const scriptObjectiveTags = Array.isArray(configuration.meta?.scriptObjectiveTags)
+      ? configuration.meta.scriptObjectiveTags.filter(Boolean)
+      : [];
 
     const defaultVoice = config.defaultVoiceModel;
     const voiceOptions = [];
@@ -801,6 +874,9 @@ async function callFlow(conversation, ctx) {
       victimName ? buildLine('👤', 'Victim', escapeMarkdown(victimName)) : null,
       buildLine('🧩', 'Script', escapeMarkdown(scriptName)),
       scriptFlowLabel ? buildLine('🧭', 'Flow', escapeMarkdown(scriptFlowLabel)) : null,
+      scriptObjectiveTags.length
+        ? buildLine('🏷️', 'Objective tags', escapeMarkdown(scriptObjectiveTags.join(', ')))
+        : null,
       buildLine('🎤', 'Voice', escapeMarkdown(payload.voice_model || defaultVoice)),
       payload.purpose ? buildLine('🎯', 'Purpose', escapeMarkdown(payload.purpose)) : null
     ].filter(Boolean);

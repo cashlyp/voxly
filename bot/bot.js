@@ -32,6 +32,7 @@ const {
 } = require("./utils/ui");
 const {
   buildCallbackData,
+  parseCallbackData,
   validateCallback,
   isDuplicateAction,
   startActionMetric,
@@ -271,8 +272,7 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
   }
 });
 
-// Live call console actions (proxy to API webhook handler)
-bot.callbackQuery(/^lc:/, async (ctx) => {
+async function proxyLiveCallAction(ctx) {
   try {
     const allowed = await requireCapability(ctx, "calllog_view", {
       actionLabel: "Live call console",
@@ -291,7 +291,6 @@ bot.callbackQuery(/^lc:/, async (ctx) => {
       ctx.update,
       { timeout: 8000 },
     );
-    return;
   } catch (error) {
     console.error("Live call action proxy error:", error?.message || error);
     await ctx.answerCallbackQuery({
@@ -299,6 +298,18 @@ bot.callbackQuery(/^lc:/, async (ctx) => {
       show_alert: false,
     });
   }
+}
+
+// Live call console actions (proxy to API webhook handler)
+bot.callbackQuery(/^lc:/, async (ctx) => {
+  await proxyLiveCallAction(ctx);
+  return;
+});
+
+// API-origin status callbacks (transcript, recording, retry, recap)
+bot.callbackQuery(/^(tr|rca|retry|recap):/, async (ctx) => {
+  await proxyLiveCallAction(ctx);
+  return;
 });
 
 // Initialize conversations middleware AFTER session
@@ -602,21 +613,32 @@ bot.command("start", async (ctx) => {
 // Enhanced callback query handler
 bot.on("callback_query:data", async (ctx) => {
   const rawAction = ctx.callbackQuery.data;
+  const parsedRawAction = parseCallbackData(rawAction);
+  const resolvedAction = parsedRawAction.action || rawAction;
   const metric = startActionMetric(ctx, "callback", { raw_action: rawAction });
   const finishMetric = (status, extra = {}) => {
     finishActionMetric(metric, status, extra);
   };
   try {
-    if (rawAction && rawAction.startsWith("lc:")) {
-      finishMetric("skipped");
+    const menuExemptPrefixes = ["alert:", "lc:", "tr:", "rca:", "retry:", "recap:"];
+    const isMenuExempt = menuExemptPrefixes.some((prefix) =>
+      String(resolvedAction || "").startsWith(prefix),
+    );
+
+    if (
+      String(resolvedAction || "").startsWith("lc:") ||
+      String(resolvedAction || "").startsWith("tr:") ||
+      String(resolvedAction || "").startsWith("rca:") ||
+      String(resolvedAction || "").startsWith("retry:") ||
+      String(resolvedAction || "").startsWith("recap:")
+    ) {
+      await proxyLiveCallAction(ctx);
+      finishMetric("ok", { route: "live_call_proxy" });
       return;
     }
-    const menuExemptPrefixes = ["alert:", "lc:"];
-    const isMenuExempt = menuExemptPrefixes.some((prefix) =>
-      rawAction.startsWith(prefix),
-    );
+
     const validation = isMenuExempt
-      ? { status: "ok", action: rawAction }
+      ? { status: "ok", action: resolvedAction }
       : validateCallback(ctx, rawAction);
     if (validation.status !== "ok") {
       const message =
