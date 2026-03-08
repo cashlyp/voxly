@@ -4,7 +4,8 @@ const httpClient = require('../utils/httpClient');
 const { getUser, isAdmin } = require('../db/db');
 const { buildCallbackData } = require('../utils/actions');
 const { guardAgainstCommandInterrupt, OperationCancelledError, startOperation } = require('../utils/sessionState');
-const { escapeMarkdown, renderMenu, sendEphemeral } = require('../utils/ui');
+const { escapeMarkdown, renderMenu, sendEphemeral, section } = require('../utils/ui');
+const { cancelledMessage, setupStepMessage } = require('../utils/flowMessages');
 
 const ADMIN_HEADER_NAME = 'x-admin-token';
 const DEFAULT_LIMIT = 20;
@@ -41,12 +42,12 @@ function normalizeStatusInput(input) {
 async function ensureAuthorizedAdmin(ctx) {
   const user = await new Promise((resolve) => getUser(ctx.from?.id, resolve));
   if (!user) {
-    await ctx.reply('❌ You are not authorized to use this bot.');
+    await ctx.reply('❌ Access denied. Your account is not authorized for this action.');
     return { isAdminUser: false };
   }
   const adminStatus = await new Promise((resolve) => isAdmin(ctx.from?.id, resolve));
   if (!adminStatus) {
-    await ctx.reply('❌ This command is for administrators only.');
+    await ctx.reply('❌ Access denied. This action is available to administrators only.');
     return { isAdminUser: false };
   }
   return { isAdminUser: true };
@@ -72,11 +73,10 @@ function buildCallerFlagsResultKeyboard(ctx) {
 }
 
 async function renderCallerFlagsMenu(ctx, note = '') {
-  const heading = '📵 Caller Flags';
   const message = note
-    ? `${heading}\n${note}`
-    : `${heading}\nManage inbound allow/block/spam decisions.`;
-  await renderMenu(ctx, message, buildCallerFlagsKeyboard(ctx));
+    ? setupStepMessage('Caller Flags', [note])
+    : setupStepMessage('Caller Flags', ['Manage inbound allow, block, and spam decisions.']);
+  await renderMenu(ctx, message, buildCallerFlagsKeyboard(ctx), { parseMode: 'Markdown' });
 }
 
 async function fetchCallerFlags(params = {}) {
@@ -227,11 +227,12 @@ async function handleCallerFlagsCommand(ctx) {
     }
 
     await ctx.reply(
-      'Usage:\n' +
-      '• /callerflags list [blocked|allowed|spam] [limit]\n' +
-      '• /callerflags allow <phone> [note]\n' +
-      '• /callerflags block <phone> [note]\n' +
-      '• /callerflags spam <phone> [note]',
+      section('📘 Caller Flags Usage', [
+        '• `/callerflags list [blocked|allowed|spam] [limit]`',
+        '• `/callerflags allow <phone> [note]`',
+        '• `/callerflags block <phone> [note]`',
+        '• `/callerflags spam <phone> [note]`'
+      ]),
       {
         parse_mode: 'Markdown',
         reply_markup: buildCallerFlagsResultKeyboard(ctx)
@@ -251,14 +252,20 @@ function createCallerFlagFlow(status) {
       const { isAdminUser } = await ensureAuthorizedAdmin(ctx);
       if (!isAdminUser) return;
 
-      await ctx.reply('📞 Enter the caller phone number (or type cancel):');
+      await ctx.reply(setupStepMessage('Caller Flags Update', [
+        'Enter the caller phone number to update.',
+        'Type `cancel` to stop.'
+      ]), {
+        parse_mode: 'Markdown'
+      });
       const phoneMsg = await conversation.wait();
       const phoneText = phoneMsg?.message?.text?.trim();
       if (phoneText) {
         await guardAgainstCommandInterrupt(ctx, phoneText);
       }
       if (isCancelInput(phoneText)) {
-        await ctx.reply('🛑 Caller flag update cancelled.', {
+        await ctx.reply(cancelledMessage('Caller flag update', 'Use /callerflags to continue managing flags.'), {
+          parse_mode: 'Markdown',
           reply_markup: buildCallerFlagsResultKeyboard(ctx)
         });
         return;
@@ -269,14 +276,20 @@ function createCallerFlagFlow(status) {
         return;
       }
 
-      await ctx.reply('📝 Optional note (type skip to ignore or cancel to abort):');
+      await ctx.reply(setupStepMessage('Caller Flags Update', [
+        'Optional: enter a note for this decision.',
+        'Type `skip` to leave it empty or `cancel` to stop.'
+      ]), {
+        parse_mode: 'Markdown'
+      });
       const noteMsg = await conversation.wait();
       const noteText = noteMsg?.message?.text?.trim();
       if (noteText) {
         await guardAgainstCommandInterrupt(ctx, noteText);
       }
       if (isCancelInput(noteText)) {
-        await ctx.reply('🛑 Caller flag update cancelled.', {
+        await ctx.reply(cancelledMessage('Caller flag update', 'Use /callerflags to continue managing flags.'), {
+          parse_mode: 'Markdown',
           reply_markup: buildCallerFlagsResultKeyboard(ctx)
         });
         return;

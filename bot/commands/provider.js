@@ -154,13 +154,13 @@ async function ensureAuthorizedAdmin(ctx) {
 
     const user = await new Promise((resolve) => getUser(fromId, resolve));
     if (!user) {
-        await ctx.reply('❌ You are not authorized to use this bot.');
+        await ctx.reply('❌ Access denied. Your account is not authorized for this action.');
         return { user: null, isAdminUser: false };
     }
 
     const admin = await new Promise((resolve) => isAdmin(fromId, resolve));
     if (!admin) {
-        await ctx.reply('❌ This command is for administrators only.');
+        await ctx.reply('❌ Access denied. This action is available to administrators only.');
         return { user, isAdminUser: false };
     }
 

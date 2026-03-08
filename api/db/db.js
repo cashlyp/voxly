@@ -1,6 +1,30 @@
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 
+const CALL_STATUS_ORDER = Object.freeze([
+    'queued',
+    'initiated',
+    'ringing',
+    'answered',
+    'in-progress',
+    'completed',
+    'voicemail',
+    'busy',
+    'no-answer',
+    'failed',
+    'canceled',
+]);
+function normalizeCallStatusForDb(value) {
+    return String(value || '')
+        .trim()
+        .toLowerCase()
+        .replace(/_/g, '-');
+}
+
+function getCallStatusRank(status) {
+    return CALL_STATUS_ORDER.indexOf(normalizeCallStatusForDb(status));
+}
+
 class EnhancedDatabase {
     constructor() {
         this.db = null;
@@ -677,8 +701,57 @@ class EnhancedDatabase {
     // Enhanced status update with comprehensive tracking
     async updateCallStatus(call_sid, status, additionalData = {}) {
         return new Promise((resolve, reject) => {
-            let updateFields = ['status = ?'];
-            let values = [status];
+            const normalizedStatus = normalizeCallStatusForDb(status);
+            const nextStatusRank = getCallStatusRank(normalizedStatus);
+            const allowTerminalUpgrade = additionalData.allow_terminal_upgrade === true
+                || additionalData.allowTerminalUpgrade === true;
+            const currentStatusExpr = "LOWER(REPLACE(COALESCE(status, ''), '_', '-'))";
+            const currentRankExpr = `
+                CASE ${currentStatusExpr}
+                    WHEN 'queued' THEN 0
+                    WHEN 'initiated' THEN 1
+                    WHEN 'ringing' THEN 2
+                    WHEN 'answered' THEN 3
+                    WHEN 'in-progress' THEN 4
+                    WHEN 'completed' THEN 5
+                    WHEN 'voicemail' THEN 6
+                    WHEN 'busy' THEN 7
+                    WHEN 'no-answer' THEN 8
+                    WHEN 'failed' THEN 9
+                    WHEN 'canceled' THEN 10
+                    ELSE -1
+                END
+            `;
+            const allowStatusTransitionExpr = `
+                (
+                    status IS NULL
+                    OR TRIM(status) = ''
+                    OR ${currentStatusExpr} = ?
+                    OR (
+                        ${currentStatusExpr} IN ('voicemail', 'busy', 'no-answer', 'failed', 'canceled')
+                        AND ? = 1
+                        AND ? = 'completed'
+                    )
+                    OR (
+                        ${currentStatusExpr} NOT IN ('completed', 'voicemail', 'busy', 'no-answer', 'failed', 'canceled')
+                        AND (
+                            ${currentRankExpr} = -1
+                            OR ? = -1
+                            OR ? >= ${currentRankExpr}
+                        )
+                    )
+                )
+            `;
+
+            let updateFields = [`status = CASE WHEN ${allowStatusTransitionExpr} THEN ? ELSE status END`];
+            let values = [
+                normalizedStatus,
+                allowTerminalUpgrade ? 1 : 0,
+                normalizedStatus,
+                nextStatusRank,
+                nextStatusRank,
+                status,
+            ];
 
             // Handle all possible additional data fields
             const fieldMappings = {

@@ -38,7 +38,10 @@ const {
 } = require('../../api/functions/relationshipFlowMetadata');
 function buildMainMenuReplyMarkup(ctx) {
   return {
-    inline_keyboard: [[{ text: '⬅️ Main Menu', callback_data: buildCallbackData(ctx, 'MENU') }]]
+    inline_keyboard: [
+      [{ text: '⬅️ Back to Call', callback_data: buildCallbackData(ctx, 'CALL') }],
+      [{ text: '⬅️ Main Menu', callback_data: buildCallbackData(ctx, 'MENU') }]
+    ]
   };
 }
 
@@ -50,6 +53,7 @@ async function notifyCallError(ctx, lines = []) {
 }
 const { section, escapeMarkdown, tipLine, buildLine, renderMenu, sendEphemeral } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
+const { cancelledMessage, setupStepMessage } = require('../utils/flowMessages');
 
 const scriptsApiBase = config.scriptsApiUrl.replace(/\/+$/, '');
 const DEFAULT_FIRST_MESSAGE = 'Hello! This is an automated call. How can I help you today?';
@@ -675,7 +679,7 @@ async function callFlow(conversation, ctx) {
     const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
     ensureActive();
     if (!user) {
-      await ctx.reply('❌ You are not authorized to use this bot.');
+      await ctx.reply('❌ Access denied. Your account is not authorized for this action.');
       return;
     }
     flow.touch('authorized');
@@ -695,7 +699,10 @@ async function callFlow(conversation, ctx) {
       }
       flow.touch('number-prefilled');
     } else {
-      await ctx.reply('📞 Enter phone number (E.164 format):');
+      await ctx.reply(setupStepMessage('Call setup', [
+        'Enter phone number in E.164 format.',
+        'Example: +16125151442'
+      ]), { parse_mode: 'Markdown' });
       const numMsg = await waitForMessage();
       number = numMsg?.message?.text?.trim();
 
@@ -714,7 +721,10 @@ async function callFlow(conversation, ctx) {
     if (victimName) {
       await ctx.reply(`👤 Using victim name: ${victimName}`);
     } else {
-      await ctx.reply('👤 Please enter the victim\'s name (as it should be spoken on the call):\nType skip to leave blank.');
+      await ctx.reply(setupStepMessage('Caller details', [
+        'Enter the victim name as it should be spoken on the call.',
+        'Type `skip` to leave blank.'
+      ]), { parse_mode: 'Markdown' });
       const nameMsg = await waitForMessage();
       const providedName = nameMsg?.message?.text?.trim();
       if (providedName && providedName.toLowerCase() !== 'skip') {
@@ -739,7 +749,8 @@ async function callFlow(conversation, ctx) {
     );
     ensureActive();
     if (!configurationMode || configurationMode.id === 'cancel') {
-      await ctx.reply('❌ Call setup cancelled.', {
+      await ctx.reply(cancelledMessage('Call setup', 'Use /call to start again.'), {
+        parse_mode: 'Markdown',
         reply_markup: buildMainMenuReplyMarkup(ctx)
       });
       return;
@@ -751,7 +762,8 @@ async function callFlow(conversation, ctx) {
       if (selection?.status === 'ok') {
         configuration = selection;
       } else if (selection?.status === 'cancel') {
-        await ctx.reply('❌ Call setup cancelled.', {
+        await ctx.reply(cancelledMessage('Call setup', 'Use /call to start again.'), {
+          parse_mode: 'Markdown',
           reply_markup: buildMainMenuReplyMarkup(ctx)
         });
         return;
@@ -763,7 +775,10 @@ async function callFlow(conversation, ctx) {
         );
         ensureActive();
         if (fallbackChoice !== 'custom') {
-          await ctx.reply('❌ Call setup cancelled.');
+          await ctx.reply(cancelledMessage('Call setup', 'Use /call to start again.'), {
+            parse_mode: 'Markdown',
+            reply_markup: buildMainMenuReplyMarkup(ctx)
+          });
           return;
         }
       } else if (selection?.status === 'error') {
@@ -781,7 +796,10 @@ async function callFlow(conversation, ctx) {
     }
 
     if (!configuration) {
-      await ctx.reply('❌ Call setup cancelled.');
+      await ctx.reply(cancelledMessage('Call setup', 'Use /call to start again.'), {
+        parse_mode: 'Markdown',
+        reply_markup: buildMainMenuReplyMarkup(ctx)
+      });
       return;
     }
     flow.touch('configuration-ready');
@@ -850,7 +868,8 @@ async function callFlow(conversation, ctx) {
     );
     ensureActive();
     if (!voiceSelection || voiceSelection.id === 'cancel') {
-      await ctx.reply('❌ Call setup cancelled.', {
+      await ctx.reply(cancelledMessage('Call setup', 'Use /call to start again.'), {
+        parse_mode: 'Markdown',
         reply_markup: buildMainMenuReplyMarkup(ctx)
       });
       return;
@@ -865,7 +884,10 @@ async function callFlow(conversation, ctx) {
     } else if (voiceSelection?.id?.startsWith('model:')) {
       payload.voice_model = voiceSelection.id.slice('model:'.length).trim() || null;
     } else if (voiceSelection?.id === 'custom') {
-      await ctx.reply('🎙️ Enter the voice model id (type skip for Auto):');
+      await ctx.reply(setupStepMessage('Voice override', [
+        'Enter the voice model id to use.',
+        'Type `skip` for Auto voice selection.'
+      ]), { parse_mode: 'Markdown' });
       const voiceMsg = await waitForMessage();
       let customVoice = voiceMsg?.message?.text?.trim();
       if (customVoice && customVoice.toLowerCase() === 'skip') {
@@ -1033,7 +1055,7 @@ function registerCallCommand(bot) {
       console.log(`Call command started by user ${ctx.from?.id || 'unknown'}`);
       const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
       if (!user) {
-        return ctx.reply('❌ You are not authorized to use this bot.');
+        return ctx.reply('❌ Access denied. Your account is not authorized for this action.');
       }
       await ctx.conversation.enter('call-conversation');
     } catch (error) {

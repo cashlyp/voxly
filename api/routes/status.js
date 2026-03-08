@@ -1,4 +1,4 @@
-require("../config/bootstrapLogger");
+require("../utils/bootstrapLogger");
 const axios = require('axios');
 const config = require('../config');
 

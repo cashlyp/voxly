@@ -38,15 +38,194 @@ const PROFILE_ALIASES = Object.freeze({
   "real estate agent": "real_estate_agent",
 });
 
-function readProfilePack(profileId, fallbackText) {
-  try {
-    const filePath = path.join(__dirname, "profiles", `${profileId}.md`);
-    const value = fs.readFileSync(filePath, "utf8");
-    const normalized = String(value || "").trim();
-    return normalized || fallbackText;
-  } catch (_) {
-    return fallbackText;
+const PROFILE_POLICY_KEYS = Object.freeze([
+  "antiImpersonation",
+  "antiHarassment",
+  "antiCoercion",
+  "antiMoneyPressure",
+]);
+
+const PROFILE_RESPONSE_CONSTRAINTS = Object.freeze({
+  general: Object.freeze({ maxChars: 260, maxQuestions: 1 }),
+  dating: Object.freeze({ maxChars: 220, maxQuestions: 1 }),
+  celebrity: Object.freeze({ maxChars: 220, maxQuestions: 1 }),
+  fan: Object.freeze({ maxChars: 220, maxQuestions: 1 }),
+  creator: Object.freeze({ maxChars: 220, maxQuestions: 1 }),
+  friendship: Object.freeze({ maxChars: 240, maxQuestions: 1 }),
+  networking: Object.freeze({ maxChars: 220, maxQuestions: 1 }),
+  community: Object.freeze({ maxChars: 240, maxQuestions: 1 }),
+  marketplace_seller: Object.freeze({ maxChars: 220, maxQuestions: 1 }),
+  real_estate_agent: Object.freeze({ maxChars: 220, maxQuestions: 1 }),
+});
+
+const REQUIRED_PROFILE_FRONTMATTER_KEYS = Object.freeze([
+  "id",
+  "pack_version",
+  "contract_version",
+  "objective_tag",
+  "flow_type",
+  "default_first_message",
+  "safe_fallback",
+  "max_chars",
+  "max_questions",
+  "policy_flags",
+  "allowed_tools",
+  "blocked_tools",
+]);
+
+const MANDATORY_POLICY_FLAGS = Object.freeze([
+  "anti_impersonation",
+  "anti_harassment",
+  "anti_coercion",
+  "anti_money_pressure",
+]);
+
+const PROFILE_PACK_CACHE = new Map(); // profileId -> parsed pack document
+
+function stripWrappingQuotes(value = "") {
+  const text = String(value || "").trim();
+  if (
+    (text.startsWith('"') && text.endsWith('"')) ||
+    (text.startsWith("'") && text.endsWith("'"))
+  ) {
+    return text.slice(1, -1).trim();
   }
+  return text;
+}
+
+function normalizeFrontmatterList(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => stripWrappingQuotes(String(entry || "")))
+      .filter(Boolean);
+  }
+  const text = stripWrappingQuotes(value);
+  if (!text) return [];
+  if (text.startsWith("[") && text.endsWith("]")) {
+    const inner = text.slice(1, -1).trim();
+    if (!inner) return [];
+    return inner
+      .split(",")
+      .map((entry) => stripWrappingQuotes(entry))
+      .filter(Boolean);
+  }
+  if (text.includes(",")) {
+    return text
+      .split(",")
+      .map((entry) => stripWrappingQuotes(entry))
+      .filter(Boolean);
+  }
+  return [text];
+}
+
+function parseFrontmatterValue(rawValue = "") {
+  const value = stripWrappingQuotes(rawValue);
+  if (!value) return "";
+  if (/^(true|false)$/i.test(value)) {
+    return value.toLowerCase() === "true";
+  }
+  if (/^-?\d+$/.test(value)) {
+    return Number(value);
+  }
+  if (value.startsWith("[") && value.endsWith("]")) {
+    return normalizeFrontmatterList(value);
+  }
+  return value;
+}
+
+function parseProfilePackDocument(rawText = "") {
+  const normalized = String(rawText || "").replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n");
+  if (!lines.length || lines[0].trim() !== "---") {
+    return {
+      hasFrontmatter: false,
+      frontmatter: null,
+      content: normalized.trim(),
+    };
+  }
+
+  let closingIndex = -1;
+  for (let index = 1; index < lines.length; index += 1) {
+    if (lines[index].trim() === "---") {
+      closingIndex = index;
+      break;
+    }
+  }
+
+  if (closingIndex === -1) {
+    return {
+      hasFrontmatter: false,
+      frontmatter: null,
+      content: normalized.trim(),
+    };
+  }
+
+  const frontmatter = {};
+  const frontmatterLines = lines.slice(1, closingIndex);
+  for (const line of frontmatterLines) {
+    const trimmed = String(line || "").trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const match = trimmed.match(/^([A-Za-z0-9_]+)\s*:\s*(.*)$/);
+    if (!match) continue;
+    const key = String(match[1] || "").trim().toLowerCase();
+    const rawValue = String(match[2] || "").trim();
+    frontmatter[key] = parseFrontmatterValue(rawValue);
+  }
+
+  const content = lines.slice(closingIndex + 1).join("\n").trim();
+  return {
+    hasFrontmatter: true,
+    frontmatter,
+    content,
+  };
+}
+
+function loadProfilePackDocument(profileId, fallbackText = "") {
+  const profileKey = String(profileId || "").trim().toLowerCase();
+  if (!profileKey) {
+    return {
+      profileId: "",
+      filePath: "",
+      hasFrontmatter: false,
+      frontmatter: null,
+      content: String(fallbackText || "").trim(),
+    };
+  }
+  if (PROFILE_PACK_CACHE.has(profileKey)) {
+    return PROFILE_PACK_CACHE.get(profileKey);
+  }
+
+  const filePath = path.join(__dirname, "profiles", `${profileKey}.md`);
+  let rawText = "";
+  try {
+    rawText = fs.readFileSync(filePath, "utf8");
+  } catch (_) {
+    const fallbackDocument = {
+      profileId: profileKey,
+      filePath,
+      hasFrontmatter: false,
+      frontmatter: null,
+      content: String(fallbackText || "").trim(),
+    };
+    PROFILE_PACK_CACHE.set(profileKey, fallbackDocument);
+    return fallbackDocument;
+  }
+
+  const parsed = parseProfilePackDocument(rawText);
+  const document = {
+    profileId: profileKey,
+    filePath,
+    hasFrontmatter: parsed.hasFrontmatter,
+    frontmatter: parsed.frontmatter,
+    content: parsed.content || String(fallbackText || "").trim(),
+  };
+  PROFILE_PACK_CACHE.set(profileKey, document);
+  return document;
+}
+
+function readProfilePack(profileId, fallbackText) {
+  const doc = loadProfilePackDocument(profileId, fallbackText);
+  return String(doc?.content || "").trim() || String(fallbackText || "").trim();
 }
 
 function getProfilesDirectory() {
@@ -65,15 +244,128 @@ function listProfilePackFiles() {
   }
 }
 
-function validateProfilePackText(fileName, rawText, options = {}) {
-  const text = String(rawText || "").trim();
+function validateProfileFrontmatterContract(frontmatter, definition, options = {}) {
   const errors = [];
   const warnings = [];
   const isRequired = options.isRequired === true;
+  const normalizedFrontmatter =
+    frontmatter && typeof frontmatter === "object" ? frontmatter : {};
+
+  if (isRequired) {
+    for (const key of REQUIRED_PROFILE_FRONTMATTER_KEYS) {
+      if (normalizedFrontmatter[key] === undefined) {
+        errors.push(`Missing required frontmatter key: ${key}`);
+      }
+    }
+  }
+
+  const idValue = String(normalizedFrontmatter.id || "").trim().toLowerCase();
+  if (idValue && definition && idValue !== definition.id) {
+    errors.push(`frontmatter.id must be "${definition.id}"`);
+  }
+
+  const objectiveTag = String(normalizedFrontmatter.objective_tag || "")
+    .trim()
+    .toLowerCase();
+  if (objectiveTag && definition && objectiveTag !== String(definition.objectiveTag || "").toLowerCase()) {
+    errors.push(`frontmatter.objective_tag must be "${definition.objectiveTag}"`);
+  }
+
+  const flowType = String(normalizedFrontmatter.flow_type || "")
+    .trim()
+    .toLowerCase();
+  if (flowType && definition && flowType !== String(definition.flowType || "").toLowerCase()) {
+    errors.push(`frontmatter.flow_type must be "${definition.flowType}"`);
+  }
+
+  const packVersion = String(normalizedFrontmatter.pack_version || "").trim();
+  if (packVersion && !/^v[0-9][a-z0-9._-]*$/i.test(packVersion)) {
+    errors.push("frontmatter.pack_version must match v<semver-like>");
+  }
+  const contractVersion = String(normalizedFrontmatter.contract_version || "").trim();
+  if (contractVersion && !/^c[0-9][a-z0-9._-]*$/i.test(contractVersion)) {
+    errors.push("frontmatter.contract_version must match c<semver-like>");
+  }
+
+  const defaultFirstMessage = String(
+    normalizedFrontmatter.default_first_message || "",
+  ).trim();
+  if (isRequired && defaultFirstMessage.length < 6) {
+    errors.push("frontmatter.default_first_message must be at least 6 characters");
+  }
+
+  const safeFallback = String(normalizedFrontmatter.safe_fallback || "").trim();
+  if (isRequired && safeFallback.length < 24) {
+    errors.push("frontmatter.safe_fallback must be at least 24 characters");
+  }
+
+  const maxChars = Number(normalizedFrontmatter.max_chars);
+  if (
+    Number.isFinite(maxChars) &&
+    (maxChars < 80 || maxChars > 500)
+  ) {
+    errors.push("frontmatter.max_chars must be between 80 and 500");
+  }
+  const maxQuestions = Number(normalizedFrontmatter.max_questions);
+  if (
+    Number.isFinite(maxQuestions) &&
+    (maxQuestions < 0 || maxQuestions > 3)
+  ) {
+    errors.push("frontmatter.max_questions must be between 0 and 3");
+  }
+
+  const policyFlags = normalizeFrontmatterList(normalizedFrontmatter.policy_flags).map(
+    (entry) => String(entry || "").trim().toLowerCase(),
+  );
+  if (isRequired) {
+    for (const key of MANDATORY_POLICY_FLAGS) {
+      if (!policyFlags.includes(key)) {
+        errors.push(`frontmatter.policy_flags must include ${key}`);
+      }
+    }
+  }
+
+  const allowedTools = normalizeFrontmatterList(normalizedFrontmatter.allowed_tools);
+  const blockedTools = normalizeFrontmatterList(normalizedFrontmatter.blocked_tools);
+  if (normalizedFrontmatter.allowed_tools !== undefined && !Array.isArray(allowedTools)) {
+    warnings.push("frontmatter.allowed_tools should be a list.");
+  }
+  if (normalizedFrontmatter.blocked_tools !== undefined && !Array.isArray(blockedTools)) {
+    warnings.push("frontmatter.blocked_tools should be a list.");
+  }
+
+  return {
+    errors,
+    warnings,
+  };
+}
+
+function validateProfilePackText(fileName, rawText, options = {}) {
+  const parsed = parseProfilePackDocument(rawText);
+  const text = String(parsed?.content || "").trim();
+  const frontmatter = parsed?.frontmatter || null;
+  const errors = [];
+  const warnings = [];
+  const isRequired = options.isRequired === true;
+  const definition =
+    options?.definition && typeof options.definition === "object"
+      ? options.definition
+      : null;
 
   if (!text) {
     errors.push("Profile pack is empty.");
     return { file: fileName, ok: false, errors, warnings };
+  }
+
+  if (isRequired && parsed?.hasFrontmatter !== true) {
+    errors.push("Required profile pack must include YAML frontmatter.");
+  }
+  if (frontmatter && typeof frontmatter === "object") {
+    const contract = validateProfileFrontmatterContract(frontmatter, definition, {
+      isRequired,
+    });
+    errors.push(...contract.errors);
+    warnings.push(...contract.warnings);
   }
 
   const firstLine = String(text.split("\n")[0] || "").trim();
@@ -88,6 +380,19 @@ function validateProfilePackText(fileName, rawText, options = {}) {
 
   if (isRequired && text.length < 80) {
     warnings.push("Required profile pack is unusually short.");
+  }
+  if (isRequired && !/\n##\s+purpose\b/i.test(`\n${text}`)) {
+    errors.push('Required profile pack must include a "## Purpose" section.');
+  }
+  if (
+    isRequired &&
+    !/\n##\s+(safety|safety rules|safety boundaries|boundaries)\b/i.test(
+      `\n${text}`,
+    )
+  ) {
+    warnings.push(
+      'Required profile pack should include a dedicated safety/boundaries section heading.',
+    );
   }
 
   const normalized = text.toLowerCase();
@@ -108,6 +413,127 @@ function validateProfilePackText(fileName, rawText, options = {}) {
   return { file: fileName, ok: errors.length === 0, errors, warnings };
 }
 
+function sanitizeEnumList(value = []) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((entry) => String(entry || "").trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function validateProfileDefinitionContract(profileKey = "", definition = {}) {
+  const errors = [];
+  const warnings = [];
+  const key = String(profileKey || "").trim().toLowerCase();
+  const id = String(definition?.id || "").trim().toLowerCase();
+
+  if (!id) errors.push("Missing required field: id");
+  if (key && id && key !== id) {
+    errors.push(`Definition id "${id}" must match key "${key}"`);
+  }
+
+  const requiredStringFields = [
+    "flowType",
+    "objectiveTag",
+    "marker",
+    "defaultFirstMessage",
+    "contextKey",
+    "safeFallback",
+  ];
+  for (const field of requiredStringFields) {
+    const value = String(definition?.[field] || "").trim();
+    if (!value) {
+      errors.push(`Missing required field: ${field}`);
+    }
+  }
+
+  const enumFields = ["stageEnum", "vibeEnum", "goalEnum"];
+  for (const field of enumFields) {
+    const values = sanitizeEnumList(definition?.[field]);
+    if (!values.length) {
+      errors.push(`${field} must contain at least one value`);
+      continue;
+    }
+    if (new Set(values).size !== values.length) {
+      errors.push(`${field} contains duplicate values`);
+    }
+  }
+
+  if (String(definition?.safeFallback || "").trim().length < 40) {
+    warnings.push("safeFallback is short; consider a clearer policy-safe fallback.");
+  }
+  if (!String(definition?.defaultFirstMessage || "").trim()) {
+    warnings.push("defaultFirstMessage should be non-empty for predictable greeting behavior.");
+  }
+
+  const policy =
+    definition?.policy && typeof definition.policy === "object"
+      ? definition.policy
+      : null;
+  if (!policy) {
+    errors.push("Missing required field: policy");
+  } else {
+    for (const keyName of PROFILE_POLICY_KEYS) {
+      if (typeof policy[keyName] !== "boolean") {
+        errors.push(`policy.${keyName} must be a boolean`);
+      }
+    }
+  }
+
+  return {
+    profile: id || key || "unknown",
+    ok: errors.length === 0,
+    errors,
+    warnings,
+  };
+}
+
+function validateProfileDefinitions() {
+  const checks = [];
+  const errors = [];
+  const warnings = [];
+  const objectiveTagOwners = new Map();
+  const flowTypeOwners = new Map();
+
+  for (const [profileKey, definition] of Object.entries(PROFILE_DEFINITIONS)) {
+    const result = validateProfileDefinitionContract(profileKey, definition);
+    checks.push(result);
+    errors.push(...result.errors.map((entry) => `${profileKey}: ${entry}`));
+    warnings.push(...result.warnings.map((entry) => `${profileKey}: ${entry}`));
+
+    const objectiveTag = String(definition?.objectiveTag || "").trim().toLowerCase();
+    if (objectiveTag) {
+      const owner = objectiveTagOwners.get(objectiveTag);
+      if (owner && owner !== profileKey) {
+        errors.push(
+          `Duplicate objectiveTag "${objectiveTag}" shared by ${owner} and ${profileKey}`,
+        );
+      } else {
+        objectiveTagOwners.set(objectiveTag, profileKey);
+      }
+    }
+
+    const flowType = String(definition?.flowType || "").trim().toLowerCase();
+    if (flowType) {
+      const owner = flowTypeOwners.get(flowType);
+      if (owner && owner !== profileKey) {
+        errors.push(
+          `Duplicate flowType "${flowType}" shared by ${owner} and ${profileKey}`,
+        );
+      } else {
+        flowTypeOwners.set(flowType, profileKey);
+      }
+    }
+  }
+
+  return {
+    ok: errors.length === 0,
+    checked_profiles: checks.length,
+    errors,
+    warnings,
+    checks,
+  };
+}
+
 function validateProfilePacks(options = {}) {
   const strict = options.strict === true;
   const failOnWarnings = options.failOnWarnings === true;
@@ -118,6 +544,14 @@ function validateProfilePacks(options = {}) {
   const checks = [];
   const errors = [];
   const warnings = [];
+  const definitionValidation = validateProfileDefinitions();
+
+  if (!definitionValidation.ok) {
+    errors.push(...definitionValidation.errors);
+  }
+  if (definitionValidation.warnings.length) {
+    warnings.push(...definitionValidation.warnings);
+  }
 
   for (const definition of Object.values(PROFILE_DEFINITIONS)) {
     const fileName = `${definition.id}.md`;
@@ -134,7 +568,10 @@ function validateProfilePacks(options = {}) {
       continue;
     }
     const content = fs.readFileSync(filePath, "utf8");
-    const result = validateProfilePackText(fileName, content, { isRequired: true });
+    const result = validateProfilePackText(fileName, content, {
+      isRequired: true,
+      definition,
+    });
     checks.push(result);
     errors.push(...result.errors.map((entry) => `${fileName}: ${entry}`));
     warnings.push(...result.warnings.map((entry) => `${fileName}: ${entry}`));
@@ -165,6 +602,7 @@ function validateProfilePacks(options = {}) {
     errors,
     warnings,
     checks,
+    profile_definition_validation: definitionValidation,
   };
 }
 
@@ -183,6 +621,28 @@ function deriveProfilePackVersion(definition = {}) {
   return "v1";
 }
 
+function deriveProfileContractVersion(definition = {}) {
+  const explicitVersion = String(definition?.contractVersion || "").trim();
+  if (!explicitVersion) return "c1";
+  return explicitVersion.toLowerCase().startsWith("c")
+    ? explicitVersion
+    : `c${explicitVersion}`;
+}
+
+function normalizeProfilePackVersion(value, fallback = "v1") {
+  const normalized = String(value || "").trim();
+  if (!normalized) return fallback;
+  if (!/^v[0-9][a-z0-9._-]*$/i.test(normalized)) return fallback;
+  return normalized;
+}
+
+function normalizeProfileContractVersion(value, fallback = "c1") {
+  const normalized = String(value || "").trim();
+  if (!normalized) return fallback;
+  if (!/^c[0-9][a-z0-9._-]*$/i.test(normalized)) return fallback;
+  return normalized;
+}
+
 function computeProfilePackChecksum(definition = {}, profilePack = "") {
   const payload = [
     String(definition?.id || ""),
@@ -190,6 +650,68 @@ function computeProfilePackChecksum(definition = {}, profilePack = "") {
     String(profilePack || ""),
   ].join("|");
   return crypto.createHash("sha256").update(payload).digest("hex").slice(0, 16);
+}
+
+function getProfileRuntimeContract(profileType) {
+  const definition = getProfileDefinition(profileType);
+  if (!definition) {
+    return {
+      id: DEFAULT_PROFILE_TYPE,
+      profilePack: "",
+      packVersion: null,
+      contractVersion: null,
+      defaultFirstMessage: "",
+      safeFallback:
+        "I can continue in a safe and respectful way with a clear next step.",
+      responseConstraints: PROFILE_RESPONSE_CONSTRAINTS.general,
+      policyFlags: [...MANDATORY_POLICY_FLAGS],
+      allowedTools: [],
+      blockedTools: [],
+      frontmatter: null,
+    };
+  }
+
+  const document = loadProfilePackDocument(definition.id, `${definition.id} profile pack`);
+  const frontmatter =
+    document?.frontmatter && typeof document.frontmatter === "object"
+      ? document.frontmatter
+      : null;
+
+  const responseConstraints = getProfileResponseConstraints(definition.id, frontmatter);
+  const packVersion = normalizeProfilePackVersion(
+    frontmatter?.pack_version,
+    deriveProfilePackVersion(definition),
+  );
+  const contractVersion = normalizeProfileContractVersion(
+    frontmatter?.contract_version,
+    deriveProfileContractVersion(definition),
+  );
+  const defaultFirstMessage = String(
+    frontmatter?.default_first_message || definition.defaultFirstMessage || "",
+  ).trim();
+  const safeFallback = String(
+    frontmatter?.safe_fallback || definition.safeFallback || "",
+  ).trim();
+
+  return {
+    id: definition.id,
+    profilePack: String(document?.content || "").trim(),
+    packVersion,
+    contractVersion,
+    defaultFirstMessage,
+    safeFallback: safeFallback || definition.safeFallback,
+    responseConstraints,
+    policyFlags: normalizeFrontmatterList(frontmatter?.policy_flags).map((entry) =>
+      String(entry || "").trim().toLowerCase(),
+    ),
+    allowedTools: normalizeFrontmatterList(frontmatter?.allowed_tools).map((entry) =>
+      String(entry || "").trim().toLowerCase(),
+    ),
+    blockedTools: normalizeFrontmatterList(frontmatter?.blocked_tools).map((entry) =>
+      String(entry || "").trim().toLowerCase(),
+    ),
+    frontmatter,
+  };
 }
 
 const PROFILE_DEFINITIONS = Object.freeze({
@@ -402,9 +924,8 @@ function getRelationshipFlowTypes() {
 }
 
 function getProfilePack(profileType) {
-  const definition = getProfileDefinition(profileType);
-  if (!definition) return "";
-  return readProfilePack(definition.id, `${definition.id} profile pack`);
+  const contract = getProfileRuntimeContract(profileType);
+  return String(contract.profilePack || "").trim();
 }
 
 function buildPlatformToneDialBlock() {
@@ -427,21 +948,28 @@ function buildProfilePromptBundle(profileType, options = {}) {
       profileType: DEFAULT_PROFILE_TYPE,
       profilePackVersion: null,
       profilePackChecksum: null,
+      profileContractVersion: null,
+      profileResponseConstraints: PROFILE_RESPONSE_CONSTRAINTS.general,
     };
   }
 
-  const profilePack = getProfilePack(definition.id);
-  const profilePackVersion = deriveProfilePackVersion(definition);
+  const profileContract = getProfileRuntimeContract(definition.id);
+  const profilePack = profileContract.profilePack;
+  const profilePackVersion = profileContract.packVersion;
   const profilePackChecksum = computeProfilePackChecksum(definition, profilePack);
+  const profileContractVersion = profileContract.contractVersion;
+  const profileResponseConstraints = profileContract.responseConstraints;
 
   if (basePrompt.includes(definition.marker)) {
     return {
       prompt: basePrompt,
-      firstMessage: firstMessage || definition.defaultFirstMessage,
+      firstMessage: firstMessage || profileContract.defaultFirstMessage,
       applied: false,
       profileType: definition.id,
       profilePackVersion,
       profilePackChecksum,
+      profileContractVersion,
+      profileResponseConstraints,
     };
   }
 
@@ -451,6 +979,7 @@ function buildProfilePromptBundle(profileType, options = {}) {
     `Relationship profile type: ${definition.id}`,
     profilePack,
     buildPlatformToneDialBlock(),
+    `Response constraints: max ${profileResponseConstraints.maxChars} spoken characters and at most ${profileResponseConstraints.maxQuestions} direct question per turn.`,
     "Policy gates: anti-impersonation, anti-harassment, anti-coercion, anti-money-pressure. If triggered, return a safe fallback response.",
   ]
     .filter(Boolean)
@@ -458,11 +987,13 @@ function buildProfilePromptBundle(profileType, options = {}) {
 
   return {
     prompt: mergedPrompt,
-    firstMessage: firstMessage || definition.defaultFirstMessage,
+    firstMessage: firstMessage || profileContract.defaultFirstMessage,
     applied: true,
     profileType: definition.id,
     profilePackVersion,
     profilePackChecksum,
+    profileContractVersion,
+    profileResponseConstraints,
   };
 }
 
@@ -472,6 +1003,116 @@ function normalizeEnumValue(value, allowed, fallbackValue) {
     return normalized;
   }
   return fallbackValue;
+}
+
+function getProfileResponseConstraints(profileType, frontmatter = null) {
+  const normalized = normalizeProfileType(profileType, DEFAULT_PROFILE_TYPE);
+  const fallback =
+    PROFILE_RESPONSE_CONSTRAINTS[normalized] || PROFILE_RESPONSE_CONSTRAINTS.general;
+  const metadata =
+    frontmatter && typeof frontmatter === "object" ? frontmatter : {};
+
+  const maxChars = Number(metadata.max_chars);
+  const maxQuestions = Number(metadata.max_questions);
+  return {
+    maxChars:
+      Number.isFinite(maxChars) && maxChars >= 80 && maxChars <= 500
+        ? Math.floor(maxChars)
+        : Number(fallback.maxChars),
+    maxQuestions:
+      Number.isFinite(maxQuestions) && maxQuestions >= 0 && maxQuestions <= 3
+        ? Math.floor(maxQuestions)
+        : Number(fallback.maxQuestions),
+  };
+}
+
+function resolveStageTransition(definition = {}, requestedStage = "", previousStage = "") {
+  const stages = sanitizeEnumList(definition?.stageEnum);
+  if (!stages.length) {
+    return {
+      stage: "",
+      transition: {
+        requested: String(requestedStage || "").trim().toLowerCase(),
+        previous: String(previousStage || "").trim().toLowerCase(),
+        resolved: "",
+        blocked: false,
+        reason: "missing_stage_enum",
+      },
+    };
+  }
+
+  const requested = normalizeEnumValue(requestedStage, stages, "");
+  const hasPreviousStage = String(previousStage || "").trim() !== "";
+  const previous = normalizeEnumValue(previousStage, stages, stages[0]);
+  if (!requested) {
+    return {
+      stage: previous,
+      transition: {
+        requested: String(requestedStage || "").trim().toLowerCase(),
+        previous,
+        resolved: previous,
+        blocked: false,
+        reason: "requested_stage_missing",
+      },
+    };
+  }
+  if (!hasPreviousStage) {
+    return {
+      stage: requested,
+      transition: {
+        requested,
+        previous: null,
+        resolved: requested,
+        blocked: false,
+        reason: "initial_stage_set",
+      },
+    };
+  }
+
+  const requestedIndex = stages.indexOf(requested);
+  const previousIndex = stages.indexOf(previous);
+  if (requestedIndex === -1 || previousIndex === -1) {
+    return {
+      stage: previous,
+      transition: {
+        requested,
+        previous,
+        resolved: previous,
+        blocked: true,
+        reason: "invalid_stage_value",
+      },
+    };
+  }
+
+  const delta = requestedIndex - previousIndex;
+  if (Math.abs(delta) <= 1) {
+    return {
+      stage: requested,
+      transition: {
+        requested,
+        previous,
+        resolved: requested,
+        blocked: false,
+        reason: "allowed_neighbor_transition",
+      },
+    };
+  }
+
+  const resolvedIndex =
+    delta > 0
+      ? Math.min(previousIndex + 1, stages.length - 1)
+      : Math.max(previousIndex - 1, 0);
+  const resolvedStage = stages[resolvedIndex];
+  return {
+    stage: resolvedStage,
+    transition: {
+      requested,
+      previous,
+      resolved: resolvedStage,
+      blocked: true,
+      reason: "stage_jump_limited",
+    },
+  };
 }
 
 function sanitizeContextNotes(value, maxLength = 320) {
@@ -486,9 +1127,17 @@ function buildRelationshipContext(profileType, input = {}, previous = {}) {
     return null;
   }
 
+  const stageDecision = resolveStageTransition(
+    definition,
+    input.stage,
+    previous.stage,
+  );
+
   return {
     profile_type: definition.id,
-    stage: normalizeEnumValue(input.stage, definition.stageEnum, previous.stage || definition.stageEnum[0]),
+    stage: stageDecision.stage,
+    stage_requested: String(input.stage || "").trim() || null,
+    stage_transition: stageDecision.transition,
     vibe: normalizeEnumValue(input.vibe, definition.vibeEnum, previous.vibe || "neutral"),
     goal: normalizeEnumValue(input.goal, definition.goalEnum, previous.goal || definition.goalEnum[0]),
     platform: normalizeEnumValue(
@@ -675,6 +1324,7 @@ function applyProfilePolicyGates(rawText = "", profileType = DEFAULT_PROFILE_TYP
       findings: [],
     };
   }
+  const runtimeContract = getProfileRuntimeContract(definition.id);
 
   const lower = text.toLowerCase();
   const findings = [];
@@ -738,6 +1388,8 @@ function applyProfilePolicyGates(rawText = "", profileType = DEFAULT_PROFILE_TYP
     anti_coercion: 3,
     anti_money_pressure: 2,
     anti_harassment: 2,
+    response_length_guard: 1,
+    question_density_guard: 1,
   };
   const riskScore = blocked.reduce(
     (total, rule) => total + Number(riskWeights[rule] || 1),
@@ -751,6 +1403,62 @@ function applyProfilePolicyGates(rawText = "", profileType = DEFAULT_PROFILE_TYP
   const action = blocked.length ? "fallback" : "allow";
 
   if (!blocked.length) {
+    const constraints = runtimeContract.responseConstraints;
+    let constrainedText = text;
+    const constrainedFindings = [];
+    const maxChars = Number(constraints?.maxChars);
+    if (Number.isFinite(maxChars) && maxChars > 0 && constrainedText.length > maxChars) {
+      let sliced = constrainedText.slice(0, maxChars);
+      const boundary = Math.max(
+        sliced.lastIndexOf("."),
+        sliced.lastIndexOf("!"),
+        sliced.lastIndexOf("?"),
+        sliced.lastIndexOf(","),
+        sliced.lastIndexOf(" "),
+      );
+      if (boundary >= 80) {
+        sliced = sliced.slice(0, boundary + 1);
+      }
+      constrainedText = sliced.trim();
+      constrainedFindings.push({
+        rule: "response_length_guard",
+        signal: "max_chars_exceeded",
+      });
+    }
+    const maxQuestions = Number(constraints?.maxQuestions);
+    if (Number.isFinite(maxQuestions) && maxQuestions >= 0) {
+      let seenQuestions = 0;
+      let questionTrimmed = false;
+      let next = "";
+      for (const char of constrainedText) {
+        if (char === "?") {
+          seenQuestions += 1;
+          if (seenQuestions > maxQuestions) {
+            next += ".";
+            questionTrimmed = true;
+            continue;
+          }
+        }
+        next += char;
+      }
+      if (questionTrimmed) {
+        constrainedText = next;
+        constrainedFindings.push({
+          rule: "question_density_guard",
+          signal: "too_many_questions",
+        });
+      }
+    }
+    if (constrainedFindings.length > 0) {
+      return {
+        text: constrainedText,
+        replaced: constrainedText !== text,
+        blocked: constrainedFindings.map((entry) => entry.rule),
+        risk_level: "low",
+        action: "sanitize",
+        findings: constrainedFindings,
+      };
+    }
     return {
       text,
       replaced: false,
@@ -762,7 +1470,7 @@ function applyProfilePolicyGates(rawText = "", profileType = DEFAULT_PROFILE_TYP
   }
 
   return {
-    text: definition.safeFallback,
+    text: runtimeContract.safeFallback,
     replaced: true,
     blocked,
     risk_level: riskLevel,
@@ -782,11 +1490,16 @@ module.exports = {
   listProfileDefinitions,
   getRelationshipObjectiveTags,
   getRelationshipFlowTypes,
+  parseProfilePackDocument,
+  loadProfilePackDocument,
+  getProfileRuntimeContract,
   getProfilePack,
   listProfilePackFiles,
   validateProfilePacks,
+  validateProfileDefinitions,
   buildProfilePromptBundle,
   buildRelationshipContext,
+  getProfileResponseConstraints,
   getProfilePolicy,
   evaluateProfileToolPolicy,
   applyProfilePolicyGates,

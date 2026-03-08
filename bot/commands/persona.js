@@ -548,14 +548,14 @@ async function personaFlow(conversation, ctx) {
     const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
     ensureActive();
     if (!user) {
-      await styledAlert(ctx, 'You are not authorized to use this bot.');
+      await styledAlert(ctx, 'Access denied. Your account is not authorized for this action.');
       return;
     }
 
     const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
     ensureActive();
     if (!adminStatus) {
-      await styledAlert(ctx, 'This command is for administrators only.');
+      await styledAlert(ctx, 'Access denied. This action is available to administrators only.');
       return;
     }
 
@@ -577,6 +577,11 @@ async function personaFlow(conversation, ctx) {
         ],
         { prefix: 'persona-menu', columns: 2, ensureActive }
       );
+
+      if (!choice?.id) {
+        await styledAlert(ctx, 'Selection expired. Please choose an option again.');
+        continue;
+      }
 
       switch (choice.id) {
         case 'list': {
@@ -692,12 +697,12 @@ function registerPersonaCommand(bot) {
     try {
       const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
       if (!user) {
-        return ctx.reply('❌ You are not authorized to use this bot.');
+        return ctx.reply('❌ Access denied. Your account is not authorized for this action.');
       }
 
       const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
       if (!adminStatus) {
-        return ctx.reply('❌ This command is for administrators only.');
+        return ctx.reply('❌ Access denied. This action is available to administrators only.');
       }
 
       await ctx.conversation.enter('persona-conversation');

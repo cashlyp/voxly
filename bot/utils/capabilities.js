@@ -52,7 +52,13 @@ const COMMAND_CAPABILITIES = {
   call: 'call',
   calllog: 'view_calllog_menu',
   sms: 'view_sms_menu',
+  schedulesms: 'view_sms_menu',
+  smsstatus: 'sms_status',
+  recentsms: 'sms_admin',
+  smsconversation: 'sms_admin',
+  smsstats: 'sms_admin',
   email: 'view_email_menu',
+  emailstatus: 'email_status',
   smssender: 'bulk_sms',
   mailer: 'bulk_email',
   scripts: 'scripts_manage',
@@ -248,7 +254,7 @@ async function sendAccessDenied(ctx, capability, options = {}) {
   const actionText = formatActionLabel(options.actionLabel);
   const lines = [
     '<b>🔒 Access Required</b>',
-    'This action is not available for your current role.',
+    'Access denied. Your current role cannot run this action.',
     'You can still use <b>Menu</b>, <b>Guide</b>, and <b>Help</b> while waiting for approval.'
   ];
   if (actionText) {

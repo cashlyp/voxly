@@ -18,6 +18,7 @@ const { section, buildLine, tipLine, escapeMarkdown, emphasize, activateMenuMess
 const { buildCallbackData } = require('../utils/actions');
 const { getAccessProfile } = require('../utils/capabilities');
 const { askOptionWithButtons } = require('../utils/persona');
+const { selectionExpiredMessage, cancelledMessage, setupStepMessage } = require('../utils/flowMessages');
 
 function normalizeEmail(value) {
   return String(value || '').trim().toLowerCase();
@@ -50,8 +51,11 @@ async function replyApiError(ctx, error, fallback) {
   return safeReply(ctx, message);
 }
 
-function buildBackToMenuKeyboard(ctx, action = 'EMAIL', label = '⬅️ Back to Email Menu') {
-  return new InlineKeyboard().text(label, buildCallbackData(ctx, action));
+function buildBackToMenuKeyboard(ctx, action = 'EMAIL', label = '⬅️ Back to Email Center') {
+  return new InlineKeyboard()
+    .text(label, buildCallbackData(ctx, action))
+    .row()
+    .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
 }
 
 async function maybeSendEmailAliasTip(ctx) {
@@ -714,6 +718,12 @@ async function showEmailTemplateDetail(conversation, ctx, template, ensureActive
       ],
       { prefix: 'email-template-action', columns: 2, ensureActive }
     );
+
+    if (!action?.id) {
+      await safeReply(ctx, selectionExpiredMessage(), { parse_mode: 'Markdown' });
+      continue;
+    }
+
     switch (action.id) {
       case 'preview':
         await previewEmailTemplate(conversation, ctx, template, ensureActive);
@@ -780,7 +790,7 @@ async function emailTemplatesFlow(conversation, ctx, options = {}) {
   try {
     const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
     if (!user) {
-      await safeReplyMarkdown(ctx, section('❌ Authorization', ['You are not authorized to use this bot.']));
+      await safeReplyMarkdown(ctx, section('❌ Authorization', ['Access denied. Your account is not authorized for this action.']));
       return;
     }
     let open = true;
@@ -798,6 +808,12 @@ async function emailTemplatesFlow(conversation, ctx, options = {}) {
         ],
         { prefix: 'email-template-main', columns: 1, ensureActive }
       );
+
+      if (!action?.id) {
+        await safeReply(ctx, selectionExpiredMessage(), { parse_mode: 'Markdown' });
+        continue;
+      }
+
       switch (action.id) {
         case 'list':
           await listEmailTemplatesFlow(conversation, ctx, ensureActive);
@@ -856,7 +872,7 @@ async function emailStatusFlow(conversation, ctx) {
     const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
     ensureActive();
     if (!user) {
-      await ctx.reply('❌ You are not authorized to use this bot.');
+      await ctx.reply('❌ Access denied. Your account is not authorized for this action.');
       return;
     }
     await ctx.reply('📬 Enter the email message ID:');
@@ -886,6 +902,8 @@ function buildBulkEmailMenuKeyboard(ctx) {
     .text('🕒 History', buildCallbackData(ctx, 'BULK_EMAIL_LIST'))
     .text('📊 Stats', buildCallbackData(ctx, 'BULK_EMAIL_STATS'))
     .row()
+    .text('⬅️ Back to Email Center', buildCallbackData(ctx, 'EMAIL'))
+    .row()
     .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
 }
 
@@ -893,7 +911,7 @@ async function renderBulkEmailMenu(ctx) {
   const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
   const admin = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
   if (!user || !admin) {
-    return ctx.reply('❌ Bulk email is for administrators only.');
+    return ctx.reply('❌ Access denied. This action is available to administrators only.');
   }
   startOperation(ctx, 'bulk-email-menu');
   const keyboard = buildBulkEmailMenuKeyboard(ctx);
@@ -945,7 +963,7 @@ async function bulkEmailHistoryFlow(conversation, ctx) {
     const admin = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
     ensureActive();
     if (!user || !admin) {
-      await ctx.reply('❌ Bulk email history is for administrators only.');
+      await ctx.reply('❌ Access denied. This action is available to administrators only.');
       return;
     }
     await ctx.reply('🕒 Enter page and limit (e.g., `1 10`). Limit max 50.', { parse_mode: 'Markdown' });
@@ -1005,7 +1023,7 @@ async function bulkEmailStatsFlow(conversation, ctx) {
     const admin = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
     ensureActive();
     if (!user || !admin) {
-      await ctx.reply('❌ Bulk email stats are for administrators only.');
+      await ctx.reply('❌ Access denied. This action is available to administrators only.');
       return;
     }
     await ctx.reply('📊 Enter timeframe in hours (e.g., 24 or 72).');
@@ -1026,7 +1044,7 @@ async function bulkEmailStatusFlow(conversation, ctx) {
     const admin = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
     ensureActive();
     if (!user || !admin) {
-      await ctx.reply('❌ Bulk email status is for administrators only.');
+      await ctx.reply('❌ Access denied. This action is available to administrators only.');
       return;
     }
     await ctx.reply('🆔 Enter the bulk email job ID:');
@@ -1326,11 +1344,11 @@ async function emailFlow(conversation, ctx) {
     ensureActive();
     const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
     if (!user) {
-      await ctx.reply(section('❌ Authorization', ['You are not authorized to use this bot.']), { parse_mode: 'Markdown' });
+      await ctx.reply(section('❌ Authorization', ['Access denied. Your account is not authorized for this action.']), { parse_mode: 'Markdown' });
       return;
     }
 
-    await ctx.reply(section('✉️ Email', [
+    await ctx.reply(setupStepMessage('Email setup', [
       'Enter the recipient email address.'
     ]), { parse_mode: 'Markdown' });
     const toMsg = await waitForMessage();
@@ -1364,7 +1382,10 @@ async function emailFlow(conversation, ctx) {
       { prefix: 'email-mode', columns: 2, ensureActive }
     );
     if (!mode) {
-      await ctx.reply('❌ Email flow cancelled.');
+      await ctx.reply(cancelledMessage('Email flow', 'Use /email to start again.'), {
+        parse_mode: 'Markdown',
+        reply_markup: buildBackToMenuKeyboard(ctx, 'EMAIL')
+      });
       return;
     }
 
@@ -1447,7 +1468,10 @@ async function emailFlow(conversation, ctx) {
     payload.is_marketing = await askMarketingFlag(conversation, ctx, ensureActive);
     const schedule = await askSchedule(conversation, ctx, ensureActive);
     if (schedule.cancelled) {
-      await ctx.reply('❌ Email send cancelled.');
+      await ctx.reply(cancelledMessage('Email send', 'Use /email to start again.'), {
+        parse_mode: 'Markdown',
+        reply_markup: buildBackToMenuKeyboard(ctx, 'EMAIL')
+      });
       return;
     }
     if (schedule.sendAt) {
@@ -1494,7 +1518,7 @@ async function bulkEmailFlow(conversation, ctx) {
     const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
     const admin = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
     if (!user || !admin) {
-      await ctx.reply(section('❌ Authorization', ['Bulk email is for administrators only.']), { parse_mode: 'Markdown' });
+      await ctx.reply(section('❌ Authorization', ['Access denied. This action is available to administrators only.']), { parse_mode: 'Markdown' });
       return;
     }
 
@@ -1538,7 +1562,10 @@ async function bulkEmailFlow(conversation, ctx) {
       { prefix: 'bulk-email-mode', columns: 2, ensureActive }
     );
     if (!mode) {
-      await ctx.reply('❌ Bulk email flow cancelled.');
+      await ctx.reply(cancelledMessage('Bulk email flow', 'Use /mailer to start again.'), {
+        parse_mode: 'Markdown',
+        reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_EMAIL', '⬅️ Back to Mailer')
+      });
       return;
     }
 
@@ -1599,7 +1626,10 @@ async function bulkEmailFlow(conversation, ctx) {
     payload.is_marketing = await askMarketingFlag(conversation, ctx, ensureActive);
     const schedule = await askSchedule(conversation, ctx, ensureActive);
     if (schedule.cancelled) {
-      await ctx.reply('❌ Bulk email cancelled.');
+      await ctx.reply(cancelledMessage('Bulk email send', 'Use /mailer to start again.'), {
+        parse_mode: 'Markdown',
+        reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_EMAIL', '⬅️ Back to Mailer')
+      });
       return;
     }
     if (schedule.sendAt) {
@@ -1617,7 +1647,7 @@ async function bulkEmailFlow(conversation, ctx) {
       buildLine('📨', 'Recipients', escapeMarkdown(String(recipients.length)))
     ]), {
       parse_mode: 'Markdown',
-      reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_EMAIL', '⬅️ Back to Bulk Email')
+      reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_EMAIL', '⬅️ Back to Mailer')
     });
     await sendBulkStatusCard(ctx, jobId, { forceReply: true });
   } catch (error) {
@@ -1649,7 +1679,7 @@ function registerEmailCommands(bot) {
     try {
       const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
       if (!user) {
-        return ctx.reply('❌ You are not authorized to use this bot.');
+        return ctx.reply('❌ Access denied. Your account is not authorized for this action.');
       }
       const args = ctx.message?.text?.split(' ') || [];
       if (args.length < 2) {

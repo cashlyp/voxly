@@ -1,4 +1,4 @@
-require("./config/bootstrapLogger");
+require("./utils/bootstrapLogger");
 require("dotenv").config();
 
 const express = require("express");
@@ -1715,11 +1715,32 @@ function resolveProfilePackMetadata(profilePrompt = null) {
     return {
       profile_pack_version: null,
       profile_pack_checksum: null,
+      profile_contract_version: null,
+      profile_response_constraints: null,
     };
   }
+  const responseConstraints =
+    profilePrompt.profileResponseConstraints &&
+    typeof profilePrompt.profileResponseConstraints === "object"
+      ? {
+          max_chars: Number.isFinite(
+            Number(profilePrompt.profileResponseConstraints.maxChars),
+          )
+            ? Math.max(1, Math.floor(Number(profilePrompt.profileResponseConstraints.maxChars)))
+            : null,
+          max_questions: Number.isFinite(
+            Number(profilePrompt.profileResponseConstraints.maxQuestions),
+          )
+            ? Math.max(0, Math.floor(Number(profilePrompt.profileResponseConstraints.maxQuestions)))
+            : null,
+        }
+      : null;
   return {
     profile_pack_version: String(profilePrompt.profilePackVersion || "").trim() || null,
     profile_pack_checksum: String(profilePrompt.profilePackChecksum || "").trim() || null,
+    profile_contract_version:
+      String(profilePrompt.profileContractVersion || "").trim() || null,
+    profile_response_constraints: responseConstraints,
   };
 }
 
@@ -2710,7 +2731,24 @@ function buildCallStatusDedupeKey(payload = {}) {
     payload.EventTimestamp ||
     payload.eventTimestamp ||
     "";
-  return `${callSid}:${status}:${sequence}:${timestamp}`;
+  if (sequence || timestamp) {
+    return `${callSid}:${status}:${sequence}:${timestamp}`;
+  }
+  const fallbackFingerprint = buildProviderEventFingerprint(
+    "twilio_call_status_fallback",
+    {
+      call_sid: callSid,
+      status,
+      duration:
+        payload.Duration ||
+        payload.CallDuration ||
+        payload.DialCallDuration ||
+        null,
+      answered_by: payload.AnsweredBy || null,
+      error_code: payload.ErrorCode || null,
+    },
+  );
+  return `${callSid}:${status}:fallback:${fallbackFingerprint.hash.slice(0, 16)}`;
 }
 
 function shouldProcessCallStatusPayload(payload = {}, options = {}) {
@@ -2726,6 +2764,57 @@ function shouldProcessCallStatusPayload(payload = {}, options = {}) {
   callStatusDedupe.set(key, now);
   pruneDedupeMap(callStatusDedupe, CALL_STATUS_DEDUPE_MAX);
   return true;
+}
+
+function buildCallStatusDedupePayload(payload = {}) {
+  const callSid = payload.CallSid || payload.callSid || null;
+  const status = normalizeCallStatus(
+    payload.CallStatus || payload.callStatus || "unknown",
+  );
+  const sequence =
+    payload.SequenceNumber ||
+    payload.sequenceNumber ||
+    payload.Sequence ||
+    payload.sequence ||
+    null;
+  const timestamp =
+    payload.Timestamp ||
+    payload.timestamp ||
+    payload.EventTimestamp ||
+    payload.eventTimestamp ||
+    null;
+  return {
+    call_sid: callSid,
+    status,
+    sequence: sequence || null,
+    timestamp: timestamp || null,
+    duration:
+      payload.Duration || payload.CallDuration || payload.DialCallDuration || null,
+    answered_by: payload.AnsweredBy || null,
+    error_code: payload.ErrorCode || null,
+    error_message: payload.ErrorMessage || null,
+  };
+}
+
+async function shouldProcessCallStatusPayloadAsync(payload = {}, options = {}) {
+  if (options.skipDedupe) return true;
+  if (!shouldProcessCallStatusPayload(payload, options)) {
+    return false;
+  }
+  if (!db?.reserveProviderEventIdempotency) {
+    return true;
+  }
+  try {
+    return await shouldProcessProviderEventAsync(
+      "twilio_call_status",
+      buildCallStatusDedupePayload(payload),
+      { ttlMs: Math.max(CALL_STATUS_DEDUPE_MS, 60_000) },
+    );
+  } catch (error) {
+    // Fail open with in-memory dedupe if persistence layer is temporarily unavailable.
+    console.error("Call status idempotency persistence unavailable:", error);
+    return true;
+  }
 }
 
 function purgeCallStatusDedupe(callSid) {
@@ -8260,7 +8349,12 @@ function shouldRunProviderPreflightForSelection(channel, provider) {
   ) {
     return false;
   }
-  return normalizedProvider === "twilio" || normalizedProvider === "vonage";
+  if (normalizedProvider === "twilio" || normalizedProvider === "vonage") {
+    return true;
+  }
+  return (
+    normalizedChannel === PROVIDER_CHANNELS.CALL && normalizedProvider === "aws"
+  );
 }
 
 function summarizePreflightReport(report) {
@@ -8303,6 +8397,8 @@ async function evaluateProviderPreflightReport(options = {}) {
     timeoutMs,
     guards: {
       twilio: typeof requireValidTwilioSignature === "function",
+      awsWebhook: typeof requireValidAwsWebhook === "function",
+      awsStream: typeof verifyAwsStreamAuth === "function",
       vonage: typeof requireValidVonageWebhook === "function",
     },
   });
@@ -9295,7 +9391,11 @@ async function recordCallStatus(callSid, status, notificationType, extra = {}) {
     ? normalizedStatus
     : normalizeCallStatus(previousStatus || normalizedStatus);
   const statusChanged = previousNormalized !== finalStatus;
-  await db.updateCallStatus(callSid, finalStatus, extra);
+  const updatePayload = {
+    ...(extra && typeof extra === "object" ? extra : {}),
+    allow_terminal_upgrade: normalizedStatus === "completed",
+  };
+  await db.updateCallStatus(callSid, finalStatus, updatePayload);
   if (applyStatus && statusChanged) {
     recordCallLifecycle(callSid, finalStatus, {
       source: "internal",
@@ -10932,7 +11032,10 @@ app.ws("/connection", (ws, req) => {
                     partialResponse: firstMessage,
                   },
                   0,
-                  { maxChars: FIRST_MESSAGE_TTS_MAX_CHARS },
+                  {
+                    maxChars: FIRST_MESSAGE_TTS_MAX_CHARS,
+                    throwOnError: true,
+                  },
                 );
               } catch (ttsError) {
                 console.error("Initial TTS error:", ttsError);
@@ -10943,7 +11046,10 @@ app.ws("/connection", (ws, req) => {
                       partialResponse: fallbackPrompt,
                     },
                     0,
-                    { maxChars: FIRST_MESSAGE_TTS_MAX_CHARS },
+                    {
+                      maxChars: FIRST_MESSAGE_TTS_MAX_CHARS,
+                      throwOnError: true,
+                    },
                   );
                   promptUsed = fallbackPrompt;
                 } catch (fallbackError) {
@@ -11097,7 +11203,10 @@ app.ws("/connection", (ws, req) => {
                     partialResponse: firstMessage,
                   },
                   0,
-                  { maxChars: FIRST_MESSAGE_TTS_MAX_CHARS },
+                  {
+                    maxChars: FIRST_MESSAGE_TTS_MAX_CHARS,
+                    throwOnError: true,
+                  },
                 );
               } catch (ttsError) {
                 console.error("Initial TTS error:", ttsError);
@@ -11108,7 +11217,10 @@ app.ws("/connection", (ws, req) => {
                       partialResponse: fallbackPrompt,
                     },
                     0,
-                    { maxChars: FIRST_MESSAGE_TTS_MAX_CHARS },
+                    {
+                      maxChars: FIRST_MESSAGE_TTS_MAX_CHARS,
+                      throwOnError: true,
+                    },
                   );
                   promptUsed = fallbackPrompt;
                 } catch (fallbackError) {
@@ -12218,18 +12330,55 @@ app.ws("/vonage/stream", async (ws, req) => {
         ? digitService.buildDigitPrompt(initialExpectation)
         : "");
     if (firstMessage) {
-      ttsService.generate(
-        { partialResponseIndex: null, partialResponse: firstMessage },
-        0,
-        { maxChars: FIRST_MESSAGE_TTS_MAX_CHARS },
-      );
-      webhookService.recordTranscriptTurn(callSid, "agent", firstMessage);
-      if (digitService?.hasExpectation(callSid)) {
-        digitService.markDigitPrompted(callSid, gptService, 0, "dtmf", {
-          allowCallEnd: true,
-          prompt_text: firstMessage,
+      let promptUsed = "";
+      try {
+        const primaryResult = await ttsService.generate(
+          { partialResponseIndex: null, partialResponse: firstMessage },
+          0,
+          {
+            maxChars: FIRST_MESSAGE_TTS_MAX_CHARS,
+            throwOnError: true,
+          },
+        );
+        if (primaryResult?.ok) {
+          promptUsed = String(primaryResult.text || firstMessage).trim();
+        }
+      } catch (ttsError) {
+        console.error("Vonage initial TTS error:", ttsError);
+      }
+
+      if (!promptUsed) {
+        const fallbackPrompt = "One moment while I pull that up.";
+        try {
+          const fallbackResult = await ttsService.generate(
+            { partialResponseIndex: null, partialResponse: fallbackPrompt },
+            0,
+            {
+              maxChars: FIRST_MESSAGE_TTS_MAX_CHARS,
+              throwOnError: true,
+            },
+          );
+          if (fallbackResult?.ok) {
+            promptUsed = String(fallbackResult.text || fallbackPrompt).trim();
+          }
+        } catch (fallbackError) {
+          console.error("Vonage initial TTS fallback error:", fallbackError);
+        }
+      }
+
+      if (promptUsed) {
+        webhookService.recordTranscriptTurn(callSid, "agent", promptUsed);
+        if (digitService?.hasExpectation(callSid)) {
+          digitService.markDigitPrompted(callSid, gptService, 0, "dtmf", {
+            allowCallEnd: true,
+            prompt_text: promptUsed,
+          });
+          digitService.scheduleDigitTimeout(callSid, gptService, 0);
+        }
+      } else {
+        webhookService.addLiveEvent(callSid, "⚠️ First prompt delivery failed", {
+          force: true,
         });
-        digitService.scheduleDigitTimeout(callSid, gptService, 0);
       }
       scheduleSilenceTimer(callSid);
     }
@@ -13355,6 +13504,12 @@ function buildProfileRuntimeCallEntry(callSid, callConfig = null, session = null
     purpose: cfg.purpose || null,
     profile_pack_version: cfg.profile_pack_version || null,
     profile_pack_checksum: cfg.profile_pack_checksum || null,
+    profile_contract_version: cfg.profile_contract_version || null,
+    profile_response_constraints:
+      cfg.profile_response_constraints &&
+      typeof cfg.profile_response_constraints === "object"
+        ? cfg.profile_response_constraints
+        : null,
     policy_gate_summary:
       cfg.policy_gate_summary &&
       typeof cfg.policy_gate_summary === "object" &&
@@ -14976,9 +15131,79 @@ async function scheduleCallJob(jobType, payload, runAt = null) {
 function computeCallJobBackoff(attempt) {
   const base = Number(config.callJobs?.retryBaseMs) || 5000;
   const max = Number(config.callJobs?.retryMaxMs) || 60000;
+  const jitterRatioRaw = Number(config.callJobs?.retryJitterRatio);
+  const jitterRatio = Number.isFinite(jitterRatioRaw)
+    ? Math.max(0, Math.min(0.5, jitterRatioRaw))
+    : 0.2;
   const exp = Math.max(0, Number(attempt) - 1);
-  const delay = Math.min(base * Math.pow(2, exp), max);
-  return delay;
+  const deterministicDelay = Math.min(base * Math.pow(2, exp), max);
+  const jitterWindow = Math.floor(deterministicDelay * jitterRatio);
+  if (jitterWindow <= 0) {
+    return deterministicDelay;
+  }
+  const offset = Math.floor(Math.random() * (jitterWindow * 2 + 1)) - jitterWindow;
+  return Math.max(500, deterministicDelay + offset);
+}
+
+function isRetryableCallJobError(error, _jobType = "") {
+  if (!error) return false;
+  const statusCode = Number(error?.status || error?.statusCode || error?.httpStatus || NaN);
+  const errorCode = String(error?.code || "").toLowerCase();
+  const message = String(error?.message || error || "").toLowerCase();
+
+  if (statusCode >= 500) return true;
+  if (statusCode === 429 || statusCode === 408) return true;
+  if (statusCode >= 400 && statusCode < 500) return false;
+
+  if (
+    [
+      "call_job_timeout",
+      "call_provider_timeout",
+      "sms_provider_timeout",
+      "etimedout",
+      "econnreset",
+      "econnrefused",
+      "enotfound",
+      "eai_again",
+      "aborterror",
+    ].includes(errorCode)
+  ) {
+    return true;
+  }
+  if (
+    [
+      "payment_requires_script",
+      "payment_policy_requires_script",
+      "payment_policy_invalid",
+      "payment_validation_error",
+      "invalid_phone_number",
+      "validation_error",
+    ].includes(errorCode)
+  ) {
+    return false;
+  }
+
+  if (
+    message.includes("missing required") ||
+    message.includes("invalid phone number") ||
+    message.includes("unsupported job type") ||
+    message.includes("must be") ||
+    message.includes("requires to and message")
+  ) {
+    return false;
+  }
+
+  if (
+    message.includes("timeout") ||
+    message.includes("temporarily unavailable") ||
+    message.includes("rate limit") ||
+    message.includes("too many requests")
+  ) {
+    return true;
+  }
+
+  // Fail open for unknown errors to preserve existing resilience behavior.
+  return true;
 }
 
 async function runWithTimeout(
@@ -15090,6 +15315,7 @@ async function processCallJobs() {
         await db.completeCallJob(job.id, "completed");
       } catch (error) {
         const isTimeout = error?.code === "call_job_timeout";
+        const retryable = isRetryableCallJobError(error, job.job_type);
         if (isTimeout) {
           db
             ?.logServiceHealth?.("call_jobs", "job_timeout", {
@@ -15103,8 +15329,12 @@ async function processCallJobs() {
         }
         const attempts = Number(job.attempts) || 1;
         const maxAttempts = Number(config.callJobs?.maxAttempts) || 3;
-        if (attempts >= maxAttempts) {
+        const shouldDeadLetter = !retryable || attempts >= maxAttempts;
+        if (shouldDeadLetter) {
           const failureReason = error.message || String(error);
+          const deadLetterReason = retryable
+            ? "max_attempts_exceeded"
+            : "non_retryable_error";
           await db.completeCallJob(
             job.id,
             "failed",
@@ -15115,7 +15345,7 @@ async function processCallJobs() {
               ...job,
               attempts,
             },
-            "max_attempts_exceeded",
+            deadLetterReason,
             failureReason,
           );
           db
@@ -15124,6 +15354,8 @@ async function processCallJobs() {
               job_type: job.job_type,
               attempts,
               max_attempts: maxAttempts,
+              retryable,
+              dead_letter_reason: deadLetterReason,
               reason: failureReason,
               at: new Date().toISOString(),
             })
@@ -15950,7 +16182,18 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
   }
 
   const source = options.source || "provider";
-  if (!shouldProcessCallStatusPayload(payload, options)) {
+  const dedupePayload = {
+    ...(payload && typeof payload === "object" ? payload : {}),
+    CallSid,
+    CallStatus,
+    Duration,
+    CallDuration,
+    DialCallDuration,
+    AnsweredBy,
+    ErrorCode,
+    ErrorMessage,
+  };
+  if (!(await shouldProcessCallStatusPayloadAsync(dedupePayload, options))) {
     console.log(`⏭️ Duplicate status webhook ignored for ${CallSid}`);
     return { ok: true, callSid: CallSid, deduped: true };
   }
@@ -16103,6 +16346,7 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
   const statusChanged = normalizeCallStatus(priorStatus) !== finalStatus;
   const finalNotificationType =
     applyStatus && statusChanged ? notificationType : null;
+  updateData.allow_terminal_upgrade = finalStatus === "completed";
 
   if (applyStatus && actualStatus === "ringing") {
     try {

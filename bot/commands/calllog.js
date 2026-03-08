@@ -2,10 +2,11 @@ const config = require('../config');
 const httpClient = require('../utils/httpClient');
 const { InlineKeyboard } = require('grammy');
 const { getUser } = require('../db/db');
-const { startOperation, ensureOperationActive } = require('../utils/sessionState');
+const { startOperation, ensureOperationActive, registerAbortController } = require('../utils/sessionState');
 const { renderMenu, escapeMarkdown, buildLine, section, sendEphemeral } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 const { getAccessProfile } = require('../utils/capabilities');
+const { cancelledMessage, setupStepMessage } = require('../utils/flowMessages');
 
 const CANCEL_KEYWORDS = new Set(['cancel', 'exit', 'quit']);
 
@@ -23,7 +24,7 @@ function parseRecentFilter(input = '') {
     return { status: trimmed };
 }
 
-async function fetchRecentCalls({ limit = 10, filter } = {}) {
+async function fetchRecentCalls(ctx, ensureActive, { limit = 10, filter } = {}) {
     const filterParams = parseRecentFilter(filter);
     const candidates = [
         {
@@ -41,9 +42,8 @@ async function fetchRecentCalls({ limit = 10, filter } = {}) {
     let lastError;
     for (const candidate of candidates) {
         try {
-            const res = await httpClient.get(null, candidate.url, {
-                params: candidate.params,
-                timeout: 12000
+            const res = await guardedGet(ctx, ensureActive, candidate.url, {
+                params: candidate.params
             });
             return {
                 calls: res.data?.calls || res.data || [],
@@ -60,6 +60,24 @@ async function fetchRecentCalls({ limit = 10, filter } = {}) {
     throw lastError || new Error('Failed to fetch calls');
 }
 
+async function guardedGet(ctx, ensureActive, url, options = {}) {
+    const controller = new AbortController();
+    const release = registerAbortController(ctx, controller);
+    try {
+        const response = await httpClient.get(null, url, {
+            timeout: 12000,
+            signal: controller.signal,
+            ...options
+        });
+        if (typeof ensureActive === 'function') {
+            ensureActive();
+        }
+        return response;
+    } finally {
+        release();
+    }
+}
+
 function buildCalllogMenuKeyboard(ctx) {
     return new InlineKeyboard()
         .text('🕒 Recent Calls', buildCallbackData(ctx, 'CALLLOG_RECENT'))
@@ -71,6 +89,17 @@ function buildCalllogMenuKeyboard(ctx) {
         .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
 }
 
+function buildCalllogLimitedKeyboard(ctx) {
+    const adminUsername = (config.admin.username || '').replace(/^@/, '');
+    const keyboard = new InlineKeyboard()
+        .text('ℹ️ Help', buildCallbackData(ctx, 'HELP'))
+        .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+    if (adminUsername) {
+        keyboard.row().url('📱 Request Access', `https://t.me/${adminUsername}`);
+    }
+    return keyboard;
+}
+
 function buildCalllogResultKeyboard(ctx) {
     return new InlineKeyboard()
         .text('⬅️ Back to Call Log', buildCallbackData(ctx, 'CALLLOG'))
@@ -78,16 +107,23 @@ function buildCalllogResultKeyboard(ctx) {
         .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
 }
 
+async function replyCalllogUnauthorized(ctx) {
+    await ctx.reply('❌ Access denied. Your account is not authorized for this action.', {
+        reply_markup: buildCalllogResultKeyboard(ctx)
+    });
+}
+
 async function renderCalllogMenu(ctx) {
     const access = await getAccessProfile(ctx);
     startOperation(ctx, 'calllog-menu');
-    const keyboard = buildCalllogMenuKeyboard(ctx);
+    const keyboard = access.user
+        ? buildCalllogMenuKeyboard(ctx)
+        : buildCalllogLimitedKeyboard(ctx);
     const title = access.user ? '📜 *Call Log*' : '🔒 *Call Log (Access limited)*';
     const lines = [
-        'Choose an action to explore call history.',
-        'Search by phone, call ID, status, or date.',
-        access.user ? 'Authorized access enabled.' : 'Limited access: request approval to view details.',
-        access.user ? '' : '🔒 Actions are locked without approval.'
+        access.user ? 'Choose an action to explore call history.' : 'Call log actions require approved account access.',
+        access.user ? 'Search by phone, call ID, status, or date.' : 'Use the Request Access button to unlock call history tools.',
+        access.user ? 'Authorized access enabled.' : 'Limited access mode is active.'
     ].filter(Boolean);
     await renderMenu(ctx, `${title}\n${lines.join('\n')}`, keyboard, { parseMode: 'Markdown' });
 }
@@ -99,27 +135,35 @@ async function calllogRecentFlow(conversation, ctx) {
         const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
         ensureActive();
         if (!user) {
-            await ctx.reply('❌ You are not authorized to use this bot.');
+            await replyCalllogUnauthorized(ctx);
             return;
         }
 
-        await ctx.reply('🕒 Enter limit (max 30) and optional filter (status or phone).\nExample: `15 completed` or `20 +1234567890`\nType `cancel` to stop.', {
+        await ctx.reply(setupStepMessage('Call Log - Recent Calls', [
+            'Enter limit (max 30) with an optional filter (status or phone).',
+            'Example: `15 completed` or `20 +1234567890`.',
+            'Type `cancel` to stop.'
+        ]), {
             parse_mode: 'Markdown'
         });
         const update = await conversation.wait();
         ensureActive();
         const raw = update?.message?.text?.trim() || '';
         if (isCancelInput(raw)) {
-            await ctx.reply('🛑 Call log lookup cancelled.', {
+            await ctx.reply(cancelledMessage('Call log lookup', 'Use /calllog to run another query.'), {
+                parse_mode: 'Markdown',
                 reply_markup: buildCalllogResultKeyboard(ctx)
             });
             return;
         }
         const parts = raw.split(/\s+/).filter(Boolean);
-        const limit = Math.min(parseInt(parts[0], 10) || 10, 30);
+        const parsedLimit = parseInt(parts[0], 10);
+        const limit = Number.isFinite(parsedLimit)
+            ? Math.max(1, Math.min(parsedLimit, 30))
+            : 10;
         const filter = parts.slice(1).join(' ');
 
-        const { calls, filtered } = await fetchRecentCalls({ limit, filter });
+        const { calls, filtered } = await fetchRecentCalls(ctx, ensureActive, { limit, filter });
         if (!calls.length) {
             await ctx.reply('ℹ️ No recent calls found.', {
                 reply_markup: buildCalllogResultKeyboard(ctx)
@@ -159,17 +203,21 @@ async function calllogSearchFlow(conversation, ctx) {
         const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
         ensureActive();
         if (!user) {
-            await ctx.reply('❌ You are not authorized to use this bot.');
+            await replyCalllogUnauthorized(ctx);
             return;
         }
-        await ctx.reply('🔍 Enter a search term (phone, call ID, or status), or type `cancel`.', {
+        await ctx.reply(setupStepMessage('Call Log - Search', [
+            'Enter a search term (phone number, call SID, or status).',
+            'Type `cancel` to stop.'
+        ]), {
             parse_mode: 'Markdown'
         });
         const update = await conversation.wait();
         ensureActive();
         const query = update?.message?.text?.trim();
         if (isCancelInput(query)) {
-            await ctx.reply('🛑 Call log search cancelled.', {
+            await ctx.reply(cancelledMessage('Call log search', 'Use /calllog to run another search.'), {
+                parse_mode: 'Markdown',
                 reply_markup: buildCalllogResultKeyboard(ctx)
             });
             return;
@@ -180,9 +228,8 @@ async function calllogSearchFlow(conversation, ctx) {
         }
 
         await sendEphemeral(ctx, '🔍 Searching call log…');
-        const res = await httpClient.get(null, `${config.apiUrl}/api/calls/search`, {
+        const res = await guardedGet(ctx, ensureActive, `${config.apiUrl}/api/calls/search`, {
             params: { q: query, limit: 10 },
-            timeout: 12000
         });
         const results = res.data?.results || [];
         if (!results.length) {
@@ -216,17 +263,21 @@ async function calllogDetailsFlow(conversation, ctx) {
         const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
         ensureActive();
         if (!user) {
-            await ctx.reply('❌ You are not authorized to use this bot.');
+            await replyCalllogUnauthorized(ctx);
             return;
         }
-        await ctx.reply('📄 Enter the call SID to view details, or type `cancel`.', {
+        await ctx.reply(setupStepMessage('Call Log - Call Details', [
+            'Enter the call SID to view detailed status and summary.',
+            'Type `cancel` to stop.'
+        ]), {
             parse_mode: 'Markdown'
         });
         const update = await conversation.wait();
         ensureActive();
         const callSid = update?.message?.text?.trim();
         if (isCancelInput(callSid)) {
-            await ctx.reply('🛑 Call details lookup cancelled.', {
+            await ctx.reply(cancelledMessage('Call details lookup', 'Use /calllog to view another call.'), {
+                parse_mode: 'Markdown',
                 reply_markup: buildCalllogResultKeyboard(ctx)
             });
             return;
@@ -236,9 +287,7 @@ async function calllogDetailsFlow(conversation, ctx) {
             return;
         }
 
-        const res = await httpClient.get(null, `${config.apiUrl}/api/calls/${encodeURIComponent(callSid)}`, {
-            timeout: 12000
-        });
+        const res = await guardedGet(ctx, ensureActive, `${config.apiUrl}/api/calls/${encodeURIComponent(callSid)}`);
         const call = res.data?.call || res.data;
         if (!call) {
             await ctx.reply('❌ Call not found.', {
@@ -276,17 +325,21 @@ async function calllogEventsFlow(conversation, ctx) {
         const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
         ensureActive();
         if (!user) {
-            await ctx.reply('❌ You are not authorized to use this bot.');
+            await replyCalllogUnauthorized(ctx);
             return;
         }
-        await ctx.reply('🧾 Enter the call SID to view recent events, or type `cancel`.', {
+        await ctx.reply(setupStepMessage('Call Log - Recent Events', [
+            'Enter the call SID to view the most recent call events.',
+            'Type `cancel` to stop.'
+        ]), {
             parse_mode: 'Markdown'
         });
         const update = await conversation.wait();
         ensureActive();
         const callSid = update?.message?.text?.trim();
         if (isCancelInput(callSid)) {
-            await ctx.reply('🛑 Call events lookup cancelled.', {
+            await ctx.reply(cancelledMessage('Call events lookup', 'Use /calllog to review another call event stream.'), {
+                parse_mode: 'Markdown',
                 reply_markup: buildCalllogResultKeyboard(ctx)
             });
             return;
@@ -296,9 +349,7 @@ async function calllogEventsFlow(conversation, ctx) {
             return;
         }
 
-        const res = await httpClient.get(null, `${config.apiUrl}/api/calls/${encodeURIComponent(callSid)}/status`, {
-            timeout: 12000
-        });
+        const res = await guardedGet(ctx, ensureActive, `${config.apiUrl}/api/calls/${encodeURIComponent(callSid)}/status`);
         const states = res.data?.recent_states || [];
         if (!states.length) {
             await ctx.reply('ℹ️ No recent events found.', {
