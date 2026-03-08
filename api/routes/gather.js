@@ -21,7 +21,6 @@ function createTwilioGatherHandler(deps = {}) {
     queuePendingDigitAction,
     getTwilioTtsAudioUrl,
     shouldUseTwilioPlay,
-    resolveTwilioSayVoice,
     isGroupedGatherPlan,
     setCallFlowState,
     ttsTimeoutMs
@@ -64,8 +63,6 @@ function createTwilioGatherHandler(deps = {}) {
       }
       const host = resolveHost(req);
       const callConfig = callConfigurations.get(callSid) || {};
-      const sayVoice = resolveTwilioSayVoice ? resolveTwilioSayVoice(callConfig) : null;
-      const sayOptions = sayVoice ? { voice: sayVoice } : null;
       const usePlayForGather = Boolean(
         typeof shouldUseTwilioPlay === 'function' && shouldUseTwilioPlay(callConfig)
       );
@@ -209,7 +206,7 @@ function createTwilioGatherHandler(deps = {}) {
           const twiml = digitService.buildTwilioGatherTwiml(
             callSid,
             exp,
-            { prompt: promptText, followup: followupText, promptUrl, followupUrl, sayOptions },
+            { prompt: promptText, followup: followupText, promptUrl, followupUrl },
             host
           );
           res.type('text/xml');

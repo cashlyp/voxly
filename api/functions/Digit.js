@@ -4185,18 +4185,6 @@ function createDigitCollectionService(options = {}) {
     if (expectation?.allow_terminator) {
       gatherOptions.finishOnKey = expectation?.terminator_char || '#';
     }
-    const allowSayFallback = options?.allowSayFallback === true;
-    const sayOptions = options?.sayOptions && typeof options.sayOptions === 'object'
-      ? options.sayOptions
-      : null;
-    const sayWithOptions = (node, text) => {
-      if (!text || !allowSayFallback) return;
-      if (sayOptions) {
-        node.say(sayOptions, text);
-      } else {
-        node.say(text);
-      }
-    };
     const playWithNode = (node, url) => {
       if (!url) return;
       node.play(url);
@@ -4207,22 +4195,14 @@ function createDigitCollectionService(options = {}) {
 
     if (preambleUrl) {
       playWithNode(response, preambleUrl);
-    } else if (options.preamble) {
-      sayWithOptions(response, options.preamble);
     }
 
     const gather = response.gather(gatherOptions);
-    const hasPromptOverride = Object.prototype.hasOwnProperty.call(options, 'prompt');
-    const prompt = hasPromptOverride ? options.prompt : buildDigitPrompt(expectation);
     if (promptUrl) {
       playWithNode(gather, promptUrl);
-    } else if (prompt) {
-      sayWithOptions(gather, prompt);
     }
     if (followupUrl) {
       playWithNode(response, followupUrl);
-    } else if (options.followup) {
-      sayWithOptions(response, options.followup);
     }
     return response.toString();
   }
@@ -4734,16 +4714,124 @@ function createDigitCollectionService(options = {}) {
     };
   }
 
-  function buildPaymentCompletionTwiml(success, session = null, host = '') {
+  async function resolveHostedPaymentTtsUrl(text, callConfig = {}, options = {}) {
+    const normalizedText = String(text || '').trim().slice(0, 240);
+    if (!normalizedText) return null;
+    if (typeof getTwilioTtsAudioUrl !== 'function') return null;
+    const timeoutMs = Number(options.timeoutMs);
+    const safeTimeoutMs =
+      Number.isFinite(timeoutMs) && timeoutMs > 0
+        ? timeoutMs
+        : Math.max(1200, Number(config?.twilio?.ttsMaxWaitMs) || 1200);
+    const retryTimeoutMs = Number(options.retryTimeoutMs);
+    const safeRetryTimeoutMs =
+      Number.isFinite(retryTimeoutMs) && retryTimeoutMs > 0
+        ? retryTimeoutMs
+        : Math.max(2500, safeTimeoutMs + 1000);
+    const baseTtsOptions =
+      options?.ttsOptions && typeof options.ttsOptions === 'object'
+        ? { ...options.ttsOptions }
+        : {};
+    if (options.forceGenerate === true) {
+      baseTtsOptions.forceGenerate = true;
+    }
+    const resolveWithTimeout = async (requestTimeoutMs, ttsOptions) => {
+      if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) {
+        return getTwilioTtsAudioUrl(normalizedText, callConfig, ttsOptions);
+      }
+      try {
+        return await Promise.race([
+          getTwilioTtsAudioUrl(normalizedText, callConfig, ttsOptions),
+          new Promise((resolve) => {
+            setTimeout(() => resolve(null), requestTimeoutMs);
+          })
+        ]);
+      } catch (error) {
+        logDigitMetric('payment_tts_error', {
+          callSid: options.callSid || null,
+          error: String(error?.message || error || 'unknown_error')
+        });
+        return null;
+      }
+    };
+
+    let url = await resolveWithTimeout(safeTimeoutMs, baseTtsOptions);
+    if (!url && options.retryOnMiss === true) {
+      url = await resolveWithTimeout(safeRetryTimeoutMs, {
+        ...baseTtsOptions,
+        forceGenerate: true
+      });
+    }
+    return typeof url === 'string' && url.trim() ? url : null;
+  }
+
+  async function appendHostedPaymentSpeech(node, text, callConfig = {}, options = {}) {
+    if (!node) return false;
+    const url = options.url || await resolveHostedPaymentTtsUrl(text, callConfig, options);
+    if (url) {
+      node.play(url);
+      return true;
+    }
+    const fallbackPauseSeconds = Math.max(
+      0,
+      Math.min(10, Math.round(Number(options.fallbackPauseSeconds) || 0))
+    );
+    if (fallbackPauseSeconds > 0 && typeof node.pause === 'function') {
+      node.pause({ length: fallbackPauseSeconds });
+    }
+    return false;
+  }
+
+  async function buildPaymentRedirectFallbackTwiml(message, host = '', callConfig = {}, options = {}) {
+    if (!VoiceResponse) return null;
+    const response = new VoiceResponse();
+    const timeoutMs = Math.max(1500, Number(config?.twilio?.finalPromptTtsTimeoutMs) || 6000);
+    const played = await appendHostedPaymentSpeech(response, message, callConfig, {
+      callSid: options.callSid || null,
+      forceGenerate: true,
+      retryOnMiss: true,
+      timeoutMs,
+      retryTimeoutMs: Math.max(2500, timeoutMs + 1500),
+      fallbackPauseSeconds: 1
+    });
+    if (!played) {
+      logDigitMetric('payment_tts_unavailable', {
+        callSid: options.callSid || null,
+        flow: options.flow || 'payment_fallback'
+      });
+    }
+    if (host) {
+      response.redirect({ method: 'POST' }, `https://${host}/incoming?resume=1`);
+    } else {
+      response.hangup();
+    }
+    return response.toString();
+  }
+
+  async function buildPaymentCompletionTwiml(success, session = null, host = '', callConfig = {}, options = {}) {
     if (!VoiceResponse) return null;
     const response = new VoiceResponse();
     const successMessage = String(session?.success_message || 'Payment processed successfully.').trim().slice(0, 240);
     const failureMessage = String(session?.failure_message || 'We were unable to process that payment. Let\'s continue.').trim().slice(0, 240);
-    response.say(success ? successMessage : failureMessage);
+    const timeoutMs = Math.max(1500, Number(config?.twilio?.finalPromptTtsTimeoutMs) || 6000);
+    await appendHostedPaymentSpeech(response, success ? successMessage : failureMessage, callConfig, {
+      callSid: options.callSid || null,
+      forceGenerate: true,
+      retryOnMiss: true,
+      timeoutMs,
+      retryTimeoutMs: Math.max(2500, timeoutMs + 1500),
+      fallbackPauseSeconds: 1
+    });
     if (!success) {
       const retryMessage = String(session?.retry_message || '').trim().slice(0, 240);
       if (retryMessage) {
-        response.say(retryMessage);
+        await appendHostedPaymentSpeech(response, retryMessage, callConfig, {
+          callSid: options.callSid || null,
+          forceGenerate: true,
+          retryOnMiss: true,
+          timeoutMs: Math.max(1200, Number(config?.twilio?.ttsMaxWaitMs) || 1200),
+          retryTimeoutMs: Math.max(2500, timeoutMs + 1000)
+        });
       }
     }
     if (host) {
@@ -5282,9 +5370,12 @@ function createDigitCollectionService(options = {}) {
     const { callConfig, session } = await resolvePaymentSession(callSid, options.paymentId || '');
     const paymentFeature = isPaymentFeatureEnabledForCall(callConfig || {});
     if (!paymentFeature.enabled) {
-      const fallback = new VoiceResponse();
-      fallback.say('Phone payment is currently unavailable. Returning to the call flow.');
-      fallback.redirect({ method: 'POST' }, `https://${host}/incoming?resume=1`);
+      const fallbackTwiml = await buildPaymentRedirectFallbackTwiml(
+        'Phone payment is currently unavailable. Returning to the call flow.',
+        host,
+        callConfig || {},
+        { callSid, flow: 'payment_feature_disabled' }
+      );
       const failedTransition = transitionPaymentState(callSid, PAYMENT_STATES.FAILED, {
         reason: 'payment_feature_disabled',
         payment_in_progress: false,
@@ -5304,13 +5395,16 @@ function createDigitCollectionService(options = {}) {
         ok: false,
         code: 'payment_feature_disabled',
         message: 'Payment feature disabled',
-        twiml: fallback.toString()
+        twiml: fallbackTwiml
       };
     }
     if (!session) {
-      const fallback = new VoiceResponse();
-      fallback.say('A payment session is not available right now. Returning to the call.');
-      fallback.redirect({ method: 'POST' }, `https://${host}/incoming?resume=1`);
+      const fallbackTwiml = await buildPaymentRedirectFallbackTwiml(
+        'A payment session is not available right now. Returning to the call.',
+        host,
+        callConfig || {},
+        { callSid, flow: 'payment_session_missing' }
+      );
       const failedTransition = transitionPaymentState(callSid, PAYMENT_STATES.FAILED, {
         reason: 'payment_session_missing',
         payment_in_progress: false,
@@ -5329,18 +5423,21 @@ function createDigitCollectionService(options = {}) {
         ok: false,
         code: 'payment_session_missing',
         message: 'Payment session not found',
-        twiml: fallback.toString()
+        twiml: fallbackTwiml
       };
     }
     if (String(session.execution_mode || 'native').toLowerCase() !== 'native') {
-      const fallback = new VoiceResponse();
-      fallback.say('This payment flow is running via secure SMS. Returning to the call.');
-      fallback.redirect({ method: 'POST' }, `https://${host}/incoming?resume=1`);
+      const fallbackTwiml = await buildPaymentRedirectFallbackTwiml(
+        'This payment flow is running via secure SMS. Returning to the call.',
+        host,
+        callConfig || {},
+        { callSid, flow: 'payment_mode_not_native' }
+      );
       return {
         ok: false,
         code: 'payment_mode_not_native',
         message: 'Payment session is not in native voice mode',
-        twiml: fallback.toString()
+        twiml: fallbackTwiml
       };
     }
 
@@ -5352,9 +5449,12 @@ function createDigitCollectionService(options = {}) {
       return { ok: false, code: 'unsupported_provider', message: 'Unsupported payment provider' };
     }
     if (!amount || !paymentConnector) {
-      const fallback = new VoiceResponse();
-      fallback.say('Payment setup is incomplete. Returning to the call flow.');
-      fallback.redirect({ method: 'POST' }, `https://${host}/incoming?resume=1`);
+      const fallbackTwiml = await buildPaymentRedirectFallbackTwiml(
+        'Payment setup is incomplete. Returning to the call flow.',
+        host,
+        callConfig || {},
+        { callSid, flow: 'payment_setup_incomplete' }
+      );
       const failedTransition = transitionPaymentState(callSid, PAYMENT_STATES.FAILED, {
         reason: 'payment_setup_incomplete',
         payment_in_progress: false,
@@ -5373,7 +5473,7 @@ function createDigitCollectionService(options = {}) {
         ok: false,
         code: 'payment_setup_incomplete',
         message: 'Payment amount or connector missing',
-        twiml: fallback.toString()
+        twiml: fallbackTwiml
       };
     }
 
@@ -5384,7 +5484,13 @@ function createDigitCollectionService(options = {}) {
     const response = new VoiceResponse();
     const startMessage = String(session.start_message || '').trim();
     if (startMessage) {
-      response.say(startMessage.slice(0, 240));
+      await appendHostedPaymentSpeech(response, startMessage.slice(0, 240), callConfig || {}, {
+        callSid,
+        forceGenerate: true,
+        retryOnMiss: true,
+        timeoutMs: Math.max(1200, Number(config?.twilio?.ttsMaxWaitMs) || 1200),
+        retryTimeoutMs: Math.max(2500, Number(config?.twilio?.finalPromptTtsTimeoutMs) || 6000)
+      });
     }
     const payAttrs = {
       paymentConnector,
@@ -5402,11 +5508,55 @@ function createDigitCollectionService(options = {}) {
     if (description) {
       payAttrs.description = description;
     }
+    const paymentPromptDefinitions = [
+      { field: 'payment-card-number', text: 'Please enter your card number, then press pound.' },
+      { field: 'expiration-date', text: 'Enter your card expiration date.' },
+      { field: 'security-code', text: 'Enter the card security code.' },
+      { field: 'postal-code', text: 'Enter your billing ZIP code.' }
+    ];
+    const paymentPromptTimeoutMs = Math.max(
+      1500,
+      Number(config?.twilio?.finalPromptTtsTimeoutMs) || 6000
+    );
+    const paymentPromptEntries = await Promise.all(
+      paymentPromptDefinitions.map(async (entry) => ({
+        ...entry,
+        promptUrl: await resolveHostedPaymentTtsUrl(entry.text, callConfig || {}, {
+          callSid,
+          forceGenerate: true,
+          retryOnMiss: true,
+          timeoutMs: paymentPromptTimeoutMs,
+          retryTimeoutMs: Math.max(2500, paymentPromptTimeoutMs + 1000)
+        })
+      }))
+    );
+    const missingPromptFields = paymentPromptEntries
+      .filter((entry) => !entry.promptUrl)
+      .map((entry) => entry.field);
+    if (missingPromptFields.length) {
+      logDigitMetric('payment_tts_unavailable', {
+        callSid,
+        flow: 'payment_prompts',
+        missing_fields: missingPromptFields.join(',')
+      });
+      const fallbackTwiml = await buildPaymentRedirectFallbackTwiml(
+        'Payment voice prompts are temporarily unavailable. Returning to the call flow.',
+        host,
+        callConfig || {},
+        { callSid, flow: 'payment_prompt_tts_missing' }
+      );
+      return {
+        ok: false,
+        code: 'payment_tts_unavailable',
+        message: 'Payment TTS prompts unavailable',
+        twiml: fallbackTwiml
+      };
+    }
     const pay = response.pay(payAttrs);
-    pay.prompt({ for: 'payment-card-number' }).say('Please enter your card number, then press pound.');
-    pay.prompt({ for: 'expiration-date' }).say('Enter your card expiration date.');
-    pay.prompt({ for: 'security-code' }).say('Enter the card security code.');
-    pay.prompt({ for: 'postal-code' }).say('Enter your billing ZIP code.');
+    for (const entry of paymentPromptEntries) {
+      const prompt = pay.prompt({ for: entry.field });
+      prompt.play(entry.promptUrl);
+    }
 
     let persistedConfig = callConfig;
     if (callConfig && typeof callConfig === 'object') {
@@ -5498,7 +5648,13 @@ function createDigitCollectionService(options = {}) {
         duplicate: true,
         success: duplicateSuccess,
         summary: existingSummary,
-        twiml: buildPaymentCompletionTwiml(duplicateSuccess, session, host)
+        twiml: await buildPaymentCompletionTwiml(
+          duplicateSuccess,
+          session,
+          host,
+          callConfig || {},
+          { callSid }
+        )
       };
     }
     const summary = {
@@ -5598,7 +5754,13 @@ function createDigitCollectionService(options = {}) {
         ...summary,
         sms_fallback_sent: smsFallbackResult?.sent === true
       },
-      twiml: buildPaymentCompletionTwiml(success, session, host)
+      twiml: await buildPaymentCompletionTwiml(
+        success,
+        session,
+        host,
+        persistedConfig || callConfig || {},
+        { callSid }
+      )
     };
   }
 
