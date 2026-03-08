@@ -114,4 +114,10 @@ Include:
 
 # Local routing helper
 /workspaces/voxly/docs/agent/route-skills.sh --from-git --query "your task text"
+
+# Local profile selector (print decision)
+/workspaces/voxly/docs/agent/select-codex-profile.sh --from-git --query "your task text"
+
+# Local profile selector (launch codex)
+/workspaces/voxly/docs/agent/select-codex-profile.sh --from-git --query "your task text" --exec
 ```

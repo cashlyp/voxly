@@ -153,9 +153,19 @@ function buildManagedVoiceAgentSettings(options = {}) {
   const outputSampleRate = toFiniteNumber(options?.audio?.output?.sample_rate, 8000);
   const outputContainer = normalizeText(options?.audio?.output?.container, "none");
   const listenModel = normalizeText(options?.agent?.listen?.provider?.model, "nova-2");
+  const listenSmartFormat =
+    options?.agent?.listen?.provider?.smart_format !== undefined
+      ? options.agent.listen.provider.smart_format === true
+      : true;
+  const listenKeyterms = Array.isArray(options?.agent?.listen?.provider?.keyterms)
+    ? options.agent.listen.provider.keyterms
+        .map((entry) => normalizeText(entry))
+        .filter(Boolean)
+        .slice(0, 24)
+    : [];
   const speakModel = normalizeText(
     options?.agent?.speak?.provider?.model,
-    "aura-asteria-en",
+    "aura-2-andromeda-en",
   );
   const language = normalizeText(
     options?.agent?.language?.type || options?.agent?.language,
@@ -180,6 +190,8 @@ function buildManagedVoiceAgentSettings(options = {}) {
         provider: {
           type: "deepgram",
           model: listenModel,
+          smart_format: listenSmartFormat,
+          ...(listenKeyterms.length > 0 ? { keyterms: listenKeyterms } : {}),
         },
       },
       speak: {

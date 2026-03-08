@@ -156,12 +156,17 @@ class StreamService extends EventEmitter {
     }, this.audioTickIntervalMs);
   }
 
-  close () {
+  flush () {
+    this.audioBuffer = {};
+    this.expectedAudioIndex = 0;
     if (this.audioTickTimer) {
       clearInterval(this.audioTickTimer);
       this.audioTickTimer = null;
     }
-    this.audioBuffer = {};
+  }
+
+  close () {
+    this.flush();
   }
 }
 

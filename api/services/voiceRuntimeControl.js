@@ -84,6 +84,15 @@ function normalizeVoiceAgentAutoCanaryConfig(raw = {}) {
         Number.isFinite(Number(raw.maxFallbackRate)) ? Number(raw.maxFallbackRate) : 0.25,
       ),
     ),
+    maxNoAudioFallbackRate: Math.max(
+      0,
+      Math.min(
+        1,
+        Number.isFinite(Number(raw.maxNoAudioFallbackRate))
+          ? Number(raw.maxNoAudioFallbackRate)
+          : 0.12,
+      ),
+    ),
     failClosedOnBreach: raw.failClosedOnBreach !== false,
   };
 }
@@ -251,6 +260,7 @@ function summarizeVoiceAgentAutoCanaryEvents(
   const totalFallbackForSlo = fallbackRuntime + fallbackNoAudio + fallbackOther;
   const errorRate = selected > 0 ? totalFailuresForErrorRate / selected : 0;
   const fallbackRate = selected > 0 ? totalFallbackForSlo / selected : 0;
+  const fallbackNoAudioRate = selected > 0 ? fallbackNoAudio / selected : 0;
   return {
     selected,
     selectedSinceLastEval,
@@ -264,6 +274,7 @@ function summarizeVoiceAgentAutoCanaryEvents(
     totalFallbackForSlo,
     errorRate,
     fallbackRate,
+    fallbackNoAudioRate,
   };
 }
 
@@ -290,6 +301,9 @@ function evaluateVoiceAgentAutoCanaryDecision(input = {}) {
   const fallbackRate = Number.isFinite(Number(summary.fallbackRate))
     ? Number(summary.fallbackRate)
     : 0;
+  const fallbackNoAudioRate = Number.isFinite(Number(summary.fallbackNoAudioRate))
+    ? Number(summary.fallbackNoAudioRate)
+    : 0;
   const circuitOpen = input.circuitOpen === true;
   const cooldownUntilMs = parseEpochMs(input.cooldownUntilMs);
   const base = {
@@ -304,6 +318,7 @@ function evaluateVoiceAgentAutoCanaryDecision(input = {}) {
     selectedSinceLastEval,
     errorRate,
     fallbackRate,
+    fallbackNoAudioRate,
     circuitOpen,
   };
 
@@ -334,7 +349,11 @@ function evaluateVoiceAgentAutoCanaryDecision(input = {}) {
 
   const breachedBySlo =
     selected >= cfg.minSamples &&
-    (errorRate > cfg.maxErrorRate || fallbackRate > cfg.maxFallbackRate);
+    (
+      errorRate > cfg.maxErrorRate ||
+      fallbackRate > cfg.maxFallbackRate ||
+      fallbackNoAudioRate > cfg.maxNoAudioFallbackRate
+    );
   if (circuitOpen || breachedBySlo) {
     const nextCanaryPercent = cfg.failClosedOnBreach
       ? 0

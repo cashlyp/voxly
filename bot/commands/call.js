@@ -12,6 +12,10 @@ const {
 } = require('../utils/persona');
 const { extractScriptVariables } = require('../utils/scripts');
 const {
+  fetchVoiceModelCatalog,
+  askVoiceModelWithPagination,
+} = require('../utils/voiceModels');
+const {
   startOperation,
   ensureOperationActive,
   registerAbortController,
@@ -363,7 +367,7 @@ async function selectCallScript(conversation, ctx, ensureActive) {
     business_id: script.business_id || config.defaultBusinessId,
     prompt: filledPrompt,
     first_message: filledFirstMessage,
-    voice_model: script.voice_model || config.defaultVoiceModel,
+    voice_model: script.voice_model || null,
     script: script.name,
     script_id: script.id
   };
@@ -476,7 +480,7 @@ async function buildCustomCallConfig(conversation, ctx, ensureActive, businessOp
   const payloadUpdates = {
     channel: 'voice',
     business_id: resolvedBusinessId,
-    voice_model: config.defaultVoiceModel,
+    voice_model: null,
     script: selectedBusiness.custom ? 'custom' : resolvedBusinessId,
     purpose: selectedBusiness.defaultPurpose || config.defaultPurpose
   };
@@ -791,7 +795,7 @@ async function callFlow(conversation, ctx) {
 
     payload.business_id = payload.business_id || config.defaultBusinessId;
     payload.purpose = payload.purpose || config.defaultPurpose;
-    payload.voice_model = payload.voice_model || config.defaultVoiceModel;
+    payload.voice_model = payload.voice_model || null;
     payload.script = payload.script || 'custom';
     payload.technical_level = payload.technical_level || 'auto';
 
@@ -814,22 +818,35 @@ async function callFlow(conversation, ctx) {
       : [];
 
     const defaultVoice = config.defaultVoiceModel;
-    const voiceOptions = [];
-    if (scriptVoiceModel && scriptVoiceModel !== defaultVoice) {
-      voiceOptions.push({ id: 'script', label: `🎤 Script voice (${scriptVoiceModel})` });
-      voiceOptions.push({ id: 'default', label: `🎧 Default voice (${defaultVoice})` });
-    } else {
-      voiceOptions.push({ id: 'default', label: `🎧 Default voice (${defaultVoice})` });
+    const voiceCatalog = await fetchVoiceModelCatalog(ctx);
+    const availableVoiceModels = Array.isArray(voiceCatalog.models) ? voiceCatalog.models : [];
+    if (availableVoiceModels.length > 8) {
+      await ctx.reply('🔎 Tip: use Search in the voice picker to filter by model id quickly.');
     }
-    voiceOptions.push({ id: 'custom', label: '✍️ Custom voice id' });
-    voiceOptions.push({ id: 'cancel', label: '❌ Cancel' });
 
-    const voiceSelection = await askOptionWithButtons(
+    const voiceSelection = await askVoiceModelWithPagination(
       conversation,
       ctx,
-      '🎙️ *Voice selection*\nChoose which voice to use for this call.',
-      voiceOptions,
-      { prefix: 'call-voice', columns: 1 }
+      {
+        prompt: '🎙️ *Voice selection*\nChoose which voice to use for this call.',
+        models: availableVoiceModels,
+        topOptions: [
+          { id: 'auto', label: '⚙️ Auto (best for flow)' },
+          ...(scriptVoiceModel
+            ? [{ id: 'script', label: `🎤 Script voice (${scriptVoiceModel})` }]
+            : []),
+          ...(defaultVoice && defaultVoice !== scriptVoiceModel
+            ? [{ id: 'default', label: `🎧 Default voice (${defaultVoice})` }]
+            : []),
+        ],
+        bottomOptions: [
+          { id: 'custom', label: '✍️ Custom voice id' },
+          { id: 'cancel', label: '❌ Cancel' },
+        ],
+        prefix: 'call-voice',
+        pageSize: 8,
+        ensureActive,
+      }
     );
     ensureActive();
     if (!voiceSelection || voiceSelection.id === 'cancel') {
@@ -839,20 +856,22 @@ async function callFlow(conversation, ctx) {
       return;
     }
 
-    if (voiceSelection?.id === 'script' && scriptVoiceModel) {
+    if (voiceSelection?.id === 'auto') {
+      payload.voice_model = null;
+    } else if (voiceSelection?.id === 'script' && scriptVoiceModel) {
       payload.voice_model = scriptVoiceModel;
     } else if (voiceSelection?.id === 'default') {
       payload.voice_model = defaultVoice;
+    } else if (voiceSelection?.id?.startsWith('model:')) {
+      payload.voice_model = voiceSelection.id.slice('model:'.length).trim() || null;
     } else if (voiceSelection?.id === 'custom') {
-      await ctx.reply('🎙️ Enter the voice model id (type skip to keep current):');
+      await ctx.reply('🎙️ Enter the voice model id (type skip for Auto):');
       const voiceMsg = await waitForMessage();
       let customVoice = voiceMsg?.message?.text?.trim();
       if (customVoice && customVoice.toLowerCase() === 'skip') {
         customVoice = null;
       }
-      if (customVoice) {
-        payload.voice_model = customVoice;
-      }
+      payload.voice_model = customVoice || null;
     }
 
     if (!payload.first_message) {
@@ -877,7 +896,7 @@ async function callFlow(conversation, ctx) {
       scriptObjectiveTags.length
         ? buildLine('🏷️', 'Objective tags', escapeMarkdown(scriptObjectiveTags.join(', ')))
         : null,
-      buildLine('🎤', 'Voice', escapeMarkdown(payload.voice_model || defaultVoice)),
+      buildLine('🎤', 'Voice', escapeMarkdown(payload.voice_model || 'Auto (best for flow)')),
       payload.purpose ? buildLine('🎯', 'Purpose', escapeMarkdown(payload.purpose)) : null
     ].filter(Boolean);
 

@@ -26,6 +26,42 @@ function truncateAtSentenceBoundary(text, maxChars) {
   return `${slice.trimEnd()}.`;
 }
 
+function applyNaturalSpeechPacing(value = "") {
+  let text = String(value || "");
+  if (!text) return text;
+
+  text = text
+    .replace(/\s*[|]+\s*/g, ", ")
+    .replace(/\s*;\s*/g, ", ")
+    .replace(/\s*:\s*/g, ", ")
+    .replace(/\s*\/\s*/g, " ")
+    .replace(/\.{4,}/g, "...")
+    .replace(/,{2,}/g, ",");
+
+  // Slow down spoken long numbers for telephony clarity.
+  text = text.replace(/\b(\d{3})(\d{3})(\d{4})\b/g, "$1. $2. $3");
+
+  // If a long response has no punctuation, add one natural break.
+  if (!/[.!?]/.test(text) && text.length > 120) {
+    const mid = Math.floor(text.length / 2);
+    const leftWindow = Math.max(0, mid - 28);
+    const rightWindow = Math.min(text.length - 1, mid + 28);
+    const windowText = text.slice(leftWindow, rightWindow + 1);
+    const commaPos = windowText.lastIndexOf(",");
+    if (commaPos >= 0) {
+      const absolute = leftWindow + commaPos;
+      text = `${text.slice(0, absolute + 1)} ${text.slice(absolute + 1)}`;
+    } else {
+      const breakPos = windowText.search(/\s(and|but|so|then)\s/i);
+      if (breakPos >= 0) {
+        const absolute = leftWindow + breakPos;
+        text = `${text.slice(0, absolute).trimEnd()}. ${text.slice(absolute).trimStart()}`;
+      }
+    }
+  }
+  return text;
+}
+
 function sanitizeVoiceOutputText(rawText = "", options = {}) {
   const fallbackText = String(options.fallbackText || "Let me help you with that.")
     .trim();
@@ -96,6 +132,8 @@ function sanitizeVoiceOutputText(rawText = "", options = {}) {
     .replace(/\s+([,.!?;:])/g, "$1")
     .replace(/([,.!?;:]){2,}/g, "$1")
     .replace(/\s{2,}/g, " ");
+
+  text = applyNaturalSpeechPacing(text);
 
   text = normalizeWhitespace(text);
   text = truncateAtSentenceBoundary(text, maxChars);

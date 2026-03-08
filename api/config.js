@@ -56,6 +56,33 @@ function parseList(rawValue) {
     .filter(Boolean);
 }
 
+function readBooleanEnv(name, fallback = false) {
+  const value = readEnv(name);
+  if (value === undefined) return fallback;
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+function normalizeVoiceAgentProfileVoiceMap(rawValue = {}, fallbackMap = {}) {
+  const normalized = {};
+  const merged = {
+    ...(fallbackMap && typeof fallbackMap === "object" ? fallbackMap : {}),
+    ...(rawValue && typeof rawValue === "object" ? rawValue : {}),
+  };
+  for (const [key, value] of Object.entries(merged)) {
+    const normalizedKey = String(key || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[^\w-]+/g, "_");
+    const model = String(value || "").trim();
+    if (!normalizedKey || !model) continue;
+    normalized[normalizedKey] = model;
+  }
+  return normalized;
+}
+
 const corsOriginsRaw = ensure("CORS_ORIGINS", "");
 const corsOrigins = corsOriginsRaw
   .split(",")
@@ -77,42 +104,142 @@ const voiceRuntimeMode = voiceRuntimeModes.has(voiceRuntimeModeRaw)
 const voiceAgentEnabled =
   String(readEnv("VOICE_AGENT_SECONDARY_ENABLED") || "false").toLowerCase() ===
   "true";
+const defaultVoiceAgentProfileVoiceMap = Object.freeze({
+  general: "aura-2-andromeda-en|aura-2-helena-en|aura-2-arcas-en",
+  sales: "aura-2-aries-en|aura-2-andromeda-en|aura-2-helena-en",
+  support: "aura-2-helena-en|aura-2-arcas-en|aura-2-thalia-en",
+  collections: "aura-2-arcas-en|aura-2-aries-en|aura-2-thalia-en",
+  verification: "aura-2-thalia-en|aura-2-arcas-en|aura-2-helena-en",
+  identity_verification: "aura-2-thalia-en|aura-2-arcas-en|aura-2-helena-en",
+  dating: "aura-2-helena-en|aura-2-arcas-en|aura-2-andromeda-en",
+  fan: "aura-2-helena-en|aura-2-andromeda-en|aura-2-arcas-en",
+  celebrity: "aura-2-thalia-en|aura-2-arcas-en|aura-2-helena-en",
+  creator: "aura-2-aries-en|aura-2-andromeda-en|aura-2-thalia-en",
+  friendship: "aura-2-helena-en|aura-2-andromeda-en|aura-2-arcas-en",
+  networking: "aura-2-arcas-en|aura-2-aries-en|aura-2-thalia-en",
+  community: "aura-2-helena-en|aura-2-andromeda-en|aura-2-thalia-en",
+  marketplace_seller: "aura-2-arcas-en|aura-2-andromeda-en|aura-2-aries-en",
+  real_estate_agent: "aura-2-arcas-en|aura-2-andromeda-en|aura-2-thalia-en",
+});
+const voiceAgentProfileVoiceMap = normalizeVoiceAgentProfileVoiceMap(
+  parseJsonObject(
+    readEnv("VOICE_AGENT_PROFILE_VOICE_MAP"),
+    "VOICE_AGENT_PROFILE_VOICE_MAP",
+  ),
+  defaultVoiceAgentProfileVoiceMap,
+);
+const voiceAgentCanaryPercentDefault =
+  voiceRuntimeMode === "hybrid" && voiceAgentEnabled ? 10 : 0;
 const voiceAgentDefaults = Object.freeze({
-  canaryPercent: 0,
-  canarySeed: "voice_agent",
-  failoverToLegacy: true,
-  openTimeoutMs: 8000,
-  settingsTimeoutMs: 8000,
-  idleTimeoutMs: 12000,
-  keepAliveMs: 8000,
-  noAudioFallbackMs: 15000,
-  managedThinkOnly: true,
-  parityCloseOnGoodbye: true,
-  language: "en",
-  listenModel: String(deepgramModel || "nova-2").trim() || "nova-2",
-  speakModel: String(readEnv("VOICE_MODEL") || "aura-asteria-en").trim() || "aura-asteria-en",
-  thinkProvider: "open_ai",
-  thinkModel: "gpt-4o-mini",
-  thinkTemperature: undefined,
+  canaryPercent: Math.max(
+    0,
+    Math.min(
+      100,
+      Math.floor(
+        Number(readEnv("VOICE_AGENT_CANARY_PERCENT") || voiceAgentCanaryPercentDefault),
+      ),
+    ),
+  ),
+  canarySeed: String(readEnv("VOICE_AGENT_CANARY_SEED") || "voice_agent").trim() || "voice_agent",
+  failoverToLegacy: readBooleanEnv("VOICE_AGENT_FAILOVER_TO_LEGACY", true),
+  openTimeoutMs: Math.max(2000, Number(readEnv("VOICE_AGENT_OPEN_TIMEOUT_MS") || "8000")),
+  settingsTimeoutMs: Math.max(2000, Number(readEnv("VOICE_AGENT_SETTINGS_TIMEOUT_MS") || "8000")),
+  idleTimeoutMs: Math.max(3000, Number(readEnv("VOICE_AGENT_IDLE_TIMEOUT_MS") || "12000")),
+  keepAliveMs: Math.max(5000, Number(readEnv("VOICE_AGENT_KEEPALIVE_MS") || "8000")),
+  noAudioFallbackMs: Math.max(
+    5000,
+    Number(readEnv("VOICE_AGENT_NO_AUDIO_FALLBACK_MS") || "15000"),
+  ),
+  managedThinkOnly: readBooleanEnv("VOICE_AGENT_MANAGED_THINK_ONLY", true),
+  parityCloseOnGoodbye: readBooleanEnv("VOICE_AGENT_PARITY_CLOSE_ON_GOODBYE", true),
+  language: String(readEnv("VOICE_AGENT_LANGUAGE") || "en").trim() || "en",
+  listenModel:
+    String(readEnv("VOICE_AGENT_LISTEN_MODEL") || deepgramModel || "nova-2").trim() ||
+    "nova-2",
+  speakModel:
+    String(readEnv("VOICE_AGENT_SPEAK_MODEL") || readEnv("VOICE_MODEL") || "aura-2-andromeda-en")
+      .trim() || "aura-2-andromeda-en",
+  profileVoiceMap: voiceAgentProfileVoiceMap,
+  thinkProvider: String(readEnv("VOICE_AGENT_THINK_PROVIDER") || "open_ai").trim() || "open_ai",
+  thinkModel: String(readEnv("VOICE_AGENT_THINK_MODEL") || "gpt-4o-mini").trim() || "gpt-4o-mini",
+  thinkTemperature: Number.isFinite(Number(readEnv("VOICE_AGENT_THINK_TEMPERATURE")))
+    ? Number(readEnv("VOICE_AGENT_THINK_TEMPERATURE"))
+    : undefined,
+  listenSmartFormat: readBooleanEnv("VOICE_AGENT_LISTEN_SMART_FORMAT", true),
+  listenKeyterms: parseList(readEnv("VOICE_AGENT_LISTEN_KEYTERMS")),
+  startupTtsProbeEnabled: readBooleanEnv("VOICE_AGENT_STARTUP_TTS_PROBE_ENABLED", true),
+  startupTtsProbeTimeoutMs: Math.max(
+    1500,
+    Number(readEnv("VOICE_AGENT_STARTUP_TTS_PROBE_TIMEOUT_MS") || "5000"),
+  ),
+  syntheticProbeText:
+    String(readEnv("VOICE_AGENT_SYNTHETIC_PROBE_TEXT") || "Hello, this is a quick voice quality probe.")
+      .trim() || "Hello, this is a quick voice quality probe.",
   circuitBreaker: {
-    enabled: true,
-    failureThreshold: 3,
-    windowMs: 120000,
-    cooldownMs: 180000,
+    enabled: readBooleanEnv("VOICE_AGENT_CIRCUIT_BREAKER_ENABLED", true),
+    failureThreshold: Math.max(
+      1,
+      Number(readEnv("VOICE_AGENT_CIRCUIT_BREAKER_FAILURE_THRESHOLD") || "3"),
+    ),
+    windowMs: Math.max(10000, Number(readEnv("VOICE_AGENT_CIRCUIT_BREAKER_WINDOW_MS") || "120000")),
+    cooldownMs: Math.max(
+      10000,
+      Number(readEnv("VOICE_AGENT_CIRCUIT_BREAKER_COOLDOWN_MS") || "180000"),
+    ),
   },
   autoCanary: {
-    enabled: false,
-    intervalMs: 60000,
-    windowMs: 300000,
-    cooldownMs: 180000,
-    minSamples: 8,
-    minPercent: 5,
-    maxPercent: 50,
-    stepUpPercent: 5,
-    stepDownPercent: 10,
-    maxErrorRate: 0.2,
-    maxFallbackRate: 0.25,
-    failClosedOnBreach: true,
+    enabled: readBooleanEnv(
+      "VOICE_AGENT_AUTO_CANARY_ENABLED",
+      voiceRuntimeMode === "hybrid" && voiceAgentEnabled,
+    ),
+    intervalMs: Math.max(5000, Number(readEnv("VOICE_AGENT_AUTO_CANARY_INTERVAL_MS") || "60000")),
+    windowMs: Math.max(10000, Number(readEnv("VOICE_AGENT_AUTO_CANARY_WINDOW_MS") || "300000")),
+    cooldownMs: Math.max(10000, Number(readEnv("VOICE_AGENT_AUTO_CANARY_COOLDOWN_MS") || "180000")),
+    minSamples: Math.max(1, Number(readEnv("VOICE_AGENT_AUTO_CANARY_MIN_SAMPLES") || "8")),
+    minPercent: Math.max(
+      1,
+      Math.min(
+        100,
+        Number(readEnv("VOICE_AGENT_AUTO_CANARY_MIN_PERCENT") || "5"),
+      ),
+    ),
+    maxPercent: Math.max(
+      1,
+      Math.min(
+        100,
+        Number(readEnv("VOICE_AGENT_AUTO_CANARY_MAX_PERCENT") || "50"),
+      ),
+    ),
+    stepUpPercent: Math.max(
+      1,
+      Math.min(
+        100,
+        Number(readEnv("VOICE_AGENT_AUTO_CANARY_STEP_UP_PERCENT") || "5"),
+      ),
+    ),
+    stepDownPercent: Math.max(
+      1,
+      Math.min(
+        100,
+        Number(readEnv("VOICE_AGENT_AUTO_CANARY_STEP_DOWN_PERCENT") || "10"),
+      ),
+    ),
+    maxErrorRate: Math.max(
+      0,
+      Math.min(1, Number(readEnv("VOICE_AGENT_AUTO_CANARY_MAX_ERROR_RATE") || "0.2")),
+    ),
+    maxFallbackRate: Math.max(
+      0,
+      Math.min(1, Number(readEnv("VOICE_AGENT_AUTO_CANARY_MAX_FALLBACK_RATE") || "0.25")),
+    ),
+    maxNoAudioFallbackRate: Math.max(
+      0,
+      Math.min(
+        1,
+        Number(readEnv("VOICE_AGENT_AUTO_CANARY_MAX_NO_AUDIO_FALLBACK_RATE") || "0.12"),
+      ),
+    ),
+    failClosedOnBreach: readBooleanEnv("VOICE_AGENT_AUTO_CANARY_FAIL_CLOSED_ON_BREACH", true),
   },
 });
 const twilioGatherFallback =
@@ -697,7 +824,7 @@ module.exports = {
   },
   deepgram: {
     apiKey: ensure("DEEPGRAM_API_KEY"),
-    voiceModel: ensure("VOICE_MODEL", "aura-asteria-en"),
+    voiceModel: ensure("VOICE_MODEL", "aura-2-andromeda-en"),
     model: deepgramModel,
     voiceAgent: {
       enabled: voiceAgentEnabled,
@@ -714,10 +841,16 @@ module.exports = {
       parityCloseOnGoodbye: voiceAgentDefaults.parityCloseOnGoodbye,
       language: voiceAgentDefaults.language,
       listenModel: voiceAgentDefaults.listenModel,
+      listenSmartFormat: voiceAgentDefaults.listenSmartFormat,
+      listenKeyterms: voiceAgentDefaults.listenKeyterms,
       speakModel: voiceAgentDefaults.speakModel,
+      profileVoiceMap: voiceAgentDefaults.profileVoiceMap,
       thinkProvider: voiceAgentDefaults.thinkProvider,
       thinkModel: voiceAgentDefaults.thinkModel,
       thinkTemperature: voiceAgentDefaults.thinkTemperature,
+      startupTtsProbeEnabled: voiceAgentDefaults.startupTtsProbeEnabled,
+      startupTtsProbeTimeoutMs: voiceAgentDefaults.startupTtsProbeTimeoutMs,
+      syntheticProbeText: voiceAgentDefaults.syntheticProbeText,
       circuitBreaker: {
         enabled: voiceAgentDefaults.circuitBreaker.enabled,
         failureThreshold: voiceAgentDefaults.circuitBreaker.failureThreshold,
@@ -736,6 +869,8 @@ module.exports = {
         stepDownPercent: voiceAgentDefaults.autoCanary.stepDownPercent,
         maxErrorRate: voiceAgentDefaults.autoCanary.maxErrorRate,
         maxFallbackRate: voiceAgentDefaults.autoCanary.maxFallbackRate,
+        maxNoAudioFallbackRate:
+          voiceAgentDefaults.autoCanary.maxNoAudioFallbackRate,
         failClosedOnBreach: voiceAgentDefaults.autoCanary.failClosedOnBreach,
       },
     },

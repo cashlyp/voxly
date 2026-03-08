@@ -1,4 +1,5 @@
 const axios = require('axios');
+const { InlineKeyboard } = require('grammy');
 const config = require('../config');
 const httpClient = require('../utils/httpClient');
 const { withRetry } = require('../utils/httpClient');
@@ -21,6 +22,10 @@ const {
 } = require('../utils/persona');
 const { extractScriptVariables } = require('../utils/scripts');
 const {
+  fetchVoiceModelCatalog,
+  askVoiceModelWithPagination,
+} = require('../utils/voiceModels');
+const {
   startOperation,
   ensureOperationActive,
   OperationCancelledError,
@@ -28,7 +33,8 @@ const {
   guardAgainstCommandInterrupt
 } = require('../utils/sessionState');
 const { emailTemplatesFlow } = require('./email');
-const { section, buildLine, tipLine } = require('../utils/ui');
+const { section, buildLine, tipLine, sendMenu, clearMenuMessages } = require('../utils/ui');
+const { buildCallbackData, matchesCallbackPrefix, parseCallbackData } = require('../utils/actions');
 const { attachHmacAuth } = require('../utils/apiAuth');
 const {
   RELATIONSHIP_FLOW_TYPES,
@@ -267,6 +273,187 @@ function isCancelInput(text) {
 
 function escapeMarkdown(text = '') {
   return text.replace(/([_*[\]`])/g, '\\$1');
+}
+
+async function askScriptSelectionWithPagination(
+  conversation,
+  ctx,
+  {
+    prompt = 'Select a script.',
+    items = [],
+    prefix = 'script-select',
+    pageSize = 8,
+    ensureActive,
+    getItemId = (item) => String(item?.id || ''),
+    getItemLabel = (item) => String(item?.name || item?.id || ''),
+    searchLabel = 'script name',
+    includeBack = true
+  } = {}
+) {
+  const safeEnsureActive = typeof ensureActive === 'function'
+    ? ensureActive
+    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  const opToken = String(ctx.session?.currentOp?.token || '').trim();
+  const safeItems = (Array.isArray(items) ? items : [])
+    .map((item, index) => ({
+      item,
+      key: String(index),
+      id: String(getItemId(item) || '').trim(),
+      label: String(getItemLabel(item) || '').trim()
+    }))
+    .filter((entry) => entry.id && entry.label);
+
+  if (!safeItems.length) {
+    return { id: 'back', item: null };
+  }
+
+  const normalizedPageSize = Math.max(1, Math.floor(Number(pageSize) || 8));
+  let page = 0;
+  let activeFilter = '';
+
+  const buildKeyboard = ({
+    pageEntries = [],
+    hasPrev = false,
+    hasNext = false,
+    hasFilter = false,
+    noResults = false
+  }) => {
+    const keyboard = new InlineKeyboard();
+    pageEntries.forEach((entry) => {
+      keyboard
+        .text(entry.label, buildCallbackData(ctx, `${prefix}:pick:${entry.key}`))
+        .row();
+    });
+
+    if (noResults) {
+      keyboard
+        .text('🔎 Search', buildCallbackData(ctx, `${prefix}:__search__`))
+        .text(hasFilter ? '✖ Clear Filter' : '⏺', buildCallbackData(ctx, `${prefix}:${hasFilter ? '__clear_search__' : '__noop__'}`))
+        .row();
+    } else {
+      keyboard
+        .text(hasPrev ? '⬅️ Previous' : '⏺', buildCallbackData(ctx, `${prefix}:${hasPrev ? '__nav_prev__' : '__noop__'}`))
+        .text('🔎 Search', buildCallbackData(ctx, `${prefix}:__search__`))
+        .text(hasNext ? 'Next ➡️' : '⏺', buildCallbackData(ctx, `${prefix}:${hasNext ? '__nav_next__' : '__noop__'}`))
+        .row();
+    }
+
+    if (hasFilter && !noResults) {
+      keyboard
+        .text('✖ Clear Filter', buildCallbackData(ctx, `${prefix}:__clear_search__`))
+        .row();
+    }
+    if (includeBack) {
+      keyboard.text('⬅️ Back', buildCallbackData(ctx, `${prefix}:__back__`)).row();
+    }
+    return keyboard;
+  };
+
+  while (true) {
+    const needle = activeFilter.trim().toLowerCase();
+    const filtered = needle
+      ? safeItems.filter((entry) => `${entry.label} ${entry.id}`.toLowerCase().includes(needle))
+      : safeItems;
+    const totalPages = Math.max(1, Math.ceil(filtered.length / normalizedPageSize));
+    page = Math.min(Math.max(0, page), totalPages - 1);
+    const start = page * normalizedPageSize;
+    const pageEntries = filtered.slice(start, start + normalizedPageSize);
+    const noResults = filtered.length === 0;
+
+    const pageHint = noResults
+      ? '\n_No matches. Adjust search or clear filter._'
+      : totalPages > 1
+      ? `\n_Page ${page + 1}/${totalPages} • ${start + 1}-${start + pageEntries.length} of ${filtered.length}_`
+      : `\n_${filtered.length} match${filtered.length === 1 ? '' : 'es'}_`;
+    const filterHint = needle ? `\n_Filter: ${escapeMarkdown(needle)}_` : '';
+    const header = `${prompt}${filterHint}${pageHint}`;
+    const keyboard = buildKeyboard({
+      pageEntries,
+      hasPrev: totalPages > 1 && page > 0,
+      hasNext: totalPages > 1 && page < totalPages - 1,
+      hasFilter: Boolean(needle),
+      noResults
+    });
+    const message = await sendMenu(ctx, header, {
+      parse_mode: 'Markdown',
+      reply_markup: keyboard
+    });
+
+    const selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {
+      const callbackData = callbackCtx?.callbackQuery?.data;
+      if (!callbackData) return false;
+      if (!matchesCallbackPrefix(callbackData, prefix)) return false;
+      const parsed = parseCallbackData(callbackData);
+      if (parsed?.signed && opToken && parsed.token && parsed.token !== opToken) {
+        return false;
+      }
+      return true;
+    });
+    safeEnsureActive();
+    await selectionCtx.answerCallbackQuery();
+
+    try {
+      await ctx.api.deleteMessage(message.chat.id, message.message_id);
+    } catch (_) {
+      await ctx.api.editMessageReplyMarkup(message.chat.id, message.message_id).catch(() => {});
+    }
+    await clearMenuMessages(ctx);
+
+    const selectedData = selectionCtx?.callbackQuery?.data || '';
+    const selectedAction = parseCallbackData(selectedData).action || selectedData;
+    const prefixSegments = String(prefix).split(':').filter(Boolean).length;
+    const selectedId = selectedAction.split(':').slice(prefixSegments).join(':');
+
+    if (selectedId === '__back__') {
+      return { id: 'back', item: null };
+    }
+    if (selectedId === '__noop__') {
+      continue;
+    }
+    if (selectedId === '__nav_prev__') {
+      if (page > 0) page -= 1;
+      continue;
+    }
+    if (selectedId === '__nav_next__') {
+      if (page < totalPages - 1) page += 1;
+      continue;
+    }
+    if (selectedId === '__clear_search__') {
+      activeFilter = '';
+      page = 0;
+      continue;
+    }
+    if (selectedId === '__search__') {
+      await ctx.reply(
+        `🔎 Enter ${searchLabel} filter. Type \`clear\` to reset or \`cancel\` to keep current results.`,
+        { parse_mode: 'Markdown' }
+      );
+      const update = await conversation.wait();
+      safeEnsureActive();
+      const input = String(update?.message?.text || '').trim();
+      if (!input) continue;
+      const lower = input.toLowerCase();
+      if (lower === 'cancel') continue;
+      if (lower === 'clear') {
+        activeFilter = '';
+        page = 0;
+        continue;
+      }
+      activeFilter = lower;
+      page = 0;
+      continue;
+    }
+
+    if (selectedId.startsWith('pick:')) {
+      const key = selectedId.slice('pick:'.length);
+      const selected = safeItems.find((entry) => entry.key === key);
+      if (selected) {
+        return { id: selected.id, item: selected.item };
+      }
+    }
+
+    return { id: 'back', item: null };
+  }
 }
 
 function normalizeScriptName(name = '') {
@@ -771,28 +958,69 @@ async function collectPromptAndVoice(conversation, ctx, defaults = {}, ensureAct
     return null;
   }
 
-  const voicePrompt = defaults.voice_model ? defaults.voice_model : 'default';
-  const voiceModel = await promptText(
+  const voiceCatalog = await fetchVoiceModelCatalog(ctx);
+  const availableModels = Array.isArray(voiceCatalog.models) ? voiceCatalog.models : [];
+  if (availableModels.length > 8) {
+    await ctx.reply('🔎 Tip: use Search in the voice picker to filter by model id quickly.');
+  }
+
+  const currentVoiceModel = defaults.voice_model ? String(defaults.voice_model).trim() : null;
+  const voiceSelection = await askVoiceModelWithPagination(
     conversation,
     ctx,
-    '🎤 Enter the Deepgram voice model for this script (or type skip to use the default).',
     {
-      allowEmpty: true,
-      allowSkip: true,
-      defaultValue: voicePrompt,
-      parse: (value) => value,
+      prompt: '🎙️ Select the voice model for this script.',
+      models: availableModels,
+      topOptions: [
+        { id: 'auto', label: '⚙️ Auto (best for flow)' },
+        ...(currentVoiceModel ? [{ id: 'keep', label: `🔁 Keep current (${currentVoiceModel})` }] : [])
+      ],
+      bottomOptions: [
+        { id: 'custom', label: '✍️ Enter custom model id' },
+        { id: 'cancel', label: '❌ Cancel' }
+      ],
+      prefix: 'script-voice-model',
+      pageSize: 8,
       ensureActive: safeEnsureActive
     }
   );
 
-  if (voiceModel === null) {
+  if (!voiceSelection || voiceSelection.id === 'cancel') {
     return null;
+  }
+
+  let resolvedVoiceModel = currentVoiceModel || null;
+  if (voiceSelection.id === 'auto') {
+    resolvedVoiceModel = null;
+  } else if (voiceSelection.id.startsWith('model:')) {
+    resolvedVoiceModel = voiceSelection.id.slice('model:'.length).trim() || null;
+  } else if (voiceSelection.id === 'custom') {
+    const customVoice = await promptText(
+      conversation,
+      ctx,
+      '🎤 Enter the Deepgram voice model id (or type skip for Auto).',
+      {
+        allowEmpty: true,
+        allowSkip: true,
+        defaultValue: currentVoiceModel || 'auto',
+        parse: (value) => value.trim(),
+        ensureActive: safeEnsureActive
+      }
+    );
+    if (customVoice === null) {
+      return null;
+    }
+    if (customVoice === undefined || customVoice === '') {
+      resolvedVoiceModel = null;
+    } else {
+      resolvedVoiceModel = customVoice;
+    }
   }
 
   return {
     prompt: prompt === undefined ? defaults.prompt : prompt,
     first_message: firstMessage === undefined ? defaults.first_message : firstMessage,
-    voice_model: voiceModel === undefined ? defaults.voice_model : (voiceModel || null)
+    voice_model: resolvedVoiceModel
   };
 }
 
@@ -1656,38 +1884,27 @@ async function listCallScriptsFlow(conversation, ctx, ensureActive, options = {}
       return;
     }
 
-    const summaryLines = validScripts.slice(0, 15).map((script, index) => {
-      const parts = [`${index + 1}. ${getCallScriptFlowBadge(script)} ${script.name}`];
-      if (script.description) {
-        parts.push(`– ${script.description}`);
-      }
-      return parts.join(' ');
-    });
-
     const header = selectedFlow
       ? `☎️ Call Scripts (${getCallScriptFlowLabel(selectedFlow)})`
       : '☎️ Call Scripts';
-    let message = `${header}\n\n`;
-    message += summaryLines.join('\n');
-    if (validScripts.length > 15) {
-      message += `\n… and ${validScripts.length - 15} more.`;
-    }
-    message += '\n\nSelect a script below to view details.';
+    await ctx.reply(`${header}\n\n${validScripts.length} script${validScripts.length === 1 ? '' : 's'} found. Use Search to filter quickly.`);
 
-    await ctx.reply(message);
-
-    const selectableOptions = validScripts.map((script) => ({
-      id: script.id.toString(),
-      label: `${getCallScriptFlowBadge(script)} ${script.name}`
-    }));
-    selectableOptions.push({ id: 'back', label: '⬅️ Back' });
-
-    const selection = await askOptionWithButtons(
+    const selection = await askScriptSelectionWithPagination(
       conversation,
       ctx,
-      'Choose a call script to manage.',
-      selectableOptions,
-      { prefix: 'call-script-select', columns: 1, formatLabel: (option) => option.label, ensureActive: safeEnsureActive }
+      {
+        prompt: 'Choose a call script to manage.',
+        items: validScripts,
+        prefix: 'call-script-select',
+        pageSize: 8,
+        ensureActive: safeEnsureActive,
+        searchLabel: 'script name or flow',
+        getItemId: (script) => String(script.id),
+        getItemLabel: (script) => {
+          const flowLabel = getCallScriptFlowLabel(getCallScriptPrimaryFlowType(script));
+          return `${getCallScriptFlowBadge(script)} ${script.name} · ${flowLabel}`;
+        }
+      }
     );
 
     if (!selection || !selection.id) {
@@ -1776,18 +1993,22 @@ async function inboundDefaultScriptMenu(conversation, ctx, ensureActive) {
           break;
         }
 
-        const options = scripts.map((script) => ({
-          id: script.id.toString(),
-          label: `📄 ${script.name}`
-        }));
-        options.push({ id: 'back', label: '⬅️ Back' });
-
-        const selection = await askOptionWithButtons(
+        const selection = await askScriptSelectionWithPagination(
           conversation,
           ctx,
-          'Select a script to use as the inbound default.',
-          options,
-          { prefix: 'inbound-default-select', columns: 1, ensureActive: safeEnsureActive }
+          {
+            prompt: 'Select a script to use as the inbound default.',
+            items: scripts,
+            prefix: 'inbound-default-select',
+            pageSize: 8,
+            ensureActive: safeEnsureActive,
+            searchLabel: 'script name or flow',
+            getItemId: (script) => String(script.id),
+            getItemLabel: (script) => {
+              const flowType = getCallScriptPrimaryFlowType(script);
+              return `${getCallScriptFlowBadge(script)} ${script.name} · ${getCallScriptFlowLabel(flowType)}`;
+            }
+          }
         );
 
         if (!selection || !selection.id || selection.id === 'back') {
@@ -2375,48 +2596,28 @@ async function listSmsScriptsFlow(conversation, ctx) {
       return;
     }
 
-    const custom = scripts.filter((script) => !script.is_builtin);
-    const builtin = scripts.filter((script) => script.is_builtin);
-
-    let message = '💬 SMS Scripts\n\n';
-    if (custom.length) {
-      message += 'Custom scripts:\n';
-      message += custom
-        .slice(0, 15)
-        .map((script) => `• ${script.name}${script.description ? ` – ${script.description}` : ''}`)
-        .join('\n');
-      message += '\n\n';
-    } else {
-      message += 'No custom scripts yet.\n\n';
-    }
-
-    if (builtin.length) {
-      message += 'Built-in scripts:\n';
-      message += builtin
-        .map((script) => `• ${script.name}${script.description ? ` – ${script.description}` : ''}`)
-        .join('\n');
-      message += '\n\n';
-    }
-
-    message += 'Select a script below to view details.';
-    await ctx.reply(message);
-
-    const options = scripts.map((script) => ({
-      id: script.name,
-      label: `${script.is_builtin ? '📦' : '📝'} ${script.name}`,
-      is_builtin: script.is_builtin
-    }));
-    options.push({ id: 'back', label: '⬅️ Back' });
-
-    const selection = await askOptionWithButtons(
-      conversation,
-      ctx,
-      'Choose an SMS script to manage.',
-      options,
-      { prefix: 'sms-script-select', columns: 1, formatLabel: (option) => option.label }
+    const customCount = scripts.filter((script) => !script.is_builtin).length;
+    const builtinCount = scripts.length - customCount;
+    await ctx.reply(
+      `💬 SMS Scripts\n\n${scripts.length} script${scripts.length === 1 ? '' : 's'} found (${customCount} custom, ${builtinCount} built-in). Use Search to filter quickly.`
     );
 
-    if (selection.id === 'back') {
+    const selection = await askScriptSelectionWithPagination(
+      conversation,
+      ctx,
+      {
+        prompt: 'Choose an SMS script to manage.',
+        items: scripts,
+        prefix: 'sms-script-select',
+        pageSize: 8,
+        searchLabel: 'script name',
+        getItemId: (script) => script.name,
+        getItemLabel: (script) =>
+          `${script.is_builtin ? '📦' : '📝'} ${script.name}${script.description ? ` · ${script.description}` : ''}`
+      }
+    );
+
+    if (!selection || selection.id === 'back') {
       return;
     }
 
@@ -2497,7 +2698,7 @@ async function scriptsFlow(conversation, ctx) {
       const selection = await askOptionWithButtons(
         conversation,
         ctx,
-        '🧰 *Script Designer*\nChoose which scripts to manage.',
+        '🧰 *Script Designer*\nChoose which scripts to manage.\n\n💡 List views support inline *Search* + *Previous/Next* navigation.',
         [
           { id: 'call', label: '☎️ Call scripts' },
           { id: 'sms', label: '💬 SMS scripts' },

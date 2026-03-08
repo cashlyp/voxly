@@ -2,6 +2,7 @@
 
 const VOICE_AGENT_THINK_MODELS_ENDPOINT =
   "https://agent.deepgram.com/v1/agent/settings/think/models";
+const VOICE_AGENT_SPEAK_PROBE_ENDPOINT = "https://api.deepgram.com/v1/speak";
 const ACTIVE_VOICE_AGENT_MODES = new Set(["hybrid", "voice_agent"]);
 const THINK_PROVIDER_ALIASES = Object.freeze({
   openai: "open_ai",
@@ -98,6 +99,213 @@ function evaluateThinkModelCompatibility(models = [], options = {}) {
     isSupported,
     providerModelCount: providerModels.length,
     providerModelsSample: providerModels.slice(0, 15),
+  };
+}
+
+function normalizeVoiceAgentAudioConfig(options = {}) {
+  const inputEncoding = normalizeText(options.inputEncoding, "mulaw").toLowerCase();
+  const inputSampleRate = Math.max(8000, Number(options.inputSampleRate) || 8000);
+  const outputEncoding = normalizeText(options.outputEncoding, "mulaw").toLowerCase();
+  const outputSampleRate = Math.max(8000, Number(options.outputSampleRate) || 8000);
+  const outputContainer = normalizeText(options.outputContainer, "none").toLowerCase();
+  return {
+    inputEncoding,
+    inputSampleRate,
+    outputEncoding,
+    outputSampleRate,
+    outputContainer,
+  };
+}
+
+function validateVoiceAgentConfig(options = {}) {
+  const listenModel = normalizeText(options.listenModel, "nova-2");
+  const speakModel = normalizeText(options.speakModel, "aura-2-andromeda-en");
+  if (!listenModel) {
+    throw createPreflightError(
+      "voice_agent_preflight_missing_listen_model",
+      "Voice Agent listen model is required for startup preflight",
+    );
+  }
+  if (!speakModel) {
+    throw createPreflightError(
+      "voice_agent_preflight_missing_speak_model",
+      "Voice Agent speak model is required for startup preflight",
+    );
+  }
+
+  const audio = normalizeVoiceAgentAudioConfig(options);
+  const telephonyProfile =
+    audio.inputEncoding === "mulaw" &&
+    audio.outputEncoding === "mulaw" &&
+    audio.inputSampleRate === 8000 &&
+    audio.outputSampleRate === 8000;
+  const warnings = [];
+  if (!telephonyProfile) {
+    warnings.push("non_mulaw_8k_audio_profile");
+  }
+
+  const syntheticTurnText = normalizeText(
+    options.syntheticTurnText,
+    "Hello, this is a quick voice quality probe.",
+  );
+  if (!syntheticTurnText || syntheticTurnText.length < 8) {
+    throw createPreflightError(
+      "voice_agent_preflight_invalid_synthetic_turn",
+      "Voice Agent synthetic turn text is too short",
+      {
+        minLength: 8,
+      },
+    );
+  }
+  if (syntheticTurnText.length > 260) {
+    throw createPreflightError(
+      "voice_agent_preflight_invalid_synthetic_turn",
+      "Voice Agent synthetic turn text is too long",
+      {
+        maxLength: 260,
+      },
+    );
+  }
+
+  return {
+    listenModel,
+    speakModel,
+    audio,
+    telephonyProfile,
+    warnings,
+    syntheticTurnText,
+  };
+}
+
+function buildSpeakProbeUrl(options = {}) {
+  const endpoint = normalizeText(
+    options.endpoint,
+    VOICE_AGENT_SPEAK_PROBE_ENDPOINT,
+  );
+  const speakModel = normalizeText(options.speakModel, "aura-2-andromeda-en");
+  const audio = normalizeVoiceAgentAudioConfig(options);
+  const params = new URLSearchParams();
+  params.set("model", speakModel);
+  params.set("encoding", audio.outputEncoding);
+  params.set("sample_rate", String(audio.outputSampleRate));
+  params.set("container", audio.outputContainer || "none");
+  return `${endpoint}?${params.toString()}`;
+}
+
+async function executeDeepgramVoiceAgentSpeakProbe(options = {}) {
+  const {
+    fetchImpl,
+    apiKey,
+    speakModel,
+    outputEncoding = "mulaw",
+    outputSampleRate = 8000,
+    outputContainer = "none",
+    syntheticTurnText = "Hello, this is a quick voice quality probe.",
+    timeoutMs = 5000,
+  } = options;
+
+  if (typeof fetchImpl !== "function") {
+    throw createPreflightError(
+      "voice_agent_preflight_fetch_missing",
+      "Voice Agent preflight fetch implementation is unavailable",
+    );
+  }
+  const token = normalizeText(apiKey);
+  if (!token) {
+    throw createPreflightError(
+      "voice_agent_preflight_missing_api_key",
+      "Deepgram API key is required for Voice Agent preflight",
+    );
+  }
+
+  const safeTimeoutMs = Math.max(1500, Number(timeoutMs) || 5000);
+  const controller =
+    typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timeoutHandle = setTimeout(() => {
+    if (controller) {
+      try {
+        controller.abort();
+      } catch {}
+    }
+  }, safeTimeoutMs);
+  if (typeof timeoutHandle.unref === "function") {
+    timeoutHandle.unref();
+  }
+
+  const probeUrl = buildSpeakProbeUrl({
+    speakModel,
+    outputEncoding,
+    outputSampleRate,
+    outputContainer,
+    endpoint: options.endpoint,
+  });
+
+  let response = null;
+  try {
+    response = await fetchImpl(probeUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Token ${token}`,
+        Accept: "audio/*",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        text: normalizeText(syntheticTurnText, "Hello from voice agent startup."),
+      }),
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+  } catch (error) {
+    const isAbort =
+      error?.name === "AbortError" ||
+      error?.type === "aborted" ||
+      error?.code === "ABORT_ERR";
+    if (isAbort) {
+      throw createPreflightError(
+        "voice_agent_preflight_speak_probe_timeout",
+        `Voice Agent speak probe timed out after ${safeTimeoutMs}ms`,
+        { timeoutMs: safeTimeoutMs },
+      );
+    }
+    throw createPreflightError(
+      "voice_agent_preflight_speak_probe_network_error",
+      `Voice Agent speak probe request failed: ${error?.message || "network_error"}`,
+      { cause: error?.message || null },
+    );
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+
+  if (!response.ok) {
+    throw createPreflightError(
+      "voice_agent_preflight_speak_probe_http_error",
+      `Voice Agent speak probe failed (${response.status} ${response.statusText || "error"})`,
+      {
+        httpStatus: Number(response.status) || null,
+      },
+    );
+  }
+
+  let bytes = 0;
+  try {
+    const body = await response.arrayBuffer();
+    bytes = Buffer.from(body || new ArrayBuffer(0)).length;
+  } catch {
+    bytes = 0;
+  }
+  if (bytes <= 0) {
+    throw createPreflightError(
+      "voice_agent_preflight_speak_probe_empty_audio",
+      "Voice Agent speak probe returned empty audio",
+    );
+  }
+
+  return {
+    ok: true,
+    model: normalizeText(speakModel, "aura-2-andromeda-en"),
+    bytes,
+    outputEncoding: normalizeText(outputEncoding, "mulaw").toLowerCase(),
+    outputSampleRate: Math.max(8000, Number(outputSampleRate) || 8000),
+    outputContainer: normalizeText(outputContainer, "none").toLowerCase(),
   };
 }
 
@@ -239,10 +447,66 @@ async function executeDeepgramVoiceAgentThinkPreflight(options = {}) {
   };
 }
 
+async function executeDeepgramVoiceAgentRuntimePreflight(options = {}) {
+  const thinkResult = await executeDeepgramVoiceAgentThinkPreflight(options);
+  if (thinkResult.skipped) {
+    return {
+      ...thinkResult,
+      configCheck: {
+        skipped: true,
+      },
+      speakProbe: {
+        skipped: true,
+      },
+      syntheticTurn: {
+        skipped: true,
+      },
+    };
+  }
+
+  const configCheck = validateVoiceAgentConfig(options);
+  const syntheticTurn = {
+    ok: true,
+    textLength: configCheck.syntheticTurnText.length,
+  };
+
+  let speakProbe = {
+    ok: true,
+    skipped: true,
+    reason: "tts_probe_disabled",
+  };
+  if (options.ttsProbeEnabled !== false) {
+    speakProbe = await executeDeepgramVoiceAgentSpeakProbe({
+      fetchImpl: options.fetchImpl,
+      apiKey: options.apiKey,
+      speakModel: configCheck.speakModel,
+      outputEncoding: configCheck.audio.outputEncoding,
+      outputSampleRate: configCheck.audio.outputSampleRate,
+      outputContainer: configCheck.audio.outputContainer,
+      syntheticTurnText: configCheck.syntheticTurnText,
+      timeoutMs: options.ttsProbeTimeoutMs || 5000,
+      endpoint: options.speakProbeEndpoint,
+    });
+  }
+
+  return {
+    ...thinkResult,
+    listenModel: configCheck.listenModel,
+    speakModel: configCheck.speakModel,
+    audio: configCheck.audio,
+    configWarnings: configCheck.warnings,
+    syntheticTurn,
+    speakProbe,
+  };
+}
+
 module.exports = {
   VOICE_AGENT_THINK_MODELS_ENDPOINT,
+  VOICE_AGENT_SPEAK_PROBE_ENDPOINT,
   shouldRunDeepgramVoiceAgentPreflight,
   normalizeThinkModelsResponse,
   evaluateThinkModelCompatibility,
+  executeDeepgramVoiceAgentSpeakProbe,
   executeDeepgramVoiceAgentThinkPreflight,
+  executeDeepgramVoiceAgentRuntimePreflight,
 };

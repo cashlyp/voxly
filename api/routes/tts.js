@@ -117,7 +117,7 @@ class TextToSpeechService extends EventEmitter {
     console.log(`🎵 TTS generating for: "${speechText.substring(0, 50)}..."`.cyan);
 
     try {
-      const voiceModel = options.voiceModel || this.voiceModel || config.deepgram.voiceModel || 'aura-asteria-en';
+      const voiceModel = options.voiceModel || this.voiceModel || config.deepgram.voiceModel || 'aura-2-andromeda-en';
       const audioSpec = {
         encoding: options.encoding || this.encoding,
         sampleRate: options.sampleRate || this.sampleRate,
@@ -155,7 +155,7 @@ class TextToSpeechService extends EventEmitter {
           pruneTtsCache();
           return base64String;
         } catch (primaryError) {
-          const fallbackVoice = config.deepgram.voiceModel || 'aura-asteria-en';
+          const fallbackVoice = config.deepgram.voiceModel || 'aura-2-andromeda-en';
           if (fallbackVoice && fallbackVoice !== voiceModel) {
             try {
               const base64String = await this.fetchSpeechAudio(
