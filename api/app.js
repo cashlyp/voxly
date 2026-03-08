@@ -3490,19 +3490,6 @@ function resolveVoiceModel(callConfig) {
   return null;
 }
 
-function resolveTwilioSayVoice(callConfig) {
-  const model = resolveVoiceModel(callConfig);
-  if (!model) return null;
-  const normalized = model.toLowerCase();
-  if (["alice", "man", "woman"].includes(normalized)) {
-    return model;
-  }
-  if (model.startsWith("Polly.")) {
-    return model;
-  }
-  return null;
-}
-
 function resolveDeepgramVoiceModel(callConfig) {
   if (callConfig && typeof callConfig === "object") {
     const lockedModel = String(callConfig.deepgram_voice_model_locked || "").trim();
@@ -3699,6 +3686,57 @@ async function getTwilioTtsAudioUrlSafe(
     console.error("Twilio TTS timeout fallback:", error);
     return null;
   }
+}
+
+async function appendHostedTwilioSpeech(response, text, callConfig, options = {}) {
+  if (!response) {
+    return { played: false, reason: "missing_response" };
+  }
+  const cleaned = normalizeTwilioTtsText(text);
+  const fallbackPauseSeconds = Math.max(
+    0,
+    Math.min(10, Math.round(Number(options?.fallbackPauseSeconds) || 0)),
+  );
+  if (!cleaned) {
+    if (fallbackPauseSeconds > 0) {
+      response.pause({ length: fallbackPauseSeconds });
+    }
+    return { played: false, reason: "empty_text" };
+  }
+  if (!shouldUseTwilioPlay(callConfig)) {
+    if (fallbackPauseSeconds > 0) {
+      response.pause({ length: fallbackPauseSeconds });
+    }
+    return { played: false, reason: "hosted_tts_unavailable" };
+  }
+
+  const timeoutMs = Number(options?.timeoutMs);
+  const safeTimeoutMs =
+    Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? timeoutMs
+      : Number(config.twilio?.ttsMaxWaitMs) || 1200;
+  const forceGenerate = options?.forceGenerate === true;
+  let ttsUrl = await getTwilioTtsAudioUrlSafe(cleaned, callConfig, safeTimeoutMs, {
+    forceGenerate,
+  });
+  if (!ttsUrl && options?.retryOnMiss === true) {
+    const retryTimeoutMs = Number(options?.retryTimeoutMs);
+    const safeRetryTimeoutMs =
+      Number.isFinite(retryTimeoutMs) && retryTimeoutMs > 0
+        ? retryTimeoutMs
+        : Math.max(2500, safeTimeoutMs + 1000);
+    ttsUrl = await getTwilioTtsAudioUrlSafe(cleaned, callConfig, safeRetryTimeoutMs, {
+      forceGenerate,
+    });
+  }
+  if (ttsUrl) {
+    response.play(ttsUrl);
+    return { played: true, url: ttsUrl };
+  }
+  if (fallbackPauseSeconds > 0) {
+    response.pause({ length: fallbackPauseSeconds });
+  }
+  return { played: false, reason: "tts_unavailable" };
 }
 
 async function runDeepgramVoiceAgentStartupPreflight() {
@@ -4518,9 +4556,25 @@ async function handleStreamTimeout(callSid, host, options = {}) {
     if (config.twilio?.accountSid && config.twilio?.authToken) {
       const client = twilio(config.twilio.accountSid, config.twilio.authToken);
       const response = new VoiceResponse();
-      response.say(
+      const playback = await appendHostedTwilioSpeech(
+        response,
         "We are having trouble connecting the call. Please try again later.",
+        callConfig,
+        {
+          forceGenerate: true,
+          retryOnMiss: true,
+          timeoutMs: Math.max(
+            1500,
+            Number(config.twilio?.finalPromptTtsTimeoutMs) || 6000,
+          ),
+          fallbackPauseSeconds: 1,
+        },
       );
+      if (!playback.played) {
+        console.warn(
+          `Hosted Twilio TTS unavailable during stream timeout for ${callSid}; ending call without spoken fallback.`,
+        );
+      }
       response.hangup();
       await client.calls(callSid).update({ twiml: response.toString() });
     }
@@ -4809,8 +4863,6 @@ function startGroupedGather(callSid, callConfig, options = {}) {
     ? digitService.buildPlanStepPrompt(expectation)
     : expectation.prompt || digitService.buildDigitPrompt(expectation);
   if (!prompt) return false;
-  const sayVoice = resolveTwilioSayVoice(callConfig);
-  const sayOptions = sayVoice ? { voice: sayVoice } : null;
   const delayMs = Math.max(
     0,
     Number.isFinite(options.delayMs) ? options.delayMs : 0,
@@ -4849,7 +4901,6 @@ function startGroupedGather(callSid, callConfig, options = {}) {
           preamble,
           promptUrl,
           preambleUrl,
-          sayOptions,
         },
       );
       if (!sent) {
@@ -8977,51 +9028,25 @@ async function speakAndEndCall(callSid, message, reason = "completed") {
       const authToken = config.twilio.authToken;
       if (accountSid && authToken) {
         const response = new VoiceResponse();
-        const shouldUseHostedTts = shouldUseTwilioPlay(callConfig);
-        const strictTtsPlay = config.twilio?.strictTtsPlay === true;
-        let playedHostedTts = false;
-        if (shouldUseHostedTts) {
-          const finalPromptTtsTimeoutMs = Number.isFinite(
-            Number(config.twilio?.finalPromptTtsTimeoutMs),
-          )
-            ? Number(config.twilio.finalPromptTtsTimeoutMs)
-            : 6000;
-          let ttsUrl = await getTwilioTtsAudioUrlSafe(
-            text,
-            callConfig,
-            Math.max(1500, finalPromptTtsTimeoutMs),
-            { forceGenerate: true },
+        const finalPromptTtsTimeoutMs = Number.isFinite(
+          Number(config.twilio?.finalPromptTtsTimeoutMs),
+        )
+          ? Number(config.twilio.finalPromptTtsTimeoutMs)
+          : 6000;
+        const playback = await appendHostedTwilioSpeech(response, text, callConfig, {
+          forceGenerate: true,
+          retryOnMiss: true,
+          timeoutMs: Math.max(1500, finalPromptTtsTimeoutMs),
+          retryTimeoutMs: Math.max(2500, finalPromptTtsTimeoutMs + 1500),
+          fallbackPauseSeconds: 1,
+        });
+        if (!playback.played) {
+          const suffix = isDigitProfileClosing
+            ? "digit profile closing"
+            : "call closing";
+          console.warn(
+            `Hosted Twilio TTS unavailable for ${callSid} (${suffix}); ending call without spoken fallback.`,
           );
-          if (!ttsUrl && strictTtsPlay) {
-            // Strict hosted-TTS mode: retry once before abandoning Twilio say().
-            ttsUrl = await getTwilioTtsAudioUrlSafe(
-              text,
-              callConfig,
-              Math.max(2500, finalPromptTtsTimeoutMs + 1500),
-              { forceGenerate: true },
-            );
-          }
-          if (ttsUrl) {
-            response.play(ttsUrl);
-            playedHostedTts = true;
-          }
-        }
-        if (!playedHostedTts) {
-          if (isDigitProfileClosing) {
-            response.pause({ length: 1 });
-          } else if (strictTtsPlay && shouldUseHostedTts) {
-            console.warn(
-              `Strict hosted TTS mode active for ${callSid}; ending call without Twilio say fallback.`,
-            );
-            response.pause({ length: 1 });
-          } else {
-            const sayVoice = resolveTwilioSayVoice(callConfig);
-            if (sayVoice) {
-              response.say({ voice: sayVoice }, text);
-            } else {
-              response.say(text);
-            }
-          }
         }
         response.hangup();
         const client = twilio(accountSid, authToken);
@@ -12632,9 +12657,25 @@ async function handleTwilioIncoming(req, res) {
               }
             }
             const limitedResponse = new VoiceResponse();
-            limitedResponse.say(
+            const limitedPlayback = await appendHostedTwilioSpeech(
+              limitedResponse,
               "We are experiencing high call volume. Please try again later.",
+              callConfigurations.get(callSid) || {},
+              {
+                forceGenerate: true,
+                retryOnMiss: true,
+                timeoutMs: Math.max(
+                  1500,
+                  Number(config.twilio?.finalPromptTtsTimeoutMs) || 6000,
+                ),
+                fallbackPauseSeconds: 1,
+              },
             );
+            if (!limitedPlayback.played) {
+              console.warn(
+                `Hosted Twilio TTS unavailable for inbound rate-limit prompt (${callSid}).`,
+              );
+            }
             limitedResponse.hangup();
             res.type("text/xml");
             res.end(limitedResponse.toString());
@@ -12660,7 +12701,25 @@ async function handleTwilioIncoming(req, res) {
             })
             .catch(() => {});
           const blockedResponse = new VoiceResponse();
-          blockedResponse.say("We cannot take your call at this time.");
+          const blockedPlayback = await appendHostedTwilioSpeech(
+            blockedResponse,
+            "We cannot take your call at this time.",
+            callConfigurations.get(callSid) || {},
+            {
+              forceGenerate: true,
+              retryOnMiss: true,
+              timeoutMs: Math.max(
+                1500,
+                Number(config.twilio?.finalPromptTtsTimeoutMs) || 6000,
+              ),
+              fallbackPauseSeconds: 1,
+            },
+          );
+          if (!blockedPlayback.played) {
+            console.warn(
+              `Hosted Twilio TTS unavailable for inbound blocked prompt (${callSid}).`,
+            );
+          }
           blockedResponse.hangup();
           res.type("text/xml");
           res.end(blockedResponse.toString());
@@ -12738,6 +12797,7 @@ async function handleTwilioIncoming(req, res) {
     }
     const response = new VoiceResponse();
     if (!isOutbound) {
+      const inboundCallConfig = callConfigurations.get(callSid) || {};
       const preconnectMessage = String(
         config.inbound?.preConnectMessage || "",
       ).trim();
@@ -12749,9 +12809,22 @@ async function handleTwilioIncoming(req, res) {
         ),
       );
       if (preconnectMessage) {
-        response.say(preconnectMessage);
-        if (pauseSeconds > 0) {
+        const preconnectPlayback = await appendHostedTwilioSpeech(
+          response,
+          preconnectMessage,
+          inboundCallConfig,
+          {
+            forceGenerate: true,
+            retryOnMiss: true,
+            timeoutMs: Math.max(1000, Number(config.twilio?.ttsMaxWaitMs) || 1200),
+          },
+        );
+        if (preconnectPlayback.played && pauseSeconds > 0) {
           response.pause({ length: pauseSeconds });
+        } else if (!preconnectPlayback.played) {
+          console.warn(
+            `Hosted Twilio TTS unavailable for inbound preconnect prompt (${callSid}).`,
+          );
         }
       }
     }
@@ -16002,7 +16075,6 @@ const twilioGatherHandler = createTwilioGatherHandler({
   getTwilioTtsAudioUrl,
   ttsTimeoutMs: Number(config.twilio?.ttsMaxWaitMs) || 1200,
   shouldUseTwilioPlay,
-  resolveTwilioSayVoice,
   isGroupedGatherPlan,
   setCallFlowState,
 });
