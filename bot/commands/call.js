@@ -36,24 +36,28 @@ const {
   getEffectiveObjectiveTags: getEffectiveObjectiveTagsShared,
   isRelationshipFlowType,
 } = require('../../api/functions/relationshipFlowMetadata');
-function buildMainMenuReplyMarkup(ctx) {
-  return {
-    inline_keyboard: [
-      [{ text: '⬅️ Back to Call', callback_data: buildCallbackData(ctx, 'CALL') }],
-      [{ text: '⬅️ Main Menu', callback_data: buildCallbackData(ctx, 'MENU') }]
-    ]
-  };
-}
+const {
+  section,
+  escapeMarkdown,
+  tipLine,
+  buildLine,
+  renderMenu,
+  sendEphemeral,
+  buildBackToMenuReplyMarkup,
+  cancelledMessage,
+  setupStepMessage
+} = require('../utils/ui');
 
 async function notifyCallError(ctx, lines = []) {
   const body = Array.isArray(lines) ? lines : [lines];
   await ctx.reply(section('❌ Call Alert', body), {
-    reply_markup: buildMainMenuReplyMarkup(ctx)
+    reply_markup: buildBackToMenuReplyMarkup(ctx, {
+      backAction: 'CALL',
+      backLabel: '⬅️ Back to Call'
+    })
   });
 }
-const { section, escapeMarkdown, tipLine, buildLine, renderMenu, sendEphemeral } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
-const { cancelledMessage, setupStepMessage } = require('../utils/flowMessages');
 
 const scriptsApiBase = config.scriptsApiUrl.replace(/\/+$/, '');
 const DEFAULT_FIRST_MESSAGE = 'Hello! This is an automated call. How can I help you today?';
@@ -751,7 +755,10 @@ async function callFlow(conversation, ctx) {
     if (!configurationMode || configurationMode.id === 'cancel') {
       await ctx.reply(cancelledMessage('Call setup', 'Use /call to start again.'), {
         parse_mode: 'Markdown',
-        reply_markup: buildMainMenuReplyMarkup(ctx)
+        reply_markup: buildBackToMenuReplyMarkup(ctx, {
+          backAction: 'CALL',
+          backLabel: '⬅️ Back to Call'
+        })
       });
       return;
     }
@@ -764,7 +771,10 @@ async function callFlow(conversation, ctx) {
       } else if (selection?.status === 'cancel') {
         await ctx.reply(cancelledMessage('Call setup', 'Use /call to start again.'), {
           parse_mode: 'Markdown',
-          reply_markup: buildMainMenuReplyMarkup(ctx)
+          reply_markup: buildBackToMenuReplyMarkup(ctx, {
+            backAction: 'CALL',
+            backLabel: '⬅️ Back to Call'
+          })
         });
         return;
       } else if (selection?.status === 'empty' || selection?.status === 'back') {
@@ -777,7 +787,10 @@ async function callFlow(conversation, ctx) {
         if (fallbackChoice !== 'custom') {
           await ctx.reply(cancelledMessage('Call setup', 'Use /call to start again.'), {
             parse_mode: 'Markdown',
-            reply_markup: buildMainMenuReplyMarkup(ctx)
+            reply_markup: buildBackToMenuReplyMarkup(ctx, {
+              backAction: 'CALL',
+              backLabel: '⬅️ Back to Call'
+            })
           });
           return;
         }
@@ -798,7 +811,10 @@ async function callFlow(conversation, ctx) {
     if (!configuration) {
       await ctx.reply(cancelledMessage('Call setup', 'Use /call to start again.'), {
         parse_mode: 'Markdown',
-        reply_markup: buildMainMenuReplyMarkup(ctx)
+        reply_markup: buildBackToMenuReplyMarkup(ctx, {
+          backAction: 'CALL',
+          backLabel: '⬅️ Back to Call'
+        })
       });
       return;
     }
@@ -870,7 +886,10 @@ async function callFlow(conversation, ctx) {
     if (!voiceSelection || voiceSelection.id === 'cancel') {
       await ctx.reply(cancelledMessage('Call setup', 'Use /call to start again.'), {
         parse_mode: 'Markdown',
-        reply_markup: buildMainMenuReplyMarkup(ctx)
+        reply_markup: buildBackToMenuReplyMarkup(ctx, {
+          backAction: 'CALL',
+          backLabel: '⬅️ Back to Call'
+        })
       });
       return;
     }
@@ -994,7 +1013,10 @@ async function callFlow(conversation, ctx) {
       flow.touch('completed');
     } else {
       await ctx.reply('⚠️ Call was sent but response format unexpected. Check logs.', {
-        reply_markup: buildMainMenuReplyMarkup(ctx)
+        reply_markup: buildBackToMenuReplyMarkup(ctx, {
+          backAction: 'CALL',
+          backLabel: '⬅️ Back to Call'
+        })
       });
     }
   } catch (error) {

@@ -2,8 +2,7 @@ const { InlineKeyboard } = require('grammy');
 const { getUser, getUserList, addUser, promoteUser, removeUser, isAdmin } = require('../db/db');
 const { buildCallbackData } = require('../utils/actions');
 const { guardAgainstCommandInterrupt, OperationCancelledError } = require('../utils/sessionState');
-const { renderMenu } = require('../utils/ui');
-const { cancelledMessage, setupStepMessage } = require('../utils/flowMessages');
+const { renderMenu, buildBackToMenuKeyboard, cancelledMessage, setupStepMessage } = require('../utils/ui');
 
 const CANCEL_KEYWORDS = new Set(['cancel', 'exit', 'quit']);
 
@@ -40,10 +39,10 @@ function buildUsersKeyboard(ctx) {
 }
 
 function buildUsersResultKeyboard(ctx) {
-  return new InlineKeyboard()
-    .text('⬅️ Back to User Management', buildCallbackData(ctx, 'USERS'))
-    .row()
-    .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+  return buildBackToMenuKeyboard(ctx, {
+    backAction: 'USERS',
+    backLabel: '⬅️ Back to User Management'
+  });
 }
 
 async function renderUsersMenu(ctx, note = '') {

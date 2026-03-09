@@ -3,10 +3,18 @@ const httpClient = require('../utils/httpClient');
 const { InlineKeyboard } = require('grammy');
 const { getUser } = require('../db/db');
 const { startOperation, ensureOperationActive, registerAbortController } = require('../utils/sessionState');
-const { renderMenu, escapeMarkdown, buildLine, section, sendEphemeral } = require('../utils/ui');
+const {
+    renderMenu,
+    escapeMarkdown,
+    buildLine,
+    section,
+    sendEphemeral,
+    buildBackToMenuKeyboard,
+    cancelledMessage,
+    setupStepMessage
+} = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 const { getAccessProfile } = require('../utils/capabilities');
-const { cancelledMessage, setupStepMessage } = require('../utils/flowMessages');
 
 const CANCEL_KEYWORDS = new Set(['cancel', 'exit', 'quit']);
 
@@ -101,10 +109,10 @@ function buildCalllogLimitedKeyboard(ctx) {
 }
 
 function buildCalllogResultKeyboard(ctx) {
-    return new InlineKeyboard()
-        .text('⬅️ Back to Call Log', buildCallbackData(ctx, 'CALLLOG'))
-        .row()
-        .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+    return buildBackToMenuKeyboard(ctx, {
+        backAction: 'CALLLOG',
+        backLabel: '⬅️ Back to Call Log'
+    });
 }
 
 async function replyCalllogUnauthorized(ctx) {

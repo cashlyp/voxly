@@ -4,8 +4,15 @@ const httpClient = require('../utils/httpClient');
 const { getUser, isAdmin } = require('../db/db');
 const { buildCallbackData } = require('../utils/actions');
 const { guardAgainstCommandInterrupt, OperationCancelledError, startOperation } = require('../utils/sessionState');
-const { escapeMarkdown, renderMenu, sendEphemeral, section } = require('../utils/ui');
-const { cancelledMessage, setupStepMessage } = require('../utils/flowMessages');
+const {
+  escapeMarkdown,
+  renderMenu,
+  sendEphemeral,
+  section,
+  buildBackToMenuKeyboard,
+  cancelledMessage,
+  setupStepMessage
+} = require('../utils/ui');
 
 const ADMIN_HEADER_NAME = 'x-admin-token';
 const DEFAULT_LIMIT = 20;
@@ -66,10 +73,10 @@ function buildCallerFlagsKeyboard(ctx) {
 }
 
 function buildCallerFlagsResultKeyboard(ctx) {
-  return new InlineKeyboard()
-    .text('⬅️ Back to Caller Flags', buildCallbackData(ctx, 'CALLER_FLAGS'))
-    .row()
-    .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+  return buildBackToMenuKeyboard(ctx, {
+    backAction: 'CALLER_FLAGS',
+    backLabel: '⬅️ Back to Caller Flags'
+  });
 }
 
 async function renderCallerFlagsMenu(ctx, note = '') {

@@ -6,6 +6,7 @@
   "scripts": {
     "test": "jest --runInBand",
     "validate:profiles": "node scripts/validate-profile-packs.js --strict",
+    "scaffold:profile": "node scripts/scaffold-profile-pack.js",
     "parity:providers": "node scripts/provider-smoke.js",
     "preflight:provider": "node scripts/provider-preflight.js",
     "dev": "nodemon .",
