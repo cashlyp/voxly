@@ -33,9 +33,16 @@ const {
   guardAgainstCommandInterrupt
 } = require('../utils/sessionState');
 const { emailTemplatesFlow } = require('./email');
-const { section, buildLine, tipLine, sendMenu, clearMenuMessages } = require('../utils/ui');
+const {
+  section,
+  buildLine,
+  tipLine,
+  sendMenu,
+  clearMenuMessages,
+  buildMainMenuReplyMarkup,
+  selectionExpiredMessage
+} = require('../utils/ui');
 const { buildCallbackData, matchesCallbackPrefix, parseCallbackData } = require('../utils/actions');
-const { selectionExpiredMessage } = require('../utils/flowMessages');
 const { attachHmacAuth } = require('../utils/apiAuth');
 const {
   RELATIONSHIP_FLOW_TYPES,
@@ -2758,9 +2765,7 @@ async function scriptsFlow(conversation, ctx) {
     }
 
     await ctx.reply('✅ Script designer closed.', {
-      reply_markup: {
-        inline_keyboard: [[{ text: '⬅️ Main Menu', callback_data: buildCallbackData(ctx, 'MENU') }]]
-      }
+      reply_markup: buildMainMenuReplyMarkup(ctx)
     });
   } catch (error) {
     if (error instanceof OperationCancelledError) {

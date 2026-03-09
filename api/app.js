@@ -51,6 +51,7 @@ const {
   applyConversationPolicyGates,
   validateRelationshipProfilePacks,
 } = require("./functions/Dating");
+const { loadProfilePackDocument } = require("./functions/profileRegistry");
 const {
   CALL_OBJECTIVE_IDS,
   CALL_SCRIPT_FLOW_TYPES,
@@ -1757,6 +1758,27 @@ function validateProfilePacksAtStartup() {
     failOnWarnings,
     includeAuxiliary: true,
   });
+  const debugPackPaths =
+    String(process.env.PROFILE_PACK_DEBUG_PATHS || "")
+      .trim()
+      .toLowerCase() === "true";
+  if (debugPackPaths) {
+    console.log("🧭 Profile pack path debug enabled (PROFILE_PACK_DEBUG_PATHS=true)");
+    for (const profileType of RELATIONSHIP_PROFILE_TYPES) {
+      const packDocument = loadProfilePackDocument(
+        profileType,
+        `${profileType} profile pack`,
+      );
+      const primaryFilePath = String(
+        packDocument?.primaryFilePath || packDocument?.filePath || "",
+      ).trim();
+      const companionFilePath =
+        String(packDocument?.companionFilePath || "").trim() || "(none)";
+      console.log(
+        `[profile-pack-paths] ${profileType}: primary=${primaryFilePath} companion=${companionFilePath}`,
+      );
+    }
+  }
   const summary = `checked=${result.checked_files}, required=${result.required_profiles}, warnings=${result.warnings.length}, errors=${result.errors.length}`;
   if (!result.ok) {
     const detail = result.errors.slice(0, 10).join(" | ");

@@ -24,10 +24,20 @@ const {
     extractScriptVariables,
     SCRIPT_METADATA
 } = require('../utils/scripts');
-const { section: formatSection, buildLine, tipLine, renderMenu, escapeMarkdown, sendEphemeral } = require('../utils/ui');
+const {
+    section: formatSection,
+    buildLine,
+    tipLine,
+    renderMenu,
+    escapeMarkdown,
+    sendEphemeral,
+    buildBackToMenuKeyboard: buildStandardBackKeyboard,
+    appendBackToMenuRows,
+    cancelledMessage,
+    setupStepMessage
+} = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 const { getAccessProfile } = require('../utils/capabilities');
-const { cancelledMessage, setupStepMessage } = require('../utils/flowMessages');
 
 async function smsAlert(ctx, text) {
     await ctx.reply(formatSection('⚠️ SMS Alert', [text]));
@@ -39,10 +49,10 @@ async function replyApiError(ctx, error, fallback) {
 }
 
 function buildBackToMenuKeyboard(ctx, action = 'SMS', label = '⬅️ Back to SMS Center') {
-    return new InlineKeyboard()
-        .text(label, buildCallbackData(ctx, action))
-        .row()
-        .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+    return buildStandardBackKeyboard(ctx, {
+        backAction: action,
+        backLabel: label
+    });
 }
 
 async function ensureAuthorizedUser(ctx) {
@@ -380,16 +390,16 @@ async function bulkSmsStatusFlow(conversation, ctx) {
 }
 
 function buildBulkSmsMenuKeyboard(ctx) {
-    return new InlineKeyboard()
+    const keyboard = new InlineKeyboard()
         .text('📤 Send Bulk SMS', buildCallbackData(ctx, 'BULK_SMS_SEND'))
         .text('🕒 Recent Jobs', buildCallbackData(ctx, 'BULK_SMS_LIST'))
         .row()
         .text('🧾 Job Status', buildCallbackData(ctx, 'BULK_SMS_STATUS'))
-        .text('📊 Bulk Stats', buildCallbackData(ctx, 'BULK_SMS_STATS'))
-        .row()
-        .text('⬅️ Back to SMS Center', buildCallbackData(ctx, 'SMS'))
-        .row()
-        .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+        .text('📊 Bulk Stats', buildCallbackData(ctx, 'BULK_SMS_STATS'));
+    return appendBackToMenuRows(keyboard, ctx, {
+        backAction: 'SMS',
+        backLabel: '⬅️ Back to SMS Center'
+    });
 }
 
 async function renderBulkSmsMenu(ctx) {

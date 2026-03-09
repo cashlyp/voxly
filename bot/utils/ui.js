@@ -1,3 +1,5 @@
+const { InlineKeyboard } = require('grammy');
+const { buildCallbackData } = require('./actions');
 const { ensureSession } = require('./sessionState');
 const config = require('../config');
 
@@ -79,6 +81,70 @@ function section(title, lines = []) {
         return header;
     }
     return `${header}\n${cleaned.join('\n')}`;
+}
+
+function selectionExpiredMessage() {
+    return section('⌛ Selection expired', [
+        'That menu button is no longer active.',
+        'Please choose an option again.'
+    ]);
+}
+
+function cancelledMessage(flowLabel = 'Action', nextHint = 'Use /menu to continue.') {
+    return section(`🛑 ${flowLabel} cancelled`, [
+        'No changes were applied.',
+        nextHint
+    ]);
+}
+
+function setupStepMessage(flowLabel, lines = []) {
+    return section(`🧭 ${flowLabel}`, lines);
+}
+
+function buildMainMenuReplyMarkup(ctx, label = '⬅️ Main Menu') {
+    return {
+        inline_keyboard: [[{ text: label, callback_data: buildCallbackData(ctx, 'MENU') }]]
+    };
+}
+
+function buildMainMenuKeyboard(ctx, label = '⬅️ Main Menu') {
+    return new InlineKeyboard().text(label, buildCallbackData(ctx, 'MENU'));
+}
+
+function appendBackToMenuRows(
+    keyboard,
+    ctx,
+    { backAction = null, backLabel = '⬅️ Back', mainLabel = '⬅️ Main Menu' } = {}
+) {
+    const target = keyboard || new InlineKeyboard();
+    let hasRows = Array.isArray(target.inline_keyboard)
+        && target.inline_keyboard.some((row) => Array.isArray(row) && row.length > 0);
+
+    if (backAction) {
+        if (hasRows) {
+            target.row();
+        }
+        target.text(backLabel, buildCallbackData(ctx, backAction));
+        hasRows = true;
+    }
+
+    if (hasRows) {
+        target.row();
+    }
+    target.text(mainLabel, buildCallbackData(ctx, 'MENU'));
+    return target;
+}
+
+function buildBackToMenuKeyboard(ctx, { backAction = null, backLabel = '⬅️ Back' } = {}) {
+    return appendBackToMenuRows(new InlineKeyboard(), ctx, {
+        backAction,
+        backLabel
+    });
+}
+
+function buildBackToMenuReplyMarkup(ctx, options = {}) {
+    const keyboard = buildBackToMenuKeyboard(ctx, options);
+    return { inline_keyboard: keyboard.inline_keyboard };
 }
 
 async function styledAlert(ctx, message, options = {}) {
@@ -256,6 +322,14 @@ module.exports = {
     buildLine,
     tipLine,
     section,
+    selectionExpiredMessage,
+    cancelledMessage,
+    setupStepMessage,
+    buildMainMenuReplyMarkup,
+    buildMainMenuKeyboard,
+    appendBackToMenuRows,
+    buildBackToMenuKeyboard,
+    buildBackToMenuReplyMarkup,
     styledAlert,
     sendMenu,
     sendEphemeral,

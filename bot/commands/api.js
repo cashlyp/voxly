@@ -1,15 +1,8 @@
 const config = require('../config');
 const httpClient = require('../utils/httpClient');
 const { getUser, isAdmin } = require('../db/db');
-const { escapeMarkdown, buildLine, sendEphemeral } = require('../utils/ui');
-const { buildCallbackData } = require('../utils/actions');
+const { escapeMarkdown, buildLine, sendEphemeral, buildMainMenuReplyMarkup } = require('../utils/ui');
 const { getDeniedAuditSummary } = require('../utils/capabilities');
-
-function buildMainMenuReplyMarkup(ctx) {
-    return {
-        inline_keyboard: [[{ text: '⬅️ Main Menu', callback_data: buildCallbackData(ctx, 'MENU') }]]
-    };
-}
 
 async function replyApiError(ctx, error, fallback, options = {}) {
     const message = httpClient.getUserMessage(error, fallback);

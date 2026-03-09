@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const config = require('../config');
 const { getUser, isAdmin } = require('../db/db');
-const { buildCallbackData } = require('./actions');
+const { buildMainMenuKeyboard } = require('./ui');
 const { ensureSession } = require('./sessionState');
 
 const DENY_WINDOW_MS = 60 * 1000;
@@ -172,8 +172,7 @@ function formatActionLabel(actionLabel = '') {
 
 function buildAccessKeyboard(ctx) {
   const adminUsername = (config.admin.username || '').replace(/^@/, '');
-  const keyboard = new InlineKeyboard()
-    .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+  const keyboard = buildMainMenuKeyboard(ctx);
   if (adminUsername) {
     keyboard.row().url('📱 Request Access', `https://t.me/${adminUsername}`);
   }

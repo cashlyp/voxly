@@ -14,11 +14,24 @@ const {
   registerAbortController,
   guardAgainstCommandInterrupt
 } = require('../utils/sessionState');
-const { section, buildLine, tipLine, escapeMarkdown, emphasize, activateMenuMessage, renderMenu, sendEphemeral } = require('../utils/ui');
+const {
+  section,
+  buildLine,
+  tipLine,
+  escapeMarkdown,
+  emphasize,
+  activateMenuMessage,
+  renderMenu,
+  sendEphemeral,
+  buildBackToMenuKeyboard: buildStandardBackKeyboard,
+  appendBackToMenuRows,
+  selectionExpiredMessage,
+  cancelledMessage,
+  setupStepMessage
+} = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 const { getAccessProfile } = require('../utils/capabilities');
 const { askOptionWithButtons } = require('../utils/persona');
-const { selectionExpiredMessage, cancelledMessage, setupStepMessage } = require('../utils/flowMessages');
 
 function normalizeEmail(value) {
   return String(value || '').trim().toLowerCase();
@@ -52,10 +65,10 @@ async function replyApiError(ctx, error, fallback) {
 }
 
 function buildBackToMenuKeyboard(ctx, action = 'EMAIL', label = '⬅️ Back to Email Center') {
-  return new InlineKeyboard()
-    .text(label, buildCallbackData(ctx, action))
-    .row()
-    .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+  return buildStandardBackKeyboard(ctx, {
+    backAction: action,
+    backLabel: label
+  });
 }
 
 async function maybeSendEmailAliasTip(ctx) {
@@ -895,16 +908,16 @@ async function emailHistoryFlow(ctx) {
 }
 
 function buildBulkEmailMenuKeyboard(ctx) {
-  return new InlineKeyboard()
+  const keyboard = new InlineKeyboard()
     .text('📤 Send Bulk Email', buildCallbackData(ctx, 'BULK_EMAIL_SEND'))
     .text('🧾 Job Status', buildCallbackData(ctx, 'BULK_EMAIL_STATUS'))
     .row()
     .text('🕒 History', buildCallbackData(ctx, 'BULK_EMAIL_LIST'))
-    .text('📊 Stats', buildCallbackData(ctx, 'BULK_EMAIL_STATS'))
-    .row()
-    .text('⬅️ Back to Email Center', buildCallbackData(ctx, 'EMAIL'))
-    .row()
-    .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+    .text('📊 Stats', buildCallbackData(ctx, 'BULK_EMAIL_STATS'));
+  return appendBackToMenuRows(keyboard, ctx, {
+    backAction: 'EMAIL',
+    backLabel: '⬅️ Back to Email Center'
+  });
 }
 
 async function renderBulkEmailMenu(ctx) {

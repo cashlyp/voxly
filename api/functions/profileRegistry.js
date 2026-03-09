@@ -180,6 +180,75 @@ function parseProfilePackDocument(rawText = "") {
   };
 }
 
+function toPosixPath(input = "") {
+  return String(input || "").split(path.sep).join("/");
+}
+
+function getProfileDirectory(profileId = "") {
+  const profileKey = String(profileId || "").trim().toLowerCase();
+  return path.join(getProfilesDirectory(), profileKey);
+}
+
+function getProfilePrimaryFileName(profileId = "") {
+  const profileKey = String(profileId || "").trim().toLowerCase();
+  return `${profileKey}.md`;
+}
+
+function getProfileCompanionCandidates(profileId = "") {
+  const profileKey = String(profileId || "").trim().toLowerCase();
+  if (!profileKey) return [];
+  const profilesDir = getProfilesDirectory();
+  const profileDir = getProfileDirectory(profileKey);
+  const candidates = [
+    path.join(profileDir, "profile.md"),
+    path.join(profilesDir, `${profileKey}-profile.md`),
+  ];
+  if (profileKey === "dating") {
+    candidates.push(path.join(profilesDir, "profile.md"));
+  }
+  return candidates;
+}
+
+function firstExistingPath(candidates = []) {
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    } catch (_) {
+      continue;
+    }
+  }
+  return null;
+}
+
+function resolveProfilePackPaths(profileId = "") {
+  const profileKey = String(profileId || "").trim().toLowerCase();
+  const profilesDir = getProfilesDirectory();
+  const profileDir = getProfileDirectory(profileKey);
+  const primaryFileName = getProfilePrimaryFileName(profileKey);
+  const canonicalPrimaryPath = path.join(profileDir, primaryFileName);
+  const legacyPrimaryPath = path.join(profilesDir, primaryFileName);
+  const primaryPath =
+    firstExistingPath([canonicalPrimaryPath, legacyPrimaryPath]) ||
+    canonicalPrimaryPath;
+
+  const companionCandidates = getProfileCompanionCandidates(profileKey);
+  const companionPath = firstExistingPath(companionCandidates);
+
+  return {
+    profileKey,
+    profileDir,
+    primaryPath,
+    canonicalPrimaryPath,
+    legacyPrimaryPath,
+    primaryFileName,
+    companionPath: companionPath || null,
+    canonicalCompanionPath: companionCandidates[0] || null,
+  };
+}
+
 function loadProfilePackDocument(profileId, fallbackText = "") {
   const profileKey = String(profileId || "").trim().toLowerCase();
   if (!profileKey) {
@@ -195,7 +264,8 @@ function loadProfilePackDocument(profileId, fallbackText = "") {
     return PROFILE_PACK_CACHE.get(profileKey);
   }
 
-  const filePath = path.join(__dirname, "profiles", `${profileKey}.md`);
+  const resolvedPaths = resolveProfilePackPaths(profileKey);
+  const filePath = resolvedPaths.primaryPath;
   let rawText = "";
   try {
     rawText = fs.readFileSync(filePath, "utf8");
@@ -212,12 +282,26 @@ function loadProfilePackDocument(profileId, fallbackText = "") {
   }
 
   const parsed = parseProfilePackDocument(rawText);
+  let companionContent = "";
+  if (resolvedPaths.companionPath) {
+    try {
+      const companionRaw = fs.readFileSync(resolvedPaths.companionPath, "utf8");
+      const companionParsed = parseProfilePackDocument(companionRaw);
+      companionContent = String(companionParsed?.content || "").trim();
+    } catch (_) {
+      companionContent = "";
+    }
+  }
+  const primaryContent = parsed.content || String(fallbackText || "").trim();
+  const content = [primaryContent, companionContent].filter(Boolean).join("\n\n").trim();
   const document = {
     profileId: profileKey,
     filePath,
+    primaryFilePath: filePath,
+    companionFilePath: resolvedPaths.companionPath,
     hasFrontmatter: parsed.hasFrontmatter,
     frontmatter: parsed.frontmatter,
-    content: parsed.content || String(fallbackText || "").trim(),
+    content,
   };
   PROFILE_PACK_CACHE.set(profileKey, document);
   return document;
@@ -234,11 +318,33 @@ function getProfilesDirectory() {
 
 function listProfilePackFiles() {
   const dirPath = getProfilesDirectory();
+  const files = [];
+
+  function walk(currentPath, relativePrefix = "") {
+    let entries = [];
+    try {
+      entries = fs.readdirSync(currentPath, { withFileTypes: true });
+    } catch (_) {
+      return;
+    }
+    for (const entry of entries) {
+      const entryName = String(entry?.name || "").trim();
+      if (!entryName) continue;
+      const absolutePath = path.join(currentPath, entryName);
+      const relativePath = toPosixPath(path.join(relativePrefix, entryName));
+      if (entry.isDirectory()) {
+        walk(absolutePath, relativePath);
+        continue;
+      }
+      if (entry.isFile() && entryName.toLowerCase().endsWith(".md")) {
+        files.push(relativePath);
+      }
+    }
+  }
+
   try {
-    return fs
-      .readdirSync(dirPath)
-      .filter((entry) => entry.toLowerCase().endsWith(".md"))
-      .sort();
+    walk(dirPath, "");
+    return files.sort();
   } catch (_) {
     return [];
   }
@@ -347,6 +453,8 @@ function validateProfilePackText(fileName, rawText, options = {}) {
   const errors = [];
   const warnings = [];
   const isRequired = options.isRequired === true;
+  const isCompanion = options.isCompanion === true;
+  const linkedProfileId = String(options.linkedProfileId || "").trim().toLowerCase();
   const definition =
     options?.definition && typeof options.definition === "object"
       ? options.definition
@@ -385,6 +493,14 @@ function validateProfilePackText(fileName, rawText, options = {}) {
     errors.push('Required profile pack must include a "## Purpose" section.');
   }
   if (
+    isCompanion &&
+    !/\n##\s+(purpose|compatibility|compatibility handshake)\b/i.test(`\n${text}`)
+  ) {
+    errors.push(
+      'Companion profile pack must include a "## Purpose" or "## Compatibility" section.',
+    );
+  }
+  if (
     isRequired &&
     !/\n##\s+(safety|safety rules|safety boundaries|boundaries)\b/i.test(
       `\n${text}`,
@@ -393,6 +509,17 @@ function validateProfilePackText(fileName, rawText, options = {}) {
     warnings.push(
       'Required profile pack should include a dedicated safety/boundaries section heading.',
     );
+  }
+  if (isCompanion && !/\bcompanion\b/i.test(text)) {
+    warnings.push('Companion profile should explicitly describe itself as a companion layer.');
+  }
+  if (isCompanion && linkedProfileId) {
+    const primaryReference = `${linkedProfileId}.md`;
+    if (!String(text || "").toLowerCase().includes(primaryReference)) {
+      errors.push(
+        `Companion profile must reference the primary pack file "${primaryReference}".`,
+      );
+    }
   }
 
   const normalized = text.toLowerCase();
@@ -541,6 +668,7 @@ function validateProfilePacks(options = {}) {
   const profileDir = getProfilesDirectory();
   const files = listProfilePackFiles();
   const fileSet = new Set(files);
+  const requiredFileSet = new Set();
   const checks = [];
   const errors = [];
   const warnings = [];
@@ -554,12 +682,20 @@ function validateProfilePacks(options = {}) {
   }
 
   for (const definition of Object.values(PROFILE_DEFINITIONS)) {
-    const fileName = `${definition.id}.md`;
-    const filePath = path.join(profileDir, fileName);
-    if (!fileSet.has(fileName)) {
-      const message = `Missing required profile pack: ${fileName}`;
+    const profileId = String(definition.id || "").trim().toLowerCase();
+    const canonicalPrimaryRelative = toPosixPath(
+      path.join(profileId, `${profileId}.md`),
+    );
+    const legacyPrimaryRelative = `${profileId}.md`;
+    const primaryRelative = fileSet.has(canonicalPrimaryRelative)
+      ? canonicalPrimaryRelative
+      : fileSet.has(legacyPrimaryRelative)
+        ? legacyPrimaryRelative
+        : null;
+    if (!primaryRelative) {
+      const message = `Missing required profile pack: ${canonicalPrimaryRelative}`;
       checks.push({
-        file: fileName,
+        file: canonicalPrimaryRelative,
         ok: false,
         errors: [message],
         warnings: [],
@@ -567,22 +703,65 @@ function validateProfilePacks(options = {}) {
       errors.push(message);
       continue;
     }
-    const content = fs.readFileSync(filePath, "utf8");
-    const result = validateProfilePackText(fileName, content, {
+    requiredFileSet.add(primaryRelative);
+    if (primaryRelative !== canonicalPrimaryRelative) {
+      warnings.push(
+        `Legacy profile pack location detected for ${profileId}; move to ${canonicalPrimaryRelative}.`,
+      );
+    }
+    const primaryPath = path.join(profileDir, primaryRelative);
+    const content = fs.readFileSync(primaryPath, "utf8");
+    const result = validateProfilePackText(primaryRelative, content, {
       isRequired: true,
       definition,
     });
     checks.push(result);
-    errors.push(...result.errors.map((entry) => `${fileName}: ${entry}`));
-    warnings.push(...result.warnings.map((entry) => `${fileName}: ${entry}`));
+    errors.push(...result.errors.map((entry) => `${primaryRelative}: ${entry}`));
+    warnings.push(...result.warnings.map((entry) => `${primaryRelative}: ${entry}`));
+
+    const companionCandidates = [
+      toPosixPath(path.join(profileId, "profile.md")),
+      `${profileId}-profile.md`,
+      ...(profileId === "dating" ? ["profile.md"] : []),
+    ];
+    const companionRelative = companionCandidates.find((entry) => fileSet.has(entry));
+    if (!companionRelative) {
+      const message = `Missing companion profile pack: ${toPosixPath(path.join(profileId, "profile.md"))}`;
+      checks.push({
+        file: toPosixPath(path.join(profileId, "profile.md")),
+        ok: false,
+        errors: [message],
+        warnings: [],
+      });
+      errors.push(message);
+      continue;
+    }
+    requiredFileSet.add(companionRelative);
+    const canonicalCompanionRelative = toPosixPath(path.join(profileId, "profile.md"));
+    if (companionRelative !== canonicalCompanionRelative) {
+      warnings.push(
+        `Legacy companion profile location detected for ${profileId}; move to ${canonicalCompanionRelative}.`,
+      );
+    }
+    const companionPath = path.join(profileDir, companionRelative);
+    const companionContent = fs.readFileSync(companionPath, "utf8");
+    const companionResult = validateProfilePackText(companionRelative, companionContent, {
+      isRequired: false,
+      isCompanion: true,
+      linkedProfileId: profileId,
+    });
+    checks.push(companionResult);
+    errors.push(
+      ...companionResult.errors.map((entry) => `${companionRelative}: ${entry}`),
+    );
+    warnings.push(
+      ...companionResult.warnings.map((entry) => `${companionRelative}: ${entry}`),
+    );
   }
 
   if (includeAuxiliary) {
     for (const fileName of files) {
-      const knownRequired = Object.values(PROFILE_DEFINITIONS).some(
-        (definition) => `${definition.id}.md` === fileName,
-      );
-      if (knownRequired) continue;
+      if (requiredFileSet.has(fileName)) continue;
       const filePath = path.join(profileDir, fileName);
       const content = fs.readFileSync(filePath, "utf8");
       const result = validateProfilePackText(fileName, content, { isRequired: false });

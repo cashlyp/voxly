@@ -27,6 +27,7 @@ const {
   clearMenuMessages,
   getLatestMenuMessageId,
   isLatestMenuExpired,
+  registerMenuMessage,
   renderMenu,
   sendEphemeral,
 } = require("./utils/ui");
@@ -168,9 +169,13 @@ bot.use(async (ctx, next) => {
     return next();
   }
   const originalReply = ctx.reply.bind(ctx);
-  ctx.reply = (text, options = {}) => {
+  ctx.reply = async (text, options = {}) => {
     const normalized = normalizeReply(text, options);
-    return originalReply(normalized.text, normalized.options);
+    const message = await originalReply(normalized.text, normalized.options);
+    if (hasInlineCallbackButtons(normalized.options.reply_markup)) {
+      registerMenuMessage(ctx, message);
+    }
+    return message;
   };
   return next();
 });
@@ -487,6 +492,23 @@ registerGuideCommand(bot);
 registerApiCommands(bot);
 registerProviderCommand(bot);
 const API_BASE = config.apiUrl;
+const MENU_EXEMPT_CALLBACK_PREFIXES = ["alert:", "lc:", "tr:", "rca:", "retry:", "recap:"];
+
+function hasInlineCallbackButtons(replyMarkup) {
+  const rows = replyMarkup?.inline_keyboard;
+  if (!Array.isArray(rows)) {
+    return false;
+  }
+  return rows.some((row) => Array.isArray(row) && row.some((button) => {
+    const callbackData = button?.callback_data;
+    if (!callbackData) {
+      return false;
+    }
+    const parsed = parseCallbackData(callbackData);
+    const action = parsed.action || String(callbackData);
+    return !MENU_EXEMPT_CALLBACK_PREFIXES.some((prefix) => action.startsWith(prefix));
+  }));
+}
 
 function parseCallbackAction(action) {
   if (!action || !action.includes(":")) {
@@ -620,8 +642,7 @@ bot.on("callback_query:data", async (ctx) => {
     finishActionMetric(metric, status, extra);
   };
   try {
-    const menuExemptPrefixes = ["alert:", "lc:", "tr:", "rca:", "retry:", "recap:"];
-    const isMenuExempt = menuExemptPrefixes.some((prefix) =>
+    const isMenuExempt = MENU_EXEMPT_CALLBACK_PREFIXES.some((prefix) =>
       String(resolvedAction || "").startsWith(prefix),
     );
 
@@ -693,9 +714,12 @@ bot.on("callback_query:data", async (ctx) => {
       }
     }
 
-    const isMenuExemptAction = menuExemptPrefixes.some((prefix) =>
+    const isMenuExemptAction = MENU_EXEMPT_CALLBACK_PREFIXES.some((prefix) =>
       action.startsWith(prefix),
     );
+    if (!isMenuExemptAction && ctx.callbackQuery?.message) {
+      registerMenuMessage(ctx, ctx.callbackQuery.message);
+    }
     const menuMessageId = ctx.callbackQuery?.message?.message_id;
     const menuChatId = ctx.callbackQuery?.message?.chat?.id;
     const latestMenuId = getLatestMenuMessageId(ctx, menuChatId);
