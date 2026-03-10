@@ -3,7 +3,7 @@
 const { InlineKeyboard } = require("grammy");
 const config = require("../config");
 const httpClient = require("./httpClient");
-const { sendMenu, clearMenuMessages, escapeMarkdown } = require("./ui");
+const { upsertMenuMessage, dismissMenuMessage, escapeMarkdown } = require("./ui");
 const {
   buildCallbackData,
   matchesCallbackPrefix,
@@ -154,6 +154,7 @@ async function askVoiceModelWithPagination(
   const opToken = String(ctx.session?.currentOp?.token || "").trim();
   let page = 0;
   let activeFilter = "";
+  let menuMessage = null;
 
   const buildKeyboard = ({
     top = [],
@@ -242,7 +243,7 @@ async function askVoiceModelWithPagination(
     const filterHint = normalizedFilter
       ? `\n_Filter: ${escapeMarkdown(normalizedFilter)}_`
       : "";
-    const message = await sendMenu(ctx, `${prompt}${filterHint}${pageHint}`, {
+    menuMessage = await upsertMenuMessage(ctx, menuMessage, `${prompt}${filterHint}${pageHint}`, {
       parse_mode: "Markdown",
       reply_markup: keyboard,
     });
@@ -261,14 +262,6 @@ async function askVoiceModelWithPagination(
     );
     safeEnsureActive();
     await selectionCtx.answerCallbackQuery();
-    try {
-      await ctx.api.deleteMessage(message.chat.id, message.message_id);
-    } catch (_) {
-      await ctx.api
-        .editMessageReplyMarkup(message.chat.id, message.message_id)
-        .catch(() => {});
-    }
-    await clearMenuMessages(ctx);
 
     const selectedData = selectionCtx?.callbackQuery?.data || "";
     const action = parseCallbackData(selectedData).action || selectedData;
@@ -304,6 +297,7 @@ async function askVoiceModelWithPagination(
       }
       const lowered = input.toLowerCase();
       if (lowered === "cancel") {
+        await dismissMenuMessage(ctx, menuMessage);
         return null;
       }
       if (lowered === "clear") {
@@ -334,8 +328,10 @@ async function askVoiceModelWithPagination(
       })),
     ].find((entry) => entry.id === selectedId);
     if (!lookup) {
+      await dismissMenuMessage(ctx, menuMessage);
       return null;
     }
+    await dismissMenuMessage(ctx, menuMessage);
     return lookup;
   }
 }

@@ -226,6 +226,7 @@ function resolveProviderExecutionOrder(options = {}) {
     context = {},
     failoverEnabled = true,
     isProviderDegraded = () => false,
+    getProviderHealthScore = null,
   } = options;
 
   const normalizedChannel = normalizeChannel(channel);
@@ -234,13 +235,20 @@ function resolveProviderExecutionOrder(options = {}) {
   const healthy = [];
   const degraded = [];
   const blocked = [];
+  const resolveScore = (provider) => {
+    if (typeof getProviderHealthScore !== "function") return null;
+    const score = Number(getProviderHealthScore(provider));
+    return Number.isFinite(score) ? score : null;
+  };
 
-  orderedProviders.forEach((provider) => {
+  orderedProviders.forEach((provider, index) => {
     if (!provider) return;
+    const score = resolveScore(provider);
     if (readiness && readiness[provider] !== true) {
       blocked.push({
         provider,
         reason: "not_ready",
+        score,
       });
       return;
     }
@@ -249,30 +257,53 @@ function resolveProviderExecutionOrder(options = {}) {
         provider,
         reason: "flow_unsupported",
         flow,
+        score,
       });
       return;
     }
     if (failoverEnabled && typeof isProviderDegraded === "function") {
       const degradedState = isProviderDegraded(provider) === true;
       if (degradedState) {
-        degraded.push(provider);
+        degraded.push({ provider, score, index });
         return;
       }
     }
-    healthy.push(provider);
+    healthy.push({ provider, score, index });
   });
 
-  const attemptOrder = healthy.length > 0
-    ? [...healthy, ...degraded]
-    : [...degraded];
+  const sortByScoreThenOrder = (left, right) => {
+    const leftScore = Number.isFinite(left?.score) ? left.score : null;
+    const rightScore = Number.isFinite(right?.score) ? right.score : null;
+    if (leftScore !== null && rightScore !== null && rightScore !== leftScore) {
+      return rightScore - leftScore;
+    }
+    return Number(left?.index || 0) - Number(right?.index || 0);
+  };
+
+  healthy.sort(sortByScoreThenOrder);
+  degraded.sort(sortByScoreThenOrder);
+
+  const healthyProviders = healthy.map((entry) => entry.provider);
+  const degradedProviders = degraded.map((entry) => entry.provider);
+  const providerScores = {};
+  [...healthy, ...degraded].forEach((entry) => {
+    if (!entry?.provider) return;
+    if (!Number.isFinite(entry.score)) return;
+    providerScores[entry.provider] = entry.score;
+  });
+
+  const attemptOrder = healthyProviders.length > 0
+    ? [...healthyProviders, ...degradedProviders]
+    : [...degradedProviders];
 
   return {
     channel: normalizedChannel,
     requested_flow: flow || null,
     preferred_provider: normalizeProviderName(preferredProvider) || null,
     ordered_providers: orderedProviders,
-    healthy_providers: healthy,
-    degraded_providers: degraded,
+    healthy_providers: healthyProviders,
+    degraded_providers: degradedProviders,
+    provider_scores: providerScores,
     blocked_providers: blocked,
     attempt_order: attemptOrder,
     selected_provider: attemptOrder[0] || null,

@@ -103,6 +103,7 @@ function createSystemStatusHandler(ctx = {}) {
     getCurrentEmailProvider,
     callConfigurations,
     getProviderCompatibilityReport,
+    getCallCanaryState,
   } = ctx;
 
   return async function handleSystemStatus(req, res) {
@@ -123,6 +124,10 @@ function createSystemStatusHandler(ctx = {}) {
             ? getProviderCompatibilityReport()
             : null,
         active_calls: callConfigurations.size,
+        call_canary:
+          typeof getCallCanaryState === "function"
+            ? getCallCanaryState()
+            : null,
       });
     } catch (error) {
       return res.status(500).json({
@@ -207,11 +212,13 @@ function createHealthHandler(ctx = {}) {
     providerHealth,
     getProviderReadiness,
     isProviderDegraded,
+    getProviderHealthScore,
     pruneExpiredKeypadProviderOverrides,
     keypadProviderOverrides,
     callConfigurations,
     functionEngine,
     callFunctionSystems,
+    getCallCanaryState,
   } = ctx;
 
   return async function handleHealth(req, res) {
@@ -295,6 +302,15 @@ function createHealthHandler(ctx = {}) {
         acc[provider] = {
           configured: Boolean(getProviderReadiness()[provider]),
           degraded: isProviderDegraded(provider),
+          circuit_state: health.circuitState || "closed",
+          health_score:
+            typeof getProviderHealthScore === "function"
+              ? getProviderHealthScore(provider)
+              : Number.isFinite(Number(health.score))
+                ? Number(health.score)
+                : null,
+          consecutive_errors: Number(health.consecutiveErrors) || 0,
+          consecutive_successes: Number(health.consecutiveSuccesses) || 0,
           last_error_at: health.lastErrorAt || null,
           last_success_at: health.lastSuccessAt || null,
         };
@@ -360,6 +376,10 @@ function createHealthHandler(ctx = {}) {
             : 0,
           active_function_systems: callFunctionSystems.size,
         },
+        call_canary:
+          typeof getCallCanaryState === "function"
+            ? getCallCanaryState()
+            : null,
         inbound_defaults: inboundDefaultSummary,
         inbound_env_defaults: inboundEnvSummary,
         system_health: recentHealthLogs,

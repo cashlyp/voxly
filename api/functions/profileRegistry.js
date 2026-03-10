@@ -492,6 +492,11 @@ function validateProfilePackText(fileName, rawText, options = {}) {
   if (isRequired && !/\n##\s+purpose\b/i.test(`\n${text}`)) {
     errors.push('Required profile pack must include a "## Purpose" section.');
   }
+  if (isRequired && !/\bprofile\.md\b/i.test(text)) {
+    warnings.push(
+      'Required profile pack should reference companion file "profile.md" for style handshake clarity.',
+    );
+  }
   if (
     isCompanion &&
     !/\n##\s+(purpose|compatibility|compatibility handshake)\b/i.test(`\n${text}`)
@@ -782,6 +787,104 @@ function validateProfilePacks(options = {}) {
     warnings,
     checks,
     profile_definition_validation: definitionValidation,
+  };
+}
+
+function runProfileRuntimeSmoke(options = {}) {
+  const selectedProfiles = Array.isArray(options.profiles)
+    ? options.profiles
+        .map((entry) => normalizeProfileType(entry))
+        .filter(Boolean)
+    : Object.keys(PROFILE_DEFINITIONS);
+  const uniqueProfiles = [...new Set(selectedProfiles)];
+  const checks = [];
+  const errors = [];
+  const warnings = [];
+
+  const longTextSample = [
+    "Thanks for sharing that.",
+    "I can keep this clear and concise while giving you a practical next step.",
+    "If this still feels unclear, I can simplify it and continue without pressure.",
+    "Tell me the one detail you want me to prioritize right now.",
+  ].join(" ");
+  const riskySample = "Send me money now or else you have no choice.";
+  const questionHeavySample =
+    "Can you confirm your name? Can you confirm your city? Can you confirm your number?";
+
+  for (const profileType of uniqueProfiles) {
+    const runtimeContract = getProfileRuntimeContract(profileType);
+    const maxChars = Number(runtimeContract?.responseConstraints?.maxChars);
+    const maxQuestions = Number(runtimeContract?.responseConstraints?.maxQuestions);
+    const fallback = String(runtimeContract?.safeFallback || "").trim();
+    const defaultFirstMessage = String(runtimeContract?.defaultFirstMessage || "").trim();
+
+    const profileChecks = [];
+    const longResult = applyProfilePolicyGates(longTextSample.repeat(3), profileType);
+    const riskyResult = applyProfilePolicyGates(riskySample, profileType);
+    const questionResult = applyProfilePolicyGates(questionHeavySample, profileType);
+
+    if (!defaultFirstMessage) {
+      errors.push(`${profileType}: runtime defaultFirstMessage is empty`);
+    } else {
+      profileChecks.push("default_first_message_present");
+    }
+
+    if (!fallback) {
+      errors.push(`${profileType}: runtime safeFallback is empty`);
+    } else {
+      profileChecks.push("safe_fallback_present");
+    }
+
+    if (Number.isFinite(maxChars) && maxChars > 0) {
+      if (String(longResult?.text || "").length > maxChars + 1) {
+        errors.push(
+          `${profileType}: response_length_guard failed (${String(longResult?.text || "").length} > ${maxChars})`,
+        );
+      } else {
+        profileChecks.push("response_length_guard");
+      }
+    } else {
+      warnings.push(`${profileType}: maxChars constraint missing or invalid`);
+    }
+
+    if (Number.isFinite(maxQuestions) && maxQuestions >= 0) {
+      const questionCount = (String(questionResult?.text || "").match(/\?/g) || []).length;
+      if (questionCount > maxQuestions) {
+        errors.push(
+          `${profileType}: question_density_guard failed (${questionCount} > ${maxQuestions})`,
+        );
+      } else {
+        profileChecks.push("question_density_guard");
+      }
+    } else {
+      warnings.push(`${profileType}: maxQuestions constraint missing or invalid`);
+    }
+
+    if (String(riskyResult?.action || "").trim().toLowerCase() !== "fallback") {
+      errors.push(`${profileType}: coercion/money pressure sample did not trigger fallback`);
+    } else {
+      profileChecks.push("policy_fallback_guard");
+    }
+
+    checks.push({
+      profile: profileType,
+      ok: profileChecks.length >= 4,
+      checks: profileChecks,
+      sample_results: {
+        long_text_action: longResult?.action || "unknown",
+        risky_action: riskyResult?.action || "unknown",
+        risky_blocked: Array.isArray(riskyResult?.blocked) ? riskyResult.blocked : [],
+        question_action: questionResult?.action || "unknown",
+      },
+    });
+  }
+
+  return {
+    ok: errors.length === 0,
+    checked_profiles: uniqueProfiles.length,
+    errors,
+    warnings,
+    checks,
   };
 }
 
@@ -1675,6 +1778,7 @@ module.exports = {
   getProfilePack,
   listProfilePackFiles,
   validateProfilePacks,
+  runProfileRuntimeSmoke,
   validateProfileDefinitions,
   buildProfilePromptBundle,
   buildRelationshipContext,

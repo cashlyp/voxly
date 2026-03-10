@@ -305,6 +305,13 @@ function evaluateVoiceAgentAutoCanaryDecision(input = {}) {
     ? Number(summary.fallbackNoAudioRate)
     : 0;
   const circuitOpen = input.circuitOpen === true;
+  const qualityBreach = input.qualityBreach === true;
+  const qualityBreachReason =
+    String(input.qualityBreachReason || "").trim().toLowerCase() || "quality_breach";
+  const qualitySummary =
+    input.qualitySummary && typeof input.qualitySummary === "object"
+      ? input.qualitySummary
+      : null;
   const cooldownUntilMs = parseEpochMs(input.cooldownUntilMs);
   const base = {
     enabled: cfg.enabled,
@@ -320,6 +327,9 @@ function evaluateVoiceAgentAutoCanaryDecision(input = {}) {
     fallbackRate,
     fallbackNoAudioRate,
     circuitOpen,
+    qualityBreach,
+    qualityBreachReason,
+    qualitySummary,
   };
 
   if (!cfg.enabled) return { action: "noop", reason: "disabled", ...base };
@@ -354,7 +364,7 @@ function evaluateVoiceAgentAutoCanaryDecision(input = {}) {
       fallbackRate > cfg.maxFallbackRate ||
       fallbackNoAudioRate > cfg.maxNoAudioFallbackRate
     );
-  if (circuitOpen || breachedBySlo) {
+  if (circuitOpen || breachedBySlo || qualityBreach) {
     const nextCanaryPercent = cfg.failClosedOnBreach
       ? 0
       : Math.max(0, currentCanaryPercent - cfg.stepDownPercent);
@@ -365,7 +375,11 @@ function evaluateVoiceAgentAutoCanaryDecision(input = {}) {
     ) {
       return {
         action: "set_canary",
-        reason: circuitOpen ? "circuit_open" : "slo_breach",
+        reason: circuitOpen
+          ? "circuit_open"
+          : breachedBySlo
+            ? "slo_breach"
+            : qualityBreachReason,
         nextCanaryPercent,
         nextCooldownUntilMs,
         ...base,

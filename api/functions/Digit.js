@@ -478,6 +478,18 @@ function createDigitCollectionService(options = {}) {
     'invoice_number',
     'confirmation_code'
   ]);
+  const RELATIONSHIP_PROFILE_HINTS = new Set([
+    'dating',
+    'friendship',
+    'creator',
+    'celebrity',
+    'fan',
+    'community',
+    'networking',
+    'relationship',
+    'romance',
+    'social'
+  ]);
 
   function normalizeProfileId(profile) {
     if (!profile) return null;
@@ -6156,6 +6168,104 @@ function createDigitCollectionService(options = {}) {
     return normalizeGroupId(rawProfile);
   }
 
+  function normalizeIntentSignal(value = '') {
+    const normalized = String(value || '')
+      .toLowerCase()
+      .trim()
+      .replace(/[\s-]+/g, '_');
+    if (!normalized) return null;
+    return normalized.replace(/[^a-z0-9_]/g, '');
+  }
+
+  function collectFlowSignals(callConfig = {}) {
+    const signals = new Set();
+    const push = (value) => {
+      const normalized = normalizeIntentSignal(value);
+      if (!normalized) return;
+      signals.add(normalized);
+      normalized.split(/[_/]+/).forEach((token) => {
+        if (token) signals.add(token);
+      });
+    };
+
+    push(callConfig.conversation_profile);
+    push(callConfig.call_profile);
+    push(callConfig.purpose);
+    push(callConfig.flow_type);
+    push(callConfig.flowType);
+    push(callConfig.script);
+    push(callConfig.business_context?.purpose);
+    push(callConfig.business_context?.flow_type);
+
+    const tpl = callConfig.script_policy || {};
+    push(tpl.flow_type);
+    push(tpl.objective_tag);
+    if (Array.isArray(tpl.flow_types)) {
+      tpl.flow_types.forEach((entry) => push(entry));
+    }
+
+    return Array.from(signals);
+  }
+
+  function hasExplicitDigitCaptureConfig(callConfig = {}) {
+    const explicitSources = [
+      callConfig.capture_group,
+      callConfig.captureGroup,
+      callConfig.capture_plan,
+      callConfig.capturePlan,
+      callConfig.digit_plan_id,
+      callConfig.digitPlanId,
+      callConfig.collection_profile,
+      callConfig.digit_profile_id,
+      callConfig.digitProfileId,
+      callConfig.digit_profile
+    ];
+    if (explicitSources.some((value) => value !== null && value !== undefined && String(value).trim() !== '')) {
+      return true;
+    }
+
+    const tpl = callConfig.script_policy || {};
+    if (tpl.requires_otp === true) return true;
+    const scriptDefaultProfile = normalizeProfileId(tpl.default_profile || '');
+    if (scriptDefaultProfile && scriptDefaultProfile !== 'generic' && isSupportedProfile(scriptDefaultProfile)) {
+      return true;
+    }
+    const scriptCollectionProfile = normalizeProfileId(tpl.collection_profile || '');
+    if (scriptCollectionProfile && scriptCollectionProfile !== 'generic' && isSupportedProfile(scriptCollectionProfile)) {
+      return true;
+    }
+
+    const intentProfile = normalizeProfileId(
+      callConfig?.digit_intent?.expectation?.profile
+        || callConfig?.digit_intent?.profile
+        || ''
+    );
+    if (intentProfile && intentProfile !== 'generic' && isSupportedProfile(intentProfile)) {
+      return true;
+    }
+
+    return false;
+  }
+
+  function resolveImplicitDigitInferenceGuard(callConfig = {}) {
+    if (!callConfig || typeof callConfig !== 'object') {
+      return { blocked: false, reason: null, matched_profiles: [] };
+    }
+    if (hasExplicitDigitCaptureConfig(callConfig)) {
+      return { blocked: false, reason: null, matched_profiles: [] };
+    }
+    const flowSignals = collectFlowSignals(callConfig);
+    const matchedProfiles = flowSignals.filter((signal) => RELATIONSHIP_PROFILE_HINTS.has(signal));
+    if (!matchedProfiles.length) {
+      return { blocked: false, reason: null, matched_profiles: [] };
+    }
+    return {
+      blocked: true,
+      reason: 'relationship_profile_without_explicit_digit_policy',
+      matched_profiles: Array.from(new Set(matchedProfiles)).slice(0, 8)
+    };
+  }
+
   const MIN_INFER_CONFIDENCE = 0.65;
 
   function inferDigitExpectationFromText(text = '', callConfig = {}) {
@@ -6174,7 +6284,7 @@ function createDigitCollectionService(options = {}) {
       return m ? parseInt(m[1], 10) : null;
     };
     const hasPress = contains(/\bpress\b/);
-    const hasEnter = contains(/\b(enter|input|key in|type|dial)\b/);
+    const hasEnter = contains(/\b(enter|input|key in|dial)\b/) || contains(/\btype\s+(?:in|the|your|[0-9])/);
     const explicitDigitCount = numberHint(/\b(\d{1,2})\s*[- ]?digit\b/);
     const explicitCodeCount = numberHint(/\b(\d{1,2})\s*[- ]?code\b/);
     const explicitLen = explicitDigitCount || explicitCodeCount;
@@ -6381,6 +6491,37 @@ function createDigitCollectionService(options = {}) {
         confidence: 0.95,
         expectation: explicit
       };
+    }
+
+    const implicitGuard = resolveImplicitDigitInferenceGuard(callConfig);
+    if (implicitGuard.blocked) {
+      logDigitMetric('intent_inference_blocked', {
+        callSid,
+        reason: implicitGuard.reason,
+        matched_profiles: implicitGuard.matched_profiles
+      });
+      if (webhookService?.addLiveEvent) {
+        webhookService.addLiveEvent(
+          callSid,
+          `🛡️ Digit inference blocked (${implicitGuard.matched_profiles.join(', ') || 'relationship'} flow requires explicit digit policy)`,
+          { force: false }
+        );
+      }
+      if (db?.updateCallState) {
+        Promise.resolve(
+          db.updateCallState(callSid, 'digit_intent_inference_blocked', {
+            reason: implicitGuard.reason,
+            matched_profiles: implicitGuard.matched_profiles,
+            prompt_preview: String(callConfig.prompt || callConfig.first_message || '').slice(0, 140) || null
+          })
+        ).catch((error) => {
+          logDigitMetric('intent_inference_blocked_state_update_failed', {
+            callSid,
+            error: error?.message || 'unknown_error'
+          });
+        });
+      }
+      return { mode: 'normal', reason: implicitGuard.reason, confidence: 0 };
     }
 
     let candidates = [];

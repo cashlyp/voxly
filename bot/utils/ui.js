@@ -164,6 +164,14 @@ function setMenuEntries(ctx, entries) {
     ctx.session.menuMessages = Array.isArray(entries) ? entries : [];
 }
 
+function removeMenuEntry(ctx, chatId, messageId) {
+    if (!chatId || !messageId) return;
+    const entries = getMenuEntries(ctx).filter((entry) => !(
+        entry?.chatId === chatId && entry?.messageId === messageId
+    ));
+    setMenuEntries(ctx, entries);
+}
+
 function getLatestMenuEntry(ctx, chatId = null) {
     const entries = getMenuEntries(ctx).filter((entry) => {
         if (!chatId) return true;
@@ -246,6 +254,76 @@ async function sendMenu(ctx, text, options = {}) {
     const message = await ctx.reply(text, options);
     registerMenuMessage(ctx, message);
     return message;
+}
+
+function toMessageRef(message, ctx) {
+    const chatId = message?.chat?.id || message?.chatId || ctx.chat?.id || null;
+    const messageId = message?.message_id || message?.messageId || null;
+    if (!chatId || !messageId) {
+        return null;
+    }
+    return {
+        chat: { id: chatId },
+        message_id: messageId,
+        chatId,
+        messageId
+    };
+}
+
+function isMessageNotModifiedError(error) {
+    const message = String(error?.message || "").toLowerCase();
+    return message.includes("message is not modified");
+}
+
+async function upsertMenuMessage(ctx, currentMessage, text, options = {}) {
+    const normalized = normalizeReply(text, options);
+    const current = toMessageRef(currentMessage, ctx);
+    if (current?.chatId && current?.messageId) {
+        try {
+            const edited = await ctx.api.editMessageText(
+                current.chatId,
+                current.messageId,
+                normalized.text,
+                normalized.options
+            );
+            const nextRef = toMessageRef(edited || current, ctx) || current;
+            registerMenuMessage(ctx, nextRef);
+            return nextRef;
+        } catch (error) {
+            if (isMessageNotModifiedError(error)) {
+                registerMenuMessage(ctx, current);
+                return current;
+            }
+        }
+    }
+    const sent = await sendMenu(ctx, normalized.text, normalized.options);
+    return toMessageRef(sent, ctx) || sent;
+}
+
+async function dismissMenuMessage(ctx, message, { clearOnly = false } = {}) {
+    const ref = toMessageRef(message, ctx);
+    if (!ref?.chatId || !ref?.messageId) {
+        return false;
+    }
+    let handled = false;
+    if (!clearOnly) {
+        try {
+            await ctx.api.deleteMessage(ref.chatId, ref.messageId);
+            handled = true;
+        } catch (_) {
+            // Fallback to clearing markup below.
+        }
+    }
+    if (!handled) {
+        try {
+            await ctx.api.editMessageReplyMarkup(ref.chatId, ref.messageId);
+            handled = true;
+        } catch (_) {
+            handled = false;
+        }
+    }
+    removeMenuEntry(ctx, ref.chatId, ref.messageId);
+    return handled;
 }
 
 async function sendEphemeral(ctx, text, options = {}) {
@@ -336,6 +414,8 @@ module.exports = {
     clearMenuMessages,
     registerMenuMessage,
     activateMenuMessage,
+    upsertMenuMessage,
+    dismissMenuMessage,
     getLatestMenuMessageId,
     isLatestMenuExpired,
     renderMenu
