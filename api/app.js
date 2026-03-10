@@ -79,6 +79,7 @@ const {
   normalizeProvider,
 } = require("./adapters/providerState");
 const {
+  normalizeProviderName,
   resolveProviderExecutionOrder,
   resolvePaymentExecutionMode,
   buildProviderCompatibilityReport,

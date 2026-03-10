@@ -728,6 +728,7 @@ function buildProviderCompatibilityReport(options = {}) {
 module.exports = {
   PROVIDER_CHANNELS,
   PROVIDER_FLOW_REGISTRY,
+  normalizeProviderName,
   listSupportedProviders,
   listProviderFlows,
   providerSupportsFlow,
