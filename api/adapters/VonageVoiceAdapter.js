@@ -18,6 +18,110 @@ function maskPhoneForLog(value) {
   return `${"*".repeat(Math.max(2, digits.length - 4))}${digits.slice(-4)}`;
 }
 
+function normalizePositiveInteger(value, fallback, { min = 0 } = {}) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  const normalized = Math.floor(parsed);
+  if (normalized < min) return fallback;
+  return normalized;
+}
+
+function extractErrorStatusCode(error) {
+  const candidates = [
+    error?.statusCode,
+    error?.status,
+    error?.response?.statusCode,
+    error?.response?.status,
+  ];
+  for (const candidate of candidates) {
+    const numeric = Number(candidate);
+    if (Number.isFinite(numeric) && numeric > 0) {
+      return numeric;
+    }
+  }
+  return null;
+}
+
+function extractErrorCode(error) {
+  const candidates = [
+    error?.code,
+    error?.errorCode,
+    error?.response?.code,
+    error?.response?.errorCode,
+  ];
+  for (const candidate of candidates) {
+    const normalized = String(candidate || "").trim();
+    if (normalized) return normalized;
+  }
+  return "";
+}
+
+function isRetriableStatus(statusCode) {
+  if (!Number.isFinite(Number(statusCode))) return false;
+  const normalized = Number(statusCode);
+  return [408, 409, 425, 429, 500, 502, 503, 504].includes(normalized);
+}
+
+function isRetriableErrorCode(code) {
+  const normalized = String(code || "").trim().toLowerCase();
+  if (!normalized) return false;
+  return new Set([
+    "operation_timeout",
+    "vonage_provider_timeout",
+    "etimedout",
+    "esockettimedout",
+    "econnreset",
+    "econnaborted",
+    "econnrefused",
+    "enotfound",
+    "eai_again",
+    "network_error",
+    "fetcherror",
+  ]).has(normalized);
+}
+
+function buildRetryDelayMs(baseMs, maxDelayMs, jitterMs, retryNumber) {
+  const exponent = Math.max(0, Number(retryNumber) - 1);
+  const withoutJitter = baseMs * (2 ** exponent);
+  const jitter = jitterMs > 0 ? Math.floor(Math.random() * (jitterMs + 1)) : 0;
+  return Math.max(0, Math.min(maxDelayMs, withoutJitter + jitter));
+}
+
+function sleepMs(delayMs) {
+  const normalized = normalizePositiveInteger(delayMs, 0);
+  if (!normalized) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, normalized);
+    if (typeof timer?.unref === "function") {
+      timer.unref();
+    }
+  });
+}
+
+function sanitizePhoneNumber(value, label) {
+  const normalized = String(value || "")
+    .trim()
+    .replace(/[\s()-]/g, "");
+  if (!normalized || !/^\+?[0-9]{7,15}$/.test(normalized)) {
+    throw new Error(`VonageVoiceAdapter requires a valid ${label} number`);
+  }
+  return normalized;
+}
+
+function validateInlineNcco(ncco) {
+  if (!Array.isArray(ncco) || ncco.length === 0) return false;
+  for (const action of ncco) {
+    if (!action || typeof action !== "object") {
+      throw new Error("VonageVoiceAdapter.createOutboundCall ncco actions must be objects");
+    }
+    const actionType = String(action.action || "").trim();
+    if (!actionType) {
+      throw new Error("VonageVoiceAdapter.createOutboundCall ncco actions require an action field");
+    }
+  }
+  return true;
+}
+
 class VonageVoiceAdapter {
   constructor(config = {}, logger = console) {
     const { apiKey, apiSecret, applicationId, privateKey, voice = {} } = config;
@@ -30,12 +134,38 @@ class VonageVoiceAdapter {
     }
 
     this.logger = logger;
-    this.fromNumber = voice.fromNumber;
+    this.fromNumber = String(voice.fromNumber || "").trim();
     this.answerUrlOverride = voice.answerUrl;
     this.eventUrlOverride = voice.eventUrl;
     const timeoutMs = Number(voice.requestTimeoutMs || config.requestTimeoutMs);
     this.requestTimeoutMs =
       Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 15000;
+    this.retryAttempts = normalizePositiveInteger(
+      voice.retryAttempts ?? config.retryAttempts,
+      1,
+      { min: 0 },
+    );
+    // Creating outbound calls is intentionally conservative to avoid duplicate call risks.
+    this.createRetryAttempts = normalizePositiveInteger(
+      voice.createRetryAttempts ?? config.createRetryAttempts,
+      0,
+      { min: 0 },
+    );
+    this.retryBaseMs = normalizePositiveInteger(
+      voice.retryBaseMs ?? config.retryBaseMs,
+      250,
+      { min: 0 },
+    );
+    this.retryMaxDelayMs = normalizePositiveInteger(
+      voice.retryMaxDelayMs ?? config.retryMaxDelayMs,
+      2000,
+      { min: 0 },
+    );
+    this.retryJitterMs = normalizePositiveInteger(
+      voice.retryJitterMs ?? config.retryJitterMs,
+      120,
+      { min: 0 },
+    );
 
     this.client =
       injectedClient ||
@@ -45,6 +175,78 @@ class VonageVoiceAdapter {
         applicationId,
         privateKey,
       });
+  }
+
+  async executeVoiceOperation(operationName, runner, options = {}) {
+    const maxRetries = normalizePositiveInteger(options.retryAttempts, 0, {
+      min: 0,
+    });
+    const maxAttempts = Math.max(1, maxRetries + 1);
+    const timeoutLabel = String(options.timeoutLabel || operationName);
+    const timeoutCode = String(options.timeoutCode || "vonage_provider_timeout");
+    const meta =
+      options.meta && typeof options.meta === "object" ? options.meta : {};
+
+    let attempt = 0;
+    while (attempt < maxAttempts) {
+      const attemptNumber = attempt + 1;
+      try {
+        return await runWithTimeout(Promise.resolve().then(() => runner()), {
+          timeoutMs: this.requestTimeoutMs,
+          label: timeoutLabel,
+          timeoutCode,
+          logger: this.logger,
+          meta: {
+            provider: "vonage",
+            operation: operationName,
+            attempt: attemptNumber,
+            max_attempts: maxAttempts,
+            ...meta,
+          },
+          warnAfterMs: Math.min(
+            5000,
+            Math.max(1000, Math.floor(this.requestTimeoutMs / 2)),
+          ),
+        });
+      } catch (error) {
+        const statusCode = extractErrorStatusCode(error);
+        const errorCode = extractErrorCode(error);
+        const retriable = isRetriableStatus(statusCode) || isRetriableErrorCode(errorCode);
+        const willRetry = retriable && attemptNumber < maxAttempts;
+        this.logger?.warn?.("vonage_voice_operation_failed", {
+          provider: "vonage",
+          operation: operationName,
+          attempt: attemptNumber,
+          max_attempts: maxAttempts,
+          retriable,
+          will_retry: willRetry,
+          status_code: statusCode,
+          code: errorCode || null,
+          error: error?.message || String(error || "unknown_error"),
+          ...meta,
+        });
+        if (!willRetry) {
+          if (error && typeof error === "object") {
+            error.provider = "vonage";
+            error.operation = operationName;
+            if (statusCode && !error.statusCode) {
+              error.statusCode = statusCode;
+            }
+          }
+          throw error;
+        }
+        const retryNumber = attemptNumber;
+        const delayMs = buildRetryDelayMs(
+          this.retryBaseMs,
+          this.retryMaxDelayMs,
+          this.retryJitterMs,
+          retryNumber,
+        );
+        await sleepMs(delayMs);
+      }
+      attempt += 1;
+    }
+    throw new Error(`VonageVoiceAdapter ${operationName} exceeded retry budget`);
   }
 
   /**
@@ -72,10 +274,12 @@ class VonageVoiceAdapter {
         "VonageVoiceAdapter requires VONAGE_VOICE_FROM_NUMBER for outbound calls",
       );
     }
+    const normalizedTo = sanitizePhoneNumber(to, "destination");
+    const normalizedFrom = sanitizePhoneNumber(this.fromNumber, "from");
 
     const finalAnswerUrl = this.answerUrlOverride || answerUrl;
     const finalEventUrl = this.eventUrlOverride || eventUrl;
-    const hasInlineNcco = Array.isArray(ncco) && ncco.length > 0;
+    const hasInlineNcco = validateInlineNcco(ncco);
 
     if (!hasInlineNcco && !isValidHttpsUrl(finalAnswerUrl)) {
       throw new Error(
@@ -92,12 +296,12 @@ class VonageVoiceAdapter {
       to: [
         {
           type: "phone",
-          number: to,
+          number: normalizedTo,
         },
       ],
       from: {
         type: "phone",
-        number: this.fromNumber,
+        number: normalizedFrom,
       },
     };
 
@@ -114,31 +318,33 @@ class VonageVoiceAdapter {
     }
 
     this.logger.info?.("VonageVoiceAdapter: creating outbound call", {
-      to: maskPhoneForLog(to),
+      to: maskPhoneForLog(normalizedTo),
       callSid,
-      from: maskPhoneForLog(this.fromNumber),
+      from: maskPhoneForLog(normalizedFrom),
       hasInlineNcco,
       answerUrl: payload.answer_url?.[0] || null,
       eventUrl: payload.event_url?.[0] || null,
     });
 
-    const response = await runWithTimeout(
-      this.client.voice.createOutboundCall(payload),
+    const response = await this.executeVoiceOperation(
+      "create_outbound_call",
+      () => this.client.voice.createOutboundCall(payload),
       {
-        timeoutMs: this.requestTimeoutMs,
-        label: "vonage_create_call_timeout",
-        timeoutCode: "vonage_provider_timeout",
-        logger: this.logger,
+        timeoutLabel: "vonage_create_call_timeout",
+        retryAttempts: this.createRetryAttempts,
         meta: {
-          provider: "vonage",
-          operation: "create_outbound_call",
+          callSid,
+          to: maskPhoneForLog(normalizedTo),
         },
-        warnAfterMs: Math.min(
-          5000,
-          Math.max(1000, Math.floor(this.requestTimeoutMs / 2)),
-        ),
       },
     );
+    if (!response?.uuid) {
+      this.logger.warn?.("vonage_create_call_missing_uuid", {
+        provider: "vonage",
+        operation: "create_outbound_call",
+        callSid,
+      });
+    }
     return response;
   }
 
@@ -146,20 +352,20 @@ class VonageVoiceAdapter {
     if (!callUuid) {
       throw new Error("VonageVoiceAdapter.hangupCall requires call UUID");
     }
-    await runWithTimeout(this.client.voice.updateCall(callUuid, { action: "hangup" }), {
-      timeoutMs: this.requestTimeoutMs,
-      label: "vonage_hangup_timeout",
-      timeoutCode: "vonage_provider_timeout",
-      logger: this.logger,
-      meta: {
-        provider: "vonage",
-        operation: "hangup",
+    await this.executeVoiceOperation(
+      "hangup",
+      () => {
+        if (typeof this.client?.voice?.hangupCall === "function") {
+          return this.client.voice.hangupCall(callUuid);
+        }
+        return this.client.voice.updateCall(callUuid, { action: "hangup" });
       },
-      warnAfterMs: Math.min(
-        5000,
-        Math.max(1000, Math.floor(this.requestTimeoutMs / 2)),
-      ),
-    });
+      {
+        timeoutLabel: "vonage_hangup_timeout",
+        retryAttempts: this.retryAttempts,
+        meta: { call_uuid: String(callUuid) },
+      },
+    );
   }
 
   async transferCallWithURL(callUuid, url) {
@@ -171,20 +377,15 @@ class VonageVoiceAdapter {
         "VonageVoiceAdapter.transferCallWithURL requires a valid HTTPS URL",
       );
     }
-    await runWithTimeout(this.client.voice.transferCallWithURL(callUuid, url), {
-      timeoutMs: this.requestTimeoutMs,
-      label: "vonage_transfer_timeout",
-      timeoutCode: "vonage_provider_timeout",
-      logger: this.logger,
-      meta: {
-        provider: "vonage",
-        operation: "transfer_with_url",
+    await this.executeVoiceOperation(
+      "transfer_with_url",
+      () => this.client.voice.transferCallWithURL(callUuid, url),
+      {
+        timeoutLabel: "vonage_transfer_timeout",
+        retryAttempts: this.retryAttempts,
+        meta: { call_uuid: String(callUuid) },
       },
-      warnAfterMs: Math.min(
-        5000,
-        Math.max(1000, Math.floor(this.requestTimeoutMs / 2)),
-      ),
-    });
+    );
   }
 }
 

@@ -2,7 +2,7 @@ const { InlineKeyboard } = require('grammy');
 const config = require('../config');
 const httpClient = require('./httpClient');
 const { ensureOperationActive, getCurrentOpId } = require('./sessionState');
-const { sendMenu, clearMenuMessages } = require('./ui');
+const { upsertMenuMessage, dismissMenuMessage } = require('./ui');
 const { buildCallbackData, matchesCallbackPrefix, parseCallbackData } = require('./actions');
 
 const FALLBACK_PERSONAS = [
@@ -389,7 +389,7 @@ async function askOptionWithButtons(
     }
   });
 
-  const message = await sendMenu(ctx, prompt, { parse_mode: 'Markdown', reply_markup: keyboard });
+  const message = await upsertMenuMessage(ctx, null, prompt, { parse_mode: 'Markdown', reply_markup: keyboard });
   const selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {
     const callbackData = callbackCtx?.callbackQuery?.data;
     if (!callbackData) {
@@ -410,12 +410,7 @@ async function askOptionWithButtons(
   activeChecker();
 
   await selectionCtx.answerCallbackQuery();
-  try {
-    await ctx.api.deleteMessage(message.chat.id, message.message_id);
-  } catch (_) {
-    await ctx.api.editMessageReplyMarkup(message.chat.id, message.message_id).catch(() => {});
-  }
-  await clearMenuMessages(ctx);
+  await dismissMenuMessage(ctx, message);
 
   const selectedData = selectionCtx?.callbackQuery?.data || '';
   const selectionAction = parseCallbackData(selectedData).action || selectedData;

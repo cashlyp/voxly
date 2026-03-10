@@ -377,6 +377,28 @@ class EnhancedDatabase {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
 
+            // Outbound call idempotency guard (provider-agnostic)
+            `CREATE TABLE IF NOT EXISTS outbound_call_idempotency (
+                idempotency_key TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                request_hash TEXT,
+                call_sid TEXT,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'completed', 'failed')),
+                response_payload TEXT,
+                error_message TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            // Durable Vonage UUID -> call SID mapping for restart-safe reconciliation
+            `CREATE TABLE IF NOT EXISTS vonage_call_mappings (
+                vonage_uuid TEXT PRIMARY KEY,
+                call_sid TEXT NOT NULL,
+                source TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
             // Persisted runtime snapshot for active calls
             `CREATE TABLE IF NOT EXISTS call_runtime_state (
                 call_sid TEXT PRIMARY KEY,
@@ -498,6 +520,11 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_gpt_tool_idem_updated ON gpt_tool_idempotency(updated_at)',
             'CREATE INDEX IF NOT EXISTS idx_provider_event_idem_source ON provider_event_idempotency(source)',
             'CREATE INDEX IF NOT EXISTS idx_provider_event_idem_expires ON provider_event_idempotency(expires_at)',
+            'CREATE INDEX IF NOT EXISTS idx_outbound_call_idem_provider ON outbound_call_idempotency(provider)',
+            'CREATE INDEX IF NOT EXISTS idx_outbound_call_idem_status ON outbound_call_idempotency(status)',
+            'CREATE INDEX IF NOT EXISTS idx_outbound_call_idem_updated ON outbound_call_idempotency(updated_at)',
+            'CREATE INDEX IF NOT EXISTS idx_vonage_call_map_call_sid ON vonage_call_mappings(call_sid)',
+            'CREATE INDEX IF NOT EXISTS idx_vonage_call_map_updated ON vonage_call_mappings(updated_at)',
             'CREATE INDEX IF NOT EXISTS idx_call_runtime_state_updated ON call_runtime_state(updated_at)',
         ];
 
@@ -1913,6 +1940,171 @@ class EnhancedDatabase {
                     reject(err);
                 } else {
                     resolve(this.changes || 0);
+                }
+            });
+        });
+    }
+
+    async reserveOutboundCallIdempotency(payload = {}) {
+        const idempotencyKey = String(payload.idempotency_key || '').trim();
+        const provider = String(payload.provider || '').trim().toLowerCase();
+        const requestHash = String(payload.request_hash || '').trim() || null;
+        if (!idempotencyKey || !provider) {
+            return { reserved: false };
+        }
+        return new Promise((resolve, reject) => {
+            const sql = `
+                INSERT OR IGNORE INTO outbound_call_idempotency (
+                    idempotency_key, provider, request_hash, status, updated_at
+                )
+                VALUES (?, ?, ?, 'pending', CURRENT_TIMESTAMP)
+            `;
+            this.db.run(sql, [idempotencyKey, provider, requestHash], function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve({ reserved: (this.changes || 0) > 0 });
+                }
+            });
+        });
+    }
+
+    async getOutboundCallIdempotency(idempotency_key) {
+        const key = String(idempotency_key || '').trim();
+        if (!key) return null;
+        return new Promise((resolve, reject) => {
+            const sql = `
+                SELECT *
+                FROM outbound_call_idempotency
+                WHERE idempotency_key = ?
+                LIMIT 1
+            `;
+            this.db.get(sql, [key], (err, row) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(row || null);
+                }
+            });
+        });
+    }
+
+    async completeOutboundCallIdempotency(payload = {}) {
+        const idempotencyKey = String(payload.idempotency_key || '').trim();
+        const provider = String(payload.provider || '').trim().toLowerCase();
+        if (!idempotencyKey || !provider) return 0;
+        const requestHash = String(payload.request_hash || '').trim() || null;
+        const callSid = String(payload.call_sid || '').trim() || null;
+        const status = ['pending', 'completed', 'failed'].includes(String(payload.status || '').toLowerCase())
+            ? String(payload.status || '').toLowerCase()
+            : 'failed';
+        const responsePayload = payload.response_payload != null
+            ? JSON.stringify(payload.response_payload)
+            : null;
+        const errorMessage = payload.error_message != null
+            ? String(payload.error_message).trim() || null
+            : null;
+
+        return new Promise((resolve, reject) => {
+            const sql = `
+                INSERT INTO outbound_call_idempotency (
+                    idempotency_key, provider, request_hash, call_sid,
+                    status, response_payload, error_message, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(idempotency_key) DO UPDATE SET
+                    provider = excluded.provider,
+                    request_hash = COALESCE(excluded.request_hash, outbound_call_idempotency.request_hash),
+                    call_sid = COALESCE(excluded.call_sid, outbound_call_idempotency.call_sid),
+                    status = excluded.status,
+                    response_payload = excluded.response_payload,
+                    error_message = excluded.error_message,
+                    updated_at = CURRENT_TIMESTAMP
+            `;
+            this.db.run(
+                sql,
+                [
+                    idempotencyKey,
+                    provider,
+                    requestHash,
+                    callSid,
+                    status,
+                    responsePayload,
+                    errorMessage,
+                ],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(this.changes || 0);
+                    }
+                }
+            );
+        });
+    }
+
+    async upsertVonageCallMapping(call_sid, vonage_uuid, source = null) {
+        const callSid = String(call_sid || '').trim();
+        const vonageUuid = String(vonage_uuid || '').trim();
+        const mappingSource = String(source || '').trim() || null;
+        if (!callSid || !vonageUuid) return 0;
+        return new Promise((resolve, reject) => {
+            const sql = `
+                INSERT INTO vonage_call_mappings (
+                    vonage_uuid, call_sid, source, updated_at
+                )
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(vonage_uuid) DO UPDATE SET
+                    call_sid = excluded.call_sid,
+                    source = COALESCE(excluded.source, vonage_call_mappings.source),
+                    updated_at = CURRENT_TIMESTAMP
+            `;
+            this.db.run(sql, [vonageUuid, callSid, mappingSource], function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.changes || 0);
+                }
+            });
+        });
+    }
+
+    async getVonageCallSidByUuid(vonage_uuid) {
+        const vonageUuid = String(vonage_uuid || '').trim();
+        if (!vonageUuid) return null;
+        return new Promise((resolve, reject) => {
+            const sql = `
+                SELECT call_sid, vonage_uuid, source, created_at, updated_at
+                FROM vonage_call_mappings
+                WHERE vonage_uuid = ?
+                LIMIT 1
+            `;
+            this.db.get(sql, [vonageUuid], (err, row) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(row || null);
+                }
+            });
+        });
+    }
+
+    async listRecentVonageCallMappings(limit = 200) {
+        const safeLimit = Number.isFinite(Number(limit))
+            ? Math.max(1, Math.min(1000, Math.floor(Number(limit))))
+            : 200;
+        return new Promise((resolve, reject) => {
+            const sql = `
+                SELECT vonage_uuid, call_sid, source, created_at, updated_at
+                FROM vonage_call_mappings
+                ORDER BY updated_at DESC
+                LIMIT ?
+            `;
+            this.db.all(sql, [safeLimit], (err, rows) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(rows || []);
                 }
             });
         });
@@ -4929,6 +5121,8 @@ class EnhancedDatabase {
            { name: 'gpt_tool_idempotency', dateField: 'updated_at' },
            { name: 'gpt_memory_facts', dateField: 'last_seen_at' },
            { name: 'provider_event_idempotency', dateField: 'created_at' },
+           { name: 'outbound_call_idempotency', dateField: 'updated_at' },
+           { name: 'vonage_call_mappings', dateField: 'updated_at' },
            { name: 'call_runtime_state', dateField: 'updated_at' }
        ];
        

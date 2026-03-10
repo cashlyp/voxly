@@ -37,8 +37,9 @@ const {
   section,
   buildLine,
   tipLine,
-  sendMenu,
   clearMenuMessages,
+  upsertMenuMessage,
+  dismissMenuMessage,
   buildMainMenuReplyMarkup,
   selectionExpiredMessage
 } = require('../utils/ui');
@@ -318,6 +319,7 @@ async function askScriptSelectionWithPagination(
   const normalizedPageSize = Math.max(1, Math.floor(Number(pageSize) || 8));
   let page = 0;
   let activeFilter = '';
+  let menuMessage = null;
 
   const buildKeyboard = ({
     pageEntries = [],
@@ -382,7 +384,7 @@ async function askScriptSelectionWithPagination(
       hasFilter: Boolean(needle),
       noResults
     });
-    const message = await sendMenu(ctx, header, {
+    menuMessage = await upsertMenuMessage(ctx, menuMessage, header, {
       parse_mode: 'Markdown',
       reply_markup: keyboard
     });
@@ -400,19 +402,13 @@ async function askScriptSelectionWithPagination(
     safeEnsureActive();
     await selectionCtx.answerCallbackQuery();
 
-    try {
-      await ctx.api.deleteMessage(message.chat.id, message.message_id);
-    } catch (_) {
-      await ctx.api.editMessageReplyMarkup(message.chat.id, message.message_id).catch(() => {});
-    }
-    await clearMenuMessages(ctx);
-
     const selectedData = selectionCtx?.callbackQuery?.data || '';
     const selectedAction = parseCallbackData(selectedData).action || selectedData;
     const prefixSegments = String(prefix).split(':').filter(Boolean).length;
     const selectedId = selectedAction.split(':').slice(prefixSegments).join(':');
 
     if (selectedId === '__back__') {
+      await dismissMenuMessage(ctx, menuMessage);
       return { id: 'back', item: null };
     }
     if (selectedId === '__noop__') {
@@ -432,12 +428,18 @@ async function askScriptSelectionWithPagination(
       continue;
     }
     if (selectedId === '__search__') {
-      await ctx.reply(
+      let searchPromptMessage = null;
+      searchPromptMessage = await upsertMenuMessage(
+        ctx,
+        searchPromptMessage,
         `🔎 Enter ${searchLabel} filter. Type \`clear\` to reset or \`cancel\` to keep current results.`,
         { parse_mode: 'Markdown' }
       );
       const update = await conversation.wait();
       safeEnsureActive();
+      if (searchPromptMessage) {
+        await dismissMenuMessage(ctx, searchPromptMessage);
+      }
       const input = String(update?.message?.text || '').trim();
       if (!input) continue;
       const lower = input.toLowerCase();
@@ -456,10 +458,12 @@ async function askScriptSelectionWithPagination(
       const key = selectedId.slice('pick:'.length);
       const selected = safeItems.find((entry) => entry.key === key);
       if (selected) {
+        await dismissMenuMessage(ctx, menuMessage);
         return { id: selected.id, item: selected.item };
       }
     }
 
+    await dismissMenuMessage(ctx, menuMessage);
     return { id: 'back', item: null };
   }
 }
@@ -1816,10 +1820,11 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
   const safeEnsureActive = typeof ensureActive === 'function'
     ? ensureActive
     : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  let summaryMessage = null;
   let viewing = true;
   while (viewing) {
     const summary = formatCallScriptSummary(script);
-    await ctx.reply(summary, { parse_mode: 'Markdown' });
+    summaryMessage = await upsertMenuMessage(ctx, summaryMessage, summary, { parse_mode: 'Markdown' });
 
     const action = await askOptionWithButtons(
       conversation,
@@ -1835,6 +1840,11 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
       ],
       { prefix: 'call-script-action', columns: 2, ensureActive: safeEnsureActive }
     );
+
+    if (summaryMessage) {
+      await dismissMenuMessage(ctx, summaryMessage);
+      summaryMessage = null;
+    }
 
     if (!action?.id) {
       await ctx.reply(selectionExpiredMessage(), { parse_mode: 'Markdown' });
@@ -1872,6 +1882,10 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
         break;
     }
   }
+
+  if (summaryMessage) {
+    await dismissMenuMessage(ctx, summaryMessage);
+  }
 }
 
 async function listCallScriptsFlow(conversation, ctx, ensureActive, options = {}) {
@@ -1879,7 +1893,9 @@ async function listCallScriptsFlow(conversation, ctx, ensureActive, options = {}
     ? ensureActive
     : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
   const selectedFlow = normalizeCallScriptFlowType(options.flowType);
+  let headerMessage = null;
   try {
+    await clearMenuMessages(ctx);
     const scripts = await fetchCallScripts({ flowType: selectedFlow });
     safeEnsureActive();
     const list = Array.isArray(scripts) ? scripts : [];
@@ -1900,7 +1916,11 @@ async function listCallScriptsFlow(conversation, ctx, ensureActive, options = {}
     const header = selectedFlow
       ? `☎️ Call Scripts (${getCallScriptFlowLabel(selectedFlow)})`
       : '☎️ Call Scripts';
-    await ctx.reply(`${header}\n\n${validScripts.length} script${validScripts.length === 1 ? '' : 's'} found. Use Search to filter quickly.`);
+    headerMessage = await upsertMenuMessage(
+      ctx,
+      headerMessage,
+      `${header}\n\n${validScripts.length} script${validScripts.length === 1 ? '' : 's'} found. Use Search to filter quickly.`
+    );
 
     const selection = await askScriptSelectionWithPagination(
       conversation,
@@ -1943,6 +1963,10 @@ async function listCallScriptsFlow(conversation, ctx, ensureActive, options = {}
         return;
       }
 
+      if (headerMessage) {
+        await dismissMenuMessage(ctx, headerMessage);
+        headerMessage = null;
+      }
       await showCallScriptDetail(conversation, ctx, script, safeEnsureActive);
     } catch (error) {
       console.error('Failed to load call script details:', error);
@@ -1951,6 +1975,10 @@ async function listCallScriptsFlow(conversation, ctx, ensureActive, options = {}
   } catch (error) {
     console.error('Failed to list scripts:', error);
     await ctx.reply(formatScriptsApiError(error, 'Failed to list call scripts'));
+  } finally {
+    if (headerMessage) {
+      await dismissMenuMessage(ctx, headerMessage);
+    }
   }
 }
 
@@ -2552,10 +2580,11 @@ async function previewSmsScript(conversation, ctx, script) {
 }
 
 async function showSmsScriptDetail(conversation, ctx, script) {
+  let summaryMessage = null;
   let viewing = true;
   while (viewing) {
     const summary = formatSmsScriptSummary(script);
-    await ctx.reply(summary, { parse_mode: 'Markdown' });
+    summaryMessage = await upsertMenuMessage(ctx, summaryMessage, summary, { parse_mode: 'Markdown' });
 
     const actions = [
       { id: 'preview', label: '📲 Preview' },
@@ -2577,6 +2606,11 @@ async function showSmsScriptDetail(conversation, ctx, script) {
       actions,
       { prefix: 'sms-script-action', columns: 2 }
     );
+
+    if (summaryMessage) {
+      await dismissMenuMessage(ctx, summaryMessage);
+      summaryMessage = null;
+    }
 
     if (!action?.id) {
       await ctx.reply(selectionExpiredMessage(), { parse_mode: 'Markdown' });
@@ -2614,10 +2648,16 @@ async function showSmsScriptDetail(conversation, ctx, script) {
         break;
     }
   }
+
+  if (summaryMessage) {
+    await dismissMenuMessage(ctx, summaryMessage);
+  }
 }
 
 async function listSmsScriptsFlow(conversation, ctx) {
+  let headerMessage = null;
   try {
+    await clearMenuMessages(ctx);
     const scripts = await fetchSmsScripts();
     if (!scripts.length) {
       await ctx.reply('ℹ️ No SMS scripts found. Use the create action to add one.');
@@ -2626,7 +2666,9 @@ async function listSmsScriptsFlow(conversation, ctx) {
 
     const customCount = scripts.filter((script) => !script.is_builtin).length;
     const builtinCount = scripts.length - customCount;
-    await ctx.reply(
+    headerMessage = await upsertMenuMessage(
+      ctx,
+      headerMessage,
       `💬 SMS Scripts\n\n${scripts.length} script${scripts.length === 1 ? '' : 's'} found (${customCount} custom, ${builtinCount} built-in). Use Search to filter quickly.`
     );
 
@@ -2656,6 +2698,10 @@ async function listSmsScriptsFlow(conversation, ctx) {
         return;
       }
 
+      if (headerMessage) {
+        await dismissMenuMessage(ctx, headerMessage);
+        headerMessage = null;
+      }
       await showSmsScriptDetail(conversation, ctx, script);
     } catch (error) {
       console.error('Failed to load SMS script details:', error);
@@ -2664,6 +2710,10 @@ async function listSmsScriptsFlow(conversation, ctx) {
   } catch (error) {
     console.error('Failed to list SMS scripts:', error);
     await ctx.reply(formatScriptsApiError(error, 'Failed to list SMS scripts'));
+  } finally {
+    if (headerMessage) {
+      await dismissMenuMessage(ctx, headerMessage);
+    }
   }
 }
 

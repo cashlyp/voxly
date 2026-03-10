@@ -296,6 +296,27 @@ const vonageWebhookRequirePayloadHash =
 const vonageDtmfWebhookEnabled =
   String(readEnv("VONAGE_DTMF_WEBHOOK_ENABLED") || "false").toLowerCase() ===
   "true";
+const vonageVoiceRequestTimeoutMs = Number(
+  readEnv("VONAGE_VOICE_REQUEST_TIMEOUT_MS") || "15000",
+);
+const vonageVoiceRetryAttempts = Number(
+  readEnv("VONAGE_VOICE_RETRY_ATTEMPTS") || "1",
+);
+const vonageVoiceCreateRetryAttempts = Number(
+  readEnv("VONAGE_VOICE_CREATE_RETRY_ATTEMPTS") || "0",
+);
+const vonageVoiceRetryBaseMs = Number(
+  readEnv("VONAGE_VOICE_RETRY_BASE_MS") || "250",
+);
+const vonageVoiceRetryMaxDelayMs = Number(
+  readEnv("VONAGE_VOICE_RETRY_MAX_DELAY_MS") || "2000",
+);
+const vonageVoiceRetryJitterMs = Number(
+  readEnv("VONAGE_VOICE_RETRY_JITTER_MS") || "120",
+);
+const vonageUuidReconcileIntervalMs = Number(
+  readEnv("VONAGE_UUID_RECONCILE_INTERVAL_MS") || "120000",
+);
 const telegramWebhookValidationRaw = (
   readEnv("TELEGRAM_WEBHOOK_VALIDATION") || (isProduction ? "strict" : "warn")
 ).toLowerCase();
@@ -429,6 +450,53 @@ const callSloAnswerDelayMs = Number(
   readEnv("CALL_SLO_ANSWER_DELAY_MS") || "12000",
 );
 const callSloSttFailures = Number(readEnv("CALL_SLO_STT_FAILURES") || "3");
+const callGreetingWatchdogEnabled = readBooleanEnv(
+  "CALL_GREETING_WATCHDOG_ENABLED",
+  true,
+);
+const callGreetingWatchdogTimeoutMs = Number(
+  readEnv("CALL_GREETING_WATCHDOG_TIMEOUT_MS") || "12000",
+);
+const callGreetingWatchdogMaxRetries = Number(
+  readEnv("CALL_GREETING_WATCHDOG_MAX_RETRIES") || "1",
+);
+const callGreetingWatchdogRecoveryPrompt = String(
+  readEnv("CALL_GREETING_WATCHDOG_RECOVERY_PROMPT") || "",
+).trim();
+const callGreetingWatchdogFallbackMessage = String(
+  readEnv("CALL_GREETING_WATCHDOG_FALLBACK_MESSAGE") || "",
+).trim();
+const callCanaryEnabled = readBooleanEnv("CALL_CANARY_ENABLED", false);
+const callCanaryIntervalMs = Number(
+  readEnv("CALL_CANARY_INTERVAL_MS") || "300000",
+);
+const callCanaryTimeoutMs = Number(
+  readEnv("CALL_CANARY_TIMEOUT_MS") || "60000",
+);
+const callCanaryDryRun = readBooleanEnv("CALL_CANARY_DRY_RUN", true);
+const callCanaryTargetNumber = String(readEnv("CALL_CANARY_TARGET_NUMBER") || "").trim();
+const callCanaryProfiles = parseList(readEnv("CALL_CANARY_PROFILES") || "creator,friendship");
+const callCanaryProviders = parseList(readEnv("CALL_CANARY_PROVIDERS") || "twilio,vonage");
+const callCanaryMaxCallsPerRun = Number(
+  readEnv("CALL_CANARY_MAX_CALLS_PER_RUN") || "2",
+);
+const callCanaryIdempotencyWindowMs = Number(
+  readEnv("CALL_CANARY_IDEMPOTENCY_WINDOW_MS") || "300000",
+);
+const callCanaryUserChatId = String(readEnv("CALL_CANARY_USER_CHAT_ID") || "").trim();
+const callCanarySloEnabled = readBooleanEnv("CALL_CANARY_SLO_ENABLED", true);
+const callCanarySloWindowMs = Number(
+  readEnv("CALL_CANARY_SLO_WINDOW_MS") || "900000",
+);
+const callCanarySloMinSamples = Number(
+  readEnv("CALL_CANARY_SLO_MIN_SAMPLES") || "3",
+);
+const callCanarySloMaxTimeoutEvents = Number(
+  readEnv("CALL_CANARY_SLO_MAX_TIMEOUT_EVENTS") || "2",
+);
+const callCanarySloMaxStallEvents = Number(
+  readEnv("CALL_CANARY_SLO_MAX_STALL_EVENTS") || "2",
+);
 const webhookRetryBaseMs = Number(readEnv("WEBHOOK_RETRY_BASE_MS") || "5000");
 const webhookRetryMaxMs = Number(readEnv("WEBHOOK_RETRY_MAX_MS") || "60000");
 const webhookRetryMaxAttempts = Number(
@@ -758,6 +826,35 @@ module.exports = {
       answerUrl: readEnv("VONAGE_ANSWER_URL"),
       eventUrl: readEnv("VONAGE_EVENT_URL"),
       websocketContentType: vonageVoiceWebsocketContentType,
+      requestTimeoutMs:
+        Number.isFinite(vonageVoiceRequestTimeoutMs) && vonageVoiceRequestTimeoutMs > 0
+          ? Math.floor(vonageVoiceRequestTimeoutMs)
+          : 15000,
+      retryAttempts:
+        Number.isFinite(vonageVoiceRetryAttempts) && vonageVoiceRetryAttempts >= 0
+          ? Math.floor(vonageVoiceRetryAttempts)
+          : 1,
+      createRetryAttempts:
+        Number.isFinite(vonageVoiceCreateRetryAttempts) && vonageVoiceCreateRetryAttempts >= 0
+          ? Math.floor(vonageVoiceCreateRetryAttempts)
+          : 0,
+      retryBaseMs:
+        Number.isFinite(vonageVoiceRetryBaseMs) && vonageVoiceRetryBaseMs >= 0
+          ? Math.floor(vonageVoiceRetryBaseMs)
+          : 250,
+      retryMaxDelayMs:
+        Number.isFinite(vonageVoiceRetryMaxDelayMs) && vonageVoiceRetryMaxDelayMs >= 0
+          ? Math.floor(vonageVoiceRetryMaxDelayMs)
+          : 2000,
+      retryJitterMs:
+        Number.isFinite(vonageVoiceRetryJitterMs) && vonageVoiceRetryJitterMs >= 0
+          ? Math.floor(vonageVoiceRetryJitterMs)
+          : 120,
+      uuidReconcileIntervalMs:
+        Number.isFinite(vonageUuidReconcileIntervalMs) &&
+        vonageUuidReconcileIntervalMs >= 0
+          ? Math.floor(vonageUuidReconcileIntervalMs)
+          : 120000,
     },
     webhookValidation: vonageWebhookValidation,
     webhookSignatureSecret: vonageWebhookSignatureSecret,
@@ -1125,6 +1222,64 @@ module.exports = {
     firstMediaMs: callSloFirstMediaMs,
     answerDelayMs: callSloAnswerDelayMs,
     sttFailureThreshold: callSloSttFailures,
+  },
+  callWatchdog: {
+    greetingEnabled: callGreetingWatchdogEnabled,
+    greetingTimeoutMs: Number.isFinite(callGreetingWatchdogTimeoutMs)
+      ? Math.max(3000, Math.floor(callGreetingWatchdogTimeoutMs))
+      : 12000,
+    greetingMaxRetries: Number.isFinite(callGreetingWatchdogMaxRetries)
+      ? Math.max(0, Math.min(3, Math.floor(callGreetingWatchdogMaxRetries)))
+      : 1,
+    greetingRecoveryPrompt: callGreetingWatchdogRecoveryPrompt || null,
+    greetingFallbackMessage: callGreetingWatchdogFallbackMessage || null,
+  },
+  callCanary: {
+    enabled: callCanaryEnabled,
+    intervalMs: Number.isFinite(callCanaryIntervalMs)
+      ? Math.max(30000, Math.floor(callCanaryIntervalMs))
+      : 300000,
+    timeoutMs: Number.isFinite(callCanaryTimeoutMs)
+      ? Math.max(10000, Math.floor(callCanaryTimeoutMs))
+      : 60000,
+    dryRun: callCanaryDryRun,
+    targetNumber: callCanaryTargetNumber || null,
+    profiles: callCanaryProfiles
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter(Boolean),
+    providers: callCanaryProviders
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter(Boolean),
+    maxCallsPerRun: Number.isFinite(callCanaryMaxCallsPerRun)
+      ? Math.max(1, Math.min(12, Math.floor(callCanaryMaxCallsPerRun)))
+      : 2,
+    idempotencyWindowMs: Number.isFinite(callCanaryIdempotencyWindowMs)
+      ? Math.max(60000, Math.floor(callCanaryIdempotencyWindowMs))
+      : 300000,
+    userChatId: callCanaryUserChatId || null,
+    quality: {
+      enabled: true,
+      failClosed: false,
+      minScore: 70,
+      minFirstMessageChars: 18,
+      maxPromptChars: 1200,
+      maxSentenceWords: 30,
+    },
+    slo: {
+      enabled: callCanarySloEnabled,
+      windowMs: Number.isFinite(callCanarySloWindowMs)
+        ? Math.max(120000, Math.floor(callCanarySloWindowMs))
+        : 900000,
+      minSamples: Number.isFinite(callCanarySloMinSamples)
+        ? Math.max(1, Math.floor(callCanarySloMinSamples))
+        : 3,
+      maxTimeoutEvents: Number.isFinite(callCanarySloMaxTimeoutEvents)
+        ? Math.max(1, Math.floor(callCanarySloMaxTimeoutEvents))
+        : 2,
+      maxStallEvents: Number.isFinite(callCanarySloMaxStallEvents)
+        ? Math.max(1, Math.floor(callCanarySloMaxStallEvents))
+        : 2,
+    },
   },
   payment: {
     enabled: paymentFeatureEnabled,

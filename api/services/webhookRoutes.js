@@ -1852,6 +1852,22 @@ function createVonageEventWebhookHandler(ctx = {}) {
       const normalizedPayload = getVonageCallPayload(req, payload);
       const { uuid, status } = payload;
       const dtmfDigits = getVonageDtmfDigits(payload);
+      const hasSignal = Boolean(
+        uuid ||
+        status ||
+        dtmfDigits ||
+        req.query?.callSid ||
+        req.query?.call_sid ||
+        payload.callSid ||
+        payload.call_sid,
+      );
+      if (!hasSignal) {
+        console.warn("Vonage event callback missing status/dtmf identifiers", {
+          request_id: req.requestId || null,
+          path: req.path || null,
+        });
+        return res.status(200).send("OK");
+      }
       const dedupePayload = {
         uuid: uuid || normalizedPayload?.uuid || null,
         status: String(status || "").toLowerCase() || null,
@@ -1935,6 +1951,12 @@ function createVonageEventWebhookHandler(ctx = {}) {
         payload || {},
         { callSid },
       );
+      if (status && !canonicalEvent.status) {
+        console.warn("Vonage event callback received unknown status", {
+          uuid: uuid || null,
+          status: String(status),
+        });
+      }
       if (callSid && canonicalEvent.status) {
         const parsedDuration = parseInt(durationRaw, 10);
         await recordCallStatus(
@@ -1942,11 +1964,13 @@ function createVonageEventWebhookHandler(ctx = {}) {
           canonicalEvent.status,
           canonicalEvent.notification_type,
           {
-          duration: Number.isFinite(Number(canonicalEvent.duration))
-            ? Math.max(0, Math.floor(Number(canonicalEvent.duration)))
-            : Number.isFinite(parsedDuration)
-              ? parsedDuration
-              : undefined,
+            duration: Number.isFinite(Number(canonicalEvent.duration))
+              ? Math.max(0, Math.floor(Number(canonicalEvent.duration)))
+              : Number.isFinite(parsedDuration)
+                ? parsedDuration
+                : undefined,
+            raw_status: canonicalEvent.raw_status || null,
+            event_timestamp: canonicalEvent.timestamp || null,
           },
         );
         if (canonicalEvent.status === "completed") {
@@ -2269,4 +2293,7 @@ function registerWebhookRoutes(app, ctx = {}) {
   app.post("/webhook/sms-delivery", handleSmsDeliveryWebhook);
 }
 
-module.exports = { registerWebhookRoutes };
+module.exports = {
+  registerWebhookRoutes,
+  createVonageEventWebhookHandler,
+};

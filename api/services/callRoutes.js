@@ -53,6 +53,11 @@ function createOutboundCallHandler(ctx = {}) {
         number,
         prompt,
         first_message: firstMessage,
+        idempotency_key:
+          req.body?.idempotency_key ||
+          req.headers?.["idempotency-key"] ||
+          req.headers?.["Idempotency-Key"] ||
+          null,
         user_chat_id: req.body?.user_chat_id,
         customer_name: resolvedCustomerName,
         business_id: req.body?.business_id,
@@ -69,6 +74,8 @@ function createOutboundCallHandler(ctx = {}) {
         profile_confidence_gate:
           req.body?.profile_confidence_gate,
         purpose: req.body?.purpose || req.body?.call_profile || req.body?.profile,
+        preferred_provider:
+          req.body?.preferred_provider || req.body?.call_provider || null,
         emotion: req.body?.emotion,
         urgency: req.body?.urgency,
         technical_level: req.body?.technical_level,
@@ -99,6 +106,7 @@ function createOutboundCallHandler(ctx = {}) {
         call_sid: result.callId,
         to: payload.number,
         status: result.callStatus,
+        deduped: result.idempotentReplay === true,
         warnings: Array.isArray(result.warnings) ? result.warnings : [],
         provider:
           result.provider ||
@@ -119,6 +127,8 @@ function createOutboundCallHandler(ctx = {}) {
         error?.code === "payment_policy_requires_script";
       const paymentPolicyInvalid = error?.code === "payment_policy_invalid";
       const paymentValidationError = error?.code === "payment_validation_error";
+      const idempotencyConflict = error?.code === "idempotency_conflict";
+      const idempotencyInProgress = error?.code === "idempotency_in_progress";
       const isValidation =
         paymentRequiresScript ||
         paymentPolicyRequiresScript ||
@@ -126,11 +136,27 @@ function createOutboundCallHandler(ctx = {}) {
         paymentValidationError ||
         message.includes("Missing required fields") ||
         message.includes("Invalid phone number format");
-      const status = paymentRequiresScript || paymentPolicyRequiresScript
-        ? 400
-        : isValidation
+      const status = idempotencyConflict || idempotencyInProgress
+        ? 409
+        : paymentRequiresScript || paymentPolicyRequiresScript || isValidation
           ? 400
           : 500;
+      let code = "outbound_call_failed";
+      if (paymentRequiresScript) {
+        code = "payment_requires_script";
+      } else if (paymentPolicyRequiresScript) {
+        code = "payment_policy_requires_script";
+      } else if (paymentPolicyInvalid) {
+        code = "payment_policy_invalid";
+      } else if (paymentValidationError) {
+        code = "payment_validation_error";
+      } else if (idempotencyConflict) {
+        code = "idempotency_conflict";
+      } else if (idempotencyInProgress) {
+        code = "idempotency_in_progress";
+      } else if (isValidation) {
+        code = "validation_error";
+      }
       console.error(
         "Error creating enhanced adaptive outbound call:",
         buildErrorDetails(error),
@@ -138,17 +164,7 @@ function createOutboundCallHandler(ctx = {}) {
       return sendApiError(
         res,
         status,
-        paymentRequiresScript
-          ? "payment_requires_script"
-          : paymentPolicyRequiresScript
-            ? "payment_policy_requires_script"
-            : paymentPolicyInvalid
-              ? "payment_policy_invalid"
-              : paymentValidationError
-                ? "payment_validation_error"
-            : isValidation
-              ? "validation_error"
-              : "outbound_call_failed",
+        code,
         paymentRequiresScript
           ? "Payment settings require a valid script_id."
           : paymentPolicyRequiresScript

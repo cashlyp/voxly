@@ -109,6 +109,10 @@ const {
   buildDeepgramVoiceModelCatalog,
 } = require("./services/deepgramVoiceModels");
 const {
+  runCallCanarySweep,
+  evaluateCallCanarySloGuardrail,
+} = require("./services/callCanary");
+const {
   VOICE_RUNTIME_CONTROL_SETTING_KEY,
   clampCanaryPercent: clampVoiceRuntimeCanaryPercent,
   normalizeVoiceRuntimeMode: normalizeVoiceRuntimeModeShared,
@@ -232,9 +236,11 @@ const streamAuthBypass = new Map(); // callSid -> { reason, at }
 const streamStatusDedupe = new Map(); // callSid:streamSid:event -> ts
 const callStatusDedupe = new Map(); // callSid:status:sequence:timestamp -> ts
 const callLifecycle = new Map(); // callSid -> { status, updatedAt }
+const callPhaseLifecycle = new Map(); // callSid -> { phase, updatedAt, source, reason }
 const streamLastMediaAt = new Map(); // callSid -> timestamp
 const sttLastFrameAt = new Map(); // callSid -> timestamp
 const streamWatchdogState = new Map(); // callSid -> { noMediaNotifiedAt, noMediaEscalatedAt, sttNotifiedAt }
+const greetingRecoveryWatchdogs = new Map(); // callSid -> { timer, retries, ... }
 const providerEventDedupe = new Map(); // source:hash -> ts
 const providerHealth = new Map();
 const keypadProviderGuardWarnings = new Set(); // provider -> warning emitted
@@ -252,6 +258,13 @@ const deepgramVoiceModelCatalogCache = {
 };
 let callJobProcessing = false;
 let paymentReconcileRunning = false;
+let callCanaryRunning = false;
+let callCanaryState = {
+  last_run_at: null,
+  last_result: null,
+  last_slo_at: null,
+  last_slo_result: null,
+};
 let backgroundWorkersStarted = false;
 const outboundRateBuckets = new Map(); // namespace:key -> { count, windowStart }
 const callLifecycleCleanupTimers = new Map();
@@ -260,6 +273,7 @@ const CALL_STATUS_DEDUPE_MAX = 5000;
 const PROVIDER_EVENT_DEDUPE_MS = 5 * 60 * 1000;
 const PROVIDER_EVENT_DEDUPE_MAX = 10000;
 const VONAGE_WEBHOOK_JTI_CACHE_MAX = 5000;
+const VONAGE_MAPPING_RECONCILE_BATCH_LIMIT = 250;
 const CALL_RUNTIME_PERSIST_DEBOUNCE_MS = 150;
 const CALL_RUNTIME_STATE_STALE_MS = 6 * 60 * 60 * 1000;
 const TOOL_LOCK_TTL_MS = 20 * 1000;
@@ -269,6 +283,19 @@ const SMS_PROVIDER_SETTING_KEY = "sms_provider_v1";
 const EMAIL_PROVIDER_SETTING_KEY = "email_provider_v1";
 const PAYMENT_FEATURE_SETTING_KEY = "payment_feature_config_v1";
 const DEEPGRAM_VOICE_MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
+const CALL_PHASE_ORDER = Object.freeze([
+  "dialing",
+  "ringing",
+  "connected",
+  "greeting",
+  "active",
+  "closing",
+  "ended",
+]);
+const GREETING_RECOVERY_DEFAULT_PROMPT =
+  "Just checking audio on your side. If you can hear me, say hello.";
+const GREETING_RECOVERY_DEFAULT_FALLBACK =
+  "I am having trouble with the audio connection, so I will end this call now. Please call again in a moment.";
 const voiceAgentCircuitEvents = []; // { kind, callSid, at, reason }
 const voiceAgentRuntimeEvents = []; // { kind, callSid, at, reason }
 let voiceAgentForcedLegacyUntilMs = 0;
@@ -501,6 +528,105 @@ function recordVoiceAgentRuntimeEvent(kind, callSid, reason = "unknown") {
   pruneVoiceAgentRuntimeEvents(now);
 }
 
+function getCallCanaryQualitySignal(windowMs = 300000, nowMs = Date.now()) {
+  const result = callCanaryState?.last_result || null;
+  if (!result || result.skipped === true) {
+    return {
+      available: false,
+      active: false,
+      reason: "missing_result",
+      checked: 0,
+      blocked: 0,
+      warned: 0,
+      adjusted: 0,
+      blocked_rate: 0,
+      warned_rate: 0,
+      adjusted_rate: 0,
+      low_score_rate: 0,
+      avg_score: null,
+      run_age_ms: null,
+      run_at: null,
+    };
+  }
+
+  const quality = result?.quality && typeof result.quality === "object" ? result.quality : {};
+  const checked = Math.max(0, Number(quality.checked) || 0);
+  const blocked = Math.max(0, Number(quality.blocked) || 0);
+  const warned = Math.max(0, Number(quality.warned) || 0);
+  const adjusted = Math.max(0, Number(quality.adjusted) || 0);
+  const runAtRaw = result?.at || callCanaryState?.last_run_at || null;
+  const runAtMs = runAtRaw ? new Date(runAtRaw).getTime() : 0;
+  const runAgeMs =
+    Number.isFinite(runAtMs) && runAtMs > 0 ? Math.max(0, nowMs - runAtMs) : null;
+
+  let scored = 0;
+  let totalScore = 0;
+  let lowScoreCount = 0;
+  const attempts = Array.isArray(result?.attempts) ? result.attempts : [];
+  for (const attempt of attempts) {
+    const score = Number(attempt?.quality?.score);
+    if (!Number.isFinite(score)) continue;
+    scored += 1;
+    totalScore += score;
+    if (score < 70) {
+      lowScoreCount += 1;
+    }
+  }
+
+  const blockedRate = checked > 0 ? blocked / checked : 0;
+  const warnedRate = checked > 0 ? warned / checked : 0;
+  const adjustedRate = checked > 0 ? adjusted / checked : 0;
+  const lowScoreRate = scored > 0 ? lowScoreCount / scored : 0;
+  const avgScore = scored > 0 ? totalScore / scored : null;
+  const staleAfterMs = Math.max(120000, Number(windowMs) || 300000) * 2;
+  const stale =
+    runAgeMs === null || (Number.isFinite(runAgeMs) && runAgeMs > staleAfterMs);
+  const active = checked > 0 && stale !== true;
+
+  return {
+    available: true,
+    active,
+    stale,
+    checked,
+    blocked,
+    warned,
+    adjusted,
+    blocked_rate: blockedRate,
+    warned_rate: warnedRate,
+    adjusted_rate: adjustedRate,
+    low_score_rate: lowScoreRate,
+    avg_score: avgScore,
+    run_age_ms: runAgeMs,
+    run_at: runAtRaw || null,
+  };
+}
+
+function assessCallCanaryQualityBreach(signal = {}) {
+  if (!signal || signal.active !== true) {
+    return { breach: false, reason: "no_active_quality_signal" };
+  }
+  const checked = Math.max(0, Number(signal.checked) || 0);
+  const blocked = Math.max(0, Number(signal.blocked) || 0);
+  const blockedRate = Number.isFinite(Number(signal.blocked_rate))
+    ? Number(signal.blocked_rate)
+    : 0;
+  const lowScoreRate = Number.isFinite(Number(signal.low_score_rate))
+    ? Number(signal.low_score_rate)
+    : 0;
+  const avgScore = Number(signal.avg_score);
+
+  if (blocked > 0 || (checked >= 2 && blockedRate >= 0.34)) {
+    return { breach: true, reason: "call_canary_quality_blocked" };
+  }
+  if (checked >= 2 && lowScoreRate >= 0.5) {
+    return { breach: true, reason: "call_canary_quality_low_score_rate" };
+  }
+  if (checked >= 2 && Number.isFinite(avgScore) && avgScore < 70) {
+    return { breach: true, reason: "call_canary_quality_avg_score_low" };
+  }
+  return { breach: false, reason: "quality_within_threshold" };
+}
+
 function getVoiceAgentAutoCanaryStatus() {
   const cfg = getVoiceAgentAutoCanaryConfig();
   const now = Date.now();
@@ -511,6 +637,8 @@ function getVoiceAgentAutoCanaryStatus() {
     now,
     voiceAgentAutoCanaryLastEvalAtMs,
   );
+  const canaryQuality = getCallCanaryQualitySignal(cfg.windowMs, now);
+  const qualityAssessment = assessCallCanaryQualityBreach(canaryQuality);
   return {
     enabled: cfg.enabled === true,
     interval_ms: cfg.intervalMs,
@@ -538,6 +666,11 @@ function getVoiceAgentAutoCanaryStatus() {
         ? new Date(voiceAgentAutoCanaryLastEvalAtMs).toISOString()
         : null,
     summary,
+    call_canary_quality: {
+      ...canaryQuality,
+      breach: qualityAssessment.breach,
+      breach_reason: qualityAssessment.reason,
+    },
   };
 }
 
@@ -650,6 +783,8 @@ async function evaluateVoiceAgentAutoCanary(options = {}) {
     now,
     voiceAgentAutoCanaryLastEvalAtMs,
   );
+  const qualitySummary = getCallCanaryQualitySignal(autoCfg.windowMs, now);
+  const qualityAssessment = assessCallCanaryQualityBreach(qualitySummary);
   const effectiveMode = normalizeVoiceRuntimeMode(
     voiceRuntimeModeOverride || runtimeCfg.mode,
   );
@@ -666,6 +801,9 @@ async function evaluateVoiceAgentAutoCanary(options = {}) {
     currentCanaryPercent,
     configuredCanaryPercent: clampCanaryPercent(runtimeCfg.canaryPercent, 0),
     summary,
+    qualityBreach: qualityAssessment.breach,
+    qualityBreachReason: qualityAssessment.reason,
+    qualitySummary,
     circuitOpen: isVoiceAgentCircuitOpen(now),
     cooldownUntilMs: voiceAgentAutoCanaryCooldownUntilMs,
     nowMs: now,
@@ -716,7 +854,10 @@ async function evaluateVoiceAgentAutoCanary(options = {}) {
       voiceAgentAutoCanaryCooldownUntilMs > 0
         ? new Date(voiceAgentAutoCanaryCooldownUntilMs).toISOString()
         : null,
-    summary,
+    summary: {
+      ...summary,
+      call_canary_quality: qualitySummary,
+    },
   };
   console.warn(JSON.stringify(payload));
   db?.logServiceHealth?.("voice_agent_runtime", "auto_canary_update", payload).catch(
@@ -1920,6 +2061,7 @@ function buildCallResponsePolicyGate(callSid, seedConfig = null) {
   return (rawText = "", metadata = {}) => {
     const runtimeConfig =
       (callSid ? callConfigurations.get(callSid) : null) || seedConfig || {};
+    const digitFlowGuard = getDigitFlowGuardState(callSid, runtimeConfig);
     const conversationProfile = resolveConversationProfile({
       purpose:
         runtimeConfig?.conversation_profile ||
@@ -1929,11 +2071,18 @@ function buildCallResponsePolicyGate(callSid, seedConfig = null) {
       prompt: runtimeConfig?.prompt,
       firstMessage: runtimeConfig?.first_message,
     });
+    const effectiveProfile = digitFlowGuard.active
+      ? "general"
+      : conversationProfile || "general";
     const result = applyConversationPolicyGates(
       rawText,
-      conversationProfile || "general",
+      effectiveProfile,
     );
-    recordCallPolicyDecisionTelemetry(callSid, runtimeConfig, result, metadata);
+    recordCallPolicyDecisionTelemetry(callSid, runtimeConfig, result, {
+      ...metadata,
+      policy_profile: effectiveProfile,
+      digit_flow_guard: digitFlowGuard.active === true ? digitFlowGuard.reason : null,
+    });
     return result;
   };
 }
@@ -2070,15 +2219,94 @@ function buildCallToolPolicyGate(callSid, seedConfig = null) {
     const toolName = String(request?.toolName || request?.tool_name || "")
       .trim()
       .toLowerCase();
+    const digitFlowGuard = getDigitFlowGuardState(callSid, runtimeConfig);
     const conversationProfile = resolveConversationProfile({
-      purpose:
-        runtimeConfig?.conversation_profile ||
-        runtimeConfig?.purpose ||
-        runtimeConfig?.business_context?.purpose,
+      purpose: digitFlowGuard.active
+        ? "general"
+        : runtimeConfig?.conversation_profile ||
+          runtimeConfig?.purpose ||
+          runtimeConfig?.business_context?.purpose,
       scriptTemplate: runtimeConfig?.script_policy || null,
       prompt: runtimeConfig?.prompt,
       firstMessage: runtimeConfig?.first_message,
     });
+    const captureFlowAllowList = new Set([
+      "collect_digits",
+      "collect_multiple_digits",
+      "confirm_identity",
+      "play_disclosure",
+      "route_to_agent",
+      "routetoagent",
+      "transfercall",
+      "transfer_call",
+    ]);
+    const paymentFlowAllowList = new Set([
+      ...captureFlowAllowList,
+      "start_payment",
+      "payment_link_generate",
+      "invoice_create",
+      "payment_intent_status",
+      "refund_request_initiate",
+    ]);
+    const activeFlowAllowList = digitFlowGuard.paymentActive
+      ? paymentFlowAllowList
+      : captureFlowAllowList;
+    if (toolName && digitFlowGuard.active) {
+      if (!activeFlowAllowList.has(toolName)) {
+        const blockedResult = {
+          allowed: false,
+          action: "deny",
+          code: "digit_flow_locked",
+          reason: "digit_flow_lock",
+          message:
+            "Tool blocked while secure digit/payment flow is active. Complete the capture flow first.",
+          profile_type: "general",
+          blocked: ["digit_flow_lock"],
+          metadata: {
+            source: "digit_flow_guard",
+            tool: toolName,
+            flow_state: digitFlowGuard.flowState,
+            flow_reason: digitFlowGuard.reason,
+          },
+        };
+        recordCallToolPolicyDecisionTelemetry(callSid, runtimeConfig, blockedResult, {
+          toolName,
+          profileType: "general",
+          interactionCount: request?.interactionCount,
+        });
+        return blockedResult;
+      }
+      if (
+        toolName === "collect_digits" ||
+        toolName === "collect_multiple_digits" ||
+        toolName === "confirm_identity" ||
+        toolName === "play_disclosure" ||
+        toolName === "route_to_agent" ||
+        toolName === "routetoagent" ||
+        toolName === "transfercall" ||
+        toolName === "transfer_call" ||
+        toolName === "start_payment"
+      ) {
+        const allowResult = {
+          allowed: true,
+          action: "allow",
+          code: "ok",
+          reason: "digit_flow_priority",
+          blocked: [],
+          metadata: {
+            source: "digit_flow_guard",
+            flow_state: digitFlowGuard.flowState,
+            flow_reason: digitFlowGuard.reason,
+          },
+        };
+        recordCallToolPolicyDecisionTelemetry(callSid, runtimeConfig, allowResult, {
+          toolName,
+          profileType: "general",
+          interactionCount: request?.interactionCount,
+        });
+        return allowResult;
+      }
+    }
     const profilePolicyResult = evaluateConversationProfileToolPolicy(
       conversationProfile || "general",
       request,
@@ -2918,6 +3146,260 @@ function recordCallLifecycle(callSid, status, meta = {}) {
   return true;
 }
 
+function normalizeCallPhase(value = "") {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  return CALL_PHASE_ORDER.includes(normalized) ? normalized : "";
+}
+
+function getCallPhaseRank(phase = "") {
+  const normalized = normalizeCallPhase(phase);
+  return CALL_PHASE_ORDER.indexOf(normalized);
+}
+
+function resolveCallPhaseFromStatus(status = "") {
+  const normalized = normalizeCallStatus(status);
+  switch (normalized) {
+    case "queued":
+    case "initiated":
+      return "dialing";
+    case "ringing":
+      return "ringing";
+    case "answered":
+    case "in-progress":
+      return "connected";
+    case "completed":
+    case "voicemail":
+    case "busy":
+    case "no-answer":
+    case "failed":
+    case "canceled":
+      return "ended";
+    default:
+      return "";
+  }
+}
+
+function shouldApplyCallPhaseTransition(previousPhase, nextPhase, options = {}) {
+  const prev = normalizeCallPhase(previousPhase);
+  const next = normalizeCallPhase(nextPhase);
+  if (!next) return false;
+  if (!prev) return true;
+  if (prev === next) return false;
+  if (next === "ended" || next === "closing") {
+    return true;
+  }
+  if (prev === "ended") return false;
+  if (options.allowBackward === true) return true;
+  const prevRank = getCallPhaseRank(prev);
+  const nextRank = getCallPhaseRank(next);
+  if (prevRank === -1 || nextRank === -1) return true;
+  return nextRank >= prevRank;
+}
+
+function setCallPhase(callSid, phase, meta = {}, options = {}) {
+  if (!callSid || !phase) return false;
+  const normalized = normalizeCallPhase(phase);
+  if (!normalized) return false;
+  const previous = callPhaseLifecycle.get(callSid)?.phase || "";
+  if (
+    !shouldApplyCallPhaseTransition(previous, normalized, {
+      allowBackward: options.allowBackward === true,
+    })
+  ) {
+    return false;
+  }
+  const updatedAt = new Date().toISOString();
+  callPhaseLifecycle.set(callSid, {
+    phase: normalized,
+    updatedAt,
+    source: meta.source || null,
+    reason: meta.reason || null,
+    retries: Number(meta.retries) || 0,
+  });
+  db?.updateCallState?.(callSid, `call_phase_${normalized}`, {
+    phase: normalized,
+    prev_phase: previous || null,
+    source: meta.source || null,
+    reason: meta.reason || null,
+    retries: Number(meta.retries) || 0,
+    at: updatedAt,
+  }).catch(() => {});
+  return true;
+}
+
+function clearGreetingRecoveryWatchdog(callSid, options = {}) {
+  if (!callSid) return;
+  const state = greetingRecoveryWatchdogs.get(callSid);
+  if (state?.timer) {
+    clearTimeout(state.timer);
+  }
+  greetingRecoveryWatchdogs.delete(callSid);
+  if (options.clearPhase !== false) {
+    const phase = callPhaseLifecycle.get(callSid)?.phase;
+    if (phase === "greeting") {
+      setCallPhase(callSid, "active", {
+        source: options.source || "greeting_watchdog_cleared",
+        reason: options.reason || "conversation_progressed",
+      });
+    }
+  }
+}
+
+function markGreetingRecoveryProgress(callSid, source = "unknown") {
+  if (!callSid) return false;
+  const state = greetingRecoveryWatchdogs.get(callSid);
+  if (!state) return false;
+  state.lastProgressAt = Date.now();
+  state.lastProgressSource = source;
+  clearGreetingRecoveryWatchdog(callSid, {
+    clearPhase: true,
+    source: "greeting_watchdog_progress",
+    reason: source,
+  });
+  return true;
+}
+
+function scheduleGreetingRecoveryWatchdog(callSid, options = {}) {
+  if (!callSid) return false;
+  const timeoutMs = Math.max(
+    3000,
+    Number(options.timeoutMs || config.callWatchdog?.greetingTimeoutMs || 12000),
+  );
+  const maxRetries = Math.max(
+    0,
+    Math.floor(
+      Number(options.maxRetries ?? config.callWatchdog?.greetingMaxRetries ?? 1),
+    ),
+  );
+  const recoveryPrompt =
+    String(options.recoveryPrompt || config.callWatchdog?.greetingRecoveryPrompt || "").trim() ||
+    GREETING_RECOVERY_DEFAULT_PROMPT;
+  const fallbackMessage =
+    String(options.fallbackMessage || config.callWatchdog?.greetingFallbackMessage || "").trim() ||
+    GREETING_RECOVERY_DEFAULT_FALLBACK;
+  const existing = greetingRecoveryWatchdogs.get(callSid);
+  if (existing?.timer) {
+    clearTimeout(existing.timer);
+  }
+  const state = {
+    enabled: options.enabled !== false && config.callWatchdog?.greetingEnabled !== false,
+    callSid,
+    timeoutMs,
+    maxRetries,
+    retries: Number(existing?.retries) || 0,
+    recoveryPrompt,
+    fallbackMessage,
+    recover: typeof options.recover === "function" ? options.recover : null,
+    fallback: typeof options.fallback === "function" ? options.fallback : null,
+    runtime: options.runtime || null,
+    source: options.source || null,
+    armedAt: Date.now(),
+    lastProgressAt: Number(existing?.lastProgressAt) || Date.now(),
+    lastProgressSource: existing?.lastProgressSource || null,
+    timer: null,
+  };
+  if (!state.enabled) {
+    greetingRecoveryWatchdogs.delete(callSid);
+    return false;
+  }
+  setCallPhase(callSid, "greeting", {
+    source: options.source || "greeting_watchdog_armed",
+    reason: options.reason || "initial_prompt",
+  });
+  state.timer = setTimeout(async () => {
+    const current = greetingRecoveryWatchdogs.get(callSid);
+    if (!current || callEndLocks.has(callSid)) {
+      clearGreetingRecoveryWatchdog(callSid, {
+        clearPhase: false,
+        source: "greeting_watchdog_cancelled",
+      });
+      return;
+    }
+    const silentMs = Date.now() - Number(current.lastProgressAt || current.armedAt || Date.now());
+    if (silentMs < current.timeoutMs) {
+      scheduleGreetingRecoveryWatchdog(callSid, {
+        ...current,
+        source: "greeting_watchdog_rearmed",
+      });
+      return;
+    }
+    const nextRetry = Number(current.retries) + 1;
+    if (nextRetry <= current.maxRetries) {
+      current.retries = nextRetry;
+      greetingRecoveryWatchdogs.set(callSid, current);
+      setCallPhase(callSid, "greeting", {
+        source: "greeting_watchdog_retry",
+        reason: "silence_detected",
+        retries: nextRetry,
+      });
+      db?.updateCallState?.(callSid, "greeting_watchdog_retry", {
+        retries: nextRetry,
+        timeout_ms: current.timeoutMs,
+        runtime: current.runtime || null,
+        source: current.source || null,
+        at: new Date().toISOString(),
+      }).catch(() => {});
+      try {
+        if (current.recover) {
+          await current.recover({
+            callSid,
+            retries: nextRetry,
+            prompt: current.recoveryPrompt,
+          });
+        }
+      } catch (error) {
+        console.error("Greeting watchdog recovery error:", error);
+      }
+      scheduleGreetingRecoveryWatchdog(callSid, {
+        ...current,
+        source: "greeting_watchdog_retry_armed",
+      });
+      return;
+    }
+
+    db?.updateCallState?.(callSid, "greeting_watchdog_fallback", {
+      retries: Number(current.retries) || 0,
+      timeout_ms: current.timeoutMs,
+      runtime: current.runtime || null,
+      source: current.source || null,
+      at: new Date().toISOString(),
+    }).catch(() => {});
+    setCallPhase(callSid, "closing", {
+      source: "greeting_watchdog_fallback",
+      reason: "silence_timeout",
+    });
+    try {
+      if (current.fallback) {
+        await current.fallback({
+          callSid,
+          retries: Number(current.retries) || 0,
+          message: current.fallbackMessage,
+        });
+      } else {
+        await speakAndEndCall(
+          callSid,
+          current.fallbackMessage,
+          "greeting_watchdog_timeout",
+        );
+      }
+    } catch (error) {
+      console.error("Greeting watchdog fallback error:", error);
+    } finally {
+      clearGreetingRecoveryWatchdog(callSid, {
+        clearPhase: false,
+        source: "greeting_watchdog_done",
+      });
+    }
+  }, timeoutMs);
+  if (state.timer && typeof state.timer.unref === "function") {
+    state.timer.unref();
+  }
+  greetingRecoveryWatchdogs.set(callSid, state);
+  return true;
+}
+
 function scheduleCallLifecycleCleanup(callSid, delayMs = 10 * 60 * 1000) {
   if (!callSid) return;
   if (callLifecycleCleanupTimers.has(callSid)) {
@@ -2927,6 +3409,11 @@ function scheduleCallLifecycleCleanup(callSid, delayMs = 10 * 60 * 1000) {
     callLifecycleCleanupTimers.delete(callSid);
     purgeCallStatusDedupe(callSid);
     callLifecycle.delete(callSid);
+    callPhaseLifecycle.delete(callSid);
+    clearGreetingRecoveryWatchdog(callSid, {
+      clearPhase: false,
+      source: "call_lifecycle_cleanup",
+    });
   }, delayMs);
   callLifecycleCleanupTimers.set(callSid, timer);
 }
@@ -3637,6 +4124,79 @@ function isCaptureActive(callSid) {
   if (!callSid) return false;
   const callConfig = callConfigurations.get(callSid);
   return isCaptureActiveConfig(callConfig);
+}
+
+function getDigitFlowCoordinationState(callSid, callConfigInput = null) {
+  const callConfig =
+    (callConfigInput && typeof callConfigInput === "object"
+      ? callConfigInput
+      : null) ||
+    (callSid ? callConfigurations.get(callSid) : null) ||
+    {};
+  const flowState = normalizeFlowStateKey(callConfig?.flow_state || "normal");
+  const captureActive = isCaptureActiveConfig(callConfig);
+  const expectationActive = Boolean(
+    callSid && typeof digitService?.hasExpectation === "function"
+      ? digitService.hasExpectation(callSid)
+      : false,
+  );
+  const planActive = Boolean(
+    callSid && typeof digitService?.hasPlan === "function"
+      ? digitService.hasPlan(callSid)
+      : false,
+  );
+  const paymentActive =
+    callConfig?.payment_in_progress === true ||
+    flowState === "payment_active" ||
+    callConfig?.call_mode === "payment_capture";
+  const digitIntentMode = callConfig?.digit_intent?.mode === "dtmf";
+  const awaitingDigitInput =
+    flowState === "capture_pending" ||
+    captureActive ||
+    expectationActive ||
+    planActive;
+  const exclusiveConversation = awaitingDigitInput || paymentActive || digitIntentMode;
+
+  let reason = "normal";
+  if (paymentActive) {
+    reason = "payment_active";
+  } else if (expectationActive) {
+    reason = "digit_expectation_active";
+  } else if (planActive) {
+    reason = "digit_plan_active";
+  } else if (captureActive) {
+    reason = "capture_active";
+  } else if (flowState === "capture_pending") {
+    reason = "capture_pending";
+  } else if (digitIntentMode) {
+    reason = "digit_intent_mode";
+  }
+
+  return {
+    flowState,
+    captureActive,
+    expectationActive,
+    planActive,
+    paymentActive,
+    digitIntentMode,
+    awaitingDigitInput,
+    exclusiveConversation,
+    reason,
+  };
+}
+
+function getDigitFlowGuardState(callSid, callConfig = null) {
+  const coordination = getDigitFlowCoordinationState(callSid, callConfig);
+  return {
+    active: coordination.exclusiveConversation === true,
+    reason: coordination.reason || "normal",
+    flowState: coordination.flowState || "normal",
+    captureActive: coordination.captureActive === true,
+    hasExpectation: coordination.expectationActive === true,
+    hasPlan: coordination.planActive === true,
+    paymentActive: coordination.paymentActive === true,
+    digitIntentMode: coordination.digitIntentMode === true,
+  };
 }
 
 function resolveVoiceModel(callConfig) {
@@ -4496,7 +5056,19 @@ function markStreamMediaSeen(callSid) {
   if (!callSid || streamFirstMediaSeen.has(callSid)) return;
   streamLastMediaAt.set(callSid, Date.now());
   streamFirstMediaSeen.add(callSid);
+  streamRetryState.delete(callSid);
   clearFirstMediaWatchdog(callSid);
+  const callConfig = callConfigurations.get(callSid);
+  const provider = normalizeProviderName(callConfig?.provider || currentProvider);
+  if (provider) {
+    recordProviderSuccess(provider);
+    recordProviderFlowMetric("stream_media_restored", {
+      channel: "call",
+      flow: "voice_stream",
+      provider,
+      call_sid: callSid,
+    });
+  }
   const startedAt = streamStartTimes.get(callSid);
   if (startedAt) {
     const deltaMs = Math.max(0, Date.now() - startedAt);
@@ -4566,18 +5138,17 @@ function shouldRetryStream(reason = "") {
     "stream_not_connected",
     "stream_auth_failed",
     "watchdog_no_media",
+    "stt_stall",
   ].includes(reason);
 }
 
-async function scheduleStreamReconnect(callSid, host, reason = "unknown") {
-  if (!callSid || !config.twilio?.accountSid || !config.twilio?.authToken)
-    return false;
+function nextStreamRetryAttempt(callSid) {
   const state = streamRetryState.get(callSid) || {
     attempts: 0,
     nextDelayMs: STREAM_RETRY_SETTINGS.baseDelayMs,
   };
   if (state.attempts >= STREAM_RETRY_SETTINGS.maxAttempts) {
-    return false;
+    return null;
   }
   state.attempts += 1;
   const delayMs = Math.min(state.nextDelayMs, STREAM_RETRY_SETTINGS.maxDelayMs);
@@ -4586,11 +5157,20 @@ async function scheduleStreamReconnect(callSid, host, reason = "unknown") {
     STREAM_RETRY_SETTINGS.maxDelayMs,
   );
   streamRetryState.set(callSid, state);
-  const jitterMs = Math.floor(Math.random() * 250);
+  return {
+    attempt: state.attempts,
+    maxAttempts: STREAM_RETRY_SETTINGS.maxAttempts,
+    delayMs,
+    jitterMs: Math.floor(Math.random() * 250),
+  };
+}
 
+async function scheduleTwilioStreamReconnect(callSid, host, reason, retryPlan) {
+  if (!config.twilio?.accountSid || !config.twilio?.authToken) return false;
+  if (!retryPlan) return false;
   webhookService.addLiveEvent(
     callSid,
-    `🔁 Retrying stream (${state.attempts}/${STREAM_RETRY_SETTINGS.maxAttempts})`,
+    `🔁 Retrying stream (${retryPlan.attempt}/${retryPlan.maxAttempts})`,
     { force: true },
   );
   setTimeout(async () => {
@@ -4600,7 +5180,8 @@ async function scheduleStreamReconnect(callSid, host, reason = "unknown") {
       await client.calls(callSid).update({ twiml });
       await db
         .updateCallState(callSid, "stream_retry", {
-          attempt: state.attempts,
+          provider: "twilio",
+          attempt: retryPlan.attempt,
           reason,
           at: new Date().toISOString(),
         })
@@ -4610,18 +5191,91 @@ async function scheduleStreamReconnect(callSid, host, reason = "unknown") {
         `Stream retry failed for ${callSid}:`,
         error?.message || error,
       );
+      recordProviderError("twilio", error);
       await db
         .updateCallState(callSid, "stream_retry_failed", {
-          attempt: state.attempts,
+          provider: "twilio",
+          attempt: retryPlan.attempt,
           reason,
           at: new Date().toISOString(),
           error: error?.message || String(error),
         })
         .catch(() => {});
     }
-  }, delayMs + jitterMs);
-
+  }, retryPlan.delayMs + retryPlan.jitterMs);
   return true;
+}
+
+async function scheduleVonageStreamReconnect(callSid, host, reason, retryPlan) {
+  if (!retryPlan) return false;
+  const callConfig = callConfigurations.get(callSid);
+  if (!callConfig) return false;
+  const vonageUuid = resolveVonageHangupUuid(callSid, callConfig);
+  if (!vonageUuid) return false;
+
+  const direction =
+    callDirections.get(callSid) || (callConfig?.inbound ? "inbound" : "outbound");
+  const req = reqForHost(host);
+  const fallbackAnswerUrl = buildVonageAnswerWebhookUrl(req, callSid, {
+    uuid: vonageUuid,
+    direction,
+  });
+  const answerUrl =
+    callConfig?.provider_metadata?.answer_url || fallbackAnswerUrl || "";
+  if (!answerUrl) return false;
+
+  webhookService.addLiveEvent(
+    callSid,
+    `🔁 Retrying stream (${retryPlan.attempt}/${retryPlan.maxAttempts})`,
+    { force: true },
+  );
+  setTimeout(async () => {
+    try {
+      const vonageAdapter = getVonageVoiceAdapter();
+      await vonageAdapter.transferCallWithURL(vonageUuid, answerUrl);
+      await db
+        .updateCallState(callSid, "stream_retry", {
+          provider: "vonage",
+          attempt: retryPlan.attempt,
+          reason,
+          at: new Date().toISOString(),
+          vonage_uuid: vonageUuid,
+        })
+        .catch(() => {});
+    } catch (error) {
+      console.error(
+        `Vonage stream retry failed for ${callSid}:`,
+        error?.message || error,
+      );
+      recordProviderError("vonage", error);
+      await db
+        .updateCallState(callSid, "stream_retry_failed", {
+          provider: "vonage",
+          attempt: retryPlan.attempt,
+          reason,
+          at: new Date().toISOString(),
+          vonage_uuid: vonageUuid,
+          error: error?.message || String(error),
+        })
+        .catch(() => {});
+    }
+  }, retryPlan.delayMs + retryPlan.jitterMs);
+  return true;
+}
+
+async function scheduleStreamReconnect(callSid, host, reason = "unknown") {
+  if (!callSid) return false;
+  const callConfig = callConfigurations.get(callSid);
+  const provider = normalizeProviderName(callConfig?.provider || currentProvider);
+  const retryPlan = nextStreamRetryAttempt(callSid);
+  if (!retryPlan) return false;
+  if (provider === "twilio") {
+    return scheduleTwilioStreamReconnect(callSid, host, reason, retryPlan);
+  }
+  if (provider === "vonage") {
+    return scheduleVonageStreamReconnect(callSid, host, reason, retryPlan);
+  }
+  return false;
 }
 
 const STREAM_WATCHDOG_INTERVAL_MS = 5000;
@@ -4693,6 +5347,7 @@ async function runStreamWatchdog() {
 
   for (const [callSid, callConfig] of callConfigurations.entries()) {
     if (!callSid || callEndLocks.has(callSid)) continue;
+    const provider = normalizeProviderName(callConfig?.provider || currentProvider);
     const state = getStreamWatchdogState(callSid);
     if (!state) continue;
     const connectedAt = resolveStreamConnectedAt(callSid);
@@ -4711,6 +5366,19 @@ async function runStreamWatchdog() {
         state,
       );
       if (notified) {
+        if (provider) {
+          recordProviderError(
+            provider,
+            new Error(`stream_stalled_no_media:${callSid}`),
+          );
+          recordProviderFlowMetric("stream_stalled_no_media", {
+            channel: "call",
+            flow: "voice_stream",
+            provider,
+            call_sid: callSid,
+            reason: "watchdog_no_media",
+          });
+        }
         await db
           ?.updateCallState?.(callSid, "stream_stalled", {
             at: new Date().toISOString(),
@@ -4746,27 +5414,48 @@ async function runStreamWatchdog() {
     if (!lastMediaAt) continue;
     const sttElapsed = now - (sttLastFrameAt.get(callSid) || lastMediaAt);
     if (sttElapsed > thresholds.sttStallMs) {
+      const canFallbackToDtmf = provider === "twilio";
       const notified = await handleStreamStallNotice(
         callSid,
-        "⚠️ Speech pipeline stalled. Switching to keypad…",
+        canFallbackToDtmf
+          ? "⚠️ Speech pipeline stalled. Switching to keypad…"
+          : "⚠️ Speech pipeline stalled. Attempting stream recovery…",
         "sttNotifiedAt",
         state,
       );
       if (notified) {
+        if (provider) {
+          recordProviderError(provider, new Error(`stt_stall:${callSid}`));
+          recordProviderFlowMetric("stream_stalled_stt", {
+            channel: "call",
+            flow: "voice_stream",
+            provider,
+            call_sid: callSid,
+            reason: "stt_stall",
+            dtmf_fallback: canFallbackToDtmf,
+          });
+        }
         await db
           ?.updateCallState?.(callSid, "stt_stalled", {
             at: new Date().toISOString(),
             elapsed_ms: sttElapsed,
           })
           .catch(() => {});
-        const session = activeCalls.get(callSid);
-        void activateDtmfFallback(
-          callSid,
-          callConfig,
-          session?.gptService,
-          session?.interactionCount || 0,
-          "stt_stall",
-        );
+        if (canFallbackToDtmf) {
+          const session = activeCalls.get(callSid);
+          void activateDtmfFallback(
+            callSid,
+            callConfig,
+            session?.gptService,
+            session?.interactionCount || 0,
+            "stt_stall",
+          );
+        } else {
+          void handleStreamTimeout(callSid, host, {
+            allowHangup: false,
+            reason: "stt_stall",
+          });
+        }
       } else if (
         !state.sttEscalatedAt &&
         sttElapsed > thresholds.sttEscalationMs
@@ -4793,6 +5482,20 @@ async function handleStreamTimeout(callSid, host, options = {}) {
   let releaseLock = false;
   try {
     const callConfig = callConfigurations.get(callSid);
+    const provider = normalizeProviderName(callConfig?.provider || currentProvider);
+    if (provider) {
+      recordProviderError(
+        provider,
+        new Error(`stream_timeout:${options.reason || "unspecified"}`),
+      );
+      recordProviderFlowMetric("stream_timeout", {
+        channel: "call",
+        flow: "voice_stream",
+        provider,
+        call_sid: callSid,
+        reason: options.reason || "unspecified",
+      });
+    }
     const callDetails = await db?.getCall?.(callSid).catch(() => null);
     const statusValue = normalizeCallStatus(
       callDetails?.status || callDetails?.twilio_status,
@@ -4808,7 +5511,7 @@ async function handleStreamTimeout(callSid, host, options = {}) {
       return;
     }
     const expectation = digitService?.getExpectation?.(callSid);
-    if (expectation && config.twilio?.gatherFallback) {
+    if (provider === "twilio" && expectation && config.twilio?.gatherFallback) {
       const prompt =
         expectation.prompt ||
         (digitService?.buildDigitPrompt
@@ -4849,7 +5552,11 @@ async function handleStreamTimeout(callSid, host, options = {}) {
       return;
     }
 
-    if (config.twilio?.accountSid && config.twilio?.authToken) {
+    if (
+      provider === "twilio" &&
+      config.twilio?.accountSid &&
+      config.twilio?.authToken
+    ) {
       const client = twilio(config.twilio.accountSid, config.twilio.authToken);
       const response = new VoiceResponse();
       const playback = await appendHostedTwilioSpeech(
@@ -4873,16 +5580,19 @@ async function handleStreamTimeout(callSid, host, options = {}) {
       }
       response.hangup();
       await client.calls(callSid).update({ twiml: response.toString() });
+    } else {
+      await endCallForProvider(callSid);
     }
 
     await db
       .updateCallState(callSid, "stream_timeout", {
         at: new Date().toISOString(),
-        provider: callConfig?.provider || currentProvider,
+        provider: provider || callConfig?.provider || currentProvider,
       })
       .catch(() => {});
   } catch (error) {
     console.error("Stream timeout handler error:", error);
+    releaseLock = true;
   } finally {
     if (releaseLock) {
       streamTimeoutCalls.delete(callSid);
@@ -5471,6 +6181,11 @@ async function handleExternalDtmfInput(callSid, digits, options = {}) {
       : 0;
 
   clearSilenceTimer(callSid);
+  markGreetingRecoveryProgress(callSid, "dtmf_input");
+  setCallPhase(callSid, "active", {
+    source: "handleExternalDtmfInput",
+    reason: "dtmf_received",
+  });
   markStreamMediaSeen(callSid);
   streamLastMediaAt.set(callSid, Date.now());
 
@@ -6533,6 +7248,10 @@ async function processNormalFlowTranscript(
   if (!callSid || !gptService) return;
   const cleaned = String(text || "").trim();
   if (!cleaned) return;
+  const digitFlowGuard = getDigitFlowGuardState(callSid);
+  if (digitFlowGuard.active) {
+    return;
+  }
   if (shouldSkipNormalInput(callSid, cleaned)) return;
 
   normalFlowBuffers.set(callSid, { text: cleaned, at: Date.now() });
@@ -6544,7 +7263,13 @@ async function processNormalFlowTranscript(
     while (normalFlowBuffers.has(callSid)) {
       const next = normalFlowBuffers.get(callSid);
       normalFlowBuffers.delete(callSid);
+      const guardAtDispatch = getDigitFlowGuardState(callSid);
+      if (guardAtDispatch.active) {
+        continue;
+      }
       await enqueueGptTask(callSid, async () => {
+        const guardDuringTask = getDigitFlowGuardState(callSid);
+        if (guardDuringTask.active) return;
         if (callEndLocks.has(callSid)) return;
         const session = activeCalls.get(callSid);
         if (session?.ending) return;
@@ -7376,9 +8101,13 @@ function applyTelephonyTools(
 }
 
 function getCallToolOptions(callSid, callConfig = {}) {
+  const digitFlowGuard = getDigitFlowGuardState(callSid, callConfig);
   const isDigitIntent =
-    callConfig?.digit_intent?.mode === "dtmf" || isCaptureActiveConfig(callConfig);
-  const flowState = normalizeFlowStateKey(callConfig?.flow_state || "normal");
+    callConfig?.digit_intent?.mode === "dtmf" ||
+    digitFlowGuard.captureActive ||
+    digitFlowGuard.hasExpectation ||
+    digitFlowGuard.hasPlan;
+  const flowState = digitFlowGuard.flowState || normalizeFlowStateKey(callConfig?.flow_state || "normal");
   const hasToolLock = Boolean(
     callConfig?.tool_in_progress || (callSid && callToolInFlight.has(callSid)),
   );
@@ -7488,6 +8217,7 @@ function configureCallTools(gptService, callSid, callConfig, functionSystem) {
 
   let tools = baseTools;
   let implementations = baseImpl;
+  const digitFlowGuard = getDigitFlowGuardState(callSid, callConfig);
   const sharedToolkitOptions = {
     callSid,
     getCallConfig: () => callConfigurations.get(callSid) || callConfig || {},
@@ -7506,7 +8236,11 @@ function configureCallTools(gptService, callSid, callConfig, functionSystem) {
     conversationProfile,
     "",
   );
-  if (normalizedProfile && RELATIONSHIP_PROFILE_SET.has(normalizedProfile)) {
+  if (
+    normalizedProfile &&
+    RELATIONSHIP_PROFILE_SET.has(normalizedProfile) &&
+    digitFlowGuard.active !== true
+  ) {
     const profileToolkit = createConversationProfileToolkit(
       normalizedProfile,
       sharedToolkitOptions,
@@ -7523,6 +8257,7 @@ function configureCallTools(gptService, callSid, callConfig, functionSystem) {
   applyTelephonyTools(gptService, callSid, tools, implementations, {
     ...options,
     callConfig,
+    digitFlowGuard,
     conversationProfile: normalizedProfile || conversationProfile || "general",
   });
   gptService.setToolPolicyGate(buildCallToolPolicyGate(callSid, callConfig));
@@ -7941,23 +8676,35 @@ const vonageCallMap = new Map();
 let awsConnectAdapter = null;
 let awsTtsAdapter = null;
 let vonageVoiceAdapter = null;
+let vonageMappingReconcileTimer = null;
 
 function rememberVonageCallMapping(callSid, vonageUuid, source = "unknown") {
   if (!callSid || !vonageUuid) return;
-  vonageCallMap.set(String(vonageUuid), String(callSid));
+  const normalizedCallSid = String(callSid);
+  const normalizedVonageUuid = String(vonageUuid);
+  vonageCallMap.set(normalizedVonageUuid, normalizedCallSid);
+  if (db?.upsertVonageCallMapping) {
+    db.upsertVonageCallMapping(
+      normalizedCallSid,
+      normalizedVonageUuid,
+      source || "unknown",
+    ).catch((error) => {
+      console.error("Failed to persist Vonage call mapping:", error);
+    });
+  }
 
-  const callConfig = callConfigurations.get(callSid);
+  const callConfig = callConfigurations.get(normalizedCallSid);
   if (callConfig) {
     if (!callConfig.provider_metadata) {
       callConfig.provider_metadata = {};
     }
-    if (callConfig.provider_metadata.vonage_uuid !== vonageUuid) {
-      callConfig.provider_metadata.vonage_uuid = String(vonageUuid);
-      callConfigurations.set(callSid, callConfig);
+    if (callConfig.provider_metadata.vonage_uuid !== normalizedVonageUuid) {
+      callConfig.provider_metadata.vonage_uuid = normalizedVonageUuid;
+      callConfigurations.set(normalizedCallSid, callConfig);
       if (db?.updateCallState) {
-        db.updateCallState(callSid, "provider_metadata_updated", {
+        db.updateCallState(normalizedCallSid, "provider_metadata_updated", {
           provider: "vonage",
-          vonage_uuid: String(vonageUuid),
+          vonage_uuid: normalizedVonageUuid,
           source,
           at: new Date().toISOString(),
         })
@@ -7981,16 +8728,32 @@ async function resolveVonageCallSidFromUuid(vonageUuid) {
     }
   }
 
+  if (db?.getVonageCallSidByUuid) {
+    try {
+      const persisted = await db.getVonageCallSidByUuid(normalizedUuid);
+      if (persisted?.call_sid) {
+        rememberVonageCallMapping(
+          persisted.call_sid,
+          normalizedUuid,
+          "db_mapping",
+        );
+        return String(persisted.call_sid);
+      }
+    } catch (_) {
+      // Fall back to state scan below if direct mapping query fails.
+    }
+  }
+
   if (!db?.db) return null;
   const rows = await new Promise((resolve) => {
     db.db.all(
       `
         SELECT call_sid, data
         FROM call_states
-        WHERE state = 'call_created'
+        WHERE state IN ('call_created', 'provider_metadata_updated')
           AND data LIKE ?
         ORDER BY id DESC
-        LIMIT 50
+        LIMIT 100
       `,
       [`%${normalizedUuid}%`],
       (err, resultRows) => {
@@ -8017,6 +8780,66 @@ async function resolveVonageCallSidFromUuid(vonageUuid) {
   }
 
   return null;
+}
+
+async function reconcileVonageCallMappings() {
+  if (!db?.db) return { scanned: 0, mapped: 0 };
+  const rows = await new Promise((resolve) => {
+    db.db.all(
+      `
+        SELECT call_sid, data
+        FROM call_states
+        WHERE state IN ('call_created', 'provider_metadata_updated')
+          AND data LIKE '%vonage_uuid%'
+        ORDER BY id DESC
+        LIMIT ?
+      `,
+      [VONAGE_MAPPING_RECONCILE_BATCH_LIMIT],
+      (err, resultRows) => {
+        if (err) {
+          resolve([]);
+          return;
+        }
+        resolve(Array.isArray(resultRows) ? resultRows : []);
+      },
+    );
+  });
+
+  let mapped = 0;
+  for (const row of rows) {
+    try {
+      const parsed = row?.data ? JSON.parse(row.data) : null;
+      const mappedUuid = parsed?.provider_metadata?.vonage_uuid || parsed?.vonage_uuid;
+      if (!row?.call_sid || !mappedUuid) continue;
+      rememberVonageCallMapping(row.call_sid, mappedUuid, "reconcile");
+      mapped += 1;
+    } catch {
+      // Ignore malformed state payloads.
+    }
+  }
+
+  return { scanned: rows.length, mapped };
+}
+
+function scheduleVonageMappingReconciler() {
+  if (vonageMappingReconcileTimer) {
+    clearInterval(vonageMappingReconcileTimer);
+    vonageMappingReconcileTimer = null;
+  }
+  const intervalMsRaw = Number(config.vonage?.voice?.uuidReconcileIntervalMs);
+  const intervalMs =
+    Number.isFinite(intervalMsRaw) && intervalMsRaw > 0
+      ? Math.max(15000, Math.floor(intervalMsRaw))
+      : 0;
+  if (!intervalMs) return;
+  vonageMappingReconcileTimer = setInterval(() => {
+    reconcileVonageCallMappings().catch((error) => {
+      console.error("Vonage mapping reconciler error:", error);
+    });
+  }, intervalMs);
+  if (typeof vonageMappingReconcileTimer.unref === "function") {
+    vonageMappingReconcileTimer.unref();
+  }
 }
 
 async function resolveVonageCallSid(req, payload = {}) {
@@ -8865,19 +9688,127 @@ function getEmailProviderReadiness() {
 }
 
 function getProviderHealthEntry(provider) {
-  if (!providerHealth.has(provider)) {
-    providerHealth.set(provider, {
+  const normalizedProvider = normalizeProviderName(provider);
+  if (!normalizedProvider) {
+    return {
       errorTimestamps: [],
       degradedUntil: 0,
       lastErrorAt: null,
       lastSuccessAt: null,
+      consecutiveErrors: 0,
+      consecutiveSuccesses: 0,
+      totalErrors: 0,
+      totalSuccesses: 0,
+      score: 100,
+      circuitState: "closed",
+      circuitUpdatedAt: null,
+      circuitReason: null,
+    };
+  }
+  if (!providerHealth.has(normalizedProvider)) {
+    providerHealth.set(normalizedProvider, {
+      errorTimestamps: [],
+      degradedUntil: 0,
+      lastErrorAt: null,
+      lastSuccessAt: null,
+      consecutiveErrors: 0,
+      consecutiveSuccesses: 0,
+      totalErrors: 0,
+      totalSuccesses: 0,
+      score: 100,
+      circuitState: "closed",
+      circuitUpdatedAt: null,
+      circuitReason: null,
     });
   }
-  return providerHealth.get(provider);
+  const health = providerHealth.get(normalizedProvider) || {};
+  health.errorTimestamps = Array.isArray(health.errorTimestamps)
+    ? health.errorTimestamps.filter((value) => Number.isFinite(Number(value)))
+    : [];
+  health.degradedUntil =
+    Number.isFinite(Number(health.degradedUntil)) && Number(health.degradedUntil) > 0
+      ? Number(health.degradedUntil)
+      : 0;
+  health.lastErrorAt = health.lastErrorAt || null;
+  health.lastSuccessAt = health.lastSuccessAt || null;
+  health.consecutiveErrors = Math.max(
+    0,
+    Math.floor(Number(health.consecutiveErrors) || 0),
+  );
+  health.consecutiveSuccesses = Math.max(
+    0,
+    Math.floor(Number(health.consecutiveSuccesses) || 0),
+  );
+  health.totalErrors = Math.max(0, Math.floor(Number(health.totalErrors) || 0));
+  health.totalSuccesses = Math.max(0, Math.floor(Number(health.totalSuccesses) || 0));
+  health.score = Number.isFinite(Number(health.score))
+    ? Math.max(0, Math.min(100, Number(health.score)))
+    : 100;
+  health.circuitState = ["closed", "open", "half_open"].includes(
+    String(health.circuitState || "").toLowerCase(),
+  )
+    ? String(health.circuitState || "").toLowerCase()
+    : "closed";
+  health.circuitUpdatedAt = health.circuitUpdatedAt || null;
+  health.circuitReason = health.circuitReason || null;
+  providerHealth.set(normalizedProvider, health);
+  return health;
+}
+
+function computeProviderHealthScore(provider, health, options = {}) {
+  const windowMs = Number(config.providerFailover?.errorWindowMs) || 120000;
+  const now = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
+  const safeHealth = health || getProviderHealthEntry(provider);
+  const recentErrors = Array.isArray(safeHealth.errorTimestamps)
+    ? safeHealth.errorTimestamps.filter((ts) => now - Number(ts) <= windowMs).length
+    : 0;
+  const consecutiveErrors = Math.max(
+    0,
+    Math.floor(Number(safeHealth.consecutiveErrors) || 0),
+  );
+  const consecutiveSuccesses = Math.max(
+    0,
+    Math.floor(Number(safeHealth.consecutiveSuccesses) || 0),
+  );
+  let score = 100;
+  score -= Math.min(60, recentErrors * 15);
+  score -= Math.min(25, consecutiveErrors * 6);
+  score += Math.min(12, consecutiveSuccesses * 3);
+  if (safeHealth.circuitState === "open") {
+    score = Math.min(score, 10);
+  } else if (safeHealth.circuitState === "half_open") {
+    score = Math.min(score, 45);
+  }
+  const lastErrorAtMs = Date.parse(String(safeHealth.lastErrorAt || ""));
+  if (Number.isFinite(lastErrorAtMs) && now - lastErrorAtMs <= windowMs) {
+    score -= 8;
+  }
+  return Math.max(0, Math.min(100, Math.round(score)));
+}
+
+function getProviderHealthScore(provider) {
+  const normalizedProvider = normalizeProviderName(provider);
+  if (!normalizedProvider) return 0;
+  const now = Date.now();
+  const health = getProviderHealthEntry(normalizedProvider);
+  if (
+    health.circuitState === "open" &&
+    health.degradedUntil &&
+    now > health.degradedUntil
+  ) {
+    health.circuitState = "half_open";
+    health.circuitUpdatedAt = new Date(now).toISOString();
+    health.circuitReason = "cooldown_elapsed";
+  }
+  health.score = computeProviderHealthScore(normalizedProvider, health, { nowMs: now });
+  providerHealth.set(normalizedProvider, health);
+  return health.score;
 }
 
 function recordProviderError(provider, error) {
-  const health = getProviderHealthEntry(provider);
+  const normalizedProvider = normalizeProviderName(provider);
+  if (!normalizedProvider) return;
+  const health = getProviderHealthEntry(normalizedProvider);
   const windowMs = Number(config.providerFailover?.errorWindowMs) || 120000;
   const threshold = Number(config.providerFailover?.errorThreshold) || 3;
   const cooldownMs = Number(config.providerFailover?.cooldownMs) || 300000;
@@ -8887,38 +9818,125 @@ function recordProviderError(provider, error) {
   );
   health.errorTimestamps.push(now);
   health.lastErrorAt = new Date().toISOString();
+  health.consecutiveErrors = Math.max(
+    1,
+    Math.floor(Number(health.consecutiveErrors) || 0) + 1,
+  );
+  health.consecutiveSuccesses = 0;
+  health.totalErrors = Math.max(0, Math.floor(Number(health.totalErrors) || 0)) + 1;
   if (health.errorTimestamps.length >= threshold) {
     health.degradedUntil = now + cooldownMs;
+    health.circuitState = "open";
+    health.circuitUpdatedAt = new Date(now).toISOString();
+    health.circuitReason = error?.message || String(error || "unknown");
     db?.logServiceHealth?.("provider_failover", "degraded", {
-      provider,
+      provider: normalizedProvider,
       errors: health.errorTimestamps.length,
       window_ms: windowMs,
       cooldown_ms: cooldownMs,
       error: error?.message || String(error || "unknown"),
+      consecutive_errors: health.consecutiveErrors,
     }).catch(() => {});
+  } else if (health.circuitState === "closed") {
+    health.circuitReason = error?.message || String(error || "unknown");
   }
-  providerHealth.set(provider, health);
+  health.score = computeProviderHealthScore(normalizedProvider, health, { nowMs: now });
+  providerHealth.set(normalizedProvider, health);
 }
 
 function recordProviderSuccess(provider) {
-  const health = getProviderHealthEntry(provider);
+  const normalizedProvider = normalizeProviderName(provider);
+  if (!normalizedProvider) return;
+  const health = getProviderHealthEntry(normalizedProvider);
+  const threshold = Number(config.providerFailover?.errorThreshold) || 3;
   health.errorTimestamps = [];
   health.lastSuccessAt = new Date().toISOString();
+  health.consecutiveSuccesses = Math.max(
+    1,
+    Math.floor(Number(health.consecutiveSuccesses) || 0) + 1,
+  );
+  health.consecutiveErrors = 0;
+  health.totalSuccesses = Math.max(0, Math.floor(Number(health.totalSuccesses) || 0)) + 1;
   if (health.degradedUntil && Date.now() > health.degradedUntil) {
     health.degradedUntil = 0;
   }
-  providerHealth.set(provider, health);
+  if (health.circuitState === "open") {
+    health.circuitState = "half_open";
+    health.circuitUpdatedAt = new Date().toISOString();
+    health.circuitReason = "successful_probe_after_cooldown";
+  }
+  if (
+    health.circuitState === "half_open" &&
+    health.consecutiveSuccesses >= Math.max(1, Math.ceil(threshold / 2))
+  ) {
+    health.circuitState = "closed";
+    health.circuitUpdatedAt = new Date().toISOString();
+    health.circuitReason = "recovered";
+    health.degradedUntil = 0;
+  }
+  health.score = computeProviderHealthScore(normalizedProvider, health);
+  providerHealth.set(normalizedProvider, health);
+}
+
+function forceProviderDegraded(provider, reason = "unknown", meta = {}) {
+  const normalizedProvider = normalizeProviderName(provider);
+  if (!normalizedProvider) return false;
+  const health = getProviderHealthEntry(normalizedProvider);
+  const cooldownMs = Number(config.providerFailover?.cooldownMs) || 300000;
+  const now = Date.now();
+  health.degradedUntil = now + cooldownMs;
+  health.lastErrorAt = new Date(now).toISOString();
+  health.circuitState = "open";
+  health.circuitUpdatedAt = new Date(now).toISOString();
+  health.circuitReason = String(reason || "unknown");
+  health.consecutiveErrors = Math.max(
+    1,
+    Math.floor(Number(health.consecutiveErrors) || 0),
+  );
+  health.consecutiveSuccesses = 0;
+  health.score = computeProviderHealthScore(normalizedProvider, health, { nowMs: now });
+  providerHealth.set(normalizedProvider, health);
+  db?.logServiceHealth?.("provider_failover", "forced_degraded", {
+    provider: normalizedProvider,
+    reason: String(reason || "unknown"),
+    cooldown_ms: cooldownMs,
+    at: new Date(now).toISOString(),
+    ...meta,
+  }).catch(() => {});
+  return true;
 }
 
 function isProviderDegraded(provider) {
-  const health = getProviderHealthEntry(provider);
-  if (!health.degradedUntil) return false;
-  if (Date.now() > health.degradedUntil) {
+  const normalizedProvider = normalizeProviderName(provider);
+  if (!normalizedProvider) return false;
+  const health = getProviderHealthEntry(normalizedProvider);
+  const now = Date.now();
+  if (health.degradedUntil && now > health.degradedUntil) {
     health.degradedUntil = 0;
-    providerHealth.set(provider, health);
-    return false;
+    if (health.circuitState === "open") {
+      health.circuitState = "half_open";
+      health.circuitUpdatedAt = new Date(now).toISOString();
+      health.circuitReason = "cooldown_elapsed";
+    }
+    health.score = computeProviderHealthScore(normalizedProvider, health, { nowMs: now });
+    providerHealth.set(normalizedProvider, health);
   }
-  return true;
+  if (health.circuitState === "open") {
+    return true;
+  }
+  if (health.degradedUntil && now <= health.degradedUntil) {
+    return true;
+  }
+  return false;
+}
+
+function getCallCanaryState() {
+  return {
+    ...(callCanaryState || {}),
+    running: callCanaryRunning === true,
+    configured: config.callCanary?.enabled === true,
+    dry_run: config.callCanary?.dryRun !== false,
+  };
 }
 
 function recordProviderFlowMetric(event, meta = {}) {
@@ -8977,6 +9995,16 @@ function assertEmailWebhookAuthConfiguration() {
   if (hasEmailSecret || hasHmacSecret) return;
   throw new Error(
     "EMAIL_WEBHOOK_VALIDATION is strict but no email webhook auth secret is configured. Set EMAIL_WEBHOOK_SECRET or API_SECRET/API_HMAC_SECRET.",
+  );
+}
+
+function assertVonageWebhookAuthConfiguration() {
+  const mode = String(config.vonage?.webhookValidation || "warn").toLowerCase();
+  if (mode !== "strict") return;
+  const hasSecret = Boolean(String(config.vonage?.webhookSignatureSecret || "").trim());
+  if (hasSecret) return;
+  throw new Error(
+    "VONAGE_WEBHOOK_VALIDATION is strict but VONAGE_WEBHOOK_SIGNATURE_SECRET is missing. Configure a webhook signature secret before startup.",
   );
 }
 
@@ -9146,6 +10174,101 @@ async function runPaymentReconciliation(options = {}) {
   }
 }
 
+async function runCallCanaryCycle(options = {}) {
+  if (callCanaryRunning) {
+    return { ok: true, skipped: true, reason: "already_running" };
+  }
+  callCanaryRunning = true;
+  const startedAtIso = new Date().toISOString();
+  callCanaryState.last_run_at = startedAtIso;
+  try {
+    const result = await runCallCanarySweep({
+      config,
+      placeOutboundCall,
+      getProviderReadiness,
+      runWithTimeout,
+      recordProviderError,
+      recordProviderFlowMetric,
+    });
+    callCanaryState.last_result = {
+      ...(result || {}),
+      source: options.source || "worker",
+      at: startedAtIso,
+    };
+    db?.logServiceHealth?.("call_canary", "run", {
+      source: options.source || "worker",
+      ...(result || {}),
+      at: startedAtIso,
+    }).catch(() => {});
+    if (getVoiceAgentAutoCanaryConfig().enabled === true) {
+      evaluateVoiceAgentAutoCanary({
+        source: "call_canary_cycle",
+      }).catch((error) => {
+        console.error("❌ Voice auto-canary run after call canary failed:", error);
+      });
+    }
+    return result;
+  } catch (error) {
+    const message = String(error?.message || error || "call_canary_failed");
+    const failed = {
+      ok: false,
+      skipped: false,
+      error: message,
+      source: options.source || "worker",
+      at: startedAtIso,
+    };
+    callCanaryState.last_result = failed;
+    db?.logServiceHealth?.("call_canary", "error", failed).catch(() => {});
+    throw error;
+  } finally {
+    callCanaryRunning = false;
+  }
+}
+
+async function runCallSloGuardrailCycle(options = {}) {
+  const startedAtIso = new Date().toISOString();
+  callCanaryState.last_slo_at = startedAtIso;
+  try {
+    const result = await evaluateCallCanarySloGuardrail({
+      db,
+      config,
+      supportedProviders: SUPPORTED_PROVIDERS,
+      onBreach: async (provider, breach) => {
+        forceProviderDegraded(provider, "call_slo_guardrail_breach", breach);
+        recordProviderFlowMetric("call_slo_guardrail_breach", {
+          channel: "call",
+          flow: "synthetic_canary",
+          provider,
+          ...breach,
+        });
+      },
+    });
+    callCanaryState.last_slo_result = {
+      ...(result || {}),
+      source: options.source || "worker",
+      at: startedAtIso,
+    };
+    if (result?.breaches?.length) {
+      db?.logServiceHealth?.("call_slo_guardrail", "breach", {
+        source: options.source || "worker",
+        breaches: result.breaches,
+        at: startedAtIso,
+      }).catch(() => {});
+    }
+    return result;
+  } catch (error) {
+    const payload = {
+      ok: false,
+      error: String(error?.message || error || "call_slo_guardrail_failed"),
+      source: options.source || "worker",
+      at: startedAtIso,
+    };
+    callCanaryState.last_slo_result = payload;
+    db?.logServiceHealth?.("call_slo_guardrail", "error", payload).catch(() => {});
+    throw error;
+  }
+}
+
 function startBackgroundWorkers() {
   if (backgroundWorkersStarted) return;
   backgroundWorkersStarted = true;
@@ -9219,6 +10342,38 @@ function startBackgroundWorkers() {
     });
   }, STREAM_WATCHDOG_INTERVAL_MS);
 
+  if (config.callCanary?.enabled === true) {
+    const intervalMs = Number(config.callCanary?.intervalMs) || 300000;
+    setInterval(() => {
+      runCallCanaryCycle({
+        source: "call_canary_interval",
+      }).catch((error) => {
+        console.error("❌ Call canary worker error:", error);
+      });
+    }, intervalMs);
+    runCallCanaryCycle({
+      source: "call_canary_startup",
+    }).catch((error) => {
+      console.error("❌ Initial call canary run failed:", error);
+    });
+  }
+
+  if (config.callCanary?.slo?.enabled === true) {
+    const intervalMs = Number(config.callCanary?.intervalMs) || 300000;
+    setInterval(() => {
+      runCallSloGuardrailCycle({
+        source: "call_slo_guardrail_interval",
+      }).catch((error) => {
+        console.error("❌ Call SLO guardrail worker error:", error);
+      });
+    }, intervalMs);
+    runCallSloGuardrailCycle({
+      source: "call_slo_guardrail_startup",
+    }).catch((error) => {
+      console.error("❌ Initial call SLO guardrail run failed:", error);
+    });
+  }
+
   setInterval(() => {
     if (!emailService) {
       return;
@@ -9258,6 +10413,11 @@ async function speakAndEndCall(callSid, message, reason = "completed") {
   }
   callEndLocks.set(callSid, true);
   clearSilenceTimer(callSid);
+  clearGreetingRecoveryWatchdog(callSid, {
+    clearPhase: false,
+    source: "speakAndEndCall",
+    reason: reason || "call_ending",
+  });
   if (digitService) {
     digitService.clearCallState(callSid);
   }
@@ -9272,6 +10432,10 @@ async function speakAndEndCall(callSid, message, reason = "completed") {
   if (session) {
     session.ending = true;
   }
+  setCallPhase(callSid, "closing", {
+    source: "speakAndEndCall",
+    reason: reason || "call_ending",
+  });
   setCallFlowState(
     callSid,
     {
@@ -9424,6 +10588,13 @@ async function recordCallStatus(callSid, status, notificationType, extra = {}) {
       raw_status: status,
       duration: extra?.duration,
     });
+    const phase = resolveCallPhaseFromStatus(finalStatus);
+    if (phase) {
+      setCallPhase(callSid, phase, {
+        source: "recordCallStatus",
+        reason: finalStatus,
+      });
+    }
     if (isTerminalStatusKey(finalStatus)) {
       scheduleCallLifecycleCleanup(callSid);
     }
@@ -9520,6 +10691,10 @@ async function ensureAwsSession(callSid) {
   gptService.on("gptreply", async (gptReply, icount) => {
     try {
       markGptReplyProgress(callSid);
+      setCallPhase(callSid, "active", {
+        source: "aws_gptreply",
+        reason: "agent_response",
+      });
       if (session?.ending) {
         return;
       }
@@ -9642,6 +10817,39 @@ async function ensureAwsSession(callSid) {
       webhookService
         .setLiveCallPhase(callSid, "agent_speaking")
         .catch(() => {});
+      setCallPhase(callSid, "greeting", {
+        source: "aws_initial_greeting",
+        reason: "initial_prompt",
+      });
+      scheduleGreetingRecoveryWatchdog(callSid, {
+        runtime: "legacy",
+        source: "aws_initial_greeting",
+        recover: async ({ prompt }) => {
+          const recoveryPrompt = String(prompt || GREETING_RECOVERY_DEFAULT_PROMPT).trim();
+          if (!recoveryPrompt) return;
+          const recovery = await ttsAdapter.synthesizeToS3(
+            recoveryPrompt,
+            voiceId ? { voiceId } : {},
+          );
+          const recoveryKey = recovery?.key;
+          if (recoveryKey && contactId) {
+            await awsAdapter.enqueueAudioPlayback({
+              contactId,
+              audioKey: recoveryKey,
+            });
+            webhookService.addLiveEvent(callSid, "🔁 Replaying greeting prompt", {
+              force: true,
+            });
+          }
+        },
+        fallback: async ({ message }) => {
+          await speakAndEndCall(
+            callSid,
+            String(message || GREETING_RECOVERY_DEFAULT_FALLBACK).trim(),
+            "greeting_watchdog_timeout",
+          );
+        },
+      });
       scheduleSpeechTicks(
         callSid,
         "agent_speaking",
@@ -9670,6 +10878,7 @@ async function startServer(options = {}) {
     console.log("🚀 Initializing Adaptive AI Call System...");
     warnIfMachineDetectionDisabled("startup");
     assertEmailWebhookAuthConfiguration();
+    assertVonageWebhookAuthConfiguration();
     validateProfilePacksAtStartup();
 
     // Initialize database first
@@ -9700,6 +10909,16 @@ async function startServer(options = {}) {
       console.warn("Database schema guardrails detected missing artifacts:", schemaGuard);
     }
     console.log("✅ Enhanced database initialized successfully");
+    const mappingReconcileResult = await reconcileVonageCallMappings().catch(() => ({
+      scanned: 0,
+      mapped: 0,
+    }));
+    if (mappingReconcileResult?.mapped > 0) {
+      console.log(
+        `✅ Vonage mapping reconciliation loaded ${mappingReconcileResult.mapped} mapping(s) from ${mappingReconcileResult.scanned} state rows`,
+      );
+    }
+    scheduleVonageMappingReconciler();
     if (smsService?.setDb) {
       smsService.setDb(db);
     }
@@ -10087,6 +11306,67 @@ app.ws("/connection", (ws, req) => {
       }
       return true;
     };
+    const armGreetingRecoveryForStream = (runtime = "legacy") => {
+      if (!callSid) return;
+      scheduleGreetingRecoveryWatchdog(callSid, {
+        runtime,
+        source: `twilio_${runtime}_greeting`,
+        recover: async ({ prompt }) => {
+          const recoveryPrompt = String(prompt || GREETING_RECOVERY_DEFAULT_PROMPT).trim();
+          if (!recoveryPrompt) return;
+          if (runtime === "voice_agent" && voiceRuntimeMode === "voice_agent") {
+            const injected =
+              voiceAgentBridge?.injectAgentMessage?.(recoveryPrompt) === true;
+            if (!injected) {
+              await switchVoiceAgentToLegacy("voice_agent_greeting_recovery");
+            } else {
+              webhookService.addLiveEvent(
+                callSid,
+                "🔁 Replaying greeting prompt (voice agent)",
+                { force: true },
+              );
+              return;
+            }
+          }
+          try {
+            await ttsService.generate(
+              {
+                partialResponseIndex: null,
+                partialResponse: recoveryPrompt,
+              },
+              0,
+              {
+                maxChars: FIRST_MESSAGE_TTS_MAX_CHARS,
+                throwOnError: false,
+              },
+            );
+            webhookService.addLiveEvent(callSid, "🔁 Replaying greeting prompt", {
+              force: true,
+            });
+          } catch (error) {
+            console.error("Greeting watchdog replay error:", error);
+          }
+        },
+        fallback: async ({ message }) => {
+          const activeSession = activeCalls.get(callSid);
+          const fallbackActivated = await activateDtmfFallback(
+            callSid,
+            callConfig || callConfigurations.get(callSid),
+            activeSession?.gptService || gptService,
+            activeSession?.interactionCount || interactionCount,
+            "greeting_watchdog_timeout",
+          );
+          if (fallbackActivated) {
+            return;
+          }
+          await speakAndEndCall(
+            callSid,
+            String(message || GREETING_RECOVERY_DEFAULT_FALLBACK).trim(),
+            "greeting_watchdog_timeout",
+          );
+        },
+      });
+    };
 
     const handleSttFailure = async (tag, error) => {
       if (!callSid) return;
@@ -10304,10 +11584,14 @@ app.ws("/connection", (ws, req) => {
             await db.updateCallStatus(callSid, "started", {
               started_at: callStartTime.toISOString(),
             });
-            await db.updateCallState(callSid, "stream_started", {
-              stream_sid: streamSid,
-              start_time: callStartTime.toISOString(),
-            });
+	            await db.updateCallState(callSid, "stream_started", {
+	              stream_sid: streamSid,
+	              start_time: callStartTime.toISOString(),
+	            });
+	            setCallPhase(callSid, "connected", {
+	              source: "twilio_stream_start",
+	              reason: "stream_started",
+	            });
 
             // Create webhook notification for stream start (internal tracking)
             const call = await db.getCall(callSid);
@@ -10483,6 +11767,14 @@ app.ws("/connection", (ws, req) => {
                   : String(content || "");
                 try {
                   if (isUser) {
+                    markGreetingRecoveryProgress(
+                      callSid,
+                      "voice_agent_conversation_text_user",
+                    );
+                    setCallPhase(callSid, "active", {
+                      source: "voice_agent_conversation_text",
+                      reason: "user_turn",
+                    });
                     webhookService
                       .setLiveCallPhase(callSid, "user_speaking")
                       .catch(() => {});
@@ -10557,6 +11849,11 @@ app.ws("/connection", (ws, req) => {
 
               voiceAgentBridge.on("userStartedSpeaking", () => {
                 clearSilenceTimer(callSid);
+                markGreetingRecoveryProgress(callSid, "voice_agent_user_started");
+                setCallPhase(callSid, "active", {
+                  source: "voice_agent_user_started",
+                  reason: "user_speaking",
+                });
                 voiceAgentLastUserSpeechAt = Date.now();
                 clearOutgoingAudioForBargeIn("voice_agent_user_started_speaking");
                 scheduleVoiceAgentNoAudioWatchdog();
@@ -10682,6 +11979,11 @@ app.ws("/connection", (ws, req) => {
               if (greetingText && callConfig) {
                 callConfig.initial_prompt_played = true;
                 callConfigurations.set(callSid, callConfig);
+                setCallPhase(callSid, "greeting", {
+                  source: "voice_agent_greeting",
+                  reason: "initial_prompt",
+                });
+                armGreetingRecoveryForStream("voice_agent");
               }
               webhookService.addLiveEvent(
                 callSid,
@@ -10942,6 +12244,10 @@ app.ws("/connection", (ws, req) => {
           // Initialize call with recording
           try {
             if (skipGreeting) {
+              clearGreetingRecoveryWatchdog(callSid, {
+                clearPhase: false,
+                source: "twilio_skip_greeting",
+              });
               isInitialized = true;
               if (voiceRuntimeMode === "voice_agent") {
                 await db
@@ -11022,6 +12328,13 @@ app.ws("/connection", (ws, req) => {
                   gptService,
                   interactionCount,
                 });
+                if (preamble) {
+                  setCallPhase(callSid, "greeting", {
+                    source: "twilio_grouped_greeting",
+                    reason: "initial_prompt",
+                  });
+                  armGreetingRecoveryForStream("legacy");
+                }
                 scheduleSilenceTimer(callSid);
                 isInitialized = true;
                 if (pendingDigitActions.length) {
@@ -11118,6 +12431,11 @@ app.ws("/connection", (ws, req) => {
                 digitService.scheduleDigitTimeout(callSid, gptService, 0);
               }
               scheduleSilenceTimer(callSid);
+              setCallPhase(callSid, "greeting", {
+                source: "twilio_initial_greeting",
+                reason: "initial_prompt",
+              });
+              armGreetingRecoveryForStream("legacy");
               startGroupedGather(callSid, callConfig, {
                 preamble: "",
                 delayMs: estimateSpeechDurationMs(promptUsed) + 200,
@@ -11139,6 +12457,10 @@ app.ws("/connection", (ws, req) => {
           } catch (recordingError) {
             console.error("Recording service error:", recordingError);
             if (skipGreeting) {
+              clearGreetingRecoveryWatchdog(callSid, {
+                clearPhase: false,
+                source: "twilio_skip_greeting_recording_error",
+              });
               isInitialized = true;
               console.log(
                 `Stream reconnected for ${callSid} (skipping greeting)`,
@@ -11205,6 +12527,13 @@ app.ws("/connection", (ws, req) => {
                   gptService,
                   interactionCount,
                 });
+                if (preamble) {
+                  setCallPhase(callSid, "greeting", {
+                    source: "twilio_grouped_greeting_recording_fallback",
+                    reason: "initial_prompt",
+                  });
+                  armGreetingRecoveryForStream("legacy");
+                }
                 scheduleSilenceTimer(callSid);
                 isInitialized = true;
                 return;
@@ -11286,6 +12615,11 @@ app.ws("/connection", (ws, req) => {
                 digitService.scheduleDigitTimeout(callSid, gptService, 0);
               }
               scheduleSilenceTimer(callSid);
+              setCallPhase(callSid, "greeting", {
+                source: "twilio_initial_greeting_recording_fallback",
+                reason: "initial_prompt",
+              });
+              armGreetingRecoveryForStream("legacy");
               startGroupedGather(callSid, callConfig, {
                 preamble: "",
                 delayMs: estimateSpeechDurationMs(promptUsed) + 200,
@@ -11339,6 +12673,11 @@ app.ws("/connection", (ws, req) => {
         } else if (event === "dtmf") {
           const digits = msg?.dtmf?.digits || msg?.dtmf?.digit || "";
           if (digits) {
+            markGreetingRecoveryProgress(callSid, "twilio_dtmf");
+            setCallPhase(callSid, "active", {
+              source: "twilio_dtmf",
+              reason: "dtmf_input",
+            });
             if (shouldFallbackVoiceAgentOnDtmf(voiceRuntimeMode)) {
               webhookService.addLiveEvent(
                 callSid,
@@ -11495,9 +12834,13 @@ app.ws("/connection", (ws, req) => {
             }
             activeCalls.delete(callSid);
             callToolInFlight.delete(callSid);
-            clearCallEndLock(callSid);
-            clearSilenceTimer(callSid);
-            return;
+	            clearCallEndLock(callSid);
+	            clearSilenceTimer(callSid);
+	            clearGreetingRecoveryWatchdog(callSid, {
+	              clearPhase: false,
+	              source: "twilio_stream_stop_preserve",
+	            });
+	            return;
           }
 
           const authBypass = streamAuthBypass.get(callSid);
@@ -11521,9 +12864,13 @@ app.ws("/connection", (ws, req) => {
               allowHangup: false,
               reason: "stream_auth_failed",
             });
-            clearCallEndLock(callSid);
-            clearSilenceTimer(callSid);
-            return;
+	            clearCallEndLock(callSid);
+	            clearSilenceTimer(callSid);
+	            clearGreetingRecoveryWatchdog(callSid, {
+	              clearPhase: false,
+	              source: "twilio_stream_stop_auth_bypass",
+	            });
+	            return;
           }
 
           await handleCallEnd(callSid, callStartTime);
@@ -11552,8 +12899,12 @@ app.ws("/connection", (ws, req) => {
           if (digitService) {
             digitService.clearCallState(callSid);
           }
-          clearCallEndLock(callSid);
-          clearSilenceTimer(callSid);
+	          clearCallEndLock(callSid);
+	          clearSilenceTimer(callSid);
+	          clearGreetingRecoveryWatchdog(callSid, {
+	            clearPhase: false,
+	            source: "twilio_stream_stop_cleanup",
+	          });
         } else {
           console.log(
             `Unrecognized WS event for ${callSid || "unknown"}: ${event || "none"}`,
@@ -11570,6 +12921,13 @@ app.ws("/connection", (ws, req) => {
         return;
       }
       clearSilenceTimer(callSid);
+      if (text && text.trim().length > 0) {
+        markGreetingRecoveryProgress(callSid, "twilio_utterance");
+        setCallPhase(callSid, "active", {
+          source: "twilio_utterance",
+          reason: "user_speaking",
+        });
+      }
       if (callSid) {
         sttLastFrameAt.set(callSid, Date.now());
       }
@@ -11590,13 +12948,23 @@ app.ws("/connection", (ws, req) => {
           return;
         }
         clearSilenceTimer(callSid);
+        markGreetingRecoveryProgress(callSid, "twilio_transcription");
+        setCallPhase(callSid, "active", {
+          source: "twilio_transcription",
+          reason: "user_transcribed",
+        });
         if (callSid) {
           sttLastFrameAt.set(callSid, Date.now());
         }
 
         const callConfig = callConfigurations.get(callSid);
-        const isDigitIntent = callConfig?.digit_intent?.mode === "dtmf";
-        const captureActive = isCaptureActiveConfig(callConfig);
+        const digitFlowGuard = getDigitFlowGuardState(callSid, callConfig);
+        const isDigitIntent =
+          callConfig?.digit_intent?.mode === "dtmf" ||
+          digitFlowGuard.captureActive ||
+          digitFlowGuard.hasExpectation ||
+          digitFlowGuard.hasPlan;
+        const captureActive = digitFlowGuard.captureActive;
         const otpContext = digitService.getOtpContext(text, callSid);
         console.log(`Customer: ${otpContext.maskedForLogs}`);
 
@@ -11656,7 +13024,7 @@ app.ws("/connection", (ws, req) => {
             { allowCallEnd: true },
           );
         }
-        if (captureActive) {
+        if (digitFlowGuard.active) {
           return;
         }
 
@@ -11782,8 +13150,12 @@ app.ws("/connection", (ws, req) => {
       clearSpeechTicks(callSid);
       clearGptQueue(callSid);
       clearNormalFlowState(callSid);
-      clearCallEndLock(callSid);
-      clearSilenceTimer(callSid);
+	      clearCallEndLock(callSid);
+	      clearSilenceTimer(callSid);
+	      clearGreetingRecoveryWatchdog(callSid, {
+	        clearPhase: false,
+	        source: "twilio_ws_close",
+	      });
       sttFallbackCalls.delete(callSid);
       streamTimeoutCalls.delete(callSid);
       streamStartTimes.delete(callSid);
@@ -11896,6 +13268,30 @@ app.ws("/vonage/stream", async (ws, req) => {
     callConfig.inbound = isInboundCall;
     callConfigurations.set(callSid, callConfig);
     callDirections.set(callSid, isInboundCall ? "inbound" : "outbound");
+    streamStartTimes.set(callSid, Date.now());
+    streamFirstMediaSeen.delete(callSid);
+    clearFirstMediaWatchdog(callSid);
+    scheduleFirstMediaWatchdog(
+      callSid,
+      resolveHost(req) || config.server?.hostname,
+      callConfig,
+    );
+    const existingConnection = activeStreamConnections.get(callSid);
+    if (
+      existingConnection &&
+      existingConnection.ws !== ws &&
+      existingConnection.ws.readyState === 1
+    ) {
+      try {
+        existingConnection.ws.close(4000, "Replaced by new Vonage stream");
+      } catch {}
+    }
+    activeStreamConnections.set(callSid, {
+      ws,
+      streamSid: vonageUuid || null,
+      provider: "vonage",
+      connectedAt: new Date().toISOString(),
+    });
     const runtimeRestore = await restoreCallRuntimeState(callSid, callConfig);
     if (runtimeRestore?.restored) {
       interactionCount = Math.max(
@@ -11911,17 +13307,21 @@ app.ws("/vonage/stream", async (ws, req) => {
         .updateCallStatus(callSid, "started", { started_at: startedAt })
         .catch(() => {});
     }
-    if (db?.updateCallState) {
-      await db.updateCallState(callSid, "stream_started", {
-        stream_provider: "vonage",
-        started_at: startedAt,
-        vonage_uuid: vonageUuid || callConfig?.provider_metadata?.vonage_uuid,
-        stream_audio_content_type: vonageAudioSpec.contentType,
-        stream_audio_encoding: vonageAudioSpec.sttEncoding,
-        stream_audio_sample_rate: vonageAudioSpec.sampleRate,
-      })
-        .catch(() => {});
-    }
+	    if (db?.updateCallState) {
+	      await db.updateCallState(callSid, "stream_started", {
+	        stream_provider: "vonage",
+	        started_at: startedAt,
+	        vonage_uuid: vonageUuid || callConfig?.provider_metadata?.vonage_uuid,
+	        stream_audio_content_type: vonageAudioSpec.contentType,
+	        stream_audio_encoding: vonageAudioSpec.sttEncoding,
+	        stream_audio_sample_rate: vonageAudioSpec.sampleRate,
+	      })
+	        .catch(() => {});
+	    }
+	    setCallPhase(callSid, "connected", {
+	      source: "vonage_stream_start",
+	      reason: "stream_started",
+	    });
     console.log(`Vonage stream connected for ${callSid}; using legacy STT+GPT+TTS`);
 
     const ttsService = new TextToSpeechService({
@@ -12151,6 +13551,11 @@ app.ws("/vonage/stream", async (ws, req) => {
     transcriptionService.on("utterance", (text) => {
       clearSilenceTimer(callSid);
       if (text && text.trim().length > 0) {
+        markGreetingRecoveryProgress(callSid, "vonage_utterance");
+        setCallPhase(callSid, "active", {
+          source: "vonage_utterance",
+          reason: "user_speaking",
+        });
         webhookService
           .setLiveCallPhase(callSid, "user_speaking")
           .catch(() => {});
@@ -12161,9 +13566,21 @@ app.ws("/vonage/stream", async (ws, req) => {
       try {
         if (!text) return;
         clearSilenceTimer(callSid);
+        markGreetingRecoveryProgress(callSid, "vonage_transcription");
+        setCallPhase(callSid, "active", {
+          source: "vonage_transcription",
+          reason: "user_transcribed",
+        });
+        sttLastFrameAt.set(callSid, Date.now());
+        markStreamMediaSeen(callSid);
         const callConfig = callConfigurations.get(callSid);
-        const isDigitIntent = callConfig?.digit_intent?.mode === "dtmf";
-        const captureActive = isCaptureActiveConfig(callConfig);
+        const digitFlowGuard = getDigitFlowGuardState(callSid, callConfig);
+        const isDigitIntent =
+          callConfig?.digit_intent?.mode === "dtmf" ||
+          digitFlowGuard.captureActive ||
+          digitFlowGuard.hasExpectation ||
+          digitFlowGuard.hasPlan;
+        const captureActive = digitFlowGuard.captureActive;
         const otpContext = digitService.getOtpContext(text, callSid);
         try {
           await db.addTranscript({
@@ -12218,7 +13635,7 @@ app.ws("/vonage/stream", async (ws, req) => {
             { allowCallEnd: true },
           );
         }
-        if (captureActive) {
+        if (digitFlowGuard.active) {
           return;
         }
         if (!otpContext.maskedForGpt || !otpContext.maskedForGpt.trim()) {
@@ -12292,6 +13709,8 @@ app.ws("/vonage/stream", async (ws, req) => {
     ws.on("message", (data) => {
       if (!data) return;
       if (Buffer.isBuffer(data)) {
+        streamLastMediaAt.set(callSid, Date.now());
+        markStreamMediaSeen(callSid);
         transcriptionService.sendBuffer(data);
         return;
       }
@@ -12300,6 +13719,8 @@ app.ws("/vonage/stream", async (ws, req) => {
         const parsed = JSON.parse(str);
         const wsDigits = getVonageDtmfDigits(parsed || {});
         if (wsDigits) {
+          streamLastMediaAt.set(callSid, Date.now());
+          markStreamMediaSeen(callSid);
           handleExternalDtmfInput(callSid, wsDigits, {
             source: "vonage_ws_dtmf",
             provider: "vonage",
@@ -12320,6 +13741,9 @@ app.ws("/vonage/stream", async (ws, req) => {
 
     ws.on("close", async () => {
       transcriptionService.close();
+      clearFirstMediaWatchdog(callSid);
+      streamFirstMediaSeen.delete(callSid);
+      streamStartTimes.delete(callSid);
       try {
         const session = activeCalls.get(callSid);
         if (session?.startTime) {
@@ -12337,10 +13761,21 @@ app.ws("/vonage/stream", async (ws, req) => {
         clearSpeechTicks(callSid);
         clearGptQueue(callSid);
         clearNormalFlowState(callSid);
-        clearCallEndLock(callSid);
-        clearSilenceTimer(callSid);
+	        clearCallEndLock(callSid);
+	        clearSilenceTimer(callSid);
+	        clearGreetingRecoveryWatchdog(callSid, {
+	          clearPhase: false,
+	          source: "vonage_ws_close",
+	        });
         sttFallbackCalls.delete(callSid);
         streamTimeoutCalls.delete(callSid);
+        streamRetryState.delete(callSid);
+        streamLastMediaAt.delete(callSid);
+        sttLastFrameAt.delete(callSid);
+        streamWatchdogState.delete(callSid);
+        if (callSid && activeStreamConnections.get(callSid)?.ws === ws) {
+          activeStreamConnections.delete(callSid);
+        }
       }
     });
 
@@ -12390,6 +13825,36 @@ app.ws("/vonage/stream", async (ws, req) => {
 
       if (promptUsed) {
         webhookService.recordTranscriptTurn(callSid, "agent", promptUsed);
+        setCallPhase(callSid, "greeting", {
+          source: "vonage_initial_greeting",
+          reason: "initial_prompt",
+        });
+        scheduleGreetingRecoveryWatchdog(callSid, {
+          runtime: "legacy",
+          source: "vonage_initial_greeting",
+          recover: async ({ prompt }) => {
+            const recoveryPrompt = String(prompt || GREETING_RECOVERY_DEFAULT_PROMPT).trim();
+            if (!recoveryPrompt) return;
+            await ttsService.generate(
+              { partialResponseIndex: null, partialResponse: recoveryPrompt },
+              0,
+              {
+                maxChars: FIRST_MESSAGE_TTS_MAX_CHARS,
+                throwOnError: false,
+              },
+            );
+            webhookService.addLiveEvent(callSid, "🔁 Replaying greeting prompt", {
+              force: true,
+            });
+          },
+          fallback: async ({ message }) => {
+            await speakAndEndCall(
+              callSid,
+              String(message || GREETING_RECOVERY_DEFAULT_FALLBACK).trim(),
+              "greeting_watchdog_timeout",
+            );
+          },
+        });
         if (digitService?.hasExpectation(callSid)) {
           digitService.markDigitPrompted(callSid, gptService, 0, "dtmf", {
             allowCallEnd: true,
@@ -12439,10 +13904,14 @@ app.ws("/aws/stream", (ws, req) => {
     }
 
     const callConfig = callConfigurations.get(callSid);
-    if (!callConfig) {
-      ws.close();
-      return;
-    }
+	    if (!callConfig) {
+	      ws.close();
+	      return;
+	    }
+	    setCallPhase(callSid, "connected", {
+	      source: "aws_stream_start",
+	      reason: "stream_connected",
+	    });
 
     if (!callConfig.provider_metadata) {
       callConfig.provider_metadata = {};
@@ -12499,6 +13968,11 @@ app.ws("/aws/stream", (ws, req) => {
     transcriptionService.on("utterance", (text) => {
       clearSilenceTimer(callSid);
       if (text && text.trim().length > 0) {
+        markGreetingRecoveryProgress(callSid, "aws_utterance");
+        setCallPhase(callSid, "active", {
+          source: "aws_utterance",
+          reason: "user_speaking",
+        });
         webhookService
           .setLiveCallPhase(callSid, "user_speaking")
           .catch(() => {});
@@ -12509,6 +13983,11 @@ app.ws("/aws/stream", (ws, req) => {
       try {
         if (!text) return;
         clearSilenceTimer(callSid);
+        markGreetingRecoveryProgress(callSid, "aws_transcription");
+        setCallPhase(callSid, "active", {
+          source: "aws_transcription",
+          reason: "user_transcribed",
+        });
         const session = await sessionPromise;
         if (!session?.gptService) {
           return;
@@ -12517,8 +13996,13 @@ app.ws("/aws/stream", (ws, req) => {
           interactionCount,
           Number(session.interactionCount || 0),
         );
-        const isDigitIntent = session?.callConfig?.digit_intent?.mode === "dtmf";
-        const captureActive = isCaptureActiveConfig(session?.callConfig);
+        const digitFlowGuard = getDigitFlowGuardState(callSid, session?.callConfig);
+        const isDigitIntent =
+          session?.callConfig?.digit_intent?.mode === "dtmf" ||
+          digitFlowGuard.captureActive ||
+          digitFlowGuard.hasExpectation ||
+          digitFlowGuard.hasPlan;
+        const captureActive = digitFlowGuard.captureActive;
         const otpContext = digitService.getOtpContext(text, callSid);
         try {
           await db.addTranscript({
@@ -12574,7 +14058,7 @@ app.ws("/aws/stream", (ws, req) => {
             { allowCallEnd: true },
           );
         }
-        if (captureActive) {
+        if (digitFlowGuard.active) {
           return;
         }
 
@@ -12668,8 +14152,12 @@ app.ws("/aws/stream", (ws, req) => {
         }
         clearGptQueue(callSid);
         clearNormalFlowState(callSid);
-        clearCallEndLock(callSid);
-        clearSilenceTimer(callSid);
+	        clearCallEndLock(callSid);
+	        clearSilenceTimer(callSid);
+	        clearGreetingRecoveryWatchdog(callSid, {
+	          clearPhase: false,
+	          source: "aws_ws_close",
+	        });
         sttFallbackCalls.delete(callSid);
         streamTimeoutCalls.delete(callSid);
       }
@@ -12687,6 +14175,10 @@ app.ws("/aws/stream", (ws, req) => {
 // Enhanced call end handler with adaptation analytics
 async function handleCallEnd(callSid, callStartTime) {
   try {
+    setCallPhase(callSid, "ended", {
+      source: "handleCallEnd",
+      reason: "call_closed",
+    });
     const callEndTime = new Date();
     const duration = Math.round((callEndTime - callStartTime) / 1000);
     for (const key of gatherEventDedupe.keys()) {
@@ -12697,6 +14189,11 @@ async function handleCallEnd(callSid, callStartTime) {
     clearGptQueue(callSid);
     clearNormalFlowState(callSid);
     clearSpeechTicks(callSid);
+    clearGreetingRecoveryWatchdog(callSid, {
+      clearPhase: false,
+      source: "handleCallEnd",
+      reason: "call_closed",
+    });
     sttFallbackCalls.delete(callSid);
     streamTimeoutCalls.delete(callSid);
     clearFirstMediaWatchdog(callSid);
@@ -12711,6 +14208,7 @@ async function handleCallEnd(callSid, callStartTime) {
     purgeStreamStatusDedupe(callSid);
     purgeCallStatusDedupe(callSid);
     callLifecycle.delete(callSid);
+    callPhaseLifecycle.delete(callSid);
     const lifecycleTimer = callLifecycleCleanupTimers.get(callSid);
     if (lifecycleTimer) {
       clearTimeout(lifecycleTimer);
@@ -15451,11 +16949,122 @@ function buildTwilioOutboundCallPayload(options = {}) {
   return payload;
 }
 
+function normalizeOutboundIdempotencyKey(value = "") {
+  const key = String(value || "").trim();
+  if (!key) return "";
+  if (!isSafeId(key, { max: 128 })) return "";
+  return key;
+}
+
+function buildVonageOutboundIdempotencyRequestHash(payload = {}) {
+  const normalized = {
+    number: String(payload?.number || "").trim(),
+    script_id: normalizeScriptId(payload?.script_id),
+    script_version: Number.isFinite(Number(payload?.script_version))
+      ? Number(payload.script_version)
+      : null,
+    call_profile:
+      String(
+        payload?.conversation_profile || payload?.call_profile || payload?.purpose || "",
+      )
+        .trim()
+        .toLowerCase() || null,
+    user_chat_id: String(payload?.user_chat_id || "").trim() || null,
+    business_id: String(payload?.business_id || "").trim() || null,
+    prompt_hash: crypto
+      .createHash("sha256")
+      .update(String(payload?.prompt || "").trim())
+      .digest("hex"),
+    first_message_hash: crypto
+      .createHash("sha256")
+      .update(String(payload?.first_message || "").trim())
+      .digest("hex"),
+  };
+  return crypto
+    .createHash("sha256")
+    .update(stableStringify(normalized))
+    .digest("hex");
+}
+
+async function reserveVonageOutboundIdempotency(payload = {}) {
+  const idempotencyKey = normalizeOutboundIdempotencyKey(payload.idempotency_key);
+  if (!idempotencyKey || !db?.reserveOutboundCallIdempotency) {
+    return { enabled: false, idempotencyKey: "", requestHash: "" };
+  }
+  const requestHash = buildVonageOutboundIdempotencyRequestHash(payload);
+  const reservation = await db.reserveOutboundCallIdempotency({
+    idempotency_key: idempotencyKey,
+    provider: "vonage",
+    request_hash: requestHash,
+  });
+  if (reservation?.reserved) {
+    return { enabled: true, idempotencyKey, requestHash };
+  }
+
+  const existing = await db.getOutboundCallIdempotency(idempotencyKey);
+  if (existing) {
+    const existingHash = String(existing.request_hash || "").trim();
+    if (existingHash && existingHash !== requestHash) {
+      const conflictError = new Error("Idempotency key reuse with different payload");
+      conflictError.code = "idempotency_conflict";
+      conflictError.status = 409;
+      throw conflictError;
+    }
+    const existingStatus = String(existing.status || "").trim().toLowerCase();
+    if (existingStatus === "completed" && existing.call_sid) {
+      let responsePayload = null;
+      try {
+        responsePayload = existing.response_payload
+          ? JSON.parse(existing.response_payload)
+          : null;
+      } catch {
+        responsePayload = null;
+      }
+      return {
+        enabled: true,
+        idempotencyKey,
+        requestHash,
+        replay: {
+          callId: String(existing.call_sid),
+          callStatus:
+            String(responsePayload?.call_status || "").trim() || "queued",
+          providerMetadata:
+            responsePayload?.provider_metadata &&
+            typeof responsePayload.provider_metadata === "object"
+              ? responsePayload.provider_metadata
+              : {},
+        },
+      };
+    }
+  }
+
+  const pendingError = new Error("Idempotency key is currently processing");
+  pendingError.code = "idempotency_in_progress";
+  pendingError.status = 409;
+  throw pendingError;
+}
+
+async function completeVonageOutboundIdempotency(context = {}, status = "failed", details = {}) {
+  if (!context?.enabled || !context?.idempotencyKey || !db?.completeOutboundCallIdempotency) {
+    return;
+  }
+  await db.completeOutboundCallIdempotency({
+    idempotency_key: context.idempotencyKey,
+    provider: "vonage",
+    request_hash: context.requestHash || null,
+    call_sid: details.callSid || null,
+    status,
+    response_payload: details.responsePayload || null,
+    error_message: details.errorMessage || null,
+  });
+}
+
 async function placeOutboundCall(payload, hostOverride = null) {
   const {
     number,
     prompt: rawPrompt,
     first_message: rawFirstMessage,
+    idempotency_key,
     user_chat_id,
     customer_name,
     business_id,
@@ -15512,6 +17121,14 @@ async function placeOutboundCall(payload, hostOverride = null) {
   }
 
   const callWarnings = [];
+  const normalizedOutboundIdempotencyKey =
+    normalizeOutboundIdempotencyKey(idempotency_key);
+  let idempotentReplay = false;
+  const requestedProvider = normalizeProviderName(
+    payloadObject.preferred_provider ||
+      payloadObject.call_provider ||
+      payloadObject.provider,
+  );
   const normalizedScriptId = normalizeScriptId(script_id);
   const requestedScriptVersion = Number(script_version);
   let resolvedScriptVersion =
@@ -15632,7 +17249,8 @@ async function placeOutboundCall(payload, hostOverride = null) {
     : null;
 
   const readiness = getProviderReadiness();
-  const preferredProvider = keypadOverride?.provider || currentProvider;
+  const preferredProvider =
+    keypadOverride?.provider || requestedProvider || currentProvider;
   const orderedProviders = getProviderOrder(preferredProvider);
   let availableProviders = orderedProviders.filter(
     (provider) => readiness[provider],
@@ -15683,6 +17301,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
     },
     failoverEnabled,
     isProviderDegraded,
+    getProviderHealthScore,
   });
   const attemptProviders = providerPlan.attempt_order;
   recordProviderFlowMetric("provider_selection_plan", {
@@ -15691,8 +17310,10 @@ async function placeOutboundCall(payload, hostOverride = null) {
     provider: providerPlan.selected_provider || preferredProvider || null,
     preferred_provider: preferredProvider || null,
     attempt_order: attemptProviders,
+    healthy_providers: providerPlan.healthy_providers,
     blocked_providers: providerPlan.blocked_providers,
     degraded_providers: providerPlan.degraded_providers,
+    provider_scores: providerPlan.provider_scores || {},
   });
   if (!attemptProviders.length) {
     throw new Error("No eligible outbound call providers are currently available");
@@ -15701,6 +17322,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
 
   for (let providerIndex = 0; providerIndex < attemptProviders.length; providerIndex += 1) {
     const provider = attemptProviders[providerIndex];
+    let vonageIdempotencyContext = null;
     try {
       recordProviderFlowMetric("outbound_call_attempt", {
         channel: "call",
@@ -15758,6 +17380,41 @@ async function placeOutboundCall(payload, hostOverride = null) {
         }
         callStatus = "queued";
       } else if (provider === "vonage") {
+        vonageIdempotencyContext = await reserveVonageOutboundIdempotency({
+          ...payloadObject,
+          idempotency_key: normalizedOutboundIdempotencyKey,
+        });
+        if (vonageIdempotencyContext?.replay) {
+          callId = vonageIdempotencyContext.replay.callId;
+          callStatus = vonageIdempotencyContext.replay.callStatus || "queued";
+          providerMetadata = {
+            ...(vonageIdempotencyContext.replay.providerMetadata || {}),
+            idempotency_key: normalizedOutboundIdempotencyKey || null,
+          };
+          idempotentReplay = true;
+          if (providerMetadata?.vonage_uuid) {
+            rememberVonageCallMapping(
+              callId,
+              providerMetadata.vonage_uuid,
+              "idempotent_replay",
+            );
+          }
+          recordProviderFlowMetric("outbound_call_idempotent_replay", {
+            channel: "call",
+            flow: keypadRequired ? "digit_capture" : "outbound_voice",
+            provider: "vonage",
+            attempt: providerIndex + 1,
+            call_sid: callId,
+          });
+          return {
+            callId,
+            callStatus,
+            functionSystem,
+            provider: "vonage",
+            idempotentReplay,
+            warnings: callWarnings,
+          };
+        }
         const vonageAdapter = getVonageVoiceAdapter();
         callId = uuidv4();
         const webhookReq = reqForHost(host);
@@ -15801,11 +17458,23 @@ async function placeOutboundCall(payload, hostOverride = null) {
           vonage_uuid: vonageUuid || null,
           answer_url: answerUrl || null,
           event_url: eventUrl || null,
+          idempotency_key: normalizedOutboundIdempotencyKey || null,
         };
         if (vonageUuid) {
           rememberVonageCallMapping(callId, vonageUuid, "outbound_create");
         }
         callStatus = response?.status || "queued";
+        await completeVonageOutboundIdempotency(
+          vonageIdempotencyContext,
+          "completed",
+          {
+            callSid: callId,
+            responsePayload: {
+              call_status: callStatus,
+              provider_metadata: providerMetadata,
+            },
+          },
+        );
       } else {
         throw new Error(`Unsupported provider ${provider}`);
       }
@@ -15819,6 +17488,36 @@ async function placeOutboundCall(payload, hostOverride = null) {
       selectedProvider = provider;
       break;
     } catch (error) {
+      if (
+        provider === "vonage" &&
+        error?.code !== "idempotency_conflict" &&
+        error?.code !== "idempotency_in_progress"
+      ) {
+        try {
+          await completeVonageOutboundIdempotency(
+            vonageIdempotencyContext || {
+              enabled: normalizedOutboundIdempotencyKey !== "",
+              idempotencyKey: normalizedOutboundIdempotencyKey,
+              requestHash: buildVonageOutboundIdempotencyRequestHash({
+                ...payloadObject,
+                idempotency_key: normalizedOutboundIdempotencyKey,
+              }),
+            },
+            "failed",
+            {
+              errorMessage: error?.message || "vonage_outbound_failed",
+            },
+          );
+        } catch (_) {
+          // Ignore idempotency persistence failures in provider attempt loop.
+        }
+      }
+      if (
+        error?.code === "idempotency_conflict" ||
+        error?.code === "idempotency_in_progress"
+      ) {
+        throw error;
+      }
       lastError = error;
       recordProviderError(provider, error);
       recordProviderFlowMetric("outbound_call_error", {
@@ -15949,6 +17648,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
     customer_name: customer_name || null,
     provider: selectedProvider || currentProvider,
     provider_metadata: providerMetadata,
+    outbound_idempotency_key: normalizedOutboundIdempotencyKey || null,
     business_context: functionSystem.context,
     function_count: functionSystem.functions.length,
     call_profile:
@@ -16107,6 +17807,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
       voice_model: voice_model || null,
       provider: selectedProvider || currentProvider,
       provider_metadata: providerMetadata,
+      outbound_idempotency_key: normalizedOutboundIdempotencyKey || null,
       from:
         (selectedProvider || currentProvider) === "twilio"
           ? config.twilio?.fromNumber
@@ -16145,6 +17846,10 @@ async function placeOutboundCall(payload, hostOverride = null) {
       call_mode: callConfig.call_mode || "normal",
       digit_capture_active: callConfig.digit_capture_active === true,
     });
+    setCallPhase(callId, "dialing", {
+      source: "placeOutboundCall",
+      reason: "outbound_created",
+    });
 
     if (user_chat_id) {
       await db.createEnhancedWebhookNotification(
@@ -16169,6 +17874,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
     callStatus,
     functionSystem,
     provider: selectedProvider || currentProvider,
+    idempotentReplay,
     warnings: callWarnings,
   };
 }
@@ -16434,6 +18140,13 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
       answered_by: AnsweredBy,
       duration: updateData.duration,
     });
+    const phase = resolveCallPhaseFromStatus(finalStatus);
+    if (phase) {
+      setCallPhase(CallSid, phase, {
+        source: "processCallStatusWebhookPayload",
+        reason: finalStatus,
+      });
+    }
     if (isTerminalStatusKey(finalStatus)) {
       scheduleCallLifecycleCleanup(CallSid);
     }
@@ -18849,6 +20562,8 @@ registerStatusRoutes(app, {
   supportedProviders: SUPPORTED_PROVIDERS,
   providerHealth,
   isProviderDegraded,
+  getProviderHealthScore,
+  getCallCanaryState,
   pruneExpiredKeypadProviderOverrides,
   keypadProviderOverrides,
   functionEngine,
@@ -19279,6 +20994,10 @@ async function gracefulShutdown(options = {}) {
     callToolInFlight.clear();
     providerEventDedupe.clear();
     callStatusDedupe.clear();
+    if (vonageMappingReconcileTimer) {
+      clearInterval(vonageMappingReconcileTimer);
+      vonageMappingReconcileTimer = null;
+    }
 
     if (db?.logServiceHealth) {
       await db.logServiceHealth("system", "shutdown_completed", {
