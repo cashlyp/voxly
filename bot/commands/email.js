@@ -3,10 +3,7 @@ const { InlineKeyboard } = require('grammy');
 const config = require('../config');
 const {
   getUser,
-  isAdmin,
-  saveScriptVersion,
-  listScriptVersions,
-  getScriptVersion
+  isAdmin
 } = require('../db/db');
 const {
   startOperation,
@@ -81,13 +78,32 @@ async function maybeSendEmailAliasTip(ctx) {
 
 function extractEmailTemplateVariables(text = '') {
   if (!text) return [];
-  const matches = text.match(/{{\\s*([\\w.-]+)\\s*}}/g) || [];
+  const matches = text.match(/{{\s*([\w.-]+)\s*}}/g) || [];
   const vars = new Set();
   matches.forEach((match) => {
     const cleaned = match.replace(/{{|}}/g, '').trim();
     if (cleaned) vars.add(cleaned);
   });
   return Array.from(vars);
+}
+
+function stableStringify(value) {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    const items = value.map((item) =>
+      item === undefined ? 'null' : stableStringify(item)
+    );
+    return `[${items.join(',')}]`;
+  }
+  const keys = Object.keys(value)
+    .filter((key) => value[key] !== undefined)
+    .sort();
+  const entries = keys.map(
+    (key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`
+  );
+  return `{${entries.join(',')}}`;
 }
 
 function buildRequiredVars(subject = '', html = '', text = '') {
@@ -216,6 +232,92 @@ async function deleteEmailTemplate(ctx, templateId) {
   await httpClient.del(ctx, `${config.apiUrl}/email/templates/${encodeURIComponent(templateId)}`, { timeout: 20000 });
 }
 
+async function submitEmailTemplateForReview(ctx, templateId) {
+  const response = await guardedPost(
+    ctx,
+    `${config.apiUrl}/email/templates/${encodeURIComponent(templateId)}/submit-review`,
+    {}
+  );
+  return response.data?.template;
+}
+
+async function reviewEmailTemplate(ctx, templateId, decision, note = null) {
+  const response = await guardedPost(
+    ctx,
+    `${config.apiUrl}/email/templates/${encodeURIComponent(templateId)}/review`,
+    { decision, note }
+  );
+  return response.data?.template;
+}
+
+async function promoteEmailTemplateLive(ctx, templateId) {
+  const response = await guardedPost(
+    ctx,
+    `${config.apiUrl}/email/templates/${encodeURIComponent(templateId)}/promote-live`,
+    {}
+  );
+  return response.data?.template;
+}
+
+async function listEmailTemplateApiVersions(ctx, templateId) {
+  const response = await guardedGet(
+    ctx,
+    `${config.apiUrl}/email/templates/${encodeURIComponent(templateId)}/versions`
+  );
+  return response.data?.versions || [];
+}
+
+async function diffEmailTemplateApiVersions(ctx, templateId, fromVersion, toVersion) {
+  const response = await guardedGet(
+    ctx,
+    `${config.apiUrl}/email/templates/${encodeURIComponent(templateId)}/diff`,
+    {
+      params: {
+        from_version: fromVersion,
+        to_version: toVersion
+      }
+    }
+  );
+  return response.data || {};
+}
+
+async function rollbackEmailTemplateApiVersion(ctx, templateId, version) {
+  const response = await guardedPost(
+    ctx,
+    `${config.apiUrl}/email/templates/${encodeURIComponent(templateId)}/rollback`,
+    { version }
+  );
+  return response.data?.template;
+}
+
+async function simulateEmailTemplateApi(ctx, templateId, variables = {}) {
+  const response = await guardedPost(
+    ctx,
+    `${config.apiUrl}/email/templates/${encodeURIComponent(templateId)}/simulate`,
+    { variables }
+  );
+  return response.data?.simulation || {};
+}
+
+function getEmailTemplateLifecycleState(template = {}) {
+  const raw = template?.lifecycle?.lifecycle_state || template?.lifecycle_state || 'draft';
+  return String(raw || 'draft').trim().toLowerCase();
+}
+
+function getEmailTemplateLifecycleBadge(template = {}) {
+  const state = getEmailTemplateLifecycleState(template);
+  switch (state) {
+    case 'review':
+      return 'In Review';
+    case 'approved':
+      return 'Approved';
+    case 'live':
+      return 'Live';
+    default:
+      return 'Draft';
+  }
+}
+
 async function downloadHtmlFromTelegram(ctx, fileId) {
   const file = await ctx.api.getFile(fileId);
   if (!file?.file_path) {
@@ -277,6 +379,20 @@ async function confirmAction(conversation, ctx, prompt, ensureActive) {
   return choice?.id === 'yes';
 }
 
+async function promptReviewNote(conversation, ctx, prompt, ensureActive) {
+  await safeReply(ctx, `${prompt}\nType "skip" for none or "cancel" to abort.`);
+  const update = await conversation.wait();
+  ensureActive();
+  const text = update?.message?.text?.trim();
+  if (!text || text.toLowerCase() === 'skip') {
+    return { cancelled: false, note: null };
+  }
+  if (text.toLowerCase() === 'cancel') {
+    return { cancelled: true, note: null };
+  }
+  return { cancelled: false, note: text };
+}
+
 function parseRequiredVars(value) {
   if (!value) return [];
   if (Array.isArray(value)) return value;
@@ -287,37 +403,21 @@ function parseRequiredVars(value) {
   }
 }
 
-function buildEmailTemplateSnapshot(template = {}) {
-  return {
-    template_id: template.template_id ?? null,
-    subject: template.subject ?? null,
-    html: template.html ?? null,
-    text: template.text ?? null,
-    required_vars: template.required_vars ?? null
-  };
-}
-
-async function storeEmailTemplateVersion(template, ctx) {
-  if (!template?.template_id) return;
-  try {
-    const payload = buildEmailTemplateSnapshot(template);
-    await saveScriptVersion(template.template_id, 'email', payload, ctx.from?.id?.toString?.());
-  } catch (error) {
-    console.warn('Failed to store email template version:', error?.message || error);
-  }
-}
-
 function formatEmailTemplateSummary(template) {
   const requiredVars = parseRequiredVars(template.required_vars);
   const varsLine = requiredVars.length ? requiredVars.join(', ') : '—';
   return section('📧 Email Template', [
     buildLine('🆔', 'ID', escapeMarkdown(template.template_id || '—')),
+    buildLine('🧾', 'Lifecycle', escapeMarkdown(getEmailTemplateLifecycleBadge(template))),
     buildLine('🧾', 'Subject', escapeMarkdown(template.subject || '—')),
+    template?.lifecycle?.review_note
+      ? buildLine('🗒️', 'Review Note', escapeMarkdown(String(template.lifecycle.review_note).slice(0, 180)))
+      : null,
     buildLine('🧩', 'Variables', escapeMarkdown(varsLine)),
     buildLine('📄', 'Has Text', template.text ? 'Yes' : 'No'),
     buildLine('🖼️', 'Has HTML', template.html ? 'Yes' : 'No'),
     buildLine('📅', 'Updated', formatTimestamp(template.updated_at || template.created_at))
-  ]);
+  ].filter(Boolean));
 }
 
 async function createEmailTemplateFlow(conversation, ctx, ensureActive) {
@@ -381,7 +481,6 @@ async function createEmailTemplateFlow(conversation, ctx, ensureActive) {
     html: htmlBody || undefined
   });
 
-  await storeEmailTemplateVersion(template, ctx);
   await safeReplyMarkdown(ctx, formatEmailTemplateSummary(template));
 }
 
@@ -440,7 +539,6 @@ async function editEmailTemplateFlow(conversation, ctx, template, ensureActive) 
   }
 
   const updated = await updateEmailTemplate(ctx, template.template_id, updates);
-  await storeEmailTemplateVersion(updated, ctx);
   await safeReplyMarkdown(ctx, formatEmailTemplateSummary(updated));
 }
 
@@ -458,7 +556,7 @@ async function selectEmailTemplateId(conversation, ctx, ensureActive) {
   }
   const options = templates.map((tpl) => ({
     id: tpl.template_id,
-    label: `📄 ${tpl.template_id}`
+    label: `📄 ${tpl.template_id} · ${getEmailTemplateLifecycleBadge(tpl)}`
   }));
   options.push({ id: 'manual', label: '✍️ Enter script_id manually' });
   const selection = await askOptionWithButtons(
@@ -489,7 +587,6 @@ async function deleteEmailTemplateFlow(conversation, ctx, template) {
     await safeReply(ctx, 'Deletion cancelled.');
     return;
   }
-  await storeEmailTemplateVersion(template, ctx);
   await deleteEmailTemplate(ctx, template.template_id);
   await safeReplyMarkdown(ctx, `🗑️ Template *${escapeMarkdown(template.template_id)}* deleted.`);
 }
@@ -513,60 +610,144 @@ async function previewEmailTemplate(conversation, ctx, template, ensureActive) {
 
 function formatEmailVersionSummary(version) {
   const createdAt = formatTimestamp(version.created_at);
-  return `#${version.version_number} • ${createdAt}${version.created_by ? ` • ${escapeMarkdown(version.created_by)}` : ''}`;
+  const reason = version.reason ? ` • ${escapeMarkdown(version.reason)}` : '';
+  return `v${version.version} • ${createdAt}${reason}${version.created_by ? ` • ${escapeMarkdown(version.created_by)}` : ''}`;
 }
 
 async function showEmailTemplateVersions(conversation, ctx, template, ensureActive) {
-  const versions = await listScriptVersions(template.template_id, 'email', 8);
+  const versions = await listEmailTemplateApiVersions(ctx, template.template_id);
   ensureActive();
   if (!versions.length) {
-    await safeReply(ctx, 'ℹ️ No saved versions yet. Versions are stored on edit/delete.');
+    await safeReply(ctx, 'ℹ️ No governance versions found yet.');
     return;
   }
+  const lines = versions.map((version) => `• ${formatEmailVersionSummary(version)}`);
+  await safeReplyMarkdown(ctx, `🗂️ *API Versions*\n${lines.join('\n')}`);
+}
+
+async function rollbackEmailTemplateVersionFlow(conversation, ctx, template, ensureActive) {
+  const versions = await listEmailTemplateApiVersions(ctx, template.template_id);
+  ensureActive();
+  if (!versions.length) {
+    await safeReply(ctx, 'ℹ️ No versions available for rollback.');
+    return template;
+  }
   const options = versions.map((version) => ({
-    id: String(version.version_number),
+    id: String(version.version),
     label: `🗂️ ${formatEmailVersionSummary(version)}`
   }));
   options.push({ id: 'back', label: '⬅️ Back' });
   const selection = await askOptionWithButtons(
     conversation,
     ctx,
-    '🗂️ *Email Template Versions*\nChoose a version to restore.',
+    '🗂️ *Email Template Versions*\nChoose a version to rollback to.',
     options,
     { prefix: 'email-template-version', columns: 1, ensureActive }
   );
   if (!selection || selection.id === 'back') {
-    return;
+    return template;
   }
   const versionNumber = Number(selection.id);
   if (Number.isNaN(versionNumber)) {
     await safeReply(ctx, '❌ Invalid version selected.');
-    return;
-  }
-  const version = await getScriptVersion(template.template_id, 'email', versionNumber);
-  ensureActive();
-  if (!version?.payload) {
-    await safeReply(ctx, '❌ Version payload not found.');
-    return;
+    return template;
   }
   const confirmRestore = await confirmAction(
     conversation,
     ctx,
-    `Restore version #${versionNumber} for *${escapeMarkdown(template.template_id)}*?`,
+    `Rollback to version #${versionNumber} for *${escapeMarkdown(template.template_id)}*?`,
     ensureActive
   );
   if (!confirmRestore) {
-    await safeReply(ctx, 'ℹ️ Restore cancelled.');
+    await safeReply(ctx, 'ℹ️ Rollback cancelled.');
+    return template;
+  }
+  const rolledBack = await rollbackEmailTemplateApiVersion(
+    ctx,
+    template.template_id,
+    versionNumber
+  );
+  await safeReplyMarkdown(
+    ctx,
+    `✅ Rolled back template *${escapeMarkdown(template.template_id)}* to version #${versionNumber}.`
+  );
+  return rolledBack || template;
+}
+
+async function showEmailTemplateVersionDiffFlow(conversation, ctx, template, ensureActive) {
+  const versions = await listEmailTemplateApiVersions(ctx, template.template_id);
+  ensureActive();
+  if (versions.length < 2) {
+    await safeReply(ctx, 'ℹ️ At least two versions are required to compare changes.');
     return;
   }
-  await storeEmailTemplateVersion(template, ctx);
-  const restored = await updateEmailTemplate(ctx, template.template_id, {
-    subject: version.payload.subject,
-    html: version.payload.html,
-    text: version.payload.text
-  });
-  await storeEmailTemplateVersion(restored, ctx);
-  await safeReplyMarkdown(ctx, `✅ Restored template to version #${versionNumber}.`);
+  const options = versions.slice(0, 12).map((version) => ({
+    id: String(version.version),
+    label: `v${version.version}`
+  }));
+  const fromSelection = await askOptionWithButtons(
+    conversation,
+    ctx,
+    'Select the *from* version.',
+    [...options, { id: 'back', label: '⬅️ Back' }],
+    { prefix: 'email-template-diff-from', columns: 2, ensureActive }
+  );
+  if (!fromSelection || fromSelection.id === 'back') return;
+  const toSelection = await askOptionWithButtons(
+    conversation,
+    ctx,
+    'Select the *to* version.',
+    [...options, { id: 'back', label: '⬅️ Back' }],
+    { prefix: 'email-template-diff-to', columns: 2, ensureActive }
+  );
+  if (!toSelection || toSelection.id === 'back') return;
+  const fromVersion = Number(fromSelection.id);
+  const toVersion = Number(toSelection.id);
+  if (!Number.isFinite(fromVersion) || !Number.isFinite(toVersion) || fromVersion === toVersion) {
+    await safeReply(ctx, '❌ Select two different versions to compare.');
+    return;
+  }
+  const diff = await diffEmailTemplateApiVersions(
+    ctx,
+    template.template_id,
+    fromVersion,
+    toVersion
+  );
+  const changes = Array.isArray(diff?.changes) ? diff.changes : [];
+  if (!changes.length) {
+    await safeReply(ctx, `ℹ️ No differences between v${fromVersion} and v${toVersion}.`);
+    return;
+  }
+  const lines = changes
+    .slice(0, 20)
+    .map((entry) => `• *${escapeMarkdown(entry.field)}*: \`${escapeMarkdown(stableStringify(entry.from))}\` → \`${escapeMarkdown(stableStringify(entry.to))}\``);
+  await safeReplyMarkdown(
+    ctx,
+    `🧮 *Template Diff* v${fromVersion} → v${toVersion}\n${lines.join('\n')}${changes.length > 20 ? '\n… (truncated)' : ''}`
+  );
+}
+
+async function simulateEmailTemplateFlow(conversation, ctx, template, ensureActive) {
+  const variables = await promptVariables(conversation, ctx, ensureActive);
+  const simulation = await simulateEmailTemplateApi(
+    ctx,
+    template.template_id,
+    variables
+  );
+  const missing = Array.isArray(simulation.missing_variables)
+    ? simulation.missing_variables
+    : [];
+  const renderedSubject = String(simulation.rendered_subject || '').slice(0, 180);
+  const renderedText = String(simulation.rendered_text || '').slice(0, 260);
+  await safeReplyMarkdown(
+    ctx,
+    section('🧪 Simulation', [
+      buildLine('🧾', 'Lifecycle', escapeMarkdown(getEmailTemplateLifecycleBadge(template))),
+      buildLine('⚠️', 'Missing Vars', escapeMarkdown(missing.length ? missing.join(', ') : 'none')),
+      buildLine('🧾', 'Subject', escapeMarkdown(renderedSubject || '—')),
+      buildLine('📄', 'Text', escapeMarkdown(renderedText || '—')),
+    ])
+  );
 }
 
 async function cloneEmailTemplateFlow(conversation, ctx, template, ensureActive) {
@@ -603,7 +784,6 @@ async function cloneEmailTemplateFlow(conversation, ctx, template, ensureActive)
     html: template.html || undefined,
     text: template.text || undefined
   });
-  await storeEmailTemplateVersion(cloned, ctx);
   await safeReplyMarkdown(ctx, `✅ Template cloned as *${escapeMarkdown(cloned.template_id)}*.`);
 }
 
@@ -667,7 +847,6 @@ async function importEmailTemplateFlow(conversation, ctx, ensureActive) {
     text: textBody || undefined,
     html: htmlBody || undefined
   });
-  await storeEmailTemplateVersion(created, ctx);
   await safeReplyMarkdown(ctx, formatEmailTemplateSummary(created));
 }
 
@@ -693,7 +872,7 @@ async function searchEmailTemplatesFlow(conversation, ctx, ensureActive) {
   }
   const options = matches.map((tpl) => ({
     id: tpl.template_id,
-    label: `📄 ${tpl.template_id}`
+    label: `📄 ${tpl.template_id} · ${getEmailTemplateLifecycleBadge(tpl)}`
   }));
   options.push({ id: 'back', label: '⬅️ Back' });
   const selection = await askOptionWithButtons(
@@ -716,19 +895,33 @@ async function showEmailTemplateDetail(conversation, ctx, template, ensureActive
   let viewing = true;
   while (viewing) {
     await safeReplyMarkdown(ctx, formatEmailTemplateSummary(template));
+    const lifecycleState = getEmailTemplateLifecycleState(template);
+    const actions = [
+      { id: 'preview', label: '🔍 Preview' },
+      { id: 'simulate', label: '🧪 Simulate' },
+      { id: 'edit', label: '✏️ Edit' },
+      { id: 'clone', label: '🧬 Clone' },
+      { id: 'export', label: '📤 Export' },
+      { id: 'versions', label: '🗂️ Versions' },
+      { id: 'diff', label: '🧮 Diff' },
+      { id: 'rollback', label: '↩️ Rollback' }
+    ];
+    if (lifecycleState === 'draft') {
+      actions.push({ id: 'submit_review', label: '📨 Submit Review' });
+    } else if (lifecycleState === 'review') {
+      actions.push({ id: 'approve', label: '✅ Approve' });
+      actions.push({ id: 'reject', label: '↩️ Reject' });
+    } else if (lifecycleState === 'approved') {
+      actions.push({ id: 'promote_live', label: '🚀 Promote Live' });
+    }
+    actions.push({ id: 'delete', label: '🗑️ Delete' });
+    actions.push({ id: 'back', label: '⬅️ Back' });
+
     const action = await askOptionWithButtons(
       conversation,
       ctx,
       'Choose an action.',
-      [
-        { id: 'preview', label: '🔍 Preview' },
-        { id: 'edit', label: '✏️ Edit' },
-        { id: 'clone', label: '🧬 Clone' },
-        { id: 'export', label: '📤 Export' },
-        { id: 'versions', label: '🗂️ Versions' },
-        { id: 'delete', label: '🗑️ Delete' },
-        { id: 'back', label: '⬅️ Back' }
-      ],
+      actions,
       { prefix: 'email-template-action', columns: 2, ensureActive }
     );
 
@@ -740,6 +933,9 @@ async function showEmailTemplateDetail(conversation, ctx, template, ensureActive
     switch (action.id) {
       case 'preview':
         await previewEmailTemplate(conversation, ctx, template, ensureActive);
+        break;
+      case 'simulate':
+        await simulateEmailTemplateFlow(conversation, ctx, template, ensureActive);
         break;
       case 'edit':
         await editEmailTemplateFlow(conversation, ctx, template, ensureActive);
@@ -755,6 +951,71 @@ async function showEmailTemplateDetail(conversation, ctx, template, ensureActive
         await showEmailTemplateVersions(conversation, ctx, template, ensureActive);
         template = await fetchEmailTemplate(ctx, template.template_id);
         break;
+      case 'diff':
+        await showEmailTemplateVersionDiffFlow(conversation, ctx, template, ensureActive);
+        break;
+      case 'rollback':
+        template = await rollbackEmailTemplateVersionFlow(conversation, ctx, template, ensureActive);
+        break;
+      case 'submit_review':
+        template = await submitEmailTemplateForReview(ctx, template.template_id);
+        await safeReply(ctx, '✅ Template submitted for review.');
+        break;
+      case 'approve': {
+        const approval = await promptReviewNote(
+          conversation,
+          ctx,
+          'Optional approval note.',
+          ensureActive
+        );
+        if (approval.cancelled) {
+          await safeReply(ctx, 'Approval cancelled.');
+          break;
+        }
+        template = await reviewEmailTemplate(
+          ctx,
+          template.template_id,
+          'approve',
+          approval.note
+        );
+        await safeReply(ctx, '✅ Template approved.');
+        break;
+      }
+      case 'reject': {
+        const rejection = await promptReviewNote(
+          conversation,
+          ctx,
+          'Optional rejection note.',
+          ensureActive
+        );
+        if (rejection.cancelled) {
+          await safeReply(ctx, 'Rejection cancelled.');
+          break;
+        }
+        template = await reviewEmailTemplate(
+          ctx,
+          template.template_id,
+          'reject',
+          rejection.note
+        );
+        await safeReply(ctx, '↩️ Template returned to draft.');
+        break;
+      }
+      case 'promote_live': {
+        const ok = await confirmAction(
+          conversation,
+          ctx,
+          `Promote *${escapeMarkdown(template.template_id)}* to live?`,
+          ensureActive
+        );
+        if (!ok) {
+          await safeReply(ctx, 'Promotion cancelled.');
+          break;
+        }
+        template = await promoteEmailTemplateLive(ctx, template.template_id);
+        await safeReply(ctx, '🚀 Template promoted to live.');
+        break;
+      }
       case 'delete':
         await deleteEmailTemplateFlow(conversation, ctx, template);
         viewing = false;

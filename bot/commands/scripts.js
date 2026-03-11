@@ -5,10 +5,7 @@ const httpClient = require('../utils/httpClient');
 const { withRetry } = require('../utils/httpClient');
 const {
   getUser,
-  isAdmin,
-  saveScriptVersion,
-  listScriptVersions,
-  getScriptVersion
+  isAdmin
 } = require('../db/db');
 const {
   getBusinessOptions,
@@ -169,6 +166,25 @@ function formatScriptsApiError(error, action) {
   }
 
   return `❌ ${action}: ${error.message}`;
+}
+
+function stableStringify(value) {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    const items = value.map((item) =>
+      item === undefined ? 'null' : stableStringify(item)
+    );
+    return `[${items.join(',')}]`;
+  }
+  const keys = Object.keys(value)
+    .filter((key) => value[key] !== undefined)
+    .sort();
+  const entries = keys.map(
+    (key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`
+  );
+  return `{${entries.join(',')}}`;
 }
 
 const CANCEL_KEYWORDS = new Set(['cancel', 'exit', 'quit']);
@@ -569,46 +585,6 @@ function replacePlaceholders(text = '', values = {}) {
     output = output.replace(pattern, value);
   }
   return output;
-}
-
-function buildCallScriptSnapshot(script = {}) {
-  return {
-    name: script.name,
-    description: script.description ?? null,
-    business_id: script.business_id ?? null,
-    persona_config: script.persona_config ?? null,
-    prompt: script.prompt ?? null,
-    first_message: script.first_message ?? null,
-    voice_model: script.voice_model ?? null,
-    flow_type: script.flow_type ?? getCallScriptPrimaryFlowType(script),
-    objective_tags: Array.isArray(script.objective_tags) ? script.objective_tags : null,
-    supports_payment: script.supports_payment ?? null,
-    supports_digit_capture: script.supports_digit_capture ?? null,
-    requires_otp: !!script.requires_otp,
-    default_profile: script.default_profile ?? null,
-    expected_length: script.expected_length ?? null,
-    allow_terminator: !!script.allow_terminator,
-    terminator_char: script.terminator_char ?? null,
-    capture_group: script.capture_group ?? null
-  };
-}
-
-function buildSmsScriptSnapshot(script = {}) {
-  return {
-    name: script.name,
-    description: script.description ?? null,
-    content: script.content ?? null,
-    metadata: script.metadata ?? null
-  };
-}
-
-async function storeScriptVersionSnapshot(script, type, ctx) {
-  try {
-    const payload = type === 'sms' ? buildSmsScriptSnapshot(script) : buildCallScriptSnapshot(script);
-    await saveScriptVersion(type === 'sms' ? script.name : script.id, type, payload, ctx.from?.id?.toString?.());
-  } catch (error) {
-    console.warn('Failed to store script version:', error?.message || error);
-  }
 }
 
 function stripUndefined(payload = {}) {
@@ -1228,11 +1204,99 @@ async function cloneCallScript(id, payload) {
   return data.script;
 }
 
+async function submitCallScriptForReview(id) {
+  const data = await scriptsApiRequest({
+    method: 'post',
+    url: `/api/call-scripts/${id}/submit-review`,
+    data: {},
+  });
+  return data.script;
+}
+
+async function reviewCallScript(id, decision, note = null) {
+  const data = await scriptsApiRequest({
+    method: 'post',
+    url: `/api/call-scripts/${id}/review`,
+    data: { decision, note },
+  });
+  return data.script;
+}
+
+async function promoteCallScriptLive(id) {
+  const data = await scriptsApiRequest({
+    method: 'post',
+    url: `/api/call-scripts/${id}/promote-live`,
+    data: {},
+  });
+  return data.script;
+}
+
+async function listCallScriptApiVersions(id) {
+  const data = await scriptsApiRequest({
+    method: 'get',
+    url: `/api/call-scripts/${id}/versions`,
+  });
+  return data.versions || [];
+}
+
+async function diffCallScriptApiVersions(id, fromVersion, toVersion) {
+  const data = await scriptsApiRequest({
+    method: 'get',
+    url: `/api/call-scripts/${id}/diff`,
+    params: {
+      from_version: fromVersion,
+      to_version: toVersion,
+    },
+  });
+  return data;
+}
+
+async function rollbackCallScriptApiVersion(id, version) {
+  const data = await scriptsApiRequest({
+    method: 'post',
+    url: `/api/call-scripts/${id}/rollback`,
+    data: { version },
+  });
+  return data.script;
+}
+
+async function simulateCallScriptApi(id, variables = {}) {
+  const data = await scriptsApiRequest({
+    method: 'post',
+    url: `/api/call-scripts/${id}/simulate`,
+    data: { variables },
+  });
+  return data.simulation || {};
+}
+
+function getCallScriptLifecycleState(script = {}) {
+  const raw = script?.lifecycle?.lifecycle_state || script?.lifecycle_state || 'draft';
+  return String(raw || 'draft').trim().toLowerCase();
+}
+
+function getCallScriptLifecycleBadge(script = {}) {
+  const state = getCallScriptLifecycleState(script);
+  switch (state) {
+    case 'review':
+      return '🟠 In Review';
+    case 'approved':
+      return '✅ Approved';
+    case 'live':
+      return '🟢 Live';
+    default:
+      return '📝 Draft';
+  }
+}
+
 function formatCallScriptSummary(script) {
   const summary = [];
   const flowTypes = getCallScriptFlowTypes(script);
   const objectiveTags = getEffectiveObjectiveTags(script);
   summary.push(`📛 *${escapeMarkdown(script.name)}*`);
+  summary.push(`🧾 Lifecycle: ${escapeMarkdown(getCallScriptLifecycleBadge(script))}`);
+  if (script?.lifecycle?.review_note) {
+    summary.push(`🗒️ Review note: ${escapeMarkdown(String(script.lifecycle.review_note).slice(0, 180))}`);
+  }
   summary.push(`🧭 Flow type: ${escapeMarkdown(getCallScriptFlowLabel(flowTypes[0] || 'general'))}`);
   if (flowTypes.length > 1) {
     summary.push(`🗂️ Flow coverage: ${flowTypes.slice(1).map((flow) => escapeMarkdown(getCallScriptFlowLabel(flow))).join(', ')}`);
@@ -1535,7 +1599,6 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
         console.warn('Capture settings update failed:', updateError.message);
       }
     }
-    await storeScriptVersionSnapshot({ ...script, ...scriptPayload }, 'call', ctx);
     await ctx.reply(`✅ Script *${escapeMarkdown(script.name)}* created successfully!`, { parse_mode: 'Markdown' });
   } catch (error) {
     console.error('Failed to create script:', error);
@@ -1673,7 +1736,6 @@ async function editCallScriptFlow(conversation, ctx, script, ensureActive) {
   }
 
   try {
-    await storeScriptVersionSnapshot(script, 'call', ctx);
     const apiUpdates = stripUndefined({ ...updates });
     delete apiUpdates.capture_group;
     if (!apiUpdates.flow_type) {
@@ -1752,7 +1814,6 @@ async function deleteCallScriptFlow(conversation, ctx, script, ensureActive) {
   }
 
   try {
-    await storeScriptVersionSnapshot(script, 'call', ctx);
     await deleteCallScript(script.id);
     await ctx.reply(`🗑️ Script *${escapeMarkdown(script.name)}* deleted.`, { parse_mode: 'Markdown' });
   } catch (error) {
@@ -1766,53 +1827,170 @@ async function showCallScriptVersions(conversation, ctx, script, ensureActive) {
     ? ensureActive
     : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
   try {
-    const versions = await listScriptVersions(script.id, 'call', 8);
+    const versions = await listCallScriptApiVersions(script.id);
     safeEnsureActive();
     if (!versions.length) {
-      await ctx.reply('ℹ️ No saved versions yet. Versions are stored on edit/delete.');
+      await ctx.reply('ℹ️ No governance versions found yet.');
       return;
     }
-    const lines = versions.map((v) => `v${v.version_number} • ${new Date(v.created_at).toLocaleString()}`);
-    await ctx.reply(`🗂️ Saved versions\n${lines.join('\n')}`);
+    const lines = versions.map((v) => {
+      const reason = v.reason ? ` • ${v.reason}` : '';
+      return `v${v.version} • ${new Date(v.created_at).toLocaleString()}${reason}`;
+    });
+    await ctx.reply(`🗂️ API versions\n${lines.join('\n')}`);
+  } catch (error) {
+    console.error('Version list failed:', error);
+    await ctx.reply(formatScriptsApiError(error, 'Failed to list versions'));
+  }
+}
 
-    const options = versions.map((v) => ({
-      id: String(v.version_number),
-      label: `↩️ Restore v${v.version_number}`
+async function rollbackCallScriptVersionFlow(conversation, ctx, script, ensureActive) {
+  const safeEnsureActive = typeof ensureActive === 'function'
+    ? ensureActive
+    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  try {
+    const versions = await listCallScriptApiVersions(script.id);
+    safeEnsureActive();
+    if (!versions.length) {
+      await ctx.reply('ℹ️ No versions available for rollback.');
+      return script;
+    }
+    const options = versions.slice(0, 12).map((v) => ({
+      id: String(v.version),
+      label: `↩️ Rollback to v${v.version}`
     }));
     options.push({ id: 'back', label: '⬅️ Back' });
-
     const selection = await askOptionWithButtons(
       conversation,
       ctx,
-      'Select a version to restore.',
+      'Select a version to rollback to.',
       options,
-      { prefix: 'call-script-version', columns: 2, ensureActive: safeEnsureActive }
+      { prefix: 'call-script-rollback', columns: 2, ensureActive: safeEnsureActive }
     );
-    if (!selection || selection.id === 'back') return;
+    if (!selection || selection.id === 'back') return script;
     const versionNumber = Number(selection.id);
     if (Number.isNaN(versionNumber)) {
       await ctx.reply('❌ Invalid version selected.');
-      return;
+      return script;
     }
-    const version = await getScriptVersion(script.id, 'call', versionNumber);
-    safeEnsureActive();
-    if (!version || !version.payload) {
-      await ctx.reply('❌ Version payload not found.');
-      return;
+    const ok = await confirm(
+      conversation,
+      ctx,
+      `Rollback *${escapeMarkdown(script.name)}* to v${versionNumber}?`,
+      safeEnsureActive
+    );
+    if (!ok) {
+      await ctx.reply('Rollback cancelled.');
+      return script;
     }
-    const confirmRestore = await confirm(conversation, ctx, `Restore version v${versionNumber}?`, safeEnsureActive);
-    if (!confirmRestore) {
-      await ctx.reply('Restore cancelled.');
-      return;
-    }
-    await storeScriptVersionSnapshot(script, 'call', ctx);
-    const payload = stripUndefined({ ...version.payload });
-    delete payload.capture_group;
-    const updated = await updateCallScript(script.id, payload);
-    await ctx.reply(`✅ Script restored to v${versionNumber} (${escapeMarkdown(updated.name)}).`, { parse_mode: 'Markdown' });
+    const updated = await rollbackCallScriptApiVersion(script.id, versionNumber);
+    await ctx.reply(
+      `✅ Rolled back to v${versionNumber} (${escapeMarkdown(updated.name)}).`,
+      { parse_mode: 'Markdown' }
+    );
+    return updated || script;
   } catch (error) {
-    console.error('Version restore failed:', error);
-    await ctx.reply(`❌ Failed to restore version: ${error.message}`);
+    console.error('Rollback flow failed:', error);
+    await ctx.reply(formatScriptsApiError(error, 'Failed to rollback version'));
+    return script;
+  }
+}
+
+async function showCallScriptVersionDiffFlow(conversation, ctx, script, ensureActive) {
+  const safeEnsureActive = typeof ensureActive === 'function'
+    ? ensureActive
+    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  try {
+    const versions = await listCallScriptApiVersions(script.id);
+    safeEnsureActive();
+    if (versions.length < 2) {
+      await ctx.reply('ℹ️ At least two versions are required to compare changes.');
+      return;
+    }
+    const options = versions.slice(0, 12).map((v) => ({
+      id: String(v.version),
+      label: `v${v.version}`
+    }));
+    const fromSelection = await askOptionWithButtons(
+      conversation,
+      ctx,
+      'Select the *from* version.',
+      [...options, { id: 'back', label: '⬅️ Back' }],
+      { prefix: 'call-script-diff-from', columns: 3, ensureActive: safeEnsureActive }
+    );
+    if (!fromSelection || fromSelection.id === 'back') return;
+    const toSelection = await askOptionWithButtons(
+      conversation,
+      ctx,
+      'Select the *to* version.',
+      [...options, { id: 'back', label: '⬅️ Back' }],
+      { prefix: 'call-script-diff-to', columns: 3, ensureActive: safeEnsureActive }
+    );
+    if (!toSelection || toSelection.id === 'back') return;
+
+    const fromVersion = Number(fromSelection.id);
+    const toVersion = Number(toSelection.id);
+    if (!Number.isFinite(fromVersion) || !Number.isFinite(toVersion) || fromVersion === toVersion) {
+      await ctx.reply('❌ Select two different versions to compare.');
+      return;
+    }
+
+    const diff = await diffCallScriptApiVersions(script.id, fromVersion, toVersion);
+    const changes = Array.isArray(diff?.changes) ? diff.changes : [];
+    if (!changes.length) {
+      await ctx.reply(`ℹ️ No differences between v${fromVersion} and v${toVersion}.`);
+      return;
+    }
+    const lines = changes
+      .slice(0, 20)
+      .map((entry) => `• *${escapeMarkdown(entry.field)}*: \`${escapeMarkdown(stableStringify(entry.from))}\` → \`${escapeMarkdown(stableStringify(entry.to))}\``);
+    await ctx.reply(
+      `🧮 Version diff v${fromVersion} → v${toVersion}\n${lines.join('\n')}${changes.length > 20 ? '\n… (truncated)' : ''}`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (error) {
+    console.error('Diff flow failed:', error);
+    await ctx.reply(formatScriptsApiError(error, 'Failed to diff versions'));
+  }
+}
+
+async function simulateCallScriptFlow(conversation, ctx, script, ensureActive) {
+  const safeEnsureActive = typeof ensureActive === 'function'
+    ? ensureActive
+    : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
+  try {
+    const placeholders = Array.from(new Set([
+      ...extractScriptVariables(script.prompt || ''),
+      ...extractScriptVariables(script.first_message || '')
+    ]));
+    let values = {};
+    if (placeholders.length > 0) {
+      await ctx.reply('🧪 Simulation mode: provide placeholder values (or type skip).');
+      const collected = await collectPlaceholderValues(conversation, ctx, placeholders, safeEnsureActive);
+      safeEnsureActive();
+      if (collected === null) {
+        await ctx.reply('❌ Simulation cancelled.');
+        return;
+      }
+      values = collected;
+    }
+    const simulation = await simulateCallScriptApi(script.id, values);
+    const missing = Array.isArray(simulation.missing_variables)
+      ? simulation.missing_variables
+      : [];
+    const renderedPrompt = String(simulation.rendered_prompt || '').slice(0, 300);
+    const renderedFirstMessage = String(simulation.rendered_first_message || '').slice(0, 300);
+    await ctx.reply(
+      `🧪 Simulation result\n` +
+      `Lifecycle: ${escapeMarkdown(getCallScriptLifecycleBadge(script))}\n` +
+      `Missing variables: ${escapeMarkdown(missing.length ? missing.join(', ') : 'none')}\n` +
+      `\n📜 Prompt:\n${escapeMarkdown(renderedPrompt)}${String(simulation.rendered_prompt || '').length > 300 ? '…' : ''}\n` +
+      `\n🗨️ First message:\n${escapeMarkdown(renderedFirstMessage)}${String(simulation.rendered_first_message || '').length > 300 ? '…' : ''}`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (error) {
+    console.error('Simulation flow failed:', error);
+    await ctx.reply(formatScriptsApiError(error, 'Failed to simulate script'));
   }
 }
 
@@ -1825,26 +2003,34 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
   while (viewing) {
     const summary = formatCallScriptSummary(script);
     summaryMessage = await upsertMenuMessage(ctx, summaryMessage, summary, { parse_mode: 'Markdown' });
+    const lifecycleState = getCallScriptLifecycleState(script);
+    const actions = [
+      { id: 'preview', label: '📞 Preview' },
+      { id: 'simulate', label: '🧪 Simulate' },
+      { id: 'edit', label: '✏️ Edit' },
+      { id: 'clone', label: '🧬 Clone' },
+      { id: 'versions', label: '🗂️ Versions' },
+      { id: 'diff', label: '🧮 Diff' },
+      { id: 'rollback', label: '↩️ Rollback' }
+    ];
+    if (lifecycleState === 'draft') {
+      actions.push({ id: 'submit_review', label: '📨 Submit Review' });
+    } else if (lifecycleState === 'review') {
+      actions.push({ id: 'approve', label: '✅ Approve' });
+      actions.push({ id: 'reject', label: '↩️ Reject' });
+    } else if (lifecycleState === 'approved') {
+      actions.push({ id: 'promote_live', label: '🚀 Promote Live' });
+    }
+    actions.push({ id: 'delete', label: '🗑️ Delete' });
+    actions.push({ id: 'back', label: '⬅️ Back' });
 
     const action = await askOptionWithButtons(
       conversation,
       ctx,
       'Choose an action for this script.',
-      [
-        { id: 'preview', label: '📞 Preview' },
-        { id: 'edit', label: '✏️ Edit' },
-        { id: 'clone', label: '🧬 Clone' },
-        { id: 'versions', label: '🗂️ Versions' },
-        { id: 'delete', label: '🗑️ Delete' },
-        { id: 'back', label: '⬅️ Back' }
-      ],
+      actions,
       { prefix: 'call-script-action', columns: 2, ensureActive: safeEnsureActive }
     );
-
-    if (summaryMessage) {
-      await dismissMenuMessage(ctx, summaryMessage);
-      summaryMessage = null;
-    }
 
     if (!action?.id) {
       await ctx.reply(selectionExpiredMessage(), { parse_mode: 'Markdown' });
@@ -1854,6 +2040,9 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
     switch (action.id) {
       case 'preview':
         await previewCallScript(conversation, ctx, script, safeEnsureActive);
+        break;
+      case 'simulate':
+        await simulateCallScriptFlow(conversation, ctx, script, safeEnsureActive);
         break;
       case 'edit':
         await editCallScriptFlow(conversation, ctx, script, safeEnsureActive);
@@ -1871,6 +2060,85 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
       case 'versions':
         await showCallScriptVersions(conversation, ctx, script, safeEnsureActive);
         break;
+      case 'diff':
+        await showCallScriptVersionDiffFlow(conversation, ctx, script, safeEnsureActive);
+        break;
+      case 'rollback':
+        script = await rollbackCallScriptVersionFlow(conversation, ctx, script, safeEnsureActive);
+        break;
+      case 'submit_review':
+        try {
+          script = await submitCallScriptForReview(script.id);
+          await ctx.reply('✅ Script submitted for review.');
+        } catch (error) {
+          await ctx.reply(formatScriptsApiError(error, 'Failed to submit review'));
+        }
+        break;
+      case 'approve': {
+        const note = await promptText(
+          conversation,
+          ctx,
+          'Optional approval note (type skip to leave blank).',
+          { allowEmpty: true, allowSkip: true, parse: (value) => value.trim(), ensureActive: safeEnsureActive }
+        );
+        if (note === null) {
+          await ctx.reply('Approval cancelled.');
+          break;
+        }
+        try {
+          script = await reviewCallScript(
+            script.id,
+            'approve',
+            note === undefined ? null : note
+          );
+          await ctx.reply('✅ Script approved.');
+        } catch (error) {
+          await ctx.reply(formatScriptsApiError(error, 'Failed to approve script'));
+        }
+        break;
+      }
+      case 'reject': {
+        const note = await promptText(
+          conversation,
+          ctx,
+          'Optional rejection note (type skip to use default).',
+          { allowEmpty: true, allowSkip: true, parse: (value) => value.trim(), ensureActive: safeEnsureActive }
+        );
+        if (note === null) {
+          await ctx.reply('Rejection cancelled.');
+          break;
+        }
+        try {
+          script = await reviewCallScript(
+            script.id,
+            'reject',
+            note === undefined ? null : note
+          );
+          await ctx.reply('↩️ Script returned to draft.');
+        } catch (error) {
+          await ctx.reply(formatScriptsApiError(error, 'Failed to reject script'));
+        }
+        break;
+      }
+      case 'promote_live': {
+        const ok = await confirm(
+          conversation,
+          ctx,
+          `Promote *${escapeMarkdown(script.name)}* to live?`,
+          safeEnsureActive
+        );
+        if (!ok) {
+          await ctx.reply('Promotion cancelled.');
+          break;
+        }
+        try {
+          script = await promoteCallScriptLive(script.id);
+          await ctx.reply('🚀 Script promoted to live.');
+        } catch (error) {
+          await ctx.reply(formatScriptsApiError(error, 'Failed to promote script'));
+        }
+        break;
+      }
       case 'delete':
         await deleteCallScriptFlow(conversation, ctx, script, safeEnsureActive);
         viewing = false;
@@ -2038,13 +2306,21 @@ async function inboundDefaultScriptMenu(conversation, ctx, ensureActive) {
           await ctx.reply('ℹ️ No call scripts available. Create one first.');
           break;
         }
+        const eligibleScripts = scripts.filter((script) => {
+          const state = getCallScriptLifecycleState(script);
+          return state === 'approved' || state === 'live';
+        });
+        if (!eligibleScripts.length) {
+          await ctx.reply('ℹ️ No approved/live scripts are available. Approve a script first.');
+          break;
+        }
 
         const selection = await askScriptSelectionWithPagination(
           conversation,
           ctx,
           {
             prompt: 'Select a script to use as the inbound default.',
-            items: scripts,
+            items: eligibleScripts,
             prefix: 'inbound-default-select',
             pageSize: 8,
             ensureActive: safeEnsureActive,
@@ -2052,7 +2328,7 @@ async function inboundDefaultScriptMenu(conversation, ctx, ensureActive) {
             getItemId: (script) => String(script.id),
             getItemLabel: (script) => {
               const flowType = getCallScriptPrimaryFlowType(script);
-              return `${getCallScriptFlowBadge(script)} ${script.name} · ${getCallScriptFlowLabel(flowType)}`;
+              return `${getCallScriptFlowBadge(script)} ${script.name} · ${getCallScriptFlowLabel(flowType)} · ${getCallScriptLifecycleBadge(script)}`;
             }
           }
         );
@@ -2219,6 +2495,94 @@ async function requestSmsScriptPreview(name, payload) {
   return data.preview;
 }
 
+async function submitSmsScriptForReview(name) {
+  const data = await scriptsApiRequest({
+    method: 'post',
+    url: `/api/sms/scripts/${encodeURIComponent(name)}/submit-review`,
+    data: {},
+  });
+  return data.script;
+}
+
+async function reviewSmsScript(name, decision, note = null) {
+  const data = await scriptsApiRequest({
+    method: 'post',
+    url: `/api/sms/scripts/${encodeURIComponent(name)}/review`,
+    data: { decision, note },
+  });
+  return data.script;
+}
+
+async function promoteSmsScriptLive(name) {
+  const data = await scriptsApiRequest({
+    method: 'post',
+    url: `/api/sms/scripts/${encodeURIComponent(name)}/promote-live`,
+    data: {},
+  });
+  return data.script;
+}
+
+async function listSmsScriptApiVersions(name) {
+  const data = await scriptsApiRequest({
+    method: 'get',
+    url: `/api/sms/scripts/${encodeURIComponent(name)}/versions`,
+  });
+  return data.versions || [];
+}
+
+async function diffSmsScriptApiVersions(name, fromVersion, toVersion) {
+  const data = await scriptsApiRequest({
+    method: 'get',
+    url: `/api/sms/scripts/${encodeURIComponent(name)}/diff`,
+    params: {
+      from_version: fromVersion,
+      to_version: toVersion,
+    },
+  });
+  return data;
+}
+
+async function rollbackSmsScriptApiVersion(name, version) {
+  const data = await scriptsApiRequest({
+    method: 'post',
+    url: `/api/sms/scripts/${encodeURIComponent(name)}/rollback`,
+    data: { version },
+  });
+  return data.script;
+}
+
+async function simulateSmsScriptApi(name, variables = {}) {
+  const data = await scriptsApiRequest({
+    method: 'post',
+    url: `/api/sms/scripts/${encodeURIComponent(name)}/simulate`,
+    data: { variables },
+  });
+  return data.simulation || {};
+}
+
+function getSmsScriptLifecycleState(script = {}) {
+  if (script?.is_builtin) return 'builtin';
+  const raw = script?.lifecycle?.lifecycle_state || script?.lifecycle_state || 'draft';
+  return String(raw || 'draft').trim().toLowerCase();
+}
+
+function getSmsScriptLifecycleBadge(script = {}) {
+  if (script?.is_builtin) {
+    return 'Built-in';
+  }
+  const state = getSmsScriptLifecycleState(script);
+  switch (state) {
+    case 'review':
+      return 'In Review';
+    case 'approved':
+      return 'Approved';
+    case 'live':
+      return 'Live';
+    default:
+      return 'Draft';
+  }
+}
+
 function formatSmsScriptSummary(script) {
   const summary = [];
   summary.push(`${script.is_builtin ? '📦' : '📛'} *${escapeMarkdown(script.name)}*`);
@@ -2226,6 +2590,12 @@ function formatSmsScriptSummary(script) {
     summary.push(`📝 ${escapeMarkdown(script.description)}`);
   }
   summary.push(script.is_builtin ? '🏷️ Type: Built-in (read-only)' : '🏷️ Type: Custom script');
+  if (!script.is_builtin) {
+    summary.push(`🧾 Lifecycle: ${escapeMarkdown(getSmsScriptLifecycleBadge(script))}`);
+    if (script?.lifecycle?.review_note) {
+      summary.push(`🗒️ Review note: ${escapeMarkdown(String(script.lifecycle.review_note).slice(0, 180))}`);
+    }
+  }
 
   const personaSummary = buildPersonaSummaryFromOverrides(script.metadata?.persona);
   if (personaSummary.length) {
@@ -2316,7 +2686,6 @@ async function createSmsScriptFlow(conversation, ctx) {
 
   try {
     const script = await createSmsScript(payload);
-    await storeScriptVersionSnapshot(script, 'sms', ctx);
     await ctx.reply(`✅ SMS script *${escapeMarkdown(script.name)}* created.`, { parse_mode: 'Markdown' });
   } catch (error) {
     console.error('Failed to create SMS script:', error);
@@ -2392,7 +2761,6 @@ async function editSmsScriptFlow(conversation, ctx, script) {
   }
 
   try {
-    await storeScriptVersionSnapshot(script, 'sms', ctx);
     const updated = await updateSmsScript(script.name, stripUndefined(updates));
     await ctx.reply(`✅ SMS script *${escapeMarkdown(updated.name)}* updated.`, { parse_mode: 'Markdown' });
   } catch (error) {
@@ -2463,7 +2831,6 @@ async function deleteSmsScriptFlow(conversation, ctx, script) {
   }
 
   try {
-    await storeScriptVersionSnapshot(script, 'sms', ctx);
     await deleteSmsScript(script.name);
     await ctx.reply(`🗑️ Script *${escapeMarkdown(script.name)}* deleted.`, { parse_mode: 'Markdown' });
   } catch (error) {
@@ -2474,52 +2841,149 @@ async function deleteSmsScriptFlow(conversation, ctx, script) {
 
 async function showSmsScriptVersions(conversation, ctx, script) {
   try {
-    const versions = await listScriptVersions(script.name, 'sms', 8);
+    const versions = await listSmsScriptApiVersions(script.name);
     if (!versions.length) {
-      await ctx.reply('ℹ️ No saved versions yet. Versions are stored on edit/delete.');
+      await ctx.reply('ℹ️ No governance versions found yet.');
       return;
     }
-    const lines = versions.map((v) => `v${v.version_number} • ${new Date(v.created_at).toLocaleString()}`);
-    await ctx.reply(`🗂️ Saved versions\n${lines.join('\n')}`);
+    const lines = versions.map((v) => {
+      const reason = v.reason ? ` • ${v.reason}` : '';
+      return `v${v.version} • ${new Date(v.created_at).toLocaleString()}${reason}`;
+    });
+    await ctx.reply(`🗂️ API versions\n${lines.join('\n')}`);
+  } catch (error) {
+    console.error('SMS version list failed:', error);
+    await ctx.reply(formatScriptsApiError(error, 'Failed to list versions'));
+  }
+}
 
-    const options = versions.map((v) => ({
-      id: String(v.version_number),
-      label: `↩️ Restore v${v.version_number}`
+async function rollbackSmsScriptVersionFlow(conversation, ctx, script) {
+  try {
+    const versions = await listSmsScriptApiVersions(script.name);
+    if (!versions.length) {
+      await ctx.reply('ℹ️ No versions available for rollback.');
+      return script;
+    }
+    const options = versions.slice(0, 12).map((v) => ({
+      id: String(v.version),
+      label: `↩️ Rollback to v${v.version}`
     }));
     options.push({ id: 'back', label: '⬅️ Back' });
-
     const selection = await askOptionWithButtons(
       conversation,
       ctx,
-      'Select a version to restore.',
+      'Select a version to rollback to.',
       options,
-      { prefix: 'sms-script-version', columns: 2 }
+      { prefix: 'sms-script-rollback', columns: 2 }
     );
-    if (!selection || selection.id === 'back') return;
+    if (!selection || selection.id === 'back') return script;
     const versionNumber = Number(selection.id);
     if (Number.isNaN(versionNumber)) {
       await ctx.reply('❌ Invalid version selected.');
-      return;
+      return script;
     }
-    const version = await getScriptVersion(script.name, 'sms', versionNumber);
-    if (!version || !version.payload) {
-      await ctx.reply('❌ Version payload not found.');
-      return;
+    const ok = await confirm(
+      conversation,
+      ctx,
+      `Rollback *${escapeMarkdown(script.name)}* to v${versionNumber}?`
+    );
+    if (!ok) {
+      await ctx.reply('Rollback cancelled.');
+      return script;
     }
-    const confirmRestore = await confirm(conversation, ctx, `Restore version v${versionNumber}?`);
-    if (!confirmRestore) {
-      await ctx.reply('Restore cancelled.');
-      return;
-    }
-    await storeScriptVersionSnapshot(script, 'sms', ctx);
-    const updated = await updateSmsScript(script.name, stripUndefined(version.payload));
-    await ctx.reply(`✅ SMS script restored to v${versionNumber}.`, { parse_mode: 'Markdown' });
-    try {
-      script = await fetchSmsScriptByName(script.name, { detailed: true });
-    } catch (_) {}
+    const updated = await rollbackSmsScriptApiVersion(script.name, versionNumber);
+    await ctx.reply(
+      `✅ Rolled back to v${versionNumber} (${escapeMarkdown(updated.name)}).`,
+      { parse_mode: 'Markdown' }
+    );
+    return updated || script;
   } catch (error) {
-    console.error('SMS version restore failed:', error);
-    await ctx.reply(`❌ Failed to restore version: ${error.message}`);
+    console.error('SMS rollback flow failed:', error);
+    await ctx.reply(formatScriptsApiError(error, 'Failed to rollback version'));
+    return script;
+  }
+}
+
+async function showSmsScriptVersionDiffFlow(conversation, ctx, script) {
+  try {
+    const versions = await listSmsScriptApiVersions(script.name);
+    if (versions.length < 2) {
+      await ctx.reply('ℹ️ At least two versions are required to compare changes.');
+      return;
+    }
+    const options = versions.slice(0, 12).map((v) => ({
+      id: String(v.version),
+      label: `v${v.version}`
+    }));
+    const fromSelection = await askOptionWithButtons(
+      conversation,
+      ctx,
+      'Select the *from* version.',
+      [...options, { id: 'back', label: '⬅️ Back' }],
+      { prefix: 'sms-script-diff-from', columns: 3 }
+    );
+    if (!fromSelection || fromSelection.id === 'back') return;
+    const toSelection = await askOptionWithButtons(
+      conversation,
+      ctx,
+      'Select the *to* version.',
+      [...options, { id: 'back', label: '⬅️ Back' }],
+      { prefix: 'sms-script-diff-to', columns: 3 }
+    );
+    if (!toSelection || toSelection.id === 'back') return;
+    const fromVersion = Number(fromSelection.id);
+    const toVersion = Number(toSelection.id);
+    if (!Number.isFinite(fromVersion) || !Number.isFinite(toVersion) || fromVersion === toVersion) {
+      await ctx.reply('❌ Select two different versions to compare.');
+      return;
+    }
+    const diff = await diffSmsScriptApiVersions(script.name, fromVersion, toVersion);
+    const changes = Array.isArray(diff?.changes) ? diff.changes : [];
+    if (!changes.length) {
+      await ctx.reply(`ℹ️ No differences between v${fromVersion} and v${toVersion}.`);
+      return;
+    }
+    const lines = changes
+      .slice(0, 20)
+      .map((entry) => `• *${escapeMarkdown(entry.field)}*: \`${escapeMarkdown(stableStringify(entry.from))}\` → \`${escapeMarkdown(stableStringify(entry.to))}\``);
+    await ctx.reply(
+      `🧮 Version diff v${fromVersion} → v${toVersion}\n${lines.join('\n')}${changes.length > 20 ? '\n… (truncated)' : ''}`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (error) {
+    console.error('SMS diff flow failed:', error);
+    await ctx.reply(formatScriptsApiError(error, 'Failed to diff versions'));
+  }
+}
+
+async function simulateSmsScriptFlow(conversation, ctx, script) {
+  try {
+    const placeholders = extractScriptVariables(script.content || '');
+    let values = {};
+    if (placeholders.length > 0) {
+      await ctx.reply('🧪 Simulation mode: provide placeholder values (or type skip).');
+      const collected = await collectPlaceholderValues(conversation, ctx, placeholders);
+      if (collected === null) {
+        await ctx.reply('❌ Simulation cancelled.');
+        return;
+      }
+      values = collected;
+    }
+    const simulation = await simulateSmsScriptApi(script.name, values);
+    const missing = Array.isArray(simulation.missing_variables)
+      ? simulation.missing_variables
+      : [];
+    const renderedContent = String(simulation.rendered_content || '').slice(0, 450);
+    await ctx.reply(
+      `🧪 Simulation result\n` +
+      `Lifecycle: ${escapeMarkdown(getSmsScriptLifecycleBadge(script))}\n` +
+      `Missing variables: ${escapeMarkdown(missing.length ? missing.join(', ') : 'none')}\n` +
+      `\n💬 Content:\n${escapeMarkdown(renderedContent)}${String(simulation.rendered_content || '').length > 450 ? '…' : ''}`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (error) {
+    console.error('SMS simulation flow failed:', error);
+    await ctx.reply(formatScriptsApiError(error, 'Failed to simulate script'));
   }
 }
 
@@ -2588,12 +3052,24 @@ async function showSmsScriptDetail(conversation, ctx, script) {
 
     const actions = [
       { id: 'preview', label: '📲 Preview' },
+      { id: 'simulate', label: '🧪 Simulate' },
       { id: 'clone', label: '🧬 Clone' }
     ];
 
     if (!script.is_builtin) {
-      actions.splice(1, 0, { id: 'edit', label: '✏️ Edit' });
-      actions.splice(2, 0, { id: 'versions', label: '🗂️ Versions' });
+      const lifecycleState = getSmsScriptLifecycleState(script);
+      actions.splice(2, 0, { id: 'edit', label: '✏️ Edit' });
+      actions.splice(3, 0, { id: 'versions', label: '🗂️ Versions' });
+      actions.splice(4, 0, { id: 'diff', label: '🧮 Diff' });
+      actions.splice(5, 0, { id: 'rollback', label: '↩️ Rollback' });
+      if (lifecycleState === 'draft') {
+        actions.push({ id: 'submit_review', label: '📨 Submit Review' });
+      } else if (lifecycleState === 'review') {
+        actions.push({ id: 'approve', label: '✅ Approve' });
+        actions.push({ id: 'reject', label: '↩️ Reject' });
+      } else if (lifecycleState === 'approved') {
+        actions.push({ id: 'promote_live', label: '🚀 Promote Live' });
+      }
       actions.push({ id: 'delete', label: '🗑️ Delete' });
     }
 
@@ -2607,11 +3083,6 @@ async function showSmsScriptDetail(conversation, ctx, script) {
       { prefix: 'sms-script-action', columns: 2 }
     );
 
-    if (summaryMessage) {
-      await dismissMenuMessage(ctx, summaryMessage);
-      summaryMessage = null;
-    }
-
     if (!action?.id) {
       await ctx.reply(selectionExpiredMessage(), { parse_mode: 'Markdown' });
       continue;
@@ -2620,6 +3091,9 @@ async function showSmsScriptDetail(conversation, ctx, script) {
     switch (action.id) {
       case 'preview':
         await previewSmsScript(conversation, ctx, script);
+        break;
+      case 'simulate':
+        await simulateSmsScriptFlow(conversation, ctx, script);
         break;
       case 'edit':
         await editSmsScriptFlow(conversation, ctx, script);
@@ -2637,6 +3111,84 @@ async function showSmsScriptDetail(conversation, ctx, script) {
       case 'versions':
         await showSmsScriptVersions(conversation, ctx, script);
         break;
+      case 'diff':
+        await showSmsScriptVersionDiffFlow(conversation, ctx, script);
+        break;
+      case 'rollback':
+        script = await rollbackSmsScriptVersionFlow(conversation, ctx, script);
+        break;
+      case 'submit_review':
+        try {
+          script = await submitSmsScriptForReview(script.name);
+          await ctx.reply('✅ SMS script submitted for review.');
+        } catch (error) {
+          await ctx.reply(formatScriptsApiError(error, 'Failed to submit review'));
+        }
+        break;
+      case 'approve': {
+        const note = await promptText(
+          conversation,
+          ctx,
+          'Optional approval note (type skip to leave blank).',
+          { allowEmpty: true, allowSkip: true, parse: (value) => value.trim() }
+        );
+        if (note === null) {
+          await ctx.reply('Approval cancelled.');
+          break;
+        }
+        try {
+          script = await reviewSmsScript(
+            script.name,
+            'approve',
+            note === undefined ? null : note
+          );
+          await ctx.reply('✅ SMS script approved.');
+        } catch (error) {
+          await ctx.reply(formatScriptsApiError(error, 'Failed to approve script'));
+        }
+        break;
+      }
+      case 'reject': {
+        const note = await promptText(
+          conversation,
+          ctx,
+          'Optional rejection note (type skip to use default).',
+          { allowEmpty: true, allowSkip: true, parse: (value) => value.trim() }
+        );
+        if (note === null) {
+          await ctx.reply('Rejection cancelled.');
+          break;
+        }
+        try {
+          script = await reviewSmsScript(
+            script.name,
+            'reject',
+            note === undefined ? null : note
+          );
+          await ctx.reply('↩️ SMS script returned to draft.');
+        } catch (error) {
+          await ctx.reply(formatScriptsApiError(error, 'Failed to reject script'));
+        }
+        break;
+      }
+      case 'promote_live': {
+        const ok = await confirm(
+          conversation,
+          ctx,
+          `Promote *${escapeMarkdown(script.name)}* to live?`
+        );
+        if (!ok) {
+          await ctx.reply('Promotion cancelled.');
+          break;
+        }
+        try {
+          script = await promoteSmsScriptLive(script.name);
+          await ctx.reply('🚀 SMS script promoted to live.');
+        } catch (error) {
+          await ctx.reply(formatScriptsApiError(error, 'Failed to promote script'));
+        }
+        break;
+      }
       case 'delete':
         await deleteSmsScriptFlow(conversation, ctx, script);
         viewing = false;
@@ -2682,8 +3234,12 @@ async function listSmsScriptsFlow(conversation, ctx) {
         pageSize: 8,
         searchLabel: 'script name',
         getItemId: (script) => script.name,
-        getItemLabel: (script) =>
-          `${script.is_builtin ? '📦' : '📝'} ${script.name}${script.description ? ` · ${script.description}` : ''}`
+        getItemLabel: (script) => {
+          const lifecycleLabel = script.is_builtin
+            ? 'Built-in'
+            : getSmsScriptLifecycleBadge(script);
+          return `${script.is_builtin ? '📦' : '📝'} ${script.name}${script.description ? ` · ${script.description}` : ''} · ${lifecycleLabel}`;
+        }
       }
     );
 

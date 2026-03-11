@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO_ID="$(basename "$ROOT_DIR")"
+FINGERPRINT_PATH="$HOME/.codex/conventions/$REPO_ID.md"
 
 QUERY=""
 USE_GIT=0
@@ -206,6 +208,11 @@ for skill in "${final[@]}"; do
 done
 
 echo "guardrails:"
+if [[ -f "$FINGERPRINT_PATH" ]]; then
+  echo "  - Load convention fingerprint first: $FINGERPRINT_PATH"
+else
+  echo "  - Generate convention fingerprint first: $ROOT_DIR/docs/agent/build-convention-fingerprint.sh --output $FINGERPRINT_PATH"
+fi
 if [[ ${#providers[@]} -gt 0 ]]; then
   echo "  - Run provider detection script before edits."
   echo "  - Load provider-docs-index.md before provider-specific references."
