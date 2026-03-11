@@ -1679,6 +1679,13 @@ function normalizeScriptTemplateRecord(template = null) {
   })();
   normalized.flow_types = flowTypes;
   normalized.flow_type = flowTypes[0] || "general";
+  const lifecycle = String(normalized.lifecycle_state || "draft")
+    .trim()
+    .toLowerCase();
+  normalized.lifecycle_state = ["draft", "review", "approved", "live"].includes(lifecycle)
+    ? lifecycle
+    : "draft";
+  normalized.is_live = normalized.lifecycle_state === "live";
   return normalized;
 }
 
@@ -15982,6 +15989,160 @@ async function suggestCallTemplateName(baseName, excludeId = null) {
   return `${fallbackBase.slice(0, 75)} ${Date.now().toString().slice(-4)}`;
 }
 
+const CALL_SCRIPT_GOVERNANCE_STATES = Object.freeze([
+  "draft",
+  "review",
+  "approved",
+  "live",
+]);
+
+function normalizeCallScriptLifecycleState(value, fallback = "draft") {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (CALL_SCRIPT_GOVERNANCE_STATES.includes(normalized)) {
+    return normalized;
+  }
+  return fallback;
+}
+
+function buildCallTemplateVersionSnapshot(script = {}) {
+  return {
+    name: script.name || null,
+    description: script.description || null,
+    prompt: script.prompt || null,
+    first_message: script.first_message || null,
+    business_id: script.business_id || null,
+    voice_model: script.voice_model || null,
+    objective_tags: Array.isArray(script.objective_tags)
+      ? script.objective_tags
+      : [],
+    supports_payment:
+      script.supports_payment === true
+        ? true
+        : script.supports_payment === false
+          ? false
+          : null,
+    supports_digit_capture:
+      script.supports_digit_capture === true
+        ? true
+        : script.supports_digit_capture === false
+          ? false
+          : null,
+    requires_otp: normalizeBooleanFlag(script.requires_otp, false),
+    default_profile: script.default_profile || null,
+    expected_length:
+      script.expected_length === undefined || script.expected_length === null
+        ? null
+        : Number(script.expected_length),
+    allow_terminator: normalizeBooleanFlag(script.allow_terminator, false),
+    terminator_char: script.terminator_char || null,
+    payment_enabled: normalizeBooleanFlag(script.payment_enabled, false),
+    payment_connector: script.payment_connector || null,
+    payment_amount:
+      script.payment_amount === undefined || script.payment_amount === null
+        ? null
+        : Number(script.payment_amount),
+    payment_currency: script.payment_currency || null,
+    payment_description: script.payment_description || null,
+    payment_policy: script.payment_policy || null,
+    payment_start_message: script.payment_start_message || null,
+    payment_success_message: script.payment_success_message || null,
+    payment_failure_message: script.payment_failure_message || null,
+    payment_retry_message: script.payment_retry_message || null,
+    lifecycle_state: normalizeCallScriptLifecycleState(
+      script.lifecycle_state,
+      "draft",
+    ),
+  };
+}
+
+async function persistCallTemplateVersionSnapshot(
+  script,
+  { reason = "update", actor = null } = {},
+) {
+  if (!script || !Number.isFinite(Number(script.id))) return;
+  const safeVersion = Number.isFinite(Number(script.version))
+    ? Math.max(1, Math.floor(Number(script.version)))
+    : 1;
+  const snapshot = buildCallTemplateVersionSnapshot(script);
+  await db.saveCallTemplateVersion(script.id, safeVersion, snapshot, {
+    reason,
+    created_by: actor,
+  });
+}
+
+function parseCallTemplateVersionSnapshot(row = null) {
+  if (!row || typeof row !== "object") return null;
+  let snapshot = null;
+  try {
+    snapshot =
+      typeof row.snapshot === "string" ? JSON.parse(row.snapshot) : row.snapshot;
+  } catch (_) {
+    snapshot = null;
+  }
+  if (!snapshot || typeof snapshot !== "object") return null;
+  return snapshot;
+}
+
+function buildCallTemplateSnapshotDiff(fromSnapshot = {}, toSnapshot = {}) {
+  const keys = Array.from(
+    new Set([
+      ...Object.keys(fromSnapshot || {}),
+      ...Object.keys(toSnapshot || {}),
+    ]),
+  ).sort();
+  const changes = [];
+  for (const key of keys) {
+    const fromValue = fromSnapshot?.[key];
+    const toValue = toSnapshot?.[key];
+    if (stableStringify(fromValue) === stableStringify(toValue)) {
+      continue;
+    }
+    changes.push({
+      field: key,
+      from: fromValue === undefined ? null : fromValue,
+      to: toValue === undefined ? null : toValue,
+    });
+  }
+  return changes;
+}
+
+function extractCallTemplateVariables(text = "") {
+  const matches = String(text || "").match(/\{(\w+)\}/g) || [];
+  return Array.from(
+    new Set(
+      matches
+        .map((token) => token.replace(/[{}]/g, "").trim())
+        .filter(Boolean),
+    ),
+  );
+}
+
+function renderCallTemplateWithVariables(text = "", variables = {}) {
+  return String(text || "").replace(/\{(\w+)\}/g, (_, key) => {
+    if (Object.prototype.hasOwnProperty.call(variables, key)) {
+      const value = variables[key];
+      if (value === null || value === undefined) return "";
+      return String(value);
+    }
+    return `{${key}}`;
+  });
+}
+
+function buildCallScriptLifecycleCard(script = null) {
+  if (!script) return null;
+  return {
+    lifecycle_state: normalizeCallScriptLifecycleState(script.lifecycle_state),
+    submitted_for_review_at: script.submitted_for_review_at || null,
+    reviewed_at: script.reviewed_at || null,
+    reviewed_by: script.reviewed_by || null,
+    review_note: script.review_note || null,
+    live_at: script.live_at || null,
+    live_by: script.live_by || null,
+  };
+}
+
 // Call script endpoints for bot script management
 app.get("/api/call-scripts", requireAdminToken, async (req, res) => {
   try {
@@ -16007,6 +16168,10 @@ app.get("/api/call-scripts", requireAdminToken, async (req, res) => {
           : flowFilter.values.includes(script?.flow_type),
       );
     }
+    scripts = scripts.map((script) => ({
+      ...script,
+      lifecycle: buildCallScriptLifecycleCard(script),
+    }));
     res.json({ success: true, scripts });
   } catch (error) {
     res
@@ -16031,7 +16196,14 @@ app.get("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
         .status(404)
         .json({ success: false, error: "Script not found" });
     }
-    res.json({ success: true, script: normalizeScriptTemplateRecord(script) });
+    const normalized = normalizeScriptTemplateRecord(script);
+    res.json({
+      success: true,
+      script: {
+        ...normalized,
+        lifecycle: buildCallScriptLifecycleCard(normalized),
+      },
+    });
   } catch (error) {
     res
       .status(500)
@@ -16127,13 +16299,27 @@ app.post("/api/call-scripts", requireAdminToken, async (req, res) => {
       ...paymentSettings.normalized,
       ...objectiveMetadata.normalized,
       payment_policy: normalizedPaymentPolicy,
+      lifecycle_state: "draft",
+      submitted_for_review_at: null,
+      reviewed_at: null,
+      reviewed_by: null,
+      review_note: null,
+      live_at: null,
+      live_by: null,
     });
     const script = normalizeScriptTemplateRecord(
       await db.getCallTemplateById(id),
     );
+    await persistCallTemplateVersionSnapshot(script, {
+      reason: "create",
+      actor: req.headers?.["x-admin-user"] || null,
+    });
     const responseBody = {
       success: true,
-      script,
+      script: {
+        ...script,
+        lifecycle: buildCallScriptLifecycleCard(script),
+      },
       warnings: [
         ...paymentSettings.warnings,
         ...paymentPolicyWarnings,
@@ -16284,6 +16470,21 @@ app.put("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
         .status(404)
         .json({ success: false, error: "Script not found" });
     }
+    const previousLifecycle = normalizeCallScriptLifecycleState(
+      existing.lifecycle_state,
+      "draft",
+    );
+    if (["review", "approved", "live"].includes(previousLifecycle)) {
+      await db.setCallTemplateLifecycle(scriptId, {
+        lifecycle_state: "draft",
+        submitted_for_review_at: null,
+        reviewed_at: null,
+        reviewed_by: null,
+        review_note: null,
+        live_at: null,
+        live_by: null,
+      });
+    }
     const script = normalizeScriptTemplateRecord(
       await db.getCallTemplateById(scriptId),
     );
@@ -16291,7 +16492,18 @@ app.put("/api/call-scripts/:id", requireAdminToken, async (req, res) => {
       inboundDefaultScript = script || null;
       inboundDefaultLoadedAt = Date.now();
     }
-    const responseBody = { success: true, script, warnings: paymentWarnings };
+    await persistCallTemplateVersionSnapshot(script, {
+      reason: "update",
+      actor: req.headers?.["x-admin-user"] || null,
+    });
+    const responseBody = {
+      success: true,
+      script: {
+        ...script,
+        lifecycle: buildCallScriptLifecycleCard(script),
+      },
+      warnings: paymentWarnings,
+    };
     completeCallScriptMutationIdempotency(idempotency, 200, responseBody);
     res.json(responseBody);
   } catch (error) {
@@ -16454,9 +16666,16 @@ app.post("/api/call-scripts/:id/clone", requireAdminToken, async (req, res) => {
     const script = normalizeScriptTemplateRecord(
       await db.getCallTemplateById(newId),
     );
+    await persistCallTemplateVersionSnapshot(script, {
+      reason: "clone",
+      actor: req.headers?.["x-admin-user"] || null,
+    });
     const responseBody = {
       success: true,
-      script,
+      script: {
+        ...script,
+        lifecycle: buildCallScriptLifecycleCard(script),
+      },
       warnings: paymentSettings.warnings,
     };
     completeCallScriptMutationIdempotency(idempotency, 201, responseBody);
@@ -16466,6 +16685,404 @@ app.post("/api/call-scripts/:id/clone", requireAdminToken, async (req, res) => {
     res
       .status(500)
       .json({ success: false, error: "Failed to clone call script" });
+  }
+});
+
+app.get("/api/call-scripts/:id/versions", requireAdminToken, async (req, res) => {
+  try {
+    const scriptId = Number(req.params.id);
+    if (!Number.isFinite(scriptId)) {
+      return res.status(400).json({ success: false, error: "Invalid script id" });
+    }
+    const script = normalizeScriptTemplateRecord(
+      await db.getCallTemplateById(scriptId),
+    );
+    if (!script) {
+      return res.status(404).json({ success: false, error: "Script not found" });
+    }
+    const existingCurrent = await db.getCallTemplateVersion(scriptId, script.version);
+    if (!existingCurrent) {
+      await persistCallTemplateVersionSnapshot(script, {
+        reason: "sync_current",
+        actor: req.headers?.["x-admin-user"] || null,
+      });
+    }
+    const versions = (await db.listCallTemplateVersions(scriptId, 50)).map((row) => ({
+      version: Number(row.version),
+      reason: row.reason || null,
+      created_by: row.created_by || null,
+      created_at: row.created_at || null,
+    }));
+    return res.json({
+      success: true,
+      script_id: scriptId,
+      current_version: Number(script.version) || 1,
+      versions,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: "Failed to list script versions",
+    });
+  }
+});
+
+app.get("/api/call-scripts/:id/diff", requireAdminToken, async (req, res) => {
+  try {
+    const scriptId = Number(req.params.id);
+    const fromVersion = Number(req.query?.from_version);
+    const toVersion = Number(req.query?.to_version);
+    if (!Number.isFinite(scriptId)) {
+      return res.status(400).json({ success: false, error: "Invalid script id" });
+    }
+    if (!Number.isFinite(fromVersion) || !Number.isFinite(toVersion)) {
+      return res.status(400).json({
+        success: false,
+        error: "from_version and to_version are required numeric values",
+      });
+    }
+    const fromRow = await db.getCallTemplateVersion(scriptId, fromVersion);
+    const toRow = await db.getCallTemplateVersion(scriptId, toVersion);
+    if (!fromRow || !toRow) {
+      return res.status(404).json({
+        success: false,
+        error: "One or both requested versions were not found",
+      });
+    }
+    const fromSnapshot = parseCallTemplateVersionSnapshot(fromRow);
+    const toSnapshot = parseCallTemplateVersionSnapshot(toRow);
+    if (!fromSnapshot || !toSnapshot) {
+      return res.status(400).json({
+        success: false,
+        error: "Version snapshot payload is invalid",
+      });
+    }
+    const changes = buildCallTemplateSnapshotDiff(fromSnapshot, toSnapshot);
+    return res.json({
+      success: true,
+      script_id: scriptId,
+      from_version: fromVersion,
+      to_version: toVersion,
+      changes,
+      changed_fields: changes.map((entry) => entry.field),
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: "Failed to diff script versions",
+    });
+  }
+});
+
+app.post("/api/call-scripts/:id/rollback", requireAdminToken, async (req, res) => {
+  const scriptIdForIdem = Number(req.params.id);
+  const idempotency = beginCallScriptMutationIdempotency(
+    req,
+    "rollback",
+    Number.isFinite(scriptIdForIdem) ? scriptIdForIdem : req.params.id,
+    req.body || {},
+  );
+  const prior = applyIdempotencyResponse(res, idempotency);
+  if (prior) return prior;
+  try {
+    const scriptId = Number(req.params.id);
+    const version = Number(req.body?.version);
+    if (!Number.isFinite(scriptId)) {
+      failCallScriptMutationIdempotency(idempotency);
+      return res.status(400).json({ success: false, error: "Invalid script id" });
+    }
+    if (!Number.isFinite(version) || version < 1) {
+      failCallScriptMutationIdempotency(idempotency);
+      return res.status(400).json({
+        success: false,
+        error: "version is required and must be a positive number",
+      });
+    }
+    const existing = normalizeScriptTemplateRecord(
+      await db.getCallTemplateById(scriptId),
+    );
+    if (!existing) {
+      failCallScriptMutationIdempotency(idempotency);
+      return res.status(404).json({ success: false, error: "Script not found" });
+    }
+    const versionRow = await db.getCallTemplateVersion(scriptId, version);
+    if (!versionRow) {
+      failCallScriptMutationIdempotency(idempotency);
+      return res.status(404).json({ success: false, error: "Version not found" });
+    }
+    const snapshot = parseCallTemplateVersionSnapshot(versionRow);
+    if (!snapshot) {
+      failCallScriptMutationIdempotency(idempotency);
+      return res.status(400).json({
+        success: false,
+        error: "Stored snapshot is invalid",
+      });
+    }
+    const rollbackPayload = { ...snapshot };
+    delete rollbackPayload.lifecycle_state;
+    const updatedRows = await db.updateCallTemplate(scriptId, rollbackPayload);
+    if (!updatedRows) {
+      failCallScriptMutationIdempotency(idempotency);
+      return res.status(404).json({ success: false, error: "Script not found" });
+    }
+    const previousLifecycle = normalizeCallScriptLifecycleState(
+      existing.lifecycle_state,
+      "draft",
+    );
+    if (["review", "approved", "live"].includes(previousLifecycle)) {
+      await db.setCallTemplateLifecycle(scriptId, {
+        lifecycle_state: "draft",
+        submitted_for_review_at: null,
+        reviewed_at: null,
+        reviewed_by: null,
+        review_note: null,
+        live_at: null,
+        live_by: null,
+      });
+    }
+    const script = normalizeScriptTemplateRecord(
+      await db.getCallTemplateById(scriptId),
+    );
+    await persistCallTemplateVersionSnapshot(script, {
+      reason: `rollback_to_v${version}`,
+      actor: req.headers?.["x-admin-user"] || null,
+    });
+    const responseBody = {
+      success: true,
+      rolled_back_to_version: version,
+      script: { ...script, lifecycle: buildCallScriptLifecycleCard(script) },
+    };
+    completeCallScriptMutationIdempotency(idempotency, 200, responseBody);
+    return res.json(responseBody);
+  } catch (error) {
+    failCallScriptMutationIdempotency(idempotency);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to rollback script version",
+    });
+  }
+});
+
+app.post("/api/call-scripts/:id/submit-review", requireAdminToken, async (req, res) => {
+  try {
+    const scriptId = Number(req.params.id);
+    if (!Number.isFinite(scriptId)) {
+      return res.status(400).json({ success: false, error: "Invalid script id" });
+    }
+    const script = normalizeScriptTemplateRecord(
+      await db.getCallTemplateById(scriptId),
+    );
+    if (!script) {
+      return res.status(404).json({ success: false, error: "Script not found" });
+    }
+    if (!script.prompt || !script.first_message) {
+      return res.status(400).json({
+        success: false,
+        error: "Script must include prompt and first_message before review",
+      });
+    }
+    const lifecycleState = normalizeCallScriptLifecycleState(
+      script.lifecycle_state,
+      "draft",
+    );
+    if (lifecycleState === "review") {
+      return res.json({
+        success: true,
+        script: { ...script, lifecycle: buildCallScriptLifecycleCard(script) },
+      });
+    }
+    if (lifecycleState !== "draft") {
+      return res.status(400).json({
+        success: false,
+        error: `Only draft scripts can be submitted for review (current state: ${lifecycleState})`,
+      });
+    }
+    await db.setCallTemplateLifecycle(scriptId, {
+      lifecycle_state: "review",
+      submitted_for_review_at: new Date().toISOString(),
+      reviewed_at: null,
+      reviewed_by: null,
+      review_note: null,
+    });
+    const updated = normalizeScriptTemplateRecord(
+      await db.getCallTemplateById(scriptId),
+    );
+    return res.json({
+      success: true,
+      script: { ...updated, lifecycle: buildCallScriptLifecycleCard(updated) },
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: "Failed to submit script for review",
+    });
+  }
+});
+
+app.post("/api/call-scripts/:id/review", requireAdminToken, async (req, res) => {
+  try {
+    const scriptId = Number(req.params.id);
+    const decision = String(req.body?.decision || "").trim().toLowerCase();
+    const note = req.body?.note ?? null;
+    if (!Number.isFinite(scriptId)) {
+      return res.status(400).json({ success: false, error: "Invalid script id" });
+    }
+    if (!["approve", "reject"].includes(decision)) {
+      return res.status(400).json({
+        success: false,
+        error: "decision must be approve or reject",
+      });
+    }
+    const script = normalizeScriptTemplateRecord(
+      await db.getCallTemplateById(scriptId),
+    );
+    if (!script) {
+      return res.status(404).json({ success: false, error: "Script not found" });
+    }
+    const lifecycleState = normalizeCallScriptLifecycleState(
+      script.lifecycle_state,
+      "draft",
+    );
+    if (lifecycleState !== "review") {
+      return res.status(400).json({
+        success: false,
+        error: `Script must be in review before ${decision} (current state: ${lifecycleState})`,
+      });
+    }
+    const actor = req.headers?.["x-admin-user"] || null;
+    if (decision === "approve") {
+      await db.setCallTemplateLifecycle(scriptId, {
+        lifecycle_state: "approved",
+        reviewed_at: new Date().toISOString(),
+        reviewed_by: actor,
+        review_note: note,
+      });
+    } else {
+      await db.setCallTemplateLifecycle(scriptId, {
+        lifecycle_state: "draft",
+        reviewed_at: new Date().toISOString(),
+        reviewed_by: actor,
+        review_note:
+          note === null || note === undefined || String(note).trim() === ""
+            ? "Returned to draft during review."
+            : note,
+      });
+    }
+    const updated = normalizeScriptTemplateRecord(
+      await db.getCallTemplateById(scriptId),
+    );
+    return res.json({
+      success: true,
+      decision,
+      script: { ...updated, lifecycle: buildCallScriptLifecycleCard(updated) },
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: "Failed to review script",
+    });
+  }
+});
+
+app.post("/api/call-scripts/:id/promote-live", requireAdminToken, async (req, res) => {
+  try {
+    const scriptId = Number(req.params.id);
+    if (!Number.isFinite(scriptId)) {
+      return res.status(400).json({ success: false, error: "Invalid script id" });
+    }
+    const script = normalizeScriptTemplateRecord(
+      await db.getCallTemplateById(scriptId),
+    );
+    if (!script) {
+      return res.status(404).json({ success: false, error: "Script not found" });
+    }
+    const lifecycleState = normalizeCallScriptLifecycleState(
+      script.lifecycle_state,
+      "draft",
+    );
+    if (lifecycleState === "live") {
+      return res.json({
+        success: true,
+        script: { ...script, lifecycle: buildCallScriptLifecycleCard(script) },
+      });
+    }
+    if (lifecycleState !== "approved") {
+      return res.status(400).json({
+        success: false,
+        error: "Script must be approved before it can be promoted to live",
+      });
+    }
+    const actor = req.headers?.["x-admin-user"] || null;
+    await db.promoteCallTemplateLive(scriptId, actor);
+    const updated = normalizeScriptTemplateRecord(
+      await db.getCallTemplateById(scriptId),
+    );
+    return res.json({
+      success: true,
+      script: { ...updated, lifecycle: buildCallScriptLifecycleCard(updated) },
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: "Failed to promote script to live",
+    });
+  }
+});
+
+app.post("/api/call-scripts/:id/simulate", requireAdminToken, async (req, res) => {
+  try {
+    const scriptId = Number(req.params.id);
+    if (!Number.isFinite(scriptId)) {
+      return res.status(400).json({ success: false, error: "Invalid script id" });
+    }
+    const script = normalizeScriptTemplateRecord(
+      await db.getCallTemplateById(scriptId),
+    );
+    if (!script) {
+      return res.status(404).json({ success: false, error: "Script not found" });
+    }
+    const rawVariables = isPlainObject(req.body?.variables)
+      ? req.body.variables
+      : {};
+    const variables = {};
+    Object.entries(rawVariables).forEach(([key, value]) => {
+      const normalizedKey = String(key || "").trim();
+      if (!normalizedKey) return;
+      variables[normalizedKey] =
+        value === null || value === undefined ? "" : String(value);
+    });
+
+    const mergedText = `${script.prompt || ""}\n${script.first_message || ""}`;
+    const requiredVariables = extractCallTemplateVariables(mergedText);
+    const missingVariables = requiredVariables.filter(
+      (key) => !Object.prototype.hasOwnProperty.call(variables, key),
+    );
+    const renderedPrompt = renderCallTemplateWithVariables(
+      script.prompt || "",
+      variables,
+    );
+    const renderedFirstMessage = renderCallTemplateWithVariables(
+      script.first_message || "",
+      variables,
+    );
+    return res.json({
+      success: true,
+      simulation: {
+        script_id: script.id,
+        script_name: script.name,
+        lifecycle_state: script.lifecycle_state,
+        required_variables: requiredVariables,
+        missing_variables: missingVariables,
+        variables,
+        rendered_prompt: renderedPrompt,
+        rendered_first_message: renderedFirstMessage,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: "Failed to simulate call script",
+    });
   }
 });
 
@@ -16479,7 +17096,10 @@ app.get("/api/inbound/default-script", requireAdminToken, async (req, res) => {
       success: true,
       mode: "script",
       script_id: inboundDefaultScriptId,
-      script: inboundDefaultScript,
+      script: {
+        ...inboundDefaultScript,
+        lifecycle: buildCallScriptLifecycleCard(inboundDefaultScript),
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -16511,6 +17131,12 @@ app.put("/api/inbound/default-script", requireAdminToken, async (req, res) => {
         error: "Script must include prompt and first_message",
       });
     }
+    if (!["approved", "live"].includes(script.lifecycle_state)) {
+      return res.status(400).json({
+        success: false,
+        error: "Script must be approved or live before it can be set as inbound default",
+      });
+    }
     await db.setSetting(INBOUND_DEFAULT_SETTING_KEY, String(scriptId));
     inboundDefaultScriptId = scriptId;
     inboundDefaultScript = script;
@@ -16524,7 +17150,7 @@ app.put("/api/inbound/default-script", requireAdminToken, async (req, res) => {
       success: true,
       mode: "script",
       script_id: scriptId,
-      script,
+      script: { ...script, lifecycle: buildCallScriptLifecycleCard(script) },
     });
   } catch (error) {
     res
@@ -18521,10 +19147,158 @@ function buildRequiredVars(subject, html, text) {
   return Array.from(required);
 }
 
+const EMAIL_TEMPLATE_GOVERNANCE_STATES = Object.freeze([
+  "draft",
+  "review",
+  "approved",
+  "live",
+]);
+
+function normalizeEmailTemplateLifecycleState(value, fallback = "draft") {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (EMAIL_TEMPLATE_GOVERNANCE_STATES.includes(normalized)) {
+    return normalized;
+  }
+  return fallback;
+}
+
+function parseEmailTemplateRequiredVars(value) {
+  if (Array.isArray(value)) return value;
+  if (!value) return [];
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [];
+    }
+  }
+  return [];
+}
+
+function buildEmailTemplateLifecycleCard(template = null) {
+  if (!template) return null;
+  return {
+    lifecycle_state: normalizeEmailTemplateLifecycleState(
+      template.lifecycle_state,
+      "draft",
+    ),
+    submitted_for_review_at: template.submitted_for_review_at || null,
+    reviewed_at: template.reviewed_at || null,
+    reviewed_by: template.reviewed_by || null,
+    review_note: template.review_note || null,
+    live_at: template.live_at || null,
+    live_by: template.live_by || null,
+  };
+}
+
+function normalizeEmailTemplateRecord(template = null) {
+  if (!template || typeof template !== "object") return template;
+  const normalized = { ...template };
+  const lifecycle = normalizeEmailTemplateLifecycleState(
+    normalized.lifecycle_state,
+    "draft",
+  );
+  normalized.lifecycle_state = lifecycle;
+  normalized.is_live = lifecycle === "live";
+  if (!Array.isArray(normalized.required_vars)) {
+    normalized.required_vars = parseEmailTemplateRequiredVars(
+      normalized.required_vars,
+    );
+  }
+  return normalized;
+}
+
+function buildEmailTemplateVersionSnapshot(template = {}) {
+  return {
+    subject: template.subject || "",
+    html: template.html || "",
+    text: template.text || "",
+    required_vars: Array.isArray(template.required_vars)
+      ? template.required_vars
+      : parseEmailTemplateRequiredVars(template.required_vars),
+    lifecycle_state: normalizeEmailTemplateLifecycleState(
+      template.lifecycle_state,
+      "draft",
+    ),
+  };
+}
+
+async function persistEmailTemplateVersionSnapshot(
+  template,
+  { reason = "update", actor = null } = {},
+) {
+  if (!template || !template.template_id) return;
+  const safeVersion = Number.isFinite(Number(template.version))
+    ? Math.max(1, Math.floor(Number(template.version)))
+    : 1;
+  const snapshot = buildEmailTemplateVersionSnapshot(template);
+  await db.saveEmailTemplateVersion(template.template_id, safeVersion, snapshot, {
+    reason,
+    created_by: actor,
+  });
+}
+
+function parseEmailTemplateVersionSnapshot(row = null) {
+  if (!row || typeof row !== "object") return null;
+  let snapshot = null;
+  try {
+    snapshot =
+      typeof row.snapshot === "string" ? JSON.parse(row.snapshot) : row.snapshot;
+  } catch (_) {
+    snapshot = null;
+  }
+  if (!snapshot || typeof snapshot !== "object") return null;
+  if (!Array.isArray(snapshot.required_vars)) {
+    snapshot.required_vars = parseEmailTemplateRequiredVars(snapshot.required_vars);
+  }
+  return snapshot;
+}
+
+function buildEmailTemplateSnapshotDiff(fromSnapshot = {}, toSnapshot = {}) {
+  const keys = Array.from(
+    new Set([
+      ...Object.keys(fromSnapshot || {}),
+      ...Object.keys(toSnapshot || {}),
+    ]),
+  ).sort();
+  const changes = [];
+  for (const key of keys) {
+    const fromValue = fromSnapshot?.[key];
+    const toValue = toSnapshot?.[key];
+    if (stableStringify(fromValue) === stableStringify(toValue)) continue;
+    changes.push({
+      field: key,
+      from: fromValue === undefined ? null : fromValue,
+      to: toValue === undefined ? null : toValue,
+    });
+  }
+  return changes;
+}
+
+function renderEmailTemplateWithVariables(content = "", variables = {}) {
+  return String(content || "").replace(/{{\s*([\w.-]+)\s*}}/g, (_, key) => {
+    if (Object.prototype.hasOwnProperty.call(variables, key)) {
+      const value = variables[key];
+      if (value === null || value === undefined) return "";
+      return String(value);
+    }
+    return `{{${key}}}`;
+  });
+}
+
 app.get("/email/templates", requireOutboundAuthorization, async (req, res) => {
   try {
     const limit = Math.min(Math.max(parseInt(req.query?.limit, 10) || 50, 1), 200);
-    const templates = await db.listEmailTemplates(limit);
+    const templates = (await db.listEmailTemplates(limit)).map((template) => {
+      const normalized = normalizeEmailTemplateRecord(template);
+      return {
+        ...normalized,
+        lifecycle: buildEmailTemplateLifecycleCard(normalized),
+      };
+    });
     res.json({ success: true, templates });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -18543,7 +19317,14 @@ app.get("/email/templates/:id", requireOutboundAuthorization, async (req, res) =
         .status(404)
         .json({ success: false, error: "Template not found" });
     }
-    res.json({ success: true, template });
+    const normalized = normalizeEmailTemplateRecord(template);
+    res.json({
+      success: true,
+      template: {
+        ...normalized,
+        lifecycle: buildEmailTemplateLifecycleCard(normalized),
+      },
+    });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -18603,9 +19384,28 @@ app.post("/email/templates", requireOutboundAuthorization, async (req, res) => {
       html,
       text,
       required_vars: JSON.stringify(requiredVars),
+      lifecycle_state: "draft",
+      submitted_for_review_at: null,
+      reviewed_at: null,
+      reviewed_by: null,
+      review_note: null,
+      live_at: null,
+      live_by: null,
     });
-    const template = await db.getEmailTemplate(templateId);
-    res.json({ success: true, template });
+    const template = normalizeEmailTemplateRecord(
+      await db.getEmailTemplate(templateId),
+    );
+    await persistEmailTemplateVersionSnapshot(template, {
+      reason: "create",
+      actor: req.headers?.["x-admin-user"] || null,
+    });
+    res.json({
+      success: true,
+      template: {
+        ...template,
+        lifecycle: buildEmailTemplateLifecycleCard(template),
+      },
+    });
   } catch (error) {
     res.status(400).json({ success: false, error: error.message });
   }
@@ -18665,8 +19465,35 @@ app.put("/email/templates/:id", requireOutboundAuthorization, async (req, res) =
       text: payload.text,
       required_vars: JSON.stringify(requiredVars),
     });
-    const template = await db.getEmailTemplate(templateId);
-    res.json({ success: true, template });
+    const previousLifecycle = normalizeEmailTemplateLifecycleState(
+      existing.lifecycle_state,
+      "draft",
+    );
+    if (["review", "approved", "live"].includes(previousLifecycle)) {
+      await db.setEmailTemplateLifecycle(templateId, {
+        lifecycle_state: "draft",
+        submitted_for_review_at: null,
+        reviewed_at: null,
+        reviewed_by: null,
+        review_note: null,
+        live_at: null,
+        live_by: null,
+      });
+    }
+    const template = normalizeEmailTemplateRecord(
+      await db.getEmailTemplate(templateId),
+    );
+    await persistEmailTemplateVersionSnapshot(template, {
+      reason: "update",
+      actor: req.headers?.["x-admin-user"] || null,
+    });
+    res.json({
+      success: true,
+      template: {
+        ...template,
+        lifecycle: buildEmailTemplateLifecycleCard(template),
+      },
+    });
   } catch (error) {
     res.status(400).json({ success: false, error: error.message });
   }
@@ -18684,6 +19511,492 @@ app.delete("/email/templates/:id", requireOutboundAuthorization, async (req, res
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
+app.get(
+  "/email/templates/:id/versions",
+  requireOutboundAuthorization,
+  async (req, res) => {
+    try {
+      const templateId = req.params.id;
+      if (!isSafeId(templateId, { max: 128 })) {
+        return res
+          .status(400)
+          .json({ success: false, error: "Invalid template identifier" });
+      }
+      const template = normalizeEmailTemplateRecord(
+        await db.getEmailTemplate(templateId),
+      );
+      if (!template) {
+        return res
+          .status(404)
+          .json({ success: false, error: "Template not found" });
+      }
+      const currentVersion = Number(template.version) || 1;
+      const existingCurrent = await db.getEmailTemplateVersion(
+        templateId,
+        currentVersion,
+      );
+      if (!existingCurrent) {
+        await persistEmailTemplateVersionSnapshot(template, {
+          reason: "sync_current",
+          actor: req.headers?.["x-admin-user"] || null,
+        });
+      }
+      const versions = (await db.listEmailTemplateVersions(templateId, 50)).map(
+        (row) => ({
+          version: Number(row.version),
+          reason: row.reason || null,
+          created_by: row.created_by || null,
+          created_at: row.created_at || null,
+        }),
+      );
+      return res.json({
+        success: true,
+        template_id: templateId,
+        current_version: currentVersion,
+        versions,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: "Failed to list template versions",
+      });
+    }
+  },
+);
+
+app.get(
+  "/email/templates/:id/diff",
+  requireOutboundAuthorization,
+  async (req, res) => {
+    try {
+      const templateId = req.params.id;
+      if (!isSafeId(templateId, { max: 128 })) {
+        return res
+          .status(400)
+          .json({ success: false, error: "Invalid template identifier" });
+      }
+      const fromVersion = Number(req.query?.from_version);
+      const toVersion = Number(req.query?.to_version);
+      if (!Number.isFinite(fromVersion) || !Number.isFinite(toVersion)) {
+        return res.status(400).json({
+          success: false,
+          error: "from_version and to_version are required numeric values",
+        });
+      }
+      const fromRow = await db.getEmailTemplateVersion(templateId, fromVersion);
+      const toRow = await db.getEmailTemplateVersion(templateId, toVersion);
+      if (!fromRow || !toRow) {
+        return res.status(404).json({
+          success: false,
+          error: "One or both requested versions were not found",
+        });
+      }
+      const fromSnapshot = parseEmailTemplateVersionSnapshot(fromRow);
+      const toSnapshot = parseEmailTemplateVersionSnapshot(toRow);
+      if (!fromSnapshot || !toSnapshot) {
+        return res.status(400).json({
+          success: false,
+          error: "Version snapshot payload is invalid",
+        });
+      }
+      const changes = buildEmailTemplateSnapshotDiff(fromSnapshot, toSnapshot);
+      return res.json({
+        success: true,
+        template_id: templateId,
+        from_version: fromVersion,
+        to_version: toVersion,
+        changes,
+        changed_fields: changes.map((entry) => entry.field),
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: "Failed to diff template versions",
+      });
+    }
+  },
+);
+
+app.post(
+  "/email/templates/:id/rollback",
+  requireOutboundAuthorization,
+  async (req, res) => {
+    try {
+      const templateId = req.params.id;
+      if (!isSafeId(templateId, { max: 128 })) {
+        return res
+          .status(400)
+          .json({ success: false, error: "Invalid template identifier" });
+      }
+      const version = Number(req.body?.version);
+      if (!Number.isFinite(version) || version < 1) {
+        return res.status(400).json({
+          success: false,
+          error: "version is required and must be a positive number",
+        });
+      }
+      const existing = normalizeEmailTemplateRecord(
+        await db.getEmailTemplate(templateId),
+      );
+      if (!existing) {
+        return res
+          .status(404)
+          .json({ success: false, error: "Template not found" });
+      }
+      const versionRow = await db.getEmailTemplateVersion(templateId, version);
+      if (!versionRow) {
+        return res.status(404).json({
+          success: false,
+          error: "Version not found",
+        });
+      }
+      const snapshot = parseEmailTemplateVersionSnapshot(versionRow);
+      if (!snapshot) {
+        return res.status(400).json({
+          success: false,
+          error: "Stored snapshot is invalid",
+        });
+      }
+      const rollbackPayload = { ...snapshot };
+      delete rollbackPayload.lifecycle_state;
+      const changed = await db.updateEmailTemplate(templateId, {
+        subject: rollbackPayload.subject,
+        html: rollbackPayload.html,
+        text: rollbackPayload.text,
+        required_vars: JSON.stringify(
+          Array.isArray(rollbackPayload.required_vars)
+            ? rollbackPayload.required_vars
+            : [],
+        ),
+      });
+      if (!changed) {
+        return res
+          .status(404)
+          .json({ success: false, error: "Template not found" });
+      }
+      const previousLifecycle = normalizeEmailTemplateLifecycleState(
+        existing.lifecycle_state,
+        "draft",
+      );
+      if (["review", "approved", "live"].includes(previousLifecycle)) {
+        await db.setEmailTemplateLifecycle(templateId, {
+          lifecycle_state: "draft",
+          submitted_for_review_at: null,
+          reviewed_at: null,
+          reviewed_by: null,
+          review_note: null,
+          live_at: null,
+          live_by: null,
+        });
+      }
+      const template = normalizeEmailTemplateRecord(
+        await db.getEmailTemplate(templateId),
+      );
+      await persistEmailTemplateVersionSnapshot(template, {
+        reason: `rollback_to_v${version}`,
+        actor: req.headers?.["x-admin-user"] || null,
+      });
+      return res.json({
+        success: true,
+        rolled_back_to_version: version,
+        template: {
+          ...template,
+          lifecycle: buildEmailTemplateLifecycleCard(template),
+        },
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: "Failed to rollback template",
+      });
+    }
+  },
+);
+
+app.post(
+  "/email/templates/:id/submit-review",
+  requireOutboundAuthorization,
+  async (req, res) => {
+    try {
+      const templateId = req.params.id;
+      if (!isSafeId(templateId, { max: 128 })) {
+        return res
+          .status(400)
+          .json({ success: false, error: "Invalid template identifier" });
+      }
+      const template = normalizeEmailTemplateRecord(
+        await db.getEmailTemplate(templateId),
+      );
+      if (!template) {
+        return res
+          .status(404)
+          .json({ success: false, error: "Template not found" });
+      }
+      if (!String(template.subject || "").trim()) {
+        return res.status(400).json({
+          success: false,
+          error: "Template subject is required before review",
+        });
+      }
+      if (!String(template.html || "").trim() && !String(template.text || "").trim()) {
+        return res.status(400).json({
+          success: false,
+          error: "Template must include html or text before review",
+        });
+      }
+      const lifecycleState = normalizeEmailTemplateLifecycleState(
+        template.lifecycle_state,
+        "draft",
+      );
+      if (lifecycleState === "review") {
+        return res.json({
+          success: true,
+          template: {
+            ...template,
+            lifecycle: buildEmailTemplateLifecycleCard(template),
+          },
+        });
+      }
+      if (lifecycleState !== "draft") {
+        return res.status(400).json({
+          success: false,
+          error: `Only draft templates can be submitted for review (current state: ${lifecycleState})`,
+        });
+      }
+      await db.setEmailTemplateLifecycle(templateId, {
+        lifecycle_state: "review",
+        submitted_for_review_at: new Date().toISOString(),
+        reviewed_at: null,
+        reviewed_by: null,
+        review_note: null,
+      });
+      const updated = normalizeEmailTemplateRecord(
+        await db.getEmailTemplate(templateId),
+      );
+      return res.json({
+        success: true,
+        template: {
+          ...updated,
+          lifecycle: buildEmailTemplateLifecycleCard(updated),
+        },
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: "Failed to submit template for review",
+      });
+    }
+  },
+);
+
+app.post(
+  "/email/templates/:id/review",
+  requireOutboundAuthorization,
+  async (req, res) => {
+    try {
+      const templateId = req.params.id;
+      if (!isSafeId(templateId, { max: 128 })) {
+        return res
+          .status(400)
+          .json({ success: false, error: "Invalid template identifier" });
+      }
+      const decision = String(req.body?.decision || "").trim().toLowerCase();
+      const note = req.body?.note ?? null;
+      if (!["approve", "reject"].includes(decision)) {
+        return res.status(400).json({
+          success: false,
+          error: "decision must be approve or reject",
+        });
+      }
+      const template = normalizeEmailTemplateRecord(
+        await db.getEmailTemplate(templateId),
+      );
+      if (!template) {
+        return res
+          .status(404)
+          .json({ success: false, error: "Template not found" });
+      }
+      const lifecycleState = normalizeEmailTemplateLifecycleState(
+        template.lifecycle_state,
+        "draft",
+      );
+      if (lifecycleState !== "review") {
+        return res.status(400).json({
+          success: false,
+          error: `Template must be in review before ${decision} (current state: ${lifecycleState})`,
+        });
+      }
+      const actor = req.headers?.["x-admin-user"] || null;
+      if (decision === "approve") {
+        await db.setEmailTemplateLifecycle(templateId, {
+          lifecycle_state: "approved",
+          reviewed_at: new Date().toISOString(),
+          reviewed_by: actor,
+          review_note: note,
+        });
+      } else {
+        await db.setEmailTemplateLifecycle(templateId, {
+          lifecycle_state: "draft",
+          reviewed_at: new Date().toISOString(),
+          reviewed_by: actor,
+          review_note:
+            note === null || note === undefined || String(note).trim() === ""
+              ? "Returned to draft during review."
+              : note,
+        });
+      }
+      const updated = normalizeEmailTemplateRecord(
+        await db.getEmailTemplate(templateId),
+      );
+      return res.json({
+        success: true,
+        decision,
+        template: {
+          ...updated,
+          lifecycle: buildEmailTemplateLifecycleCard(updated),
+        },
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: "Failed to review template",
+      });
+    }
+  },
+);
+
+app.post(
+  "/email/templates/:id/promote-live",
+  requireOutboundAuthorization,
+  async (req, res) => {
+    try {
+      const templateId = req.params.id;
+      if (!isSafeId(templateId, { max: 128 })) {
+        return res
+          .status(400)
+          .json({ success: false, error: "Invalid template identifier" });
+      }
+      const template = normalizeEmailTemplateRecord(
+        await db.getEmailTemplate(templateId),
+      );
+      if (!template) {
+        return res
+          .status(404)
+          .json({ success: false, error: "Template not found" });
+      }
+      const lifecycleState = normalizeEmailTemplateLifecycleState(
+        template.lifecycle_state,
+        "draft",
+      );
+      if (lifecycleState === "live") {
+        return res.json({
+          success: true,
+          template: {
+            ...template,
+            lifecycle: buildEmailTemplateLifecycleCard(template),
+          },
+        });
+      }
+      if (lifecycleState !== "approved") {
+        return res.status(400).json({
+          success: false,
+          error: "Template must be approved before it can be promoted to live",
+        });
+      }
+      await db.promoteEmailTemplateLive(
+        templateId,
+        req.headers?.["x-admin-user"] || null,
+      );
+      const updated = normalizeEmailTemplateRecord(
+        await db.getEmailTemplate(templateId),
+      );
+      return res.json({
+        success: true,
+        template: {
+          ...updated,
+          lifecycle: buildEmailTemplateLifecycleCard(updated),
+        },
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: "Failed to promote template to live",
+      });
+    }
+  },
+);
+
+app.post(
+  "/email/templates/:id/simulate",
+  requireOutboundAuthorization,
+  async (req, res) => {
+    try {
+      const templateId = req.params.id;
+      if (!isSafeId(templateId, { max: 128 })) {
+        return res
+          .status(400)
+          .json({ success: false, error: "Invalid template identifier" });
+      }
+      const template = normalizeEmailTemplateRecord(
+        await db.getEmailTemplate(templateId),
+      );
+      if (!template) {
+        return res
+          .status(404)
+          .json({ success: false, error: "Template not found" });
+      }
+      const rawVariables = isPlainObject(req.body?.variables)
+        ? req.body.variables
+        : {};
+      const variables = {};
+      Object.entries(rawVariables).forEach(([key, value]) => {
+        const normalizedKey = String(key || "").trim();
+        if (!normalizedKey) return;
+        variables[normalizedKey] =
+          value === null || value === undefined ? "" : String(value);
+      });
+      const requiredVars = buildRequiredVars(
+        template.subject || "",
+        template.html || "",
+        template.text || "",
+      );
+      const missingVariables = requiredVars.filter(
+        (key) => !Object.prototype.hasOwnProperty.call(variables, key),
+      );
+      const renderedSubject = renderEmailTemplateWithVariables(
+        template.subject || "",
+        variables,
+      );
+      const renderedText = renderEmailTemplateWithVariables(
+        template.text || "",
+        variables,
+      );
+      const renderedHtml = renderEmailTemplateWithVariables(
+        template.html || "",
+        variables,
+      );
+      return res.json({
+        success: true,
+        simulation: {
+          template_id: templateId,
+          lifecycle_state: template.lifecycle_state,
+          required_variables: requiredVars,
+          missing_variables: missingVariables,
+          variables,
+          rendered_subject: renderedSubject,
+          rendered_text: renderedText,
+          rendered_html: renderedHtml,
+        },
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: "Failed to simulate template",
+      });
+    }
+  },
+);
 
 function normalizeEmailMessageForApi(message) {
   if (!message || typeof message !== "object") return message;
@@ -19839,6 +21152,119 @@ async function suggestSmsScriptName(baseName) {
   return `${normalizedBase}_${Date.now().toString().slice(-4)}`;
 }
 
+const SMS_SCRIPT_GOVERNANCE_STATES = Object.freeze([
+  "draft",
+  "review",
+  "approved",
+  "live",
+]);
+
+function normalizeSmsScriptLifecycleState(value, fallback = "draft") {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (SMS_SCRIPT_GOVERNANCE_STATES.includes(normalized)) {
+    return normalized;
+  }
+  return fallback;
+}
+
+function buildSmsScriptVersionSnapshot(script = {}) {
+  return {
+    description: script.description || null,
+    content: script.content || "",
+    metadata: isPlainObject(script.metadata) ? script.metadata : {},
+    lifecycle_state: normalizeSmsScriptLifecycleState(
+      script.lifecycle_state,
+      "draft",
+    ),
+  };
+}
+
+async function persistSmsScriptVersionSnapshot(
+  script,
+  { reason = "update", actor = null } = {},
+) {
+  if (!script || script.is_builtin || !script.name) return;
+  const safeVersion = Number.isFinite(Number(script.version))
+    ? Math.max(1, Math.floor(Number(script.version)))
+    : 1;
+  const snapshot = buildSmsScriptVersionSnapshot(script);
+  await db.saveSmsScriptVersion(script.name, safeVersion, snapshot, {
+    reason,
+    created_by: actor,
+  });
+}
+
+function parseSmsScriptVersionSnapshot(row = null) {
+  if (!row || typeof row !== "object") return null;
+  let snapshot = null;
+  try {
+    snapshot =
+      typeof row.snapshot === "string" ? JSON.parse(row.snapshot) : row.snapshot;
+  } catch (_) {
+    snapshot = null;
+  }
+  if (!snapshot || typeof snapshot !== "object") return null;
+  return snapshot;
+}
+
+function buildSmsScriptSnapshotDiff(fromSnapshot = {}, toSnapshot = {}) {
+  const keys = Array.from(
+    new Set([
+      ...Object.keys(fromSnapshot || {}),
+      ...Object.keys(toSnapshot || {}),
+    ]),
+  ).sort();
+  const changes = [];
+  for (const key of keys) {
+    const fromValue = fromSnapshot?.[key];
+    const toValue = toSnapshot?.[key];
+    if (stableStringify(fromValue) === stableStringify(toValue)) continue;
+    changes.push({
+      field: key,
+      from: fromValue === undefined ? null : fromValue,
+      to: toValue === undefined ? null : toValue,
+    });
+  }
+  return changes;
+}
+
+function extractSmsScriptVariables(content = "") {
+  const matches = String(content || "").match(/\{(\w+)\}/g) || [];
+  return Array.from(
+    new Set(
+      matches
+        .map((token) => token.replace(/[{}]/g, "").trim())
+        .filter(Boolean),
+    ),
+  );
+}
+
+function renderSmsScriptWithVariables(content = "", variables = {}) {
+  return String(content || "").replace(/\{(\w+)\}/g, (_, key) => {
+    if (Object.prototype.hasOwnProperty.call(variables, key)) {
+      const value = variables[key];
+      if (value === null || value === undefined) return "";
+      return String(value);
+    }
+    return `{${key}}`;
+  });
+}
+
+function buildSmsScriptLifecycleCard(script = null) {
+  if (!script || script.is_builtin) return null;
+  return {
+    lifecycle_state: normalizeSmsScriptLifecycleState(script.lifecycle_state),
+    submitted_for_review_at: script.submitted_for_review_at || null,
+    reviewed_at: script.reviewed_at || null,
+    reviewed_by: script.reviewed_by || null,
+    review_note: script.review_note || null,
+    live_at: script.live_at || null,
+    live_by: script.live_by || null,
+  };
+}
+
 // SMS script management endpoints
 app.get("/api/sms/scripts", requireAdminToken, async (req, res) => {
   try {
@@ -19886,6 +21312,7 @@ app.get("/api/sms/scripts", requireAdminToken, async (req, res) => {
       ...script,
       content: detailed ? script.content : "",
       is_builtin: false,
+      lifecycle: buildSmsScriptLifecycleCard(script),
     }));
     const builtinScripts = includeBuiltins
       ? getBuiltinSmsScriptNames().map((name) => ({
@@ -19932,9 +21359,12 @@ app.get("/api/sms/scripts/:scriptName", requireAdminToken, async (req, res) => {
         error: `Script '${normalizedName}' not found`,
       });
     }
+    const isBuiltin = !!builtinScript && !customScript;
     const payload = {
       ...script,
       content: detailed ? script.content : "",
+      is_builtin: isBuiltin,
+      lifecycle: isBuiltin ? null : buildSmsScriptLifecycleCard(script),
     };
     return res.json({
       success: true,
@@ -20003,15 +21433,27 @@ app.post("/api/sms/scripts", requireAdminToken, async (req, res) => {
       description: body.description || null,
       content,
       metadata: metadata === undefined ? null : metadata,
+      lifecycle_state: "draft",
+      submitted_for_review_at: null,
+      reviewed_at: null,
+      reviewed_by: null,
+      review_note: null,
+      live_at: null,
+      live_by: null,
       created_by: body.created_by || req.headers?.["x-admin-user"] || null,
       updated_by: body.updated_by || req.headers?.["x-admin-user"] || null,
     });
     const script = await db.getSmsScript(normalizedName);
+    await persistSmsScriptVersionSnapshot(script, {
+      reason: "create",
+      actor: req.headers?.["x-admin-user"] || null,
+    });
     return res.status(201).json({
       success: true,
       script: {
         ...script,
         is_builtin: false,
+        lifecycle: buildSmsScriptLifecycleCard(script),
       },
     });
   } catch (error) {
@@ -20090,12 +21532,32 @@ app.put("/api/sms/scripts/:scriptName", requireAdminToken, async (req, res) => {
     updates.updated_by = body.updated_by || req.headers?.["x-admin-user"] || null;
 
     await db.updateSmsScript(normalizedName, updates);
+    const previousLifecycle = normalizeSmsScriptLifecycleState(
+      existing.lifecycle_state,
+      "draft",
+    );
+    if (["review", "approved", "live"].includes(previousLifecycle)) {
+      await db.setSmsScriptLifecycle(normalizedName, {
+        lifecycle_state: "draft",
+        submitted_for_review_at: null,
+        reviewed_at: null,
+        reviewed_by: null,
+        review_note: null,
+        live_at: null,
+        live_by: null,
+      });
+    }
     const script = await db.getSmsScript(normalizedName);
+    await persistSmsScriptVersionSnapshot(script, {
+      reason: "update",
+      actor: req.headers?.["x-admin-user"] || null,
+    });
     return res.json({
       success: true,
       script: {
         ...script,
         is_builtin: false,
+        lifecycle: buildSmsScriptLifecycleCard(script),
       },
     });
   } catch (error) {
@@ -20146,6 +21608,499 @@ app.delete("/api/sms/scripts/:scriptName", requireAdminToken, async (req, res) =
     });
   }
 });
+
+app.get(
+  "/api/sms/scripts/:scriptName/versions",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const normalizedName = normalizeSmsScriptName(req.params.scriptName);
+      if (!normalizedName) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid script name",
+        });
+      }
+      if (getBuiltinSmsScriptByName(normalizedName)) {
+        return res.status(400).json({
+          success: false,
+          error: "Built-in scripts do not support governance versions",
+        });
+      }
+      const script = await db.getSmsScript(normalizedName);
+      if (!script) {
+        return res.status(404).json({
+          success: false,
+          error: `Script '${normalizedName}' not found`,
+        });
+      }
+      const currentVersion = Number(script.version) || 1;
+      const existingCurrent = await db.getSmsScriptVersion(
+        normalizedName,
+        currentVersion,
+      );
+      if (!existingCurrent) {
+        await persistSmsScriptVersionSnapshot(script, {
+          reason: "sync_current",
+          actor: req.headers?.["x-admin-user"] || null,
+        });
+      }
+      const versions = (await db.listSmsScriptVersions(normalizedName, 50)).map(
+        (row) => ({
+          version: Number(row.version),
+          reason: row.reason || null,
+          created_by: row.created_by || null,
+          created_at: row.created_at || null,
+        }),
+      );
+      return res.json({
+        success: true,
+        script_name: normalizedName,
+        current_version: currentVersion,
+        versions,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: "Failed to list SMS script versions",
+      });
+    }
+  },
+);
+
+app.get(
+  "/api/sms/scripts/:scriptName/diff",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const normalizedName = normalizeSmsScriptName(req.params.scriptName);
+      if (!normalizedName) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid script name",
+        });
+      }
+      const fromVersion = Number(req.query?.from_version);
+      const toVersion = Number(req.query?.to_version);
+      if (!Number.isFinite(fromVersion) || !Number.isFinite(toVersion)) {
+        return res.status(400).json({
+          success: false,
+          error: "from_version and to_version are required numeric values",
+        });
+      }
+      const fromRow = await db.getSmsScriptVersion(normalizedName, fromVersion);
+      const toRow = await db.getSmsScriptVersion(normalizedName, toVersion);
+      if (!fromRow || !toRow) {
+        return res.status(404).json({
+          success: false,
+          error: "One or both requested versions were not found",
+        });
+      }
+      const fromSnapshot = parseSmsScriptVersionSnapshot(fromRow);
+      const toSnapshot = parseSmsScriptVersionSnapshot(toRow);
+      if (!fromSnapshot || !toSnapshot) {
+        return res.status(400).json({
+          success: false,
+          error: "Version snapshot payload is invalid",
+        });
+      }
+      const changes = buildSmsScriptSnapshotDiff(fromSnapshot, toSnapshot);
+      return res.json({
+        success: true,
+        script_name: normalizedName,
+        from_version: fromVersion,
+        to_version: toVersion,
+        changes,
+        changed_fields: changes.map((entry) => entry.field),
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: "Failed to diff SMS script versions",
+      });
+    }
+  },
+);
+
+app.post(
+  "/api/sms/scripts/:scriptName/rollback",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const normalizedName = normalizeSmsScriptName(req.params.scriptName);
+      if (!normalizedName) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid script name",
+        });
+      }
+      if (getBuiltinSmsScriptByName(normalizedName)) {
+        return res.status(400).json({
+          success: false,
+          error: "Built-in scripts are read-only and cannot be rolled back",
+        });
+      }
+      const version = Number(req.body?.version);
+      if (!Number.isFinite(version) || version < 1) {
+        return res.status(400).json({
+          success: false,
+          error: "version is required and must be a positive number",
+        });
+      }
+      const existing = await db.getSmsScript(normalizedName);
+      if (!existing) {
+        return res.status(404).json({
+          success: false,
+          error: `Script '${normalizedName}' not found`,
+        });
+      }
+      const versionRow = await db.getSmsScriptVersion(normalizedName, version);
+      if (!versionRow) {
+        return res.status(404).json({
+          success: false,
+          error: "Version not found",
+        });
+      }
+      const snapshot = parseSmsScriptVersionSnapshot(versionRow);
+      if (!snapshot) {
+        return res.status(400).json({
+          success: false,
+          error: "Stored snapshot is invalid",
+        });
+      }
+      const rollbackPayload = { ...snapshot };
+      delete rollbackPayload.lifecycle_state;
+      const changed = await db.updateSmsScript(normalizedName, rollbackPayload);
+      if (!changed) {
+        return res.status(404).json({
+          success: false,
+          error: `Script '${normalizedName}' not found`,
+        });
+      }
+      const previousLifecycle = normalizeSmsScriptLifecycleState(
+        existing.lifecycle_state,
+        "draft",
+      );
+      if (["review", "approved", "live"].includes(previousLifecycle)) {
+        await db.setSmsScriptLifecycle(normalizedName, {
+          lifecycle_state: "draft",
+          submitted_for_review_at: null,
+          reviewed_at: null,
+          reviewed_by: null,
+          review_note: null,
+          live_at: null,
+          live_by: null,
+        });
+      }
+      const script = await db.getSmsScript(normalizedName);
+      await persistSmsScriptVersionSnapshot(script, {
+        reason: `rollback_to_v${version}`,
+        actor: req.headers?.["x-admin-user"] || null,
+      });
+      return res.json({
+        success: true,
+        rolled_back_to_version: version,
+        script: {
+          ...script,
+          is_builtin: false,
+          lifecycle: buildSmsScriptLifecycleCard(script),
+        },
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: "Failed to rollback SMS script",
+      });
+    }
+  },
+);
+
+app.post(
+  "/api/sms/scripts/:scriptName/submit-review",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const normalizedName = normalizeSmsScriptName(req.params.scriptName);
+      if (!normalizedName) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid script name",
+        });
+      }
+      if (getBuiltinSmsScriptByName(normalizedName)) {
+        return res.status(400).json({
+          success: false,
+          error: "Built-in scripts are read-only and cannot be reviewed",
+        });
+      }
+      const script = await db.getSmsScript(normalizedName);
+      if (!script) {
+        return res.status(404).json({
+          success: false,
+          error: `Script '${normalizedName}' not found`,
+        });
+      }
+      if (!String(script.content || "").trim()) {
+        return res.status(400).json({
+          success: false,
+          error: "Script content is required before review",
+        });
+      }
+      const lifecycleState = normalizeSmsScriptLifecycleState(
+        script.lifecycle_state,
+        "draft",
+      );
+      if (lifecycleState === "review") {
+        return res.json({
+          success: true,
+          script: {
+            ...script,
+            is_builtin: false,
+            lifecycle: buildSmsScriptLifecycleCard(script),
+          },
+        });
+      }
+      if (lifecycleState !== "draft") {
+        return res.status(400).json({
+          success: false,
+          error: `Only draft scripts can be submitted for review (current state: ${lifecycleState})`,
+        });
+      }
+      await db.setSmsScriptLifecycle(normalizedName, {
+        lifecycle_state: "review",
+        submitted_for_review_at: new Date().toISOString(),
+        reviewed_at: null,
+        reviewed_by: null,
+        review_note: null,
+      });
+      const updated = await db.getSmsScript(normalizedName);
+      return res.json({
+        success: true,
+        script: {
+          ...updated,
+          is_builtin: false,
+          lifecycle: buildSmsScriptLifecycleCard(updated),
+        },
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: "Failed to submit SMS script for review",
+      });
+    }
+  },
+);
+
+app.post(
+  "/api/sms/scripts/:scriptName/review",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const normalizedName = normalizeSmsScriptName(req.params.scriptName);
+      if (!normalizedName) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid script name",
+        });
+      }
+      if (getBuiltinSmsScriptByName(normalizedName)) {
+        return res.status(400).json({
+          success: false,
+          error: "Built-in scripts are read-only and cannot be reviewed",
+        });
+      }
+      const decision = String(req.body?.decision || "").trim().toLowerCase();
+      const note = req.body?.note ?? null;
+      if (!["approve", "reject"].includes(decision)) {
+        return res.status(400).json({
+          success: false,
+          error: "decision must be approve or reject",
+        });
+      }
+      const script = await db.getSmsScript(normalizedName);
+      if (!script) {
+        return res.status(404).json({
+          success: false,
+          error: `Script '${normalizedName}' not found`,
+        });
+      }
+      const lifecycleState = normalizeSmsScriptLifecycleState(
+        script.lifecycle_state,
+        "draft",
+      );
+      if (lifecycleState !== "review") {
+        return res.status(400).json({
+          success: false,
+          error: `Script must be in review before ${decision} (current state: ${lifecycleState})`,
+        });
+      }
+      const actor = req.headers?.["x-admin-user"] || null;
+      if (decision === "approve") {
+        await db.setSmsScriptLifecycle(normalizedName, {
+          lifecycle_state: "approved",
+          reviewed_at: new Date().toISOString(),
+          reviewed_by: actor,
+          review_note: note,
+        });
+      } else {
+        await db.setSmsScriptLifecycle(normalizedName, {
+          lifecycle_state: "draft",
+          reviewed_at: new Date().toISOString(),
+          reviewed_by: actor,
+          review_note:
+            note === null || note === undefined || String(note).trim() === ""
+              ? "Returned to draft during review."
+              : note,
+        });
+      }
+      const updated = await db.getSmsScript(normalizedName);
+      return res.json({
+        success: true,
+        decision,
+        script: {
+          ...updated,
+          is_builtin: false,
+          lifecycle: buildSmsScriptLifecycleCard(updated),
+        },
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: "Failed to review SMS script",
+      });
+    }
+  },
+);
+
+app.post(
+  "/api/sms/scripts/:scriptName/promote-live",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const normalizedName = normalizeSmsScriptName(req.params.scriptName);
+      if (!normalizedName) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid script name",
+        });
+      }
+      if (getBuiltinSmsScriptByName(normalizedName)) {
+        return res.status(400).json({
+          success: false,
+          error: "Built-in scripts are read-only and cannot be promoted",
+        });
+      }
+      const script = await db.getSmsScript(normalizedName);
+      if (!script) {
+        return res.status(404).json({
+          success: false,
+          error: `Script '${normalizedName}' not found`,
+        });
+      }
+      const lifecycleState = normalizeSmsScriptLifecycleState(
+        script.lifecycle_state,
+        "draft",
+      );
+      if (lifecycleState === "live") {
+        return res.json({
+          success: true,
+          script: {
+            ...script,
+            is_builtin: false,
+            lifecycle: buildSmsScriptLifecycleCard(script),
+          },
+        });
+      }
+      if (lifecycleState !== "approved") {
+        return res.status(400).json({
+          success: false,
+          error: "Script must be approved before it can be promoted to live",
+        });
+      }
+      await db.promoteSmsScriptLive(
+        normalizedName,
+        req.headers?.["x-admin-user"] || null,
+      );
+      const updated = await db.getSmsScript(normalizedName);
+      return res.json({
+        success: true,
+        script: {
+          ...updated,
+          is_builtin: false,
+          lifecycle: buildSmsScriptLifecycleCard(updated),
+        },
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: "Failed to promote SMS script to live",
+      });
+    }
+  },
+);
+
+app.post(
+  "/api/sms/scripts/:scriptName/simulate",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const normalizedName = normalizeSmsScriptName(req.params.scriptName);
+      if (!normalizedName) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid script name",
+        });
+      }
+      const customScript = await db.getSmsScript(normalizedName);
+      const builtinScript = getBuiltinSmsScriptByName(normalizedName);
+      const script = customScript || builtinScript;
+      if (!script) {
+        return res.status(404).json({
+          success: false,
+          error: `Script '${normalizedName}' not found`,
+        });
+      }
+      const rawVariables = isPlainObject(req.body?.variables)
+        ? req.body.variables
+        : {};
+      const variables = {};
+      Object.entries(rawVariables).forEach(([key, value]) => {
+        const normalizedKey = String(key || "").trim();
+        if (!normalizedKey) return;
+        variables[normalizedKey] =
+          value === null || value === undefined ? "" : String(value);
+      });
+      const requiredVariables = extractSmsScriptVariables(script.content || "");
+      const missingVariables = requiredVariables.filter(
+        (key) => !Object.prototype.hasOwnProperty.call(variables, key),
+      );
+      const renderedContent = renderSmsScriptWithVariables(
+        script.content || "",
+        variables,
+      );
+      return res.json({
+        success: true,
+        simulation: {
+          script_name: normalizedName,
+          is_builtin: !!builtinScript && !customScript,
+          lifecycle_state:
+            customScript && customScript.lifecycle_state
+              ? customScript.lifecycle_state
+              : null,
+          required_variables: requiredVariables,
+          missing_variables: missingVariables,
+          variables,
+          rendered_content: renderedContent,
+        },
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: "Failed to simulate SMS script",
+      });
+    }
+  },
+);
 
 app.post(
   "/api/sms/scripts/:scriptName/preview",

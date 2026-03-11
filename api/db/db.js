@@ -196,8 +196,28 @@ class EnhancedDatabase {
                 payment_success_message TEXT,
                 payment_failure_message TEXT,
                 payment_retry_message TEXT,
+                lifecycle_state TEXT DEFAULT 'draft',
+                submitted_for_review_at DATETIME,
+                reviewed_at DATETIME,
+                reviewed_by TEXT,
+                review_note TEXT,
+                live_at DATETIME,
+                live_by TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            // Version snapshots for call-template governance (diff/rollback)
+            `CREATE TABLE IF NOT EXISTS call_template_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                template_id INTEGER NOT NULL,
+                version INTEGER NOT NULL,
+                snapshot TEXT NOT NULL,
+                reason TEXT,
+                created_by TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(template_id, version),
+                FOREIGN KEY(template_id) REFERENCES call_templates(id) ON DELETE CASCADE
             )`,
 
             // Enhanced webhook notifications table with delivery metrics
@@ -447,7 +467,14 @@ class EnhancedDatabase {
             'payment_start_message',
             'payment_success_message',
             'payment_failure_message',
-            'payment_retry_message'
+            'payment_retry_message',
+            'lifecycle_state',
+            'submitted_for_review_at',
+            'reviewed_at',
+            'reviewed_by',
+            'review_note',
+            'live_at',
+            'live_by'
         ]);
         await this.ensureNotificationColumns(['last_attempt_at', 'next_attempt_at']);
 
@@ -480,6 +507,8 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_call_digits_profile ON call_digits(profile)',
             'CREATE INDEX IF NOT EXISTS idx_call_digits_created_at ON call_digits(created_at)',
             'CREATE INDEX IF NOT EXISTS idx_call_templates_name ON call_templates(name)',
+            'CREATE INDEX IF NOT EXISTS idx_call_templates_lifecycle_state ON call_templates(lifecycle_state)',
+            'CREATE INDEX IF NOT EXISTS idx_call_template_versions_template_version ON call_template_versions(template_id, version)',
             
             // Notification indexes
             'CREATE INDEX IF NOT EXISTS idx_notifications_status ON webhook_notifications(status)',
@@ -646,6 +675,20 @@ class EnhancedDatabase {
                 await addColumn('payment_failure_message', 'TEXT');
             } else if (column === 'payment_retry_message') {
                 await addColumn('payment_retry_message', 'TEXT');
+            } else if (column === 'lifecycle_state') {
+                await addColumn('lifecycle_state', "TEXT DEFAULT 'draft'");
+            } else if (column === 'submitted_for_review_at') {
+                await addColumn('submitted_for_review_at', 'DATETIME');
+            } else if (column === 'reviewed_at') {
+                await addColumn('reviewed_at', 'DATETIME');
+            } else if (column === 'reviewed_by') {
+                await addColumn('reviewed_by', 'TEXT');
+            } else if (column === 'review_note') {
+                await addColumn('review_note', 'TEXT');
+            } else if (column === 'live_at') {
+                await addColumn('live_at', 'DATETIME');
+            } else if (column === 'live_by') {
+                await addColumn('live_by', 'TEXT');
             }
         }
     }
@@ -1151,6 +1194,7 @@ class EnhancedDatabase {
                        payment_enabled, payment_connector, payment_amount, payment_currency, payment_description,
                        payment_policy,
                        payment_start_message, payment_success_message, payment_failure_message, payment_retry_message,
+                       lifecycle_state, submitted_for_review_at, reviewed_at, reviewed_by, review_note, live_at, live_by,
                        created_at, updated_at
                 FROM call_templates
                 ORDER BY id DESC
@@ -1174,6 +1218,7 @@ class EnhancedDatabase {
                        payment_enabled, payment_connector, payment_amount, payment_currency, payment_description,
                        payment_policy,
                        payment_start_message, payment_success_message, payment_failure_message, payment_retry_message,
+                       lifecycle_state, submitted_for_review_at, reviewed_at, reviewed_by, review_note, live_at, live_by,
                        created_at, updated_at
                 FROM call_templates
                 WHERE id = ?
@@ -1214,7 +1259,14 @@ class EnhancedDatabase {
             payment_start_message = null,
             payment_success_message = null,
             payment_failure_message = null,
-            payment_retry_message = null
+            payment_retry_message = null,
+            lifecycle_state = 'draft',
+            submitted_for_review_at = null,
+            reviewed_at = null,
+            reviewed_by = null,
+            review_note = null,
+            live_at = null,
+            live_by = null
         } = payload || {};
         const normalizedVersionParsed = Number(version);
         const normalizedVersion = Number.isFinite(normalizedVersionParsed) && normalizedVersionParsed > 0
@@ -1302,6 +1354,12 @@ class EnhancedDatabase {
         const normalizedPaymentRetryMessage = payment_retry_message
             ? String(payment_retry_message).trim().slice(0, 240)
             : null;
+        const normalizedLifecycleState = String(lifecycle_state || 'draft')
+            .trim()
+            .toLowerCase();
+        const safeLifecycleState = ['draft', 'review', 'approved', 'live'].includes(normalizedLifecycleState)
+            ? normalizedLifecycleState
+            : 'draft';
         return new Promise((resolve, reject) => {
             const sql = `
                 INSERT INTO call_templates (
@@ -1311,9 +1369,10 @@ class EnhancedDatabase {
                     payment_enabled, payment_connector, payment_amount, payment_currency, payment_description,
                     payment_policy,
                     payment_start_message, payment_success_message, payment_failure_message, payment_retry_message,
+                    lifecycle_state, submitted_for_review_at, reviewed_at, reviewed_by, review_note, live_at, live_by,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             `;
             this.db.run(
                 sql,
@@ -1342,7 +1401,14 @@ class EnhancedDatabase {
                     normalizedPaymentStartMessage,
                     normalizedPaymentSuccessMessage,
                     normalizedPaymentFailureMessage,
-                    normalizedPaymentRetryMessage
+                    normalizedPaymentRetryMessage,
+                    safeLifecycleState,
+                    submitted_for_review_at,
+                    reviewed_at,
+                    reviewed_by,
+                    review_note,
+                    live_at,
+                    live_by
                 ],
                 function(err) {
                     if (err) {
@@ -1487,6 +1553,184 @@ class EnhancedDatabase {
                 } else {
                     resolve(this.changes);
                 }
+            });
+        });
+    }
+
+    async listCallTemplateVersions(templateId, limit = 20) {
+        const safeLimit = Number.isFinite(Number(limit))
+            ? Math.max(1, Math.min(100, Math.floor(Number(limit))))
+            : 20;
+        return new Promise((resolve, reject) => {
+            const sql = `
+                SELECT id, template_id, version, snapshot, reason, created_by, created_at
+                FROM call_template_versions
+                WHERE template_id = ?
+                ORDER BY version DESC
+                LIMIT ?
+            `;
+            this.db.all(sql, [templateId, safeLimit], (err, rows) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(rows || []);
+                }
+            });
+        });
+    }
+
+    async getCallTemplateVersion(templateId, version) {
+        return new Promise((resolve, reject) => {
+            const sql = `
+                SELECT id, template_id, version, snapshot, reason, created_by, created_at
+                FROM call_template_versions
+                WHERE template_id = ? AND version = ?
+                LIMIT 1
+            `;
+            this.db.get(sql, [templateId, version], (err, row) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(row || null);
+                }
+            });
+        });
+    }
+
+    async saveCallTemplateVersion(templateId, version, snapshot, options = {}) {
+        const safeVersion = Number.isFinite(Number(version))
+            ? Math.max(1, Math.floor(Number(version)))
+            : 1;
+        const reason = options.reason ? String(options.reason).slice(0, 120) : null;
+        const createdBy = options.created_by ? String(options.created_by).slice(0, 120) : null;
+        const serializedSnapshot = typeof snapshot === 'string'
+            ? snapshot
+            : JSON.stringify(snapshot || {});
+        return new Promise((resolve, reject) => {
+            const sql = `
+                INSERT INTO call_template_versions (
+                    template_id, version, snapshot, reason, created_by, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(template_id, version) DO UPDATE SET
+                    snapshot = excluded.snapshot,
+                    reason = excluded.reason,
+                    created_by = excluded.created_by,
+                    created_at = CURRENT_TIMESTAMP
+            `;
+            this.db.run(
+                sql,
+                [templateId, safeVersion, serializedSnapshot, reason, createdBy],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(this.changes);
+                    }
+                },
+            );
+        });
+    }
+
+    async setCallTemplateLifecycle(templateId, updates = {}) {
+        const fields = [];
+        const values = [];
+        const mapping = {
+            lifecycle_state: 'lifecycle_state',
+            submitted_for_review_at: 'submitted_for_review_at',
+            reviewed_at: 'reviewed_at',
+            reviewed_by: 'reviewed_by',
+            review_note: 'review_note',
+            live_at: 'live_at',
+            live_by: 'live_by',
+        };
+        Object.entries(mapping).forEach(([key, column]) => {
+            if (!Object.prototype.hasOwnProperty.call(updates, key)) {
+                return;
+            }
+            let value = updates[key];
+            if (key === 'lifecycle_state') {
+                const normalized = String(value || '').trim().toLowerCase();
+                value = ['draft', 'review', 'approved', 'live'].includes(normalized)
+                    ? normalized
+                    : 'draft';
+            } else if (key === 'review_note') {
+                value = value === null || value === undefined ? null : String(value).slice(0, 500);
+            } else {
+                value = value === null || value === undefined ? null : String(value);
+            }
+            fields.push(`${column} = ?`);
+            values.push(value);
+        });
+        if (!fields.length) {
+            return 0;
+        }
+        fields.push('updated_at = CURRENT_TIMESTAMP');
+        values.push(templateId);
+        return new Promise((resolve, reject) => {
+            const sql = `UPDATE call_templates SET ${fields.join(', ')} WHERE id = ?`;
+            this.db.run(sql, values, function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.changes);
+                }
+            });
+        });
+    }
+
+    async promoteCallTemplateLive(templateId, actor = null) {
+        const safeActor = actor === null || actor === undefined ? null : String(actor).slice(0, 120);
+        return new Promise((resolve, reject) => {
+            const dbConn = this.db;
+            dbConn.serialize(() => {
+                dbConn.run('BEGIN TRANSACTION');
+                dbConn.run(
+                    `UPDATE call_templates
+                     SET lifecycle_state = 'approved',
+                         live_at = NULL,
+                         live_by = NULL,
+                         updated_at = CURRENT_TIMESTAMP
+                     WHERE lifecycle_state = 'live' AND id != ?`,
+                    [templateId],
+                    (demoteErr) => {
+                        if (demoteErr) {
+                            dbConn.run('ROLLBACK');
+                            reject(demoteErr);
+                            return;
+                        }
+                        dbConn.run(
+                            `UPDATE call_templates
+                             SET lifecycle_state = 'live',
+                                 live_at = CURRENT_TIMESTAMP,
+                                 live_by = ?,
+                                 updated_at = CURRENT_TIMESTAMP
+                             WHERE id = ?`,
+                            [safeActor, templateId],
+                            function(promoteErr) {
+                                if (promoteErr) {
+                                    dbConn.run('ROLLBACK');
+                                    reject(promoteErr);
+                                    return;
+                                }
+                                if (this.changes === 0) {
+                                    dbConn.run('ROLLBACK');
+                                    resolve(0);
+                                    return;
+                                }
+                                const promotedChanges = this.changes;
+                                dbConn.run('COMMIT', (commitErr) => {
+                                    if (commitErr) {
+                                        dbConn.run('ROLLBACK');
+                                        reject(commitErr);
+                                    } else {
+                                        resolve(promotedChanges);
+                                    }
+                                });
+                            },
+                        );
+                    },
+                );
             });
         });
     }
@@ -3390,10 +3634,30 @@ class EnhancedDatabase {
                description TEXT,
                content TEXT NOT NULL,
                metadata TEXT,
+               version INTEGER DEFAULT 1,
+               lifecycle_state TEXT DEFAULT 'draft',
+               submitted_for_review_at DATETIME,
+               reviewed_at DATETIME,
+               reviewed_by TEXT,
+               review_note TEXT,
+               live_at DATETIME,
+               live_by TEXT,
                created_by TEXT,
                updated_by TEXT,
                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+           )`;
+
+           const createSmsScriptVersionsTable = `CREATE TABLE IF NOT EXISTS sms_script_versions (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               script_name TEXT NOT NULL,
+               version INTEGER NOT NULL,
+               snapshot TEXT NOT NULL,
+               reason TEXT,
+               created_by TEXT,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               UNIQUE(script_name, version),
+               FOREIGN KEY(script_name) REFERENCES sms_scripts(name) ON DELETE CASCADE
            )`;
 
            this.db.serialize(() => {
@@ -3429,25 +3693,45 @@ class EnhancedDatabase {
                                    reject(scriptErr);
                                    return;
                                }
-                               this.ensureSmsColumns(['provider']).then(() => {
-                                   const smsIndexes = [
-                                       'CREATE INDEX IF NOT EXISTS idx_sms_messages_status_updated_at ON sms_messages(status, updated_at)',
-                                       'CREATE INDEX IF NOT EXISTS idx_sms_messages_direction_updated_at ON sms_messages(direction, updated_at)',
-                                       'CREATE INDEX IF NOT EXISTS idx_sms_messages_provider ON sms_messages(provider)',
-                                       'CREATE INDEX IF NOT EXISTS idx_sms_scripts_updated_at ON sms_scripts(updated_at)',
-                                   ];
-                                   Promise.all(
-                                       smsIndexes.map((sql) => new Promise((indexResolve, indexReject) => {
-                                           this.db.run(sql, (indexErr) => {
-                                               if (indexErr) indexReject(indexErr);
-                                               else indexResolve();
-                                           });
-                                       })),
-                                   ).then(() => {
-                                       console.log('✅ SMS tables created successfully');
-                                       resolve();
+                               this.db.run(createSmsScriptVersionsTable, (versionsErr) => {
+                                   if (versionsErr) {
+                                       console.error('Error creating sms_script_versions table:', versionsErr);
+                                       reject(versionsErr);
+                                       return;
+                                   }
+                                   this.ensureSmsColumns(['provider']).then(() => {
+                                       this.ensureSmsScriptColumns([
+                                           'version',
+                                           'lifecycle_state',
+                                           'submitted_for_review_at',
+                                           'reviewed_at',
+                                           'reviewed_by',
+                                           'review_note',
+                                           'live_at',
+                                           'live_by',
+                                       ]).then(() => {
+                                           const smsIndexes = [
+                                               'CREATE INDEX IF NOT EXISTS idx_sms_messages_status_updated_at ON sms_messages(status, updated_at)',
+                                               'CREATE INDEX IF NOT EXISTS idx_sms_messages_direction_updated_at ON sms_messages(direction, updated_at)',
+                                               'CREATE INDEX IF NOT EXISTS idx_sms_messages_provider ON sms_messages(provider)',
+                                               'CREATE INDEX IF NOT EXISTS idx_sms_scripts_updated_at ON sms_scripts(updated_at)',
+                                               'CREATE INDEX IF NOT EXISTS idx_sms_scripts_lifecycle_state ON sms_scripts(lifecycle_state)',
+                                               'CREATE INDEX IF NOT EXISTS idx_sms_script_versions_name_version ON sms_script_versions(script_name, version)',
+                                           ];
+                                           Promise.all(
+                                               smsIndexes.map((sql) => new Promise((indexResolve, indexReject) => {
+                                                   this.db.run(sql, (indexErr) => {
+                                                       if (indexErr) indexReject(indexErr);
+                                                       else indexResolve();
+                                                   });
+                                               })),
+                                           ).then(() => {
+                                               console.log('✅ SMS tables created successfully');
+                                               resolve();
+                                           }).catch(reject);
+                                       }).catch(reject);
                                    }).catch(reject);
-                               }).catch(reject);
+                               });
                            });
                        });
                    });
@@ -3482,6 +3766,50 @@ class EnhancedDatabase {
            if (existingNames.has(column)) continue;
            if (column === 'provider') {
                await addColumn('provider', 'TEXT');
+           }
+       }
+   }
+
+   async ensureSmsScriptColumns(columns = []) {
+       if (!columns.length) return;
+       const existing = await new Promise((resolve, reject) => {
+           this.db.all('PRAGMA table_info(sms_scripts)', (err, rows) => {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(rows || []);
+               }
+           });
+       });
+       const existingNames = new Set(existing.map((row) => row.name));
+       const addColumn = (name, definition) => new Promise((resolve, reject) => {
+           this.db.run(`ALTER TABLE sms_scripts ADD COLUMN ${name} ${definition}`, (err) => {
+               if (err) {
+                   if (String(err.message || '').includes('duplicate')) resolve();
+                   else reject(err);
+               } else {
+                   resolve();
+               }
+           });
+       });
+       for (const column of columns) {
+           if (existingNames.has(column)) continue;
+           if (column === 'version') {
+               await addColumn('version', 'INTEGER DEFAULT 1');
+           } else if (column === 'lifecycle_state') {
+               await addColumn('lifecycle_state', "TEXT DEFAULT 'draft'");
+           } else if (column === 'submitted_for_review_at') {
+               await addColumn('submitted_for_review_at', 'DATETIME');
+           } else if (column === 'reviewed_at') {
+               await addColumn('reviewed_at', 'DATETIME');
+           } else if (column === 'reviewed_by') {
+               await addColumn('reviewed_by', 'TEXT');
+           } else if (column === 'review_note') {
+               await addColumn('review_note', 'TEXT');
+           } else if (column === 'live_at') {
+               await addColumn('live_at', 'DATETIME');
+           } else if (column === 'live_by') {
+               await addColumn('live_by', 'TEXT');
            }
        }
    }
@@ -3597,8 +3925,28 @@ class EnhancedDatabase {
                html TEXT,
                text TEXT,
                required_vars TEXT,
+               version INTEGER DEFAULT 1,
+               lifecycle_state TEXT DEFAULT 'draft',
+               submitted_for_review_at DATETIME,
+               reviewed_at DATETIME,
+               reviewed_by TEXT,
+               review_note TEXT,
+               live_at DATETIME,
+               live_by TEXT,
                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+           )`;
+
+           const createEmailTemplateVersionsTable = `CREATE TABLE IF NOT EXISTS email_template_versions (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               template_id TEXT NOT NULL,
+               version INTEGER NOT NULL,
+               snapshot TEXT NOT NULL,
+               reason TEXT,
+               created_by TEXT,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               UNIQUE(template_id, version),
+               FOREIGN KEY(template_id) REFERENCES email_templates(template_id) ON DELETE CASCADE
            )`;
 
            const createEmailMetricsTable = `CREATE TABLE IF NOT EXISTS email_metrics (
@@ -3625,7 +3973,9 @@ class EnhancedDatabase {
                'CREATE INDEX IF NOT EXISTS idx_email_suppression_email ON email_suppression(email)',
                'CREATE INDEX IF NOT EXISTS idx_email_provider_events_key ON email_provider_events(event_key)',
                'CREATE INDEX IF NOT EXISTS idx_email_provider_events_message_id ON email_provider_events(message_id)',
-               'CREATE INDEX IF NOT EXISTS idx_email_provider_events_created_at ON email_provider_events(created_at)'
+               'CREATE INDEX IF NOT EXISTS idx_email_provider_events_created_at ON email_provider_events(created_at)',
+               'CREATE INDEX IF NOT EXISTS idx_email_templates_lifecycle_state ON email_templates(lifecycle_state)',
+               'CREATE INDEX IF NOT EXISTS idx_email_template_versions_template_version ON email_template_versions(template_id, version)'
            ];
 
            this.db.serialize(() => {
@@ -3685,6 +4035,13 @@ class EnhancedDatabase {
                        return;
                    }
                });
+               this.db.run(createEmailTemplateVersionsTable, (versionErr) => {
+                   if (versionErr) {
+                       console.error('Error creating email_template_versions table:', versionErr);
+                       reject(versionErr);
+                       return;
+                   }
+               });
                this.db.run(createEmailMetricsTable, (err) => {
                    if (err) {
                        console.error('Error creating email_metrics table:', err);
@@ -3706,8 +4063,19 @@ class EnhancedDatabase {
                    reject(indexErrors);
                    return;
                }
-               console.log('✅ Email tables created successfully');
-               resolve();
+               this.ensureEmailTemplateColumns([
+                   'version',
+                   'lifecycle_state',
+                   'submitted_for_review_at',
+                   'reviewed_at',
+                   'reviewed_by',
+                   'review_note',
+                   'live_at',
+                   'live_by',
+               ]).then(() => {
+                   console.log('✅ Email tables created successfully');
+                   resolve();
+               }).catch(reject);
            });
        });
    }
@@ -3777,6 +4145,54 @@ class EnhancedDatabase {
            );
        });
        this.emailDlqColumnsEnsured = true;
+   }
+
+   async ensureEmailTemplateColumns(columns = []) {
+       if (!columns.length) return;
+       const existing = await new Promise((resolve, reject) => {
+           this.db.all('PRAGMA table_info(email_templates)', (err, rows) => {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(rows || []);
+               }
+           });
+       });
+       const names = new Set(existing.map((row) => row.name));
+       const addColumn = (name, definition) => new Promise((resolve, reject) => {
+           this.db.run(`ALTER TABLE email_templates ADD COLUMN ${name} ${definition}`, (err) => {
+               if (err) {
+                   const message = String(err.message || '').toLowerCase();
+                   if (message.includes('duplicate column name')) {
+                       resolve();
+                       return;
+                   }
+                   reject(err);
+               } else {
+                   resolve();
+               }
+           });
+       });
+       for (const column of columns) {
+           if (names.has(column)) continue;
+           if (column === 'version') {
+               await addColumn('version', 'INTEGER DEFAULT 1');
+           } else if (column === 'lifecycle_state') {
+               await addColumn('lifecycle_state', "TEXT DEFAULT 'draft'");
+           } else if (column === 'submitted_for_review_at') {
+               await addColumn('submitted_for_review_at', 'DATETIME');
+           } else if (column === 'reviewed_at') {
+               await addColumn('reviewed_at', 'DATETIME');
+           } else if (column === 'reviewed_by') {
+               await addColumn('reviewed_by', 'TEXT');
+           } else if (column === 'review_note') {
+               await addColumn('review_note', 'TEXT');
+           } else if (column === 'live_at') {
+               await addColumn('live_at', 'DATETIME');
+           } else if (column === 'live_by') {
+               await addColumn('live_by', 'TEXT');
+           }
+       }
    }
 
    async ensureEmailQueueColumns() {
@@ -4161,11 +4577,28 @@ class EnhancedDatabase {
                metadata = {};
            }
        }
+       const lifecycle = String(row.lifecycle_state || 'draft').trim().toLowerCase();
+       const lifecycleState = ['draft', 'review', 'approved', 'live'].includes(lifecycle)
+           ? lifecycle
+           : 'draft';
+       const parsedVersion = Number(row.version);
+       const version = Number.isFinite(parsedVersion) && parsedVersion > 0
+           ? Math.max(1, Math.floor(parsedVersion))
+           : 1;
        return {
            name: row.name,
            description: row.description || null,
            content: row.content || '',
            metadata,
+           version,
+           lifecycle_state: lifecycleState,
+           submitted_for_review_at: row.submitted_for_review_at || null,
+           reviewed_at: row.reviewed_at || null,
+           reviewed_by: row.reviewed_by || null,
+           review_note: row.review_note || null,
+           live_at: row.live_at || null,
+           live_by: row.live_by || null,
+           is_live: lifecycleState === 'live',
            created_by: row.created_by || null,
            updated_by: row.updated_by || null,
            created_at: row.created_at || null,
@@ -4176,7 +4609,9 @@ class EnhancedDatabase {
    async listSmsScripts() {
        return new Promise((resolve, reject) => {
            const sql = `
-               SELECT name, description, content, metadata, created_by, updated_by, created_at, updated_at
+               SELECT name, description, content, metadata, version,
+                      lifecycle_state, submitted_for_review_at, reviewed_at, reviewed_by, review_note, live_at, live_by,
+                      created_by, updated_by, created_at, updated_at
                FROM sms_scripts
                ORDER BY datetime(updated_at) DESC, name COLLATE NOCASE ASC
            `;
@@ -4193,7 +4628,9 @@ class EnhancedDatabase {
    async getSmsScript(name) {
        return new Promise((resolve, reject) => {
            const sql = `
-               SELECT name, description, content, metadata, created_by, updated_by, created_at, updated_at
+               SELECT name, description, content, metadata, version,
+                      lifecycle_state, submitted_for_review_at, reviewed_at, reviewed_by, review_note, live_at, live_by,
+                      created_by, updated_by, created_at, updated_at
                FROM sms_scripts
                WHERE name = ?
            `;
@@ -4211,11 +4648,21 @@ class EnhancedDatabase {
        const metadata = payload.metadata && typeof payload.metadata === 'object'
            ? JSON.stringify(payload.metadata)
            : null;
+       const lifecycle = String(payload.lifecycle_state || 'draft').trim().toLowerCase();
+       const lifecycleState = ['draft', 'review', 'approved', 'live'].includes(lifecycle)
+           ? lifecycle
+           : 'draft';
+       const parsedVersion = Number(payload.version);
+       const version = Number.isFinite(parsedVersion) && parsedVersion > 0
+           ? Math.max(1, Math.floor(parsedVersion))
+           : 1;
        return new Promise((resolve, reject) => {
            const sql = `
                INSERT INTO sms_scripts (
-                   name, description, content, metadata, created_by, updated_by, created_at, updated_at
-               ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                   name, description, content, metadata, version,
+                   lifecycle_state, submitted_for_review_at, reviewed_at, reviewed_by, review_note, live_at, live_by,
+                   created_by, updated_by, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
            `;
            this.db.run(
                sql,
@@ -4224,6 +4671,14 @@ class EnhancedDatabase {
                    payload.description || null,
                    payload.content || '',
                    metadata,
+                   version,
+                   lifecycleState,
+                   payload.submitted_for_review_at || null,
+                   payload.reviewed_at || null,
+                   payload.reviewed_by || null,
+                   payload.review_note || null,
+                   payload.live_at || null,
+                   payload.live_by || null,
                    payload.created_by || null,
                    payload.created_by || payload.updated_by || null,
                ],
@@ -4263,6 +4718,7 @@ class EnhancedDatabase {
        if (!fields.length) {
            return 0;
        }
+       fields.push('version = COALESCE(version, 1) + 1');
        fields.push('updated_at = CURRENT_TIMESTAMP');
        values.push(name);
        return new Promise((resolve, reject) => {
@@ -4285,6 +4741,178 @@ class EnhancedDatabase {
                } else {
                    resolve(this.changes || 0);
                }
+           });
+       });
+   }
+
+   async listSmsScriptVersions(scriptName, limit = 20) {
+       const safeLimit = Number.isFinite(Number(limit))
+           ? Math.max(1, Math.min(100, Math.floor(Number(limit))))
+           : 20;
+       return new Promise((resolve, reject) => {
+           const sql = `
+               SELECT id, script_name, version, snapshot, reason, created_by, created_at
+               FROM sms_script_versions
+               WHERE script_name = ?
+               ORDER BY version DESC
+               LIMIT ?
+           `;
+           this.db.all(sql, [scriptName, safeLimit], (err, rows) => {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(rows || []);
+               }
+           });
+       });
+   }
+
+   async getSmsScriptVersion(scriptName, version) {
+       return new Promise((resolve, reject) => {
+           const sql = `
+               SELECT id, script_name, version, snapshot, reason, created_by, created_at
+               FROM sms_script_versions
+               WHERE script_name = ? AND version = ?
+               LIMIT 1
+           `;
+           this.db.get(sql, [scriptName, version], (err, row) => {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(row || null);
+               }
+           });
+       });
+   }
+
+   async saveSmsScriptVersion(scriptName, version, snapshot, options = {}) {
+       const safeVersion = Number.isFinite(Number(version))
+           ? Math.max(1, Math.floor(Number(version)))
+           : 1;
+       const reason = options.reason ? String(options.reason).slice(0, 120) : null;
+       const createdBy = options.created_by ? String(options.created_by).slice(0, 120) : null;
+       const serializedSnapshot = typeof snapshot === 'string'
+           ? snapshot
+           : JSON.stringify(snapshot || {});
+       return new Promise((resolve, reject) => {
+           const sql = `
+               INSERT INTO sms_script_versions (
+                   script_name, version, snapshot, reason, created_by, created_at
+               )
+               VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(script_name, version) DO UPDATE SET
+                   snapshot = excluded.snapshot,
+                   reason = excluded.reason,
+                   created_by = excluded.created_by,
+                   created_at = CURRENT_TIMESTAMP
+           `;
+           this.db.run(sql, [scriptName, safeVersion, serializedSnapshot, reason, createdBy], function (err) {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(this.changes || 0);
+               }
+           });
+       });
+   }
+
+   async setSmsScriptLifecycle(scriptName, updates = {}) {
+       const fields = [];
+       const values = [];
+       const mapping = {
+           lifecycle_state: 'lifecycle_state',
+           submitted_for_review_at: 'submitted_for_review_at',
+           reviewed_at: 'reviewed_at',
+           reviewed_by: 'reviewed_by',
+           review_note: 'review_note',
+           live_at: 'live_at',
+           live_by: 'live_by',
+       };
+       Object.entries(mapping).forEach(([key, column]) => {
+           if (!Object.prototype.hasOwnProperty.call(updates, key)) return;
+           let value = updates[key];
+           if (key === 'lifecycle_state') {
+               const normalized = String(value || '').trim().toLowerCase();
+               value = ['draft', 'review', 'approved', 'live'].includes(normalized)
+                   ? normalized
+                   : 'draft';
+           } else if (key === 'review_note') {
+               value = value === null || value === undefined ? null : String(value).slice(0, 500);
+           } else {
+               value = value === null || value === undefined ? null : String(value);
+           }
+           fields.push(`${column} = ?`);
+           values.push(value);
+       });
+       if (!fields.length) {
+           return 0;
+       }
+       fields.push('updated_at = CURRENT_TIMESTAMP');
+       values.push(scriptName);
+       return new Promise((resolve, reject) => {
+           const sql = `UPDATE sms_scripts SET ${fields.join(', ')} WHERE name = ?`;
+           this.db.run(sql, values, function (err) {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(this.changes || 0);
+               }
+           });
+       });
+   }
+
+   async promoteSmsScriptLive(scriptName, actor = null) {
+       const safeActor = actor === null || actor === undefined ? null : String(actor).slice(0, 120);
+       return new Promise((resolve, reject) => {
+           const dbConn = this.db;
+           dbConn.serialize(() => {
+               dbConn.run('BEGIN TRANSACTION');
+               dbConn.run(
+                   `UPDATE sms_scripts
+                    SET lifecycle_state = 'approved',
+                        live_at = NULL,
+                        live_by = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE lifecycle_state = 'live' AND name != ?`,
+                   [scriptName],
+                   (demoteErr) => {
+                       if (demoteErr) {
+                           dbConn.run('ROLLBACK');
+                           reject(demoteErr);
+                           return;
+                       }
+                       dbConn.run(
+                           `UPDATE sms_scripts
+                            SET lifecycle_state = 'live',
+                                live_at = CURRENT_TIMESTAMP,
+                                live_by = ?,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE name = ?`,
+                           [safeActor, scriptName],
+                           function (promoteErr) {
+                               if (promoteErr) {
+                                   dbConn.run('ROLLBACK');
+                                   reject(promoteErr);
+                                   return;
+                               }
+                               if (this.changes === 0) {
+                                   dbConn.run('ROLLBACK');
+                                   resolve(0);
+                                   return;
+                               }
+                               const promotedChanges = this.changes;
+                               dbConn.run('COMMIT', (commitErr) => {
+                                   if (commitErr) {
+                                       dbConn.run('ROLLBACK');
+                                       reject(commitErr);
+                                   } else {
+                                       resolve(promotedChanges);
+                                   }
+                               });
+                           },
+                       );
+                   },
+               );
            });
        });
    }
@@ -4681,6 +5309,30 @@ class EnhancedDatabase {
       });
   }
 
+   normalizeEmailTemplateRow(row = {}) {
+       if (!row || typeof row !== 'object') return null;
+       const lifecycle = String(row.lifecycle_state || 'draft').trim().toLowerCase();
+       const lifecycleState = ['draft', 'review', 'approved', 'live'].includes(lifecycle)
+           ? lifecycle
+           : 'draft';
+       const parsedVersion = Number(row.version);
+       const version = Number.isFinite(parsedVersion) && parsedVersion > 0
+           ? Math.max(1, Math.floor(parsedVersion))
+           : 1;
+       return {
+           ...row,
+           version,
+           lifecycle_state: lifecycleState,
+           submitted_for_review_at: row.submitted_for_review_at || null,
+           reviewed_at: row.reviewed_at || null,
+           reviewed_by: row.reviewed_by || null,
+           review_note: row.review_note || null,
+           live_at: row.live_at || null,
+           live_by: row.live_by || null,
+           is_live: lifecycleState === 'live',
+       };
+   }
+
    async getEmailTemplate(templateId) {
        return new Promise((resolve, reject) => {
            const sql = `SELECT * FROM email_templates WHERE template_id = ?`;
@@ -4689,26 +5341,31 @@ class EnhancedDatabase {
                    console.error('Error fetching email template:', err);
                    reject(err);
                } else {
-                   resolve(row || null);
+                   resolve(row ? this.normalizeEmailTemplateRow(row) : null);
                }
            });
        });
    }
 
    async listEmailTemplates(limit = 50) {
+       const safeLimit = Number.isFinite(Number(limit))
+           ? Math.max(1, Math.min(200, Math.floor(Number(limit))))
+           : 50;
        return new Promise((resolve, reject) => {
            const sql = `
-               SELECT template_id, subject, required_vars, created_at, updated_at
+               SELECT template_id, subject, html, text, required_vars, version,
+                      lifecycle_state, submitted_for_review_at, reviewed_at, reviewed_by, review_note, live_at, live_by,
+                      created_at, updated_at
                FROM email_templates
                ORDER BY updated_at DESC
                LIMIT ?
            `;
-           this.db.all(sql, [limit], (err, rows) => {
+           this.db.all(sql, [safeLimit], (err, rows) => {
                if (err) {
                    console.error('Error listing email templates:', err);
                    reject(err);
                } else {
-                   resolve(rows || []);
+                   resolve((rows || []).map((row) => this.normalizeEmailTemplateRow(row)).filter(Boolean));
                }
            });
        });
@@ -4720,18 +5377,50 @@ class EnhancedDatabase {
            subject = '',
            html = '',
            text = '',
-           required_vars = null
+           required_vars = null,
+           version = 1,
+           lifecycle_state = 'draft',
+           submitted_for_review_at = null,
+           reviewed_at = null,
+           reviewed_by = null,
+           review_note = null,
+           live_at = null,
+           live_by = null,
        } = payload || {};
+       const parsedVersion = Number(version);
+       const normalizedVersion = Number.isFinite(parsedVersion) && parsedVersion > 0
+           ? Math.max(1, Math.floor(parsedVersion))
+           : 1;
+       const lifecycle = String(lifecycle_state || 'draft').trim().toLowerCase();
+       const lifecycleState = ['draft', 'review', 'approved', 'live'].includes(lifecycle)
+           ? lifecycle
+           : 'draft';
        return new Promise((resolve, reject) => {
            const sql = `
                INSERT INTO email_templates (
-                   template_id, subject, html, text, required_vars, created_at, updated_at
+                   template_id, subject, html, text, required_vars, version,
+                   lifecycle_state, submitted_for_review_at, reviewed_at, reviewed_by, review_note, live_at, live_by,
+                   created_at, updated_at
                )
-               VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
            `;
            this.db.run(
                sql,
-               [template_id, subject, html, text, required_vars],
+               [
+                   template_id,
+                   subject,
+                   html,
+                   text,
+                   required_vars,
+                   normalizedVersion,
+                   lifecycleState,
+                   submitted_for_review_at,
+                   reviewed_at,
+                   reviewed_by,
+                   review_note,
+                   live_at,
+                   live_by,
+               ],
                function (err) {
                    if (err) {
                        console.error('Error creating email template:', err);
@@ -4762,6 +5451,7 @@ class EnhancedDatabase {
        if (!fields.length) {
            return 0;
        }
+       fields.push('version = COALESCE(version, 1) + 1');
        fields.push('updated_at = CURRENT_TIMESTAMP');
        values.push(templateId);
        return new Promise((resolve, reject) => {
@@ -4786,6 +5476,178 @@ class EnhancedDatabase {
                } else {
                    resolve(this.changes);
                }
+           });
+       });
+   }
+
+   async listEmailTemplateVersions(templateId, limit = 20) {
+       const safeLimit = Number.isFinite(Number(limit))
+           ? Math.max(1, Math.min(100, Math.floor(Number(limit))))
+           : 20;
+       return new Promise((resolve, reject) => {
+           const sql = `
+               SELECT id, template_id, version, snapshot, reason, created_by, created_at
+               FROM email_template_versions
+               WHERE template_id = ?
+               ORDER BY version DESC
+               LIMIT ?
+           `;
+           this.db.all(sql, [templateId, safeLimit], (err, rows) => {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(rows || []);
+               }
+           });
+       });
+   }
+
+   async getEmailTemplateVersion(templateId, version) {
+       return new Promise((resolve, reject) => {
+           const sql = `
+               SELECT id, template_id, version, snapshot, reason, created_by, created_at
+               FROM email_template_versions
+               WHERE template_id = ? AND version = ?
+               LIMIT 1
+           `;
+           this.db.get(sql, [templateId, version], (err, row) => {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(row || null);
+               }
+           });
+       });
+   }
+
+   async saveEmailTemplateVersion(templateId, version, snapshot, options = {}) {
+       const safeVersion = Number.isFinite(Number(version))
+           ? Math.max(1, Math.floor(Number(version)))
+           : 1;
+       const reason = options.reason ? String(options.reason).slice(0, 120) : null;
+       const createdBy = options.created_by ? String(options.created_by).slice(0, 120) : null;
+       const serializedSnapshot = typeof snapshot === 'string'
+           ? snapshot
+           : JSON.stringify(snapshot || {});
+       return new Promise((resolve, reject) => {
+           const sql = `
+               INSERT INTO email_template_versions (
+                   template_id, version, snapshot, reason, created_by, created_at
+               )
+               VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(template_id, version) DO UPDATE SET
+                   snapshot = excluded.snapshot,
+                   reason = excluded.reason,
+                   created_by = excluded.created_by,
+                   created_at = CURRENT_TIMESTAMP
+           `;
+           this.db.run(sql, [templateId, safeVersion, serializedSnapshot, reason, createdBy], function (err) {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(this.changes || 0);
+               }
+           });
+       });
+   }
+
+   async setEmailTemplateLifecycle(templateId, updates = {}) {
+       const fields = [];
+       const values = [];
+       const mapping = {
+           lifecycle_state: 'lifecycle_state',
+           submitted_for_review_at: 'submitted_for_review_at',
+           reviewed_at: 'reviewed_at',
+           reviewed_by: 'reviewed_by',
+           review_note: 'review_note',
+           live_at: 'live_at',
+           live_by: 'live_by',
+       };
+       Object.entries(mapping).forEach(([key, column]) => {
+           if (!Object.prototype.hasOwnProperty.call(updates, key)) return;
+           let value = updates[key];
+           if (key === 'lifecycle_state') {
+               const normalized = String(value || '').trim().toLowerCase();
+               value = ['draft', 'review', 'approved', 'live'].includes(normalized)
+                   ? normalized
+                   : 'draft';
+           } else if (key === 'review_note') {
+               value = value === null || value === undefined ? null : String(value).slice(0, 500);
+           } else {
+               value = value === null || value === undefined ? null : String(value);
+           }
+           fields.push(`${column} = ?`);
+           values.push(value);
+       });
+       if (!fields.length) {
+           return 0;
+       }
+       fields.push('updated_at = CURRENT_TIMESTAMP');
+       values.push(templateId);
+       return new Promise((resolve, reject) => {
+           const sql = `UPDATE email_templates SET ${fields.join(', ')} WHERE template_id = ?`;
+           this.db.run(sql, values, function (err) {
+               if (err) {
+                   reject(err);
+               } else {
+                   resolve(this.changes || 0);
+               }
+           });
+       });
+   }
+
+   async promoteEmailTemplateLive(templateId, actor = null) {
+       const safeActor = actor === null || actor === undefined ? null : String(actor).slice(0, 120);
+       return new Promise((resolve, reject) => {
+           const dbConn = this.db;
+           dbConn.serialize(() => {
+               dbConn.run('BEGIN TRANSACTION');
+               dbConn.run(
+                   `UPDATE email_templates
+                    SET lifecycle_state = 'approved',
+                        live_at = NULL,
+                        live_by = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE lifecycle_state = 'live' AND template_id != ?`,
+                   [templateId],
+                   (demoteErr) => {
+                       if (demoteErr) {
+                           dbConn.run('ROLLBACK');
+                           reject(demoteErr);
+                           return;
+                       }
+                       dbConn.run(
+                           `UPDATE email_templates
+                            SET lifecycle_state = 'live',
+                                live_at = CURRENT_TIMESTAMP,
+                                live_by = ?,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE template_id = ?`,
+                           [safeActor, templateId],
+                           function (promoteErr) {
+                               if (promoteErr) {
+                                   dbConn.run('ROLLBACK');
+                                   reject(promoteErr);
+                                   return;
+                               }
+                               if (this.changes === 0) {
+                                   dbConn.run('ROLLBACK');
+                                   resolve(0);
+                                   return;
+                               }
+                               const promotedChanges = this.changes;
+                               dbConn.run('COMMIT', (commitErr) => {
+                                   if (commitErr) {
+                                       dbConn.run('ROLLBACK');
+                                       reject(commitErr);
+                                   } else {
+                                       resolve(promotedChanges);
+                                   }
+                               });
+                           },
+                       );
+                   },
+               );
            });
        });
    }

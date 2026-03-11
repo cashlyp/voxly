@@ -9,13 +9,14 @@ Use it together with [AGENTS.md](/workspaces/voxly/AGENTS.md).
 Run this sequence for every task:
 
 1. Check explicit user skill requests.
-2. Apply mandatory safety triggers.
-3. Detect provider surface (query + files).
-4. Detect repo area.
-5. Detect primary intent.
-6. Detect runtime constraints.
-7. Build minimal covering skill set.
-8. Run preflight guardrails.
+2. Load convention fingerprint for this repo when present (`~/.codex/conventions/<repo-id>.md`).
+3. Apply mandatory safety triggers.
+4. Detect provider surface (query + files).
+5. Detect repo area.
+6. Detect primary intent.
+7. Detect runtime constraints.
+8. Build minimal covering skill set.
+9. Run preflight guardrails.
 
 ## 2. Intent -> Skill Mapping
 
@@ -93,6 +94,14 @@ Abort and reroute skills when:
 - bug-fix work starts without a reproducible failure path.
 - large implementation starts without `intent-codegen`.
 
+### 6.5 Convention Fingerprint Guard
+
+Required for `intent-codegen` and `bug-risk-review`:
+1. Resolve repo id and check `~/.codex/conventions/<repo-id>.md`.
+2. If missing, generate baseline with `docs/agent/build-convention-fingerprint.sh`.
+3. Treat fingerprint rules as defaults unless user explicitly overrides.
+4. Record any drift or exception in `Known Exceptions`.
+
 ## 7. Evidence Checklist for Final Output
 
 Include:
@@ -114,6 +123,9 @@ Include:
 
 # Local routing helper
 /workspaces/voxly/docs/agent/route-skills.sh --from-git --query "your task text"
+
+# Generate/refresh convention fingerprint
+/workspaces/voxly/docs/agent/build-convention-fingerprint.sh --from-git --output ~/.codex/conventions/voxly.md
 
 # Local profile selector (print decision)
 /workspaces/voxly/docs/agent/select-codex-profile.sh --from-git --query "your task text"

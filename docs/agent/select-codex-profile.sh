@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO_ID="$(basename "$ROOT_DIR")"
+FINGERPRINT_PATH="$HOME/.codex/conventions/$REPO_ID.md"
 
 QUERY=""
 USE_GIT=0
@@ -187,6 +189,12 @@ fi
 if [[ $PRINT_MODE -eq 1 ]]; then
   echo "Codex Profile Selector"
   echo "repo: $ROOT_DIR"
+  if [[ -f "$FINGERPRINT_PATH" ]]; then
+    echo "convention_fingerprint: $FINGERPRINT_PATH"
+  else
+    echo "convention_fingerprint: missing"
+    echo "fingerprint_generate: $ROOT_DIR/docs/agent/build-convention-fingerprint.sh --output $FINGERPRINT_PATH"
+  fi
   [[ -n "$QUERY" ]] && echo "query: $QUERY"
   if [[ ${#FILES[@]} -gt 0 ]]; then
     echo "files: ${FILES[*]}"
