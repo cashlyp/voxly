@@ -24,7 +24,9 @@ const {
   appendBackToMenuRows,
   selectionExpiredMessage,
   cancelledMessage,
-  setupStepMessage
+  setupStepMessage,
+  upsertMenuMessage,
+  dismissMenuMessage
 } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 const { getAccessProfile } = require('../utils/capabilities');
@@ -892,139 +894,148 @@ async function searchEmailTemplatesFlow(conversation, ctx, ensureActive) {
 }
 
 async function showEmailTemplateDetail(conversation, ctx, template, ensureActive) {
+  let summaryMessage = null;
   let viewing = true;
-  while (viewing) {
-    await safeReplyMarkdown(ctx, formatEmailTemplateSummary(template));
-    const lifecycleState = getEmailTemplateLifecycleState(template);
-    const actions = [
-      { id: 'preview', label: '🔍 Preview' },
-      { id: 'simulate', label: '🧪 Simulate' },
-      { id: 'edit', label: '✏️ Edit' },
-      { id: 'clone', label: '🧬 Clone' },
-      { id: 'export', label: '📤 Export' },
-      { id: 'versions', label: '🗂️ Versions' },
-      { id: 'diff', label: '🧮 Diff' },
-      { id: 'rollback', label: '↩️ Rollback' }
-    ];
-    if (lifecycleState === 'draft') {
-      actions.push({ id: 'submit_review', label: '📨 Submit Review' });
-    } else if (lifecycleState === 'review') {
-      actions.push({ id: 'approve', label: '✅ Approve' });
-      actions.push({ id: 'reject', label: '↩️ Reject' });
-    } else if (lifecycleState === 'approved') {
-      actions.push({ id: 'promote_live', label: '🚀 Promote Live' });
+  try {
+    while (viewing) {
+      summaryMessage = await upsertMenuMessage(ctx, summaryMessage, formatEmailTemplateSummary(template), {
+        parse_mode: 'Markdown'
+      });
+      const lifecycleState = getEmailTemplateLifecycleState(template);
+      const actions = [
+        { id: 'preview', label: '🔍 Preview' },
+        { id: 'simulate', label: '🧪 Simulate' },
+        { id: 'edit', label: '✏️ Edit' },
+        { id: 'clone', label: '🧬 Clone' },
+        { id: 'export', label: '📤 Export' },
+        { id: 'versions', label: '🗂️ Versions' },
+        { id: 'diff', label: '🧮 Diff' },
+        { id: 'rollback', label: '↩️ Rollback' }
+      ];
+      if (lifecycleState === 'draft') {
+        actions.push({ id: 'submit_review', label: '📨 Submit Review' });
+      } else if (lifecycleState === 'review') {
+        actions.push({ id: 'approve', label: '✅ Approve' });
+        actions.push({ id: 'reject', label: '↩️ Reject' });
+      } else if (lifecycleState === 'approved') {
+        actions.push({ id: 'promote_live', label: '🚀 Promote Live' });
+      }
+      actions.push({ id: 'delete', label: '🗑️ Delete' });
+      actions.push({ id: 'back', label: '⬅️ Back' });
+
+      const action = await askOptionWithButtons(
+        conversation,
+        ctx,
+        'Choose an action.',
+        actions,
+        { prefix: 'email-template-action', columns: 2, ensureActive, keepMessage: summaryMessage }
+      );
+
+      if (!action?.id) {
+        await safeReply(ctx, selectionExpiredMessage(), { parse_mode: 'Markdown' });
+        continue;
+      }
+
+      switch (action.id) {
+        case 'preview':
+          await previewEmailTemplate(conversation, ctx, template, ensureActive);
+          break;
+        case 'simulate':
+          await simulateEmailTemplateFlow(conversation, ctx, template, ensureActive);
+          break;
+        case 'edit':
+          await editEmailTemplateFlow(conversation, ctx, template, ensureActive);
+          template = await fetchEmailTemplate(ctx, template.template_id);
+          break;
+        case 'clone':
+          await cloneEmailTemplateFlow(conversation, ctx, template, ensureActive);
+          break;
+        case 'export':
+          await exportEmailTemplate(ctx, template);
+          break;
+        case 'versions':
+          await showEmailTemplateVersions(conversation, ctx, template, ensureActive);
+          template = await fetchEmailTemplate(ctx, template.template_id);
+          break;
+        case 'diff':
+          await showEmailTemplateVersionDiffFlow(conversation, ctx, template, ensureActive);
+          break;
+        case 'rollback':
+          template = await rollbackEmailTemplateVersionFlow(conversation, ctx, template, ensureActive);
+          break;
+        case 'submit_review':
+          template = await submitEmailTemplateForReview(ctx, template.template_id);
+          await safeReply(ctx, '✅ Template submitted for review.');
+          break;
+        case 'approve': {
+          const approval = await promptReviewNote(
+            conversation,
+            ctx,
+            'Optional approval note.',
+            ensureActive
+          );
+          if (approval.cancelled) {
+            await safeReply(ctx, 'Approval cancelled.');
+            break;
+          }
+          template = await reviewEmailTemplate(
+            ctx,
+            template.template_id,
+            'approve',
+            approval.note
+          );
+          await safeReply(ctx, '✅ Template approved.');
+          break;
+        }
+        case 'reject': {
+          const rejection = await promptReviewNote(
+            conversation,
+            ctx,
+            'Optional rejection note.',
+            ensureActive
+          );
+          if (rejection.cancelled) {
+            await safeReply(ctx, 'Rejection cancelled.');
+            break;
+          }
+          template = await reviewEmailTemplate(
+            ctx,
+            template.template_id,
+            'reject',
+            rejection.note
+          );
+          await safeReply(ctx, '↩️ Template returned to draft.');
+          break;
+        }
+        case 'promote_live': {
+          const ok = await confirmAction(
+            conversation,
+            ctx,
+            `Promote *${escapeMarkdown(template.template_id)}* to live?`,
+            ensureActive
+          );
+          if (!ok) {
+            await safeReply(ctx, 'Promotion cancelled.');
+            break;
+          }
+          template = await promoteEmailTemplateLive(ctx, template.template_id);
+          await safeReply(ctx, '🚀 Template promoted to live.');
+          break;
+        }
+        case 'delete':
+          await deleteEmailTemplateFlow(conversation, ctx, template);
+          viewing = false;
+          break;
+        case 'back':
+          viewing = false;
+          break;
+        default:
+          break;
+      }
     }
-    actions.push({ id: 'delete', label: '🗑️ Delete' });
-    actions.push({ id: 'back', label: '⬅️ Back' });
-
-    const action = await askOptionWithButtons(
-      conversation,
-      ctx,
-      'Choose an action.',
-      actions,
-      { prefix: 'email-template-action', columns: 2, ensureActive }
-    );
-
-    if (!action?.id) {
-      await safeReply(ctx, selectionExpiredMessage(), { parse_mode: 'Markdown' });
-      continue;
-    }
-
-    switch (action.id) {
-      case 'preview':
-        await previewEmailTemplate(conversation, ctx, template, ensureActive);
-        break;
-      case 'simulate':
-        await simulateEmailTemplateFlow(conversation, ctx, template, ensureActive);
-        break;
-      case 'edit':
-        await editEmailTemplateFlow(conversation, ctx, template, ensureActive);
-        template = await fetchEmailTemplate(ctx, template.template_id);
-        break;
-      case 'clone':
-        await cloneEmailTemplateFlow(conversation, ctx, template, ensureActive);
-        break;
-      case 'export':
-        await exportEmailTemplate(ctx, template);
-        break;
-      case 'versions':
-        await showEmailTemplateVersions(conversation, ctx, template, ensureActive);
-        template = await fetchEmailTemplate(ctx, template.template_id);
-        break;
-      case 'diff':
-        await showEmailTemplateVersionDiffFlow(conversation, ctx, template, ensureActive);
-        break;
-      case 'rollback':
-        template = await rollbackEmailTemplateVersionFlow(conversation, ctx, template, ensureActive);
-        break;
-      case 'submit_review':
-        template = await submitEmailTemplateForReview(ctx, template.template_id);
-        await safeReply(ctx, '✅ Template submitted for review.');
-        break;
-      case 'approve': {
-        const approval = await promptReviewNote(
-          conversation,
-          ctx,
-          'Optional approval note.',
-          ensureActive
-        );
-        if (approval.cancelled) {
-          await safeReply(ctx, 'Approval cancelled.');
-          break;
-        }
-        template = await reviewEmailTemplate(
-          ctx,
-          template.template_id,
-          'approve',
-          approval.note
-        );
-        await safeReply(ctx, '✅ Template approved.');
-        break;
-      }
-      case 'reject': {
-        const rejection = await promptReviewNote(
-          conversation,
-          ctx,
-          'Optional rejection note.',
-          ensureActive
-        );
-        if (rejection.cancelled) {
-          await safeReply(ctx, 'Rejection cancelled.');
-          break;
-        }
-        template = await reviewEmailTemplate(
-          ctx,
-          template.template_id,
-          'reject',
-          rejection.note
-        );
-        await safeReply(ctx, '↩️ Template returned to draft.');
-        break;
-      }
-      case 'promote_live': {
-        const ok = await confirmAction(
-          conversation,
-          ctx,
-          `Promote *${escapeMarkdown(template.template_id)}* to live?`,
-          ensureActive
-        );
-        if (!ok) {
-          await safeReply(ctx, 'Promotion cancelled.');
-          break;
-        }
-        template = await promoteEmailTemplateLive(ctx, template.template_id);
-        await safeReply(ctx, '🚀 Template promoted to live.');
-        break;
-      }
-      case 'delete':
-        await deleteEmailTemplateFlow(conversation, ctx, template);
-        viewing = false;
-        break;
-      case 'back':
-        viewing = false;
-        break;
-      default:
-        break;
+  } finally {
+    if (summaryMessage) {
+      await dismissMenuMessage(ctx, summaryMessage);
     }
   }
 }

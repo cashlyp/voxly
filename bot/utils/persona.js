@@ -2,7 +2,12 @@ const { InlineKeyboard } = require('grammy');
 const config = require('../config');
 const httpClient = require('./httpClient');
 const { ensureOperationActive, getCurrentOpId } = require('./sessionState');
-const { upsertMenuMessage, dismissMenuMessage } = require('./ui');
+const {
+  upsertMenuMessage,
+  dismissMenuMessage,
+  clearMenuMessages,
+  registerMenuMessage
+} = require('./ui');
 const { buildCallbackData, matchesCallbackPrefix, parseCallbackData } = require('./actions');
 
 const FALLBACK_PERSONAS = [
@@ -364,7 +369,7 @@ async function askOptionWithButtons(
   ctx,
   prompt,
   options,
-  { prefix, columns = 2, formatLabel, ensureActive } = {}
+  { prefix, columns = 2, formatLabel, ensureActive, keepMessage = null } = {}
 ) {
   const keyboard = new InlineKeyboard();
   const basePrefix = prefix || 'option';
@@ -389,7 +394,15 @@ async function askOptionWithButtons(
     }
   });
 
-  const message = await upsertMenuMessage(ctx, null, prompt, { parse_mode: 'Markdown', reply_markup: keyboard });
+  const keepMessageId = keepMessage?.message_id || keepMessage?.messageId || null;
+  let message = null;
+  if (keepMessageId) {
+    await clearMenuMessages(ctx, { keepMessageId });
+    message = await ctx.reply(prompt, { parse_mode: 'Markdown', reply_markup: keyboard });
+    registerMenuMessage(ctx, message);
+  } else {
+    message = await upsertMenuMessage(ctx, null, prompt, { parse_mode: 'Markdown', reply_markup: keyboard });
+  }
   const selectionCtx = await conversation.waitFor('callback_query:data', (callbackCtx) => {
     const callbackData = callbackCtx?.callbackQuery?.data;
     if (!callbackData) {
