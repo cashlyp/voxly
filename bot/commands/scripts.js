@@ -2000,159 +2000,166 @@ async function showCallScriptDetail(conversation, ctx, script, ensureActive) {
     : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
   let summaryMessage = null;
   let viewing = true;
-  while (viewing) {
-    const summary = formatCallScriptSummary(script);
-    summaryMessage = await upsertMenuMessage(ctx, summaryMessage, summary, { parse_mode: 'Markdown' });
-    const lifecycleState = getCallScriptLifecycleState(script);
-    const actions = [
-      { id: 'preview', label: '📞 Preview' },
-      { id: 'simulate', label: '🧪 Simulate' },
-      { id: 'edit', label: '✏️ Edit' },
-      { id: 'clone', label: '🧬 Clone' },
-      { id: 'versions', label: '🗂️ Versions' },
-      { id: 'diff', label: '🧮 Diff' },
-      { id: 'rollback', label: '↩️ Rollback' }
-    ];
-    if (lifecycleState === 'draft') {
-      actions.push({ id: 'submit_review', label: '📨 Submit Review' });
-    } else if (lifecycleState === 'review') {
-      actions.push({ id: 'approve', label: '✅ Approve' });
-      actions.push({ id: 'reject', label: '↩️ Reject' });
-    } else if (lifecycleState === 'approved') {
-      actions.push({ id: 'promote_live', label: '🚀 Promote Live' });
-    }
-    actions.push({ id: 'delete', label: '🗑️ Delete' });
-    actions.push({ id: 'back', label: '⬅️ Back' });
+  try {
+    while (viewing) {
+      const summary = formatCallScriptSummary(script);
+      summaryMessage = await upsertMenuMessage(ctx, summaryMessage, summary, { parse_mode: 'Markdown' });
+      const lifecycleState = getCallScriptLifecycleState(script);
+      const actions = [
+        { id: 'preview', label: '📞 Preview' },
+        { id: 'simulate', label: '🧪 Simulate' },
+        { id: 'edit', label: '✏️ Edit' },
+        { id: 'clone', label: '🧬 Clone' },
+        { id: 'versions', label: '🗂️ Versions' },
+        { id: 'diff', label: '🧮 Diff' },
+        { id: 'rollback', label: '↩️ Rollback' }
+      ];
+      if (lifecycleState === 'draft') {
+        actions.push({ id: 'submit_review', label: '📨 Submit Review' });
+      } else if (lifecycleState === 'review') {
+        actions.push({ id: 'approve', label: '✅ Approve' });
+        actions.push({ id: 'reject', label: '↩️ Reject' });
+      } else if (lifecycleState === 'approved') {
+        actions.push({ id: 'promote_live', label: '🚀 Promote Live' });
+      }
+      actions.push({ id: 'delete', label: '🗑️ Delete' });
+      actions.push({ id: 'back', label: '⬅️ Back' });
 
-    const action = await askOptionWithButtons(
-      conversation,
-      ctx,
-      'Choose an action for this script.',
-      actions,
-      { prefix: 'call-script-action', columns: 2, ensureActive: safeEnsureActive }
-    );
+      const action = await askOptionWithButtons(
+        conversation,
+        ctx,
+        'Choose an action for this script.',
+        actions,
+        {
+          prefix: 'call-script-action',
+          columns: 2,
+          ensureActive: safeEnsureActive,
+          keepMessage: summaryMessage
+        }
+      );
 
-    if (!action?.id) {
-      await ctx.reply(selectionExpiredMessage(), { parse_mode: 'Markdown' });
-      continue;
-    }
+      if (!action?.id) {
+        await ctx.reply(selectionExpiredMessage(), { parse_mode: 'Markdown' });
+        continue;
+      }
 
-    switch (action.id) {
-      case 'preview':
-        await previewCallScript(conversation, ctx, script, safeEnsureActive);
-        break;
-      case 'simulate':
-        await simulateCallScriptFlow(conversation, ctx, script, safeEnsureActive);
-        break;
-      case 'edit':
-        await editCallScriptFlow(conversation, ctx, script, safeEnsureActive);
-        try {
-          script = await fetchCallScriptById(script.id);
-        } catch (error) {
-          console.error('Failed to refresh call script after edit:', error);
-          await ctx.reply(formatScriptsApiError(error, 'Failed to refresh script details'));
+      switch (action.id) {
+        case 'preview':
+          await previewCallScript(conversation, ctx, script, safeEnsureActive);
+          break;
+        case 'simulate':
+          await simulateCallScriptFlow(conversation, ctx, script, safeEnsureActive);
+          break;
+        case 'edit':
+          await editCallScriptFlow(conversation, ctx, script, safeEnsureActive);
+          try {
+            script = await fetchCallScriptById(script.id);
+          } catch (error) {
+            console.error('Failed to refresh call script after edit:', error);
+            await ctx.reply(formatScriptsApiError(error, 'Failed to refresh script details'));
+            viewing = false;
+          }
+          break;
+        case 'clone':
+          await cloneCallScriptFlow(conversation, ctx, script, safeEnsureActive);
+          break;
+        case 'versions':
+          await showCallScriptVersions(conversation, ctx, script, safeEnsureActive);
+          break;
+        case 'diff':
+          await showCallScriptVersionDiffFlow(conversation, ctx, script, safeEnsureActive);
+          break;
+        case 'rollback':
+          script = await rollbackCallScriptVersionFlow(conversation, ctx, script, safeEnsureActive);
+          break;
+        case 'submit_review':
+          try {
+            script = await submitCallScriptForReview(script.id);
+            await ctx.reply('✅ Script submitted for review.');
+          } catch (error) {
+            await ctx.reply(formatScriptsApiError(error, 'Failed to submit review'));
+          }
+          break;
+        case 'approve': {
+          const note = await promptText(
+            conversation,
+            ctx,
+            'Optional approval note (type skip to leave blank).',
+            { allowEmpty: true, allowSkip: true, parse: (value) => value.trim(), ensureActive: safeEnsureActive }
+          );
+          if (note === null) {
+            await ctx.reply('Approval cancelled.');
+            break;
+          }
+          try {
+            script = await reviewCallScript(
+              script.id,
+              'approve',
+              note === undefined ? null : note
+            );
+            await ctx.reply('✅ Script approved.');
+          } catch (error) {
+            await ctx.reply(formatScriptsApiError(error, 'Failed to approve script'));
+          }
+          break;
+        }
+        case 'reject': {
+          const note = await promptText(
+            conversation,
+            ctx,
+            'Optional rejection note (type skip to use default).',
+            { allowEmpty: true, allowSkip: true, parse: (value) => value.trim(), ensureActive: safeEnsureActive }
+          );
+          if (note === null) {
+            await ctx.reply('Rejection cancelled.');
+            break;
+          }
+          try {
+            script = await reviewCallScript(
+              script.id,
+              'reject',
+              note === undefined ? null : note
+            );
+            await ctx.reply('↩️ Script returned to draft.');
+          } catch (error) {
+            await ctx.reply(formatScriptsApiError(error, 'Failed to reject script'));
+          }
+          break;
+        }
+        case 'promote_live': {
+          const ok = await confirm(
+            conversation,
+            ctx,
+            `Promote *${escapeMarkdown(script.name)}* to live?`,
+            safeEnsureActive
+          );
+          if (!ok) {
+            await ctx.reply('Promotion cancelled.');
+            break;
+          }
+          try {
+            script = await promoteCallScriptLive(script.id);
+            await ctx.reply('🚀 Script promoted to live.');
+          } catch (error) {
+            await ctx.reply(formatScriptsApiError(error, 'Failed to promote script'));
+          }
+          break;
+        }
+        case 'delete':
+          await deleteCallScriptFlow(conversation, ctx, script, safeEnsureActive);
           viewing = false;
-        }
-        break;
-      case 'clone':
-        await cloneCallScriptFlow(conversation, ctx, script, safeEnsureActive);
-        break;
-      case 'versions':
-        await showCallScriptVersions(conversation, ctx, script, safeEnsureActive);
-        break;
-      case 'diff':
-        await showCallScriptVersionDiffFlow(conversation, ctx, script, safeEnsureActive);
-        break;
-      case 'rollback':
-        script = await rollbackCallScriptVersionFlow(conversation, ctx, script, safeEnsureActive);
-        break;
-      case 'submit_review':
-        try {
-          script = await submitCallScriptForReview(script.id);
-          await ctx.reply('✅ Script submitted for review.');
-        } catch (error) {
-          await ctx.reply(formatScriptsApiError(error, 'Failed to submit review'));
-        }
-        break;
-      case 'approve': {
-        const note = await promptText(
-          conversation,
-          ctx,
-          'Optional approval note (type skip to leave blank).',
-          { allowEmpty: true, allowSkip: true, parse: (value) => value.trim(), ensureActive: safeEnsureActive }
-        );
-        if (note === null) {
-          await ctx.reply('Approval cancelled.');
           break;
-        }
-        try {
-          script = await reviewCallScript(
-            script.id,
-            'approve',
-            note === undefined ? null : note
-          );
-          await ctx.reply('✅ Script approved.');
-        } catch (error) {
-          await ctx.reply(formatScriptsApiError(error, 'Failed to approve script'));
-        }
-        break;
-      }
-      case 'reject': {
-        const note = await promptText(
-          conversation,
-          ctx,
-          'Optional rejection note (type skip to use default).',
-          { allowEmpty: true, allowSkip: true, parse: (value) => value.trim(), ensureActive: safeEnsureActive }
-        );
-        if (note === null) {
-          await ctx.reply('Rejection cancelled.');
+        case 'back':
+          viewing = false;
           break;
-        }
-        try {
-          script = await reviewCallScript(
-            script.id,
-            'reject',
-            note === undefined ? null : note
-          );
-          await ctx.reply('↩️ Script returned to draft.');
-        } catch (error) {
-          await ctx.reply(formatScriptsApiError(error, 'Failed to reject script'));
-        }
-        break;
-      }
-      case 'promote_live': {
-        const ok = await confirm(
-          conversation,
-          ctx,
-          `Promote *${escapeMarkdown(script.name)}* to live?`,
-          safeEnsureActive
-        );
-        if (!ok) {
-          await ctx.reply('Promotion cancelled.');
+        default:
           break;
-        }
-        try {
-          script = await promoteCallScriptLive(script.id);
-          await ctx.reply('🚀 Script promoted to live.');
-        } catch (error) {
-          await ctx.reply(formatScriptsApiError(error, 'Failed to promote script'));
-        }
-        break;
       }
-      case 'delete':
-        await deleteCallScriptFlow(conversation, ctx, script, safeEnsureActive);
-        viewing = false;
-        break;
-      case 'back':
-        viewing = false;
-        break;
-      default:
-        break;
     }
-  }
-
-  if (summaryMessage) {
-    await dismissMenuMessage(ctx, summaryMessage);
+  } finally {
+    if (summaryMessage) {
+      await dismissMenuMessage(ctx, summaryMessage);
+    }
   }
 }
 
@@ -3046,163 +3053,169 @@ async function previewSmsScript(conversation, ctx, script) {
 async function showSmsScriptDetail(conversation, ctx, script) {
   let summaryMessage = null;
   let viewing = true;
-  while (viewing) {
-    const summary = formatSmsScriptSummary(script);
-    summaryMessage = await upsertMenuMessage(ctx, summaryMessage, summary, { parse_mode: 'Markdown' });
+  try {
+    while (viewing) {
+      const summary = formatSmsScriptSummary(script);
+      summaryMessage = await upsertMenuMessage(ctx, summaryMessage, summary, { parse_mode: 'Markdown' });
 
-    const actions = [
-      { id: 'preview', label: '📲 Preview' },
-      { id: 'simulate', label: '🧪 Simulate' },
-      { id: 'clone', label: '🧬 Clone' }
-    ];
+      const actions = [
+        { id: 'preview', label: '📲 Preview' },
+        { id: 'simulate', label: '🧪 Simulate' },
+        { id: 'clone', label: '🧬 Clone' }
+      ];
 
-    if (!script.is_builtin) {
-      const lifecycleState = getSmsScriptLifecycleState(script);
-      actions.splice(2, 0, { id: 'edit', label: '✏️ Edit' });
-      actions.splice(3, 0, { id: 'versions', label: '🗂️ Versions' });
-      actions.splice(4, 0, { id: 'diff', label: '🧮 Diff' });
-      actions.splice(5, 0, { id: 'rollback', label: '↩️ Rollback' });
-      if (lifecycleState === 'draft') {
-        actions.push({ id: 'submit_review', label: '📨 Submit Review' });
-      } else if (lifecycleState === 'review') {
-        actions.push({ id: 'approve', label: '✅ Approve' });
-        actions.push({ id: 'reject', label: '↩️ Reject' });
-      } else if (lifecycleState === 'approved') {
-        actions.push({ id: 'promote_live', label: '🚀 Promote Live' });
+      if (!script.is_builtin) {
+        const lifecycleState = getSmsScriptLifecycleState(script);
+        actions.splice(2, 0, { id: 'edit', label: '✏️ Edit' });
+        actions.splice(3, 0, { id: 'versions', label: '🗂️ Versions' });
+        actions.splice(4, 0, { id: 'diff', label: '🧮 Diff' });
+        actions.splice(5, 0, { id: 'rollback', label: '↩️ Rollback' });
+        if (lifecycleState === 'draft') {
+          actions.push({ id: 'submit_review', label: '📨 Submit Review' });
+        } else if (lifecycleState === 'review') {
+          actions.push({ id: 'approve', label: '✅ Approve' });
+          actions.push({ id: 'reject', label: '↩️ Reject' });
+        } else if (lifecycleState === 'approved') {
+          actions.push({ id: 'promote_live', label: '🚀 Promote Live' });
+        }
+        actions.push({ id: 'delete', label: '🗑️ Delete' });
       }
-      actions.push({ id: 'delete', label: '🗑️ Delete' });
-    }
 
-    actions.push({ id: 'back', label: '⬅️ Back' });
+      actions.push({ id: 'back', label: '⬅️ Back' });
 
-    const action = await askOptionWithButtons(
-      conversation,
-      ctx,
-      'Choose an action for this SMS script.',
-      actions,
-      { prefix: 'sms-script-action', columns: 2 }
-    );
+      const action = await askOptionWithButtons(
+        conversation,
+        ctx,
+        'Choose an action for this SMS script.',
+        actions,
+        {
+          prefix: 'sms-script-action',
+          columns: 2,
+          keepMessage: summaryMessage
+        }
+      );
 
-    if (!action?.id) {
-      await ctx.reply(selectionExpiredMessage(), { parse_mode: 'Markdown' });
-      continue;
-    }
+      if (!action?.id) {
+        await ctx.reply(selectionExpiredMessage(), { parse_mode: 'Markdown' });
+        continue;
+      }
 
-    switch (action.id) {
-      case 'preview':
-        await previewSmsScript(conversation, ctx, script);
-        break;
-      case 'simulate':
-        await simulateSmsScriptFlow(conversation, ctx, script);
-        break;
-      case 'edit':
-        await editSmsScriptFlow(conversation, ctx, script);
-        try {
-          script = await fetchSmsScriptByName(script.name, { detailed: true });
-        } catch (error) {
-          console.error('Failed to refresh SMS script after edit:', error);
-          await ctx.reply(formatScriptsApiError(error, 'Failed to refresh script details'));
+      switch (action.id) {
+        case 'preview':
+          await previewSmsScript(conversation, ctx, script);
+          break;
+        case 'simulate':
+          await simulateSmsScriptFlow(conversation, ctx, script);
+          break;
+        case 'edit':
+          await editSmsScriptFlow(conversation, ctx, script);
+          try {
+            script = await fetchSmsScriptByName(script.name, { detailed: true });
+          } catch (error) {
+            console.error('Failed to refresh SMS script after edit:', error);
+            await ctx.reply(formatScriptsApiError(error, 'Failed to refresh script details'));
+            viewing = false;
+          }
+          break;
+        case 'clone':
+          await cloneSmsScriptFlow(conversation, ctx, script);
+          break;
+        case 'versions':
+          await showSmsScriptVersions(conversation, ctx, script);
+          break;
+        case 'diff':
+          await showSmsScriptVersionDiffFlow(conversation, ctx, script);
+          break;
+        case 'rollback':
+          script = await rollbackSmsScriptVersionFlow(conversation, ctx, script);
+          break;
+        case 'submit_review':
+          try {
+            script = await submitSmsScriptForReview(script.name);
+            await ctx.reply('✅ SMS script submitted for review.');
+          } catch (error) {
+            await ctx.reply(formatScriptsApiError(error, 'Failed to submit review'));
+          }
+          break;
+        case 'approve': {
+          const note = await promptText(
+            conversation,
+            ctx,
+            'Optional approval note (type skip to leave blank).',
+            { allowEmpty: true, allowSkip: true, parse: (value) => value.trim() }
+          );
+          if (note === null) {
+            await ctx.reply('Approval cancelled.');
+            break;
+          }
+          try {
+            script = await reviewSmsScript(
+              script.name,
+              'approve',
+              note === undefined ? null : note
+            );
+            await ctx.reply('✅ SMS script approved.');
+          } catch (error) {
+            await ctx.reply(formatScriptsApiError(error, 'Failed to approve script'));
+          }
+          break;
+        }
+        case 'reject': {
+          const note = await promptText(
+            conversation,
+            ctx,
+            'Optional rejection note (type skip to use default).',
+            { allowEmpty: true, allowSkip: true, parse: (value) => value.trim() }
+          );
+          if (note === null) {
+            await ctx.reply('Rejection cancelled.');
+            break;
+          }
+          try {
+            script = await reviewSmsScript(
+              script.name,
+              'reject',
+              note === undefined ? null : note
+            );
+            await ctx.reply('↩️ SMS script returned to draft.');
+          } catch (error) {
+            await ctx.reply(formatScriptsApiError(error, 'Failed to reject script'));
+          }
+          break;
+        }
+        case 'promote_live': {
+          const ok = await confirm(
+            conversation,
+            ctx,
+            `Promote *${escapeMarkdown(script.name)}* to live?`
+          );
+          if (!ok) {
+            await ctx.reply('Promotion cancelled.');
+            break;
+          }
+          try {
+            script = await promoteSmsScriptLive(script.name);
+            await ctx.reply('🚀 SMS script promoted to live.');
+          } catch (error) {
+            await ctx.reply(formatScriptsApiError(error, 'Failed to promote script'));
+          }
+          break;
+        }
+        case 'delete':
+          await deleteSmsScriptFlow(conversation, ctx, script);
           viewing = false;
-        }
-        break;
-      case 'clone':
-        await cloneSmsScriptFlow(conversation, ctx, script);
-        break;
-      case 'versions':
-        await showSmsScriptVersions(conversation, ctx, script);
-        break;
-      case 'diff':
-        await showSmsScriptVersionDiffFlow(conversation, ctx, script);
-        break;
-      case 'rollback':
-        script = await rollbackSmsScriptVersionFlow(conversation, ctx, script);
-        break;
-      case 'submit_review':
-        try {
-          script = await submitSmsScriptForReview(script.name);
-          await ctx.reply('✅ SMS script submitted for review.');
-        } catch (error) {
-          await ctx.reply(formatScriptsApiError(error, 'Failed to submit review'));
-        }
-        break;
-      case 'approve': {
-        const note = await promptText(
-          conversation,
-          ctx,
-          'Optional approval note (type skip to leave blank).',
-          { allowEmpty: true, allowSkip: true, parse: (value) => value.trim() }
-        );
-        if (note === null) {
-          await ctx.reply('Approval cancelled.');
           break;
-        }
-        try {
-          script = await reviewSmsScript(
-            script.name,
-            'approve',
-            note === undefined ? null : note
-          );
-          await ctx.reply('✅ SMS script approved.');
-        } catch (error) {
-          await ctx.reply(formatScriptsApiError(error, 'Failed to approve script'));
-        }
-        break;
-      }
-      case 'reject': {
-        const note = await promptText(
-          conversation,
-          ctx,
-          'Optional rejection note (type skip to use default).',
-          { allowEmpty: true, allowSkip: true, parse: (value) => value.trim() }
-        );
-        if (note === null) {
-          await ctx.reply('Rejection cancelled.');
+        case 'back':
+          viewing = false;
           break;
-        }
-        try {
-          script = await reviewSmsScript(
-            script.name,
-            'reject',
-            note === undefined ? null : note
-          );
-          await ctx.reply('↩️ SMS script returned to draft.');
-        } catch (error) {
-          await ctx.reply(formatScriptsApiError(error, 'Failed to reject script'));
-        }
-        break;
-      }
-      case 'promote_live': {
-        const ok = await confirm(
-          conversation,
-          ctx,
-          `Promote *${escapeMarkdown(script.name)}* to live?`
-        );
-        if (!ok) {
-          await ctx.reply('Promotion cancelled.');
+        default:
           break;
-        }
-        try {
-          script = await promoteSmsScriptLive(script.name);
-          await ctx.reply('🚀 SMS script promoted to live.');
-        } catch (error) {
-          await ctx.reply(formatScriptsApiError(error, 'Failed to promote script'));
-        }
-        break;
       }
-      case 'delete':
-        await deleteSmsScriptFlow(conversation, ctx, script);
-        viewing = false;
-        break;
-      case 'back':
-        viewing = false;
-        break;
-      default:
-        break;
     }
-  }
-
-  if (summaryMessage) {
-    await dismissMenuMessage(ctx, summaryMessage);
+  } finally {
+    if (summaryMessage) {
+      await dismissMenuMessage(ctx, summaryMessage);
+    }
   }
 }
 
