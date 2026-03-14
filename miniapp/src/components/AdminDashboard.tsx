@@ -113,7 +113,7 @@ export function AdminDashboard() {
     const response = await fetch(buildApiUrl('/miniapp/session'), {
       method: 'POST',
       headers: {
-        Authorization: `tma ${initDataRaw}`,
+        'x-telegram-init-data': initDataRaw,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ init_data_raw: initDataRaw }),
