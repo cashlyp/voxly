@@ -38,6 +38,15 @@ describe("miniappAuth", () => {
     expect(buildDataCheckString(params)).toBe("a=1\nb=2");
   });
 
+  test("buildDataCheckString excludes signature field as well", () => {
+    const params = new URLSearchParams();
+    params.set("auth_date", "1710000000");
+    params.set("signature", "skip-me");
+    params.set("hash", "skip-too");
+    params.set("query_id", "QID");
+    expect(buildDataCheckString(params)).toBe("auth_date=1710000000\nquery_id=QID");
+  });
+
   test("validateInitData accepts valid payload", () => {
     const { raw, botToken } = buildInitDataQuery({});
     const result = validateInitData(raw, botToken, {

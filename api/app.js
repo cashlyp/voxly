@@ -257,8 +257,10 @@ const keypadProviderOverrides = new Map(); // scopeKey -> { provider, expiresAt,
 const keypadDtmfSeen = new Map(); // callSid -> { seenAt, source, digitsLength }
 const keypadDtmfWatchdogs = new Map(); // callSid -> timeoutId
 const vonageWebhookJtiCache = new Map(); // jti -> expiresAtMs
-const miniAppReplayCache = new Map(); // queryId/hash -> expiresAtMs
-const miniAppSessionRevocations = new Map(); // jti -> expiresAtMs
+const miniAppReplayFallbackCache = new Map(); // queryId/hash -> expiresAtMs
+const miniAppSessionRevocationFallback = new Map(); // jti -> expiresAtMs
+const miniAppAlertCounters = new Map(); // signal -> { count, windowStartMs }
+const miniAppAlertCooldowns = new Map(); // signal -> cooldownUntilMs
 const callRuntimePersistTimers = new Map(); // callSid -> timeoutId
 const callRuntimePendingWrites = new Map(); // callSid -> patch
 const callToolInFlight = new Map(); // callSid -> { tool, startedAt }
@@ -4781,6 +4783,9 @@ function buildApiError(code, message, requestId = null, extra = {}) {
 }
 
 function sendApiError(res, status, code, message, requestId = null, extra = {}) {
+  if (res && res.locals) {
+    res.locals.apiErrorCode = code;
+  }
   return res.status(status).json(buildApiError(code, message, requestId, extra));
 }
 
@@ -6779,25 +6784,268 @@ function buildMiniAppReplayKey(validationResult = {}) {
   return null;
 }
 
-function hasSeenMiniAppReplay(key, nowMs = Date.now()) {
-  if (!key) return false;
-  pruneExpiringMap(miniAppReplayCache, MINI_APP_REPLAY_CACHE_MAX, nowMs);
-  const expiresAt = miniAppReplayCache.get(String(key));
+function normalizeMiniAppTtlSeconds(ttlSeconds, fallbackSeconds = 300) {
+  const parsed = Number(ttlSeconds);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return Math.max(30, Math.floor(Number(fallbackSeconds) || 300));
+  }
+  return Math.max(30, Math.floor(parsed));
+}
+
+function buildMiniAppEphemeralKey(source, key) {
+  const safeSource = String(source || "").trim().toLowerCase();
+  const safeKey = String(key || "").trim();
+  if (!safeSource || !safeKey) return null;
+  const payloadHash = crypto.createHash("sha256").update(safeKey).digest("hex");
+  return {
+    source: safeSource,
+    key: safeKey,
+    payloadHash,
+    eventKey: `${safeSource}:${payloadHash}`,
+  };
+}
+
+async function reserveMiniAppEphemeralKey(options = {}) {
+  const keyPayload = buildMiniAppEphemeralKey(options.source, options.key);
+  if (!keyPayload) {
+    return { reserved: false, store: "none" };
+  }
+  const nowMs = Number(options.nowMs) || Date.now();
+  const ttlSeconds = normalizeMiniAppTtlSeconds(options.ttlSeconds, 300);
+  if (db?.reserveProviderEventIdempotency) {
+    try {
+      const result = await db.reserveProviderEventIdempotency({
+        source: keyPayload.source,
+        payload_hash: keyPayload.payloadHash,
+        event_key: keyPayload.eventKey,
+        ttl_ms: ttlSeconds * 1000,
+      });
+      return { reserved: Boolean(result?.reserved), store: "db" };
+    } catch (error) {
+      console.error("miniapp_ephemeral_reserve_db_error", {
+        source: keyPayload.source,
+        request_id: options.requestId || null,
+        reason: buildErrorDetails(error),
+      });
+    }
+  }
+
+  const fallbackCache =
+    options.fallbackCache instanceof Map ? options.fallbackCache : miniAppReplayFallbackCache;
+  const fallbackMaxSize = Number.isFinite(options.fallbackMaxSize)
+    ? options.fallbackMaxSize
+    : MINI_APP_REPLAY_CACHE_MAX;
+  pruneExpiringMap(fallbackCache, fallbackMaxSize, nowMs);
+  const existingExpiry = Number(fallbackCache.get(keyPayload.key));
+  const alreadyActive = Number.isFinite(existingExpiry) && existingExpiry > nowMs;
+  fallbackCache.set(keyPayload.key, nowMs + ttlSeconds * 1000);
+  pruneExpiringMap(fallbackCache, fallbackMaxSize, nowMs);
+  return { reserved: !alreadyActive, store: "memory" };
+}
+
+async function isMiniAppEphemeralKeyActive(options = {}) {
+  const keyPayload = buildMiniAppEphemeralKey(options.source, options.key);
+  if (!keyPayload) return false;
+  const nowMs = Number(options.nowMs) || Date.now();
+  if (db?.isProviderEventIdempotencyActive) {
+    try {
+      const result = await db.isProviderEventIdempotencyActive({
+        source: keyPayload.source,
+        payload_hash: keyPayload.payloadHash,
+        event_key: keyPayload.eventKey,
+      });
+      return result?.active === true;
+    } catch (error) {
+      console.error("miniapp_ephemeral_check_db_error", {
+        source: keyPayload.source,
+        request_id: options.requestId || null,
+        reason: buildErrorDetails(error),
+      });
+    }
+  }
+
+  const fallbackCache =
+    options.fallbackCache instanceof Map ? options.fallbackCache : miniAppSessionRevocationFallback;
+  const fallbackMaxSize = Number.isFinite(options.fallbackMaxSize)
+    ? options.fallbackMaxSize
+    : MINI_APP_SESSION_REVOCATION_MAX;
+  pruneExpiringMap(fallbackCache, fallbackMaxSize, nowMs);
+  const expiresAt = Number(fallbackCache.get(keyPayload.key));
   if (!Number.isFinite(expiresAt)) return false;
   if (expiresAt <= nowMs) {
-    miniAppReplayCache.delete(String(key));
+    fallbackCache.delete(keyPayload.key);
     return false;
   }
   return true;
 }
 
-function markMiniAppReplay(key, ttlSeconds, nowMs = Date.now()) {
-  if (!key) return;
-  const safeTtl = Number.isFinite(Number(ttlSeconds))
-    ? Math.max(30, Math.floor(Number(ttlSeconds)))
-    : 300;
-  miniAppReplayCache.set(String(key), nowMs + safeTtl * 1000);
-  pruneExpiringMap(miniAppReplayCache, MINI_APP_REPLAY_CACHE_MAX, nowMs);
+async function detectAndMarkMiniAppReplay(key, ttlSeconds, options = {}) {
+  if (!key) return false;
+  const reserveResult = await reserveMiniAppEphemeralKey({
+    source: "miniapp_replay",
+    key,
+    ttlSeconds,
+    fallbackCache: miniAppReplayFallbackCache,
+    fallbackMaxSize: MINI_APP_REPLAY_CACHE_MAX,
+    requestId: options.requestId || null,
+  });
+  return reserveResult.reserved === false;
+}
+
+async function isMiniAppSessionRevoked(jti, options = {}) {
+  return isMiniAppEphemeralKeyActive({
+    source: "miniapp_session_revocation",
+    key: jti,
+    fallbackCache: miniAppSessionRevocationFallback,
+    fallbackMaxSize: MINI_APP_SESSION_REVOCATION_MAX,
+    requestId: options.requestId || null,
+  });
+}
+
+async function revokeMiniAppSession(jti, ttlSeconds, options = {}) {
+  return reserveMiniAppEphemeralKey({
+    source: "miniapp_session_revocation",
+    key: jti,
+    ttlSeconds,
+    fallbackCache: miniAppSessionRevocationFallback,
+    fallbackMaxSize: MINI_APP_SESSION_REVOCATION_MAX,
+    requestId: options.requestId || null,
+  });
+}
+
+function getMiniAppAlertThreshold(signal) {
+  const thresholds = config.miniApp?.alerting?.thresholds || {};
+  if (signal === "invalid_signature") {
+    return Number(thresholds.invalidSignature);
+  }
+  if (signal === "auth_failures") {
+    return Number(thresholds.authFailures);
+  }
+  if (signal === "bridge_failures") {
+    return Number(thresholds.bridgeFailures);
+  }
+  return 0;
+}
+
+function noteMiniAppAlertSignal(signal, details = {}, nowMs = Date.now()) {
+  const threshold = getMiniAppAlertThreshold(signal);
+  if (!Number.isFinite(threshold) || threshold <= 0) return;
+
+  const windowMsRaw = Number(config.miniApp?.alerting?.windowMs);
+  const cooldownMsRaw = Number(config.miniApp?.alerting?.cooldownMs);
+  const windowMs = Number.isFinite(windowMsRaw) && windowMsRaw > 0 ? windowMsRaw : 300000;
+  const cooldownMs = Number.isFinite(cooldownMsRaw) && cooldownMsRaw > 0 ? cooldownMsRaw : 300000;
+  const key = `miniapp:${String(signal || "unknown")}`;
+  const existing = miniAppAlertCounters.get(key);
+  const state =
+    existing && nowMs - Number(existing.windowStartMs || 0) < windowMs
+      ? existing
+      : { count: 0, windowStartMs: nowMs };
+  state.count += 1;
+  state.windowStartMs = Number(state.windowStartMs || nowMs);
+  miniAppAlertCounters.set(key, state);
+
+  const cooldownUntil = Number(miniAppAlertCooldowns.get(key) || 0);
+  if (state.count < threshold || cooldownUntil > nowMs) {
+    return;
+  }
+
+  miniAppAlertCooldowns.set(key, nowMs + cooldownMs);
+  const payload = {
+    signal,
+    count: state.count,
+    threshold,
+    window_seconds: Math.round(windowMs / 1000),
+    cooldown_seconds: Math.round(cooldownMs / 1000),
+    ...(details && typeof details === "object" ? details : {}),
+  };
+  console.warn("miniapp_alert_threshold", payload);
+  db?.logServiceHealth?.("miniapp_alert", `${signal}_threshold`, payload).catch(() => {});
+}
+
+function getMiniAppActorKey(req) {
+  const session = req?.miniAppSession || {};
+  const telegramId = String(
+    session.telegram_id || session.telegramId || session.sub || "",
+  ).trim();
+  if (telegramId) return telegramId;
+  return String(req?.ip || req?.headers?.["x-forwarded-for"] || "miniapp-anonymous");
+}
+
+async function enforceMiniAppRateLimit(req, res, scope) {
+  const rateLimits = config.miniApp?.rateLimits || {};
+  const scopeConfig = rateLimits[scope] || {};
+  const windowMsRaw = Number(rateLimits.windowMs);
+  const perUserRaw = Number(scopeConfig.perUser);
+  const globalRaw = Number(scopeConfig.global);
+  return enforceOutboundRateLimits(req, res, {
+    namespace: `miniapp_${String(scope || "unknown")}`,
+    actorKey: getMiniAppActorKey(req),
+    windowMs:
+      Number.isFinite(windowMsRaw) && windowMsRaw > 0
+        ? Math.floor(windowMsRaw)
+        : 60000,
+    perUserLimit: Number.isFinite(perUserRaw) ? Math.floor(perUserRaw) : 0,
+    globalLimit: Number.isFinite(globalRaw) ? Math.floor(globalRaw) : 0,
+  });
+}
+
+function getMiniAppPayloadBytes(payload) {
+  if (payload === undefined || payload === null) return 0;
+  try {
+    return Buffer.byteLength(stableStringify(payload), "utf8");
+  } catch {
+    return 0;
+  }
+}
+
+function enforceMiniAppPayloadLimit(req, res, options = {}) {
+  const maxBytesRaw = Number(options.maxBytes);
+  if (!Number.isFinite(maxBytesRaw) || maxBytesRaw <= 0) return null;
+  const payloadBytes = getMiniAppPayloadBytes(options.payload);
+  if (payloadBytes <= maxBytesRaw) return null;
+  return sendApiError(
+    res,
+    413,
+    String(options.code || "miniapp_payload_too_large"),
+    String(options.message || "Mini App request payload is too large"),
+    req.requestId || null,
+    {
+      payload_bytes: payloadBytes,
+      max_bytes: Math.floor(maxBytesRaw),
+    },
+  );
+}
+
+function resolveMiniAppApiRouteLabel(req, res) {
+  const explicit = String(res?.locals?.miniAppRoute || "").trim();
+  if (explicit) return explicit;
+  const path = String(req?.path || req?.originalUrl || "").split("?")[0] || "";
+  if (path === "/miniapp/session") return "session";
+  if (path === "/miniapp/logout") return "logout";
+  if (path === "/miniapp/bootstrap") return "bootstrap";
+  if (path === "/miniapp/jobs/poll") return "jobs_poll";
+  if (path === "/miniapp/action") return "action";
+  return "";
+}
+
+function recordMiniAppRouteTelemetry(req, res, durationMs) {
+  const routeLabel = resolveMiniAppApiRouteLabel(req, res);
+  if (!routeLabel) return;
+  const statusCode = Number(res?.statusCode || 0);
+  const errorCode = String(res?.locals?.apiErrorCode || "").trim() || null;
+  const payload = {
+    route: routeLabel,
+    method: String(req?.method || "GET").toUpperCase(),
+    status: statusCode,
+    ok: statusCode >= 200 && statusCode < 400,
+    error_code: errorCode,
+    duration_ms: Number.isFinite(Number(durationMs))
+      ? Math.max(0, Math.floor(Number(durationMs)))
+      : null,
+    request_id: req?.requestId || null,
+  };
+  db?.logServiceHealth?.("miniapp_route", payload.ok ? "ok" : "error", payload).catch(() => {});
 }
 
 function isTelegramAdminUser(telegramId) {
@@ -6838,9 +7086,14 @@ function parseMiniAppAuthorization(req) {
   return token ? String(token).trim() : null;
 }
 
-function requireMiniAppSession(req, res, next) {
+async function requireMiniAppSession(req, res, next) {
   const token = parseMiniAppAuthorization(req);
   if (!token) {
+    noteMiniAppAlertSignal("auth_failures", {
+      route: req.path || req.originalUrl || "/miniapp",
+      code: "miniapp_auth_required",
+      request_id: req.requestId || null,
+    });
     return sendApiError(
       res,
       401,
@@ -6853,9 +7106,15 @@ function requireMiniAppSession(req, res, next) {
     const session = verifyMiniAppSessionToken(token, config.miniApp?.sessionSecret, {
       skewSeconds: 30,
     });
-    pruneExpiringMap(miniAppSessionRevocations, MINI_APP_SESSION_REVOCATION_MAX);
-    const revokedUntil = miniAppSessionRevocations.get(String(session.jti || ""));
-    if (Number.isFinite(revokedUntil) && revokedUntil > Date.now()) {
+    const isRevoked = await isMiniAppSessionRevoked(String(session.jti || ""), {
+      requestId: req.requestId || null,
+    });
+    if (isRevoked) {
+      noteMiniAppAlertSignal("auth_failures", {
+        route: req.path || req.originalUrl || "/miniapp",
+        code: "miniapp_token_revoked",
+        request_id: req.requestId || null,
+      });
       return sendApiError(
         res,
         401,
@@ -6867,6 +7126,11 @@ function requireMiniAppSession(req, res, next) {
     req.miniAppSession = session;
     return next();
   } catch (error) {
+    noteMiniAppAlertSignal("auth_failures", {
+      route: req.path || req.originalUrl || "/miniapp",
+      code: error?.code || "miniapp_auth_invalid",
+      request_id: req.requestId || null,
+    });
     if (error instanceof MiniAppAuthError) {
       return sendApiError(
         res,
@@ -6996,25 +7260,42 @@ async function callMiniAppBridgeApi(options = {}) {
     ...buildInternalHmacHeaders(method, requestPath, body),
   };
 
-  const response = await fetch(targetUrl, {
-    method,
-    headers,
-    timeout: MINI_APP_INTERNAL_REQUEST_TIMEOUT_MS,
-    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-  });
-  const contentType = String(response.headers.get("content-type") || "").toLowerCase();
-  let payload = null;
-  if (contentType.includes("application/json")) {
-    payload = await response.json().catch(() => null);
-  } else {
-    const text = await response.text().catch(() => "");
-    payload = text ? { success: false, error: text } : null;
+  try {
+    const response = await fetch(targetUrl, {
+      method,
+      headers,
+      timeout: MINI_APP_INTERNAL_REQUEST_TIMEOUT_MS,
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    });
+    const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+    let payload = null;
+    if (contentType.includes("application/json")) {
+      payload = await response.json().catch(() => null);
+    } else {
+      const text = await response.text().catch(() => "");
+      payload = text ? { success: false, error: text } : null;
+    }
+    if (!response.ok) {
+      noteMiniAppAlertSignal("bridge_failures", {
+        bridge_path: String(options.path || "/"),
+        bridge_status: response.status,
+        request_id: requestId,
+      });
+    }
+    return {
+      ok: response.ok,
+      status: response.status,
+      data: payload,
+    };
+  } catch (error) {
+    noteMiniAppAlertSignal("bridge_failures", {
+      bridge_path: String(options.path || "/"),
+      bridge_status: "fetch_error",
+      request_id: requestId,
+      reason: buildErrorDetails(error),
+    });
+    throw error;
   }
-  return {
-    ok: response.ok,
-    status: response.status,
-    data: payload,
-  };
 }
 
 function decodeBase64UrlJson(segment) {
@@ -7236,6 +7517,19 @@ app.set("trust proxy", 1);
 const allowedCorsOrigins = Array.isArray(config.server?.corsOrigins)
   ? config.server.corsOrigins.filter(Boolean)
   : [];
+const miniAppConfiguredOrigin = (() => {
+  const miniAppUrl = String(config.miniApp?.url || "").trim();
+  if (!miniAppUrl) return "";
+  try {
+    return new URL(miniAppUrl).origin;
+  } catch {
+    console.warn("MINI_APP_URL is invalid; unable to infer CORS origin allowlist entry.");
+    return "";
+  }
+})();
+if (miniAppConfiguredOrigin && !allowedCorsOrigins.includes(miniAppConfiguredOrigin)) {
+  allowedCorsOrigins.push(miniAppConfiguredOrigin);
+}
 const allowAllCorsInDev = !isProduction && allowedCorsOrigins.length === 0;
 if (isProduction && allowedCorsOrigins.length === 0) {
   console.warn(
@@ -7283,6 +7577,19 @@ app.use((req, res, next) => {
   req.requestId = requestId;
   res.setHeader("x-request-id", requestId);
   next();
+});
+
+app.use((req, res, next) => {
+  const path = String(req.path || req.originalUrl || "").split("?")[0];
+  if (!path.startsWith("/miniapp")) {
+    return next();
+  }
+  const startedAt = Date.now();
+  res.on("finish", () => {
+    const durationMs = Date.now() - startedAt;
+    recordMiniAppRouteTelemetry(req, res, durationMs);
+  });
+  return next();
 });
 
 const apiLimiter = rateLimit({
@@ -15606,6 +15913,20 @@ function buildMiniAppActionSpec(action, payload = {}) {
 }
 
 app.post("/miniapp/session", async (req, res) => {
+  res.locals.miniAppRoute = "session";
+  if (await enforceMiniAppRateLimit(req, res, "session")) {
+    return;
+  }
+  if (
+    enforceMiniAppPayloadLimit(req, res, {
+      payload: req.body && typeof req.body === "object" ? req.body : {},
+      maxBytes: config.miniApp?.maxInitDataBytes,
+      code: "miniapp_session_payload_too_large",
+      message: "Mini App session payload is too large",
+    })
+  ) {
+    return;
+  }
   const bodyInitDataRaw = String(
     req.body?.init_data_raw || req.body?.initDataRaw || "",
   ).trim();
@@ -15627,6 +15948,22 @@ app.post("/miniapp/session", async (req, res) => {
       "Missing Telegram Mini App init data",
       req.requestId || null,
       { source: initDataSource },
+    );
+  }
+  const initDataSizeBytes = Buffer.byteLength(initDataRaw, "utf8");
+  const maxInitDataBytes = Number(config.miniApp?.maxInitDataBytes) || 8192;
+  if (initDataSizeBytes > maxInitDataBytes) {
+    return sendApiError(
+      res,
+      413,
+      "miniapp_init_data_too_large",
+      "Telegram Mini App init data exceeds allowed size",
+      req.requestId || null,
+      {
+        source: initDataSource,
+        init_data_len: initDataSizeBytes,
+        max_bytes: Math.floor(maxInitDataBytes),
+      },
     );
   }
   if (!String(config.telegram?.botToken || "").trim()) {
@@ -15675,8 +16012,11 @@ app.post("/miniapp/session", async (req, res) => {
     }
 
     const replayKey = buildMiniAppReplayKey(validation);
-    const replayDetected = hasSeenMiniAppReplay(replayKey);
-    markMiniAppReplay(replayKey, config.miniApp?.replayWindowSeconds);
+    const replayDetected = await detectAndMarkMiniAppReplay(
+      replayKey,
+      config.miniApp?.replayWindowSeconds,
+      { requestId: req.requestId || null },
+    );
 
     const role = isAdminUser ? "admin" : "user";
     const caps = getMiniAppCapabilitiesForRole(role);
@@ -15717,6 +16057,13 @@ app.post("/miniapp/session", async (req, res) => {
     });
   } catch (error) {
     if (error instanceof MiniAppAuthError) {
+      if (error.code === "miniapp_invalid_signature") {
+        noteMiniAppAlertSignal("invalid_signature", {
+          route: "session",
+          request_id: req.requestId || null,
+          source: initDataSource,
+        });
+      }
       const message =
         error.code === "miniapp_invalid_signature"
           ? `${error.message}. Verify API TELEGRAM_BOT_TOKEN matches the bot that launched this Mini App.`
@@ -15748,23 +16095,37 @@ app.post("/miniapp/session", async (req, res) => {
 });
 
 app.post("/miniapp/logout", requireMiniAppSession, async (req, res) => {
+  res.locals.miniAppRoute = "logout";
+  if (await enforceMiniAppRateLimit(req, res, "action")) {
+    return;
+  }
   const session = req.miniAppSession || {};
   const jti = String(session.jti || "").trim();
   const exp = Number(session.exp);
   const nowMs = Date.now();
+  let store = null;
   if (jti) {
-    const expiresAtMs = Number.isFinite(exp) ? exp * 1000 : nowMs + 5 * 60 * 1000;
-    miniAppSessionRevocations.set(jti, expiresAtMs);
-    pruneExpiringMap(miniAppSessionRevocations, MINI_APP_SESSION_REVOCATION_MAX, nowMs);
+    const ttlSeconds = Number.isFinite(exp)
+      ? Math.max(30, exp - Math.floor(nowMs / 1000))
+      : 5 * 60;
+    const revokeResult = await revokeMiniAppSession(jti, ttlSeconds, {
+      requestId: req.requestId || null,
+    });
+    store = revokeResult?.store || null;
   }
   return res.json({
     success: true,
     revoked: Boolean(jti),
+    store,
     request_id: req.requestId || null,
   });
 });
 
 app.get("/miniapp/bootstrap", requireMiniAppSession, async (req, res) => {
+  res.locals.miniAppRoute = "bootstrap";
+  if (await enforceMiniAppRateLimit(req, res, "bootstrap")) {
+    return;
+  }
   if (!requireMiniAppCapability(req, res, "dashboard_view")) {
     return;
   }
@@ -15795,6 +16156,10 @@ app.get("/miniapp/bootstrap", requireMiniAppSession, async (req, res) => {
 });
 
 app.get("/miniapp/jobs/poll", requireMiniAppSession, async (req, res) => {
+  res.locals.miniAppRoute = "jobs_poll";
+  if (await enforceMiniAppRateLimit(req, res, "poll")) {
+    return;
+  }
   if (!requireMiniAppCapability(req, res, "dashboard_view")) {
     return;
   }
@@ -15891,6 +16256,20 @@ app.get("/miniapp/jobs/poll", requireMiniAppSession, async (req, res) => {
 });
 
 app.post("/miniapp/action", requireMiniAppSession, async (req, res) => {
+  res.locals.miniAppRoute = "action";
+  if (await enforceMiniAppRateLimit(req, res, "action")) {
+    return;
+  }
+  if (
+    enforceMiniAppPayloadLimit(req, res, {
+      payload: req.body && typeof req.body === "object" ? req.body : {},
+      maxBytes: config.miniApp?.maxActionPayloadBytes,
+      code: "miniapp_action_payload_too_large",
+      message: "Mini App action payload is too large",
+    })
+  ) {
+    return;
+  }
   const action = String(req.body?.action || "").trim();
   const payload =
     req.body?.payload && typeof req.body.payload === "object" ? req.body.payload : {};

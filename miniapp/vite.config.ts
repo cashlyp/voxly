@@ -27,7 +27,25 @@ export default defineConfig({
   ],
   build: {
     target: 'esnext',
-    minify: 'terser'
+    minify: 'terser',
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('node_modules')) {
+            if (/node_modules\/(react|react-dom|scheduler)\//.test(id)) {
+              return 'vendor-react';
+            }
+            if (id.includes('@tma.js') || id.includes('@telegram-apps/telegram-ui')) {
+              return 'vendor-telegram';
+            }
+            if (id.includes('@tonconnect')) {
+              return 'vendor-tonconnect';
+            }
+          }
+          return undefined;
+        },
+      },
+    },
   },
   publicDir: './public',
   server: {

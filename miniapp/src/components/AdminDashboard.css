@@ -78,6 +78,15 @@
   color: var(--tg-theme-text-color, #eff4ff);
 }
 
+.va-health.is-healthy {
+  border-color: rgba(52, 199, 89, 0.45);
+}
+
+.va-health.is-degraded {
+  border-color: rgba(255, 159, 67, 0.62);
+  box-shadow: 0 10px 24px rgba(140, 74, 22, 0.28);
+}
+
 .va-card h3 {
   margin: 0 0 8px;
   font-size: 15px;

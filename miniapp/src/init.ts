@@ -25,10 +25,12 @@ export async function init(options: {
 
   // Add Eruda only in local development.
   if (import.meta.env.DEV && options.eruda) {
-    void import('eruda').then(({ default: eruda }) => {
-      eruda.init();
-      eruda.position({ x: window.innerWidth - 50, y: 0 });
-    });
+    void import('eruda')
+      .then(({ default: eruda }) => {
+        eruda.init();
+        eruda.position({ x: window.innerWidth - 50, y: 0 });
+      })
+      .catch(() => {});
   }
 
   // Telegram for macOS has a ton of bugs, including cases, when the client doesn't
@@ -72,8 +74,10 @@ export async function init(options: {
   }
 
   if (viewport.mount.isAvailable()) {
-    viewport.mount().then(() => {
-      viewport.bindCssVars();
-    });
+    await viewport.mount()
+      .then(() => {
+        viewport.bindCssVars();
+      })
+      .catch(() => {});
   }
 }

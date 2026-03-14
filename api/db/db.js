@@ -2173,6 +2173,54 @@ class EnhancedDatabase {
         });
     }
 
+    async isProviderEventIdempotencyActive(payload = {}) {
+        const source = String(payload.source || '').trim();
+        const payloadHash = String(payload.payload_hash || '').trim();
+        const eventKey = String(payload.event_key || '').trim();
+        if (!eventKey && (!source || !payloadHash)) {
+            return { active: false };
+        }
+
+        return new Promise((resolve, reject) => {
+            const cleanupSql = `
+                DELETE FROM provider_event_idempotency
+                WHERE expires_at <= CURRENT_TIMESTAMP
+            `;
+            const byEventKeySql = `
+                SELECT event_key
+                FROM provider_event_idempotency
+                WHERE event_key = ?
+                  AND expires_at > CURRENT_TIMESTAMP
+                LIMIT 1
+            `;
+            const bySourceHashSql = `
+                SELECT event_key
+                FROM provider_event_idempotency
+                WHERE source = ?
+                  AND payload_hash = ?
+                  AND expires_at > CURRENT_TIMESTAMP
+                LIMIT 1
+            `;
+
+            this.db.run(cleanupSql, (cleanupErr) => {
+                if (cleanupErr) {
+                    reject(cleanupErr);
+                    return;
+                }
+
+                const sql = eventKey ? byEventKeySql : bySourceHashSql;
+                const params = eventKey ? [eventKey] : [source, payloadHash];
+                this.db.get(sql, params, (err, row) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve({ active: Boolean(row) });
+                    }
+                });
+            });
+        });
+    }
+
     async pruneProviderEventIdempotency() {
         return new Promise((resolve, reject) => {
             const sql = `

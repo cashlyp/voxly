@@ -5,7 +5,6 @@ import ReactDOM from 'react-dom/client';
 import { StrictMode } from 'react';
 import { retrieveLaunchParams } from '@tma.js/sdk-react';
 
-import { Root } from '@/components/Root.tsx';
 import { EnvUnsupported } from '@/components/EnvUnsupported.tsx';
 import { init } from '@/init.ts';
 
@@ -29,14 +28,15 @@ try {
     debug,
     eruda: debug && ['ios', 'android'].includes(platform),
     mockForMacOS: platform === 'macos',
-  })
-    .then(() => {
-      root.render(
-        <StrictMode>
-          <Root/>
-        </StrictMode>,
-      );
-    });
-} catch (e) {
+  });
+  const { Root } = await import('@/components/Root.tsx');
+
+  root.render(
+    <StrictMode>
+      <Root/>
+    </StrictMode>,
+  );
+} catch (error) {
+  console.error('Mini App initialization failed:', error);
   root.render(<EnvUnsupported/>);
 }
