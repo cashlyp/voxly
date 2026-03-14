@@ -15606,10 +15606,19 @@ function buildMiniAppActionSpec(action, payload = {}) {
 }
 
 app.post("/miniapp/session", async (req, res) => {
-  const initDataRaw =
-    parseTmaAuthorization(req) ||
-    String(req.headers?.["x-telegram-init-data"] || "").trim() ||
-    String(req.body?.init_data_raw || req.body?.initDataRaw || "").trim();
+  const bodyInitDataRaw = String(
+    req.body?.init_data_raw || req.body?.initDataRaw || "",
+  ).trim();
+  const headerInitDataRaw = String(req.headers?.["x-telegram-init-data"] || "").trim();
+  const authInitDataRaw = parseTmaAuthorization(req);
+  const initDataRaw = bodyInitDataRaw || headerInitDataRaw || authInitDataRaw || "";
+  const initDataSource = bodyInitDataRaw
+    ? "body"
+    : headerInitDataRaw
+      ? "x-telegram-init-data"
+      : authInitDataRaw
+        ? "authorization"
+        : "none";
   if (!initDataRaw) {
     return sendApiError(
       res,
@@ -15617,6 +15626,7 @@ app.post("/miniapp/session", async (req, res) => {
       "miniapp_missing_init_data",
       "Missing Telegram Mini App init data",
       req.requestId || null,
+      { source: initDataSource },
     );
   }
   if (!String(config.telegram?.botToken || "").trim()) {
@@ -15717,6 +15727,10 @@ app.post("/miniapp/session", async (req, res) => {
         error.code || "miniapp_auth_invalid",
         message,
         req.requestId || null,
+        {
+          source: initDataSource,
+          init_data_len: initDataRaw.length,
+        },
       );
     }
     console.error("miniapp_session_error", {
