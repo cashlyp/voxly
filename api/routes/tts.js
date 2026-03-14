@@ -1,4 +1,3 @@
-require('dotenv').config();
 const { Buffer } = require('node:buffer');
 const EventEmitter = require('events');
 const fetch = require('node-fetch');

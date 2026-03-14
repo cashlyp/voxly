@@ -26,13 +26,14 @@ function buildInitDataRaw({ botToken, userId, authDate, queryId = "QID_TEST_123"
 describe("miniapp route auth flow", () => {
   const originalEnv = { ...process.env };
   const BOT_TOKEN = "123456:TEST_TOKEN";
+  const STALE_TELEGRAM_BOT_TOKEN = "123456:STALE_TOKEN";
   const SESSION_SECRET = "test-miniapp-session-secret";
   const ADMIN_USER_ID = "7770001";
   let app;
 
   beforeAll(() => {
     process.env.NODE_ENV = "test";
-    process.env.TELEGRAM_BOT_TOKEN = BOT_TOKEN;
+    process.env.TELEGRAM_BOT_TOKEN = STALE_TELEGRAM_BOT_TOKEN;
     process.env.BOT_TOKEN = BOT_TOKEN;
     process.env.MINI_APP_SESSION_SECRET = SESSION_SECRET;
     process.env.TELEGRAM_ADMIN_USER_IDS = ADMIN_USER_ID;

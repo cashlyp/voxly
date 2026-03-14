@@ -1,5 +1,4 @@
 require("./utils/bootstrapLogger");
-require("dotenv").config();
 
 const express = require("express");
 const fetch = require("node-fetch");
@@ -6782,6 +6781,73 @@ function buildMiniAppReplayKey(validationResult = {}) {
     return `hash:${validationResult.hash}`;
   }
   return null;
+}
+
+function getMiniAppBotTokenCandidates() {
+  const configured = Array.isArray(config.telegram?.botTokenCandidates)
+    ? config.telegram.botTokenCandidates
+    : [];
+  const envList = String(process.env.TELEGRAM_BOT_TOKENS || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  return Array.from(
+    new Set(
+      [
+        ...configured,
+        config.telegram?.botToken,
+        process.env.TELEGRAM_BOT_TOKEN,
+        process.env.BOT_TOKEN,
+        process.env.MINI_APP_BOT_TOKEN,
+        ...envList,
+      ]
+        .map((value) => String(value || "").trim())
+        .filter(Boolean),
+    ),
+  );
+}
+
+function validateMiniAppInitDataWithCandidates(initDataRaw, options = {}) {
+  const candidates = Array.isArray(options.botTokens)
+    ? options.botTokens.map((value) => String(value || "").trim()).filter(Boolean)
+    : getMiniAppBotTokenCandidates();
+  if (!candidates.length) {
+    throw new MiniAppAuthError(
+      "Telegram bot token is not configured",
+      "miniapp_missing_bot_token",
+      500,
+    );
+  }
+  let lastSignatureError = null;
+  for (let i = 0; i < candidates.length; i += 1) {
+    const candidate = candidates[i];
+    try {
+      const validation = validateInitData(initDataRaw, candidate, {
+        maxAgeSeconds: options.maxAgeSeconds,
+      });
+      return {
+        ...validation,
+        matchedBotTokenIndex: i,
+        botTokenCandidates: candidates.length,
+      };
+    } catch (error) {
+      if (!(error instanceof MiniAppAuthError)) {
+        throw error;
+      }
+      if (error.code !== "miniapp_invalid_signature") {
+        throw error;
+      }
+      lastSignatureError = error;
+    }
+  }
+  throw (
+    lastSignatureError ||
+    new MiniAppAuthError(
+      "Telegram init data signature is invalid",
+      "miniapp_invalid_signature",
+      401,
+    )
+  );
 }
 
 function normalizeMiniAppTtlSeconds(ttlSeconds, fallbackSeconds = 300) {
@@ -15966,7 +16032,8 @@ app.post("/miniapp/session", async (req, res) => {
       },
     );
   }
-  if (!String(config.telegram?.botToken || "").trim()) {
+  const botTokenCandidates = getMiniAppBotTokenCandidates();
+  if (!botTokenCandidates.length) {
     return sendApiError(
       res,
       500,
@@ -15986,7 +16053,8 @@ app.post("/miniapp/session", async (req, res) => {
   }
 
   try {
-    const validation = validateInitData(initDataRaw, config.telegram.botToken, {
+    const validation = validateMiniAppInitDataWithCandidates(initDataRaw, {
+      botTokens: botTokenCandidates,
       maxAgeSeconds: config.miniApp?.initDataMaxAgeSeconds,
     });
     const userId =
@@ -16066,7 +16134,7 @@ app.post("/miniapp/session", async (req, res) => {
       }
       const message =
         error.code === "miniapp_invalid_signature"
-          ? `${error.message}. Verify API TELEGRAM_BOT_TOKEN matches the bot that launched this Mini App.`
+          ? `${error.message}. Verify API TELEGRAM_BOT_TOKEN/BOT_TOKEN/MINI_APP_BOT_TOKEN (or TELEGRAM_BOT_TOKENS) includes the bot that launched this Mini App.`
           : error.message || "Mini App init data validation failed";
       return sendApiError(
         res,
@@ -16077,6 +16145,7 @@ app.post("/miniapp/session", async (req, res) => {
         {
           source: initDataSource,
           init_data_len: initDataRaw.length,
+          token_candidates: botTokenCandidates.length,
         },
       );
     }

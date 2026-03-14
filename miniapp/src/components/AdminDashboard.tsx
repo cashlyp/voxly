@@ -1,5 +1,5 @@
 import { initData, useRawInitData, useSignal } from '@tma.js/sdk-react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import '@/components/AdminDashboard.css';
 
@@ -37,11 +37,13 @@ interface SessionResponse {
   token?: string;
   expires_at?: number;
   error?: string;
+  code?: string;
 }
 
 interface ApiErrorPayload {
   error?: string;
   message?: string;
+  code?: string;
 }
 
 interface ProviderChannelData {
@@ -214,6 +216,21 @@ function parseApiError(payload: unknown, status: number): string {
   return body.error || body.message || `Request failed (${status})`;
 }
 
+function parseApiErrorCode(payload: unknown): string {
+  const body = asRecord(payload) as ApiErrorPayload;
+  return toText(body.code, '');
+}
+
+function isSessionBootstrapBlockingCode(code: string): boolean {
+  return [
+    'miniapp_invalid_signature',
+    'miniapp_missing_init_data',
+    'miniapp_init_data_expired',
+    'miniapp_auth_date_future',
+    'miniapp_admin_required',
+  ].includes(String(code || '').trim());
+}
+
 function readSessionCache(): SessionCacheEntry | null {
   try {
     const raw = sessionStorage.getItem(SESSION_STORAGE_KEY);
@@ -255,6 +272,7 @@ export function AdminDashboard() {
   const [token, setToken] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string>('');
+  const [errorCode, setErrorCode] = useState<string>('');
   const [notice, setNotice] = useState<string>('');
   const [bootstrap, setBootstrap] = useState<DashboardApiPayload | null>(null);
   const [pollPayload, setPollPayload] = useState<DashboardApiPayload | null>(null);
@@ -263,6 +281,8 @@ export function AdminDashboard() {
   const [lastPollAt, setLastPollAt] = useState<number | null>(null);
   const [lastSuccessfulPollAt, setLastSuccessfulPollAt] = useState<number | null>(null);
   const [nextPollAt, setNextPollAt] = useState<number | null>(null);
+  const [sessionBlocked, setSessionBlocked] = useState<boolean>(false);
+  const sessionRequestRef = useRef<Promise<string> | null>(null);
 
   const userLabel = useMemo(() => {
     const user = asRecord(initDataState?.user);
@@ -279,36 +299,63 @@ export function AdminDashboard() {
     const cached = readSessionCache();
     if (cached?.token) {
       setToken(cached.token);
+      setSessionBlocked(false);
       return cached.token;
     }
 
+    if (sessionRequestRef.current) {
+      return sessionRequestRef.current;
+    }
+
     if (!initDataRaw) {
+      setSessionBlocked(true);
+      setErrorCode('miniapp_missing_init_data');
       throw new Error('Mini App init data is unavailable. Open this page from Telegram.');
     }
 
-    const response = await fetch(buildApiUrl('/miniapp/session'), {
-      method: 'POST',
-      headers: {
-        Authorization: `tma ${initDataRaw}`,
-        'x-telegram-init-data': initDataRaw,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ init_data_raw: initDataRaw }),
-    });
+    const sessionRequest = (async (): Promise<string> => {
+      const response = await fetch(buildApiUrl('/miniapp/session'), {
+        method: 'POST',
+        headers: {
+          Authorization: `tma ${initDataRaw}`,
+          'x-telegram-init-data': initDataRaw,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ init_data_raw: initDataRaw }),
+      });
 
-    const payload = (await parseJsonResponse(response)) as SessionResponse | null;
-    if (!response.ok || !payload?.success || !payload?.token) {
-      throw new Error(payload?.error || `Session request failed (${response.status})`);
+      const payload = (await parseJsonResponse(response)) as SessionResponse | null;
+      const code = toText(payload?.code, '');
+      if (!response.ok || !payload?.success || !payload?.token) {
+        if (isSessionBootstrapBlockingCode(code)) {
+          setSessionBlocked(true);
+        }
+        if (code) {
+          setErrorCode(code);
+        }
+        throw new Error(payload?.error || `Session request failed (${response.status})`);
+      }
+
+      const nextToken = payload.token;
+      const cacheEntry: SessionCacheEntry = {
+        token: nextToken,
+        exp: Number.isFinite(Number(payload.expires_at)) ? Number(payload.expires_at) : null,
+      };
+      writeSessionCache(cacheEntry);
+      setToken(nextToken);
+      setErrorCode('');
+      setSessionBlocked(false);
+      return nextToken;
+    })();
+
+    sessionRequestRef.current = sessionRequest;
+    try {
+      return await sessionRequest;
+    } finally {
+      if (sessionRequestRef.current === sessionRequest) {
+        sessionRequestRef.current = null;
+      }
     }
-
-    const nextToken = payload.token;
-    const cacheEntry: SessionCacheEntry = {
-      token: nextToken,
-      exp: Number.isFinite(Number(payload.expires_at)) ? Number(payload.expires_at) : null,
-    };
-    writeSessionCache(cacheEntry);
-    setToken(nextToken);
-    return nextToken;
   }, [initDataRaw]);
 
   const request = useCallback(async <T,>(path: string, options: RequestInit = {}, retryCount = 0): Promise<T> => {
@@ -331,8 +378,16 @@ export function AdminDashboard() {
       return request<T>(path, options, retryCount + 1);
     }
     if (!response.ok) {
+      const code = parseApiErrorCode(payload);
+      if (code) {
+        setErrorCode(code);
+      }
+      if (isSessionBootstrapBlockingCode(code)) {
+        setSessionBlocked(true);
+      }
       throw new Error(parseApiError(payload, response.status));
     }
+    setErrorCode('');
     return payload as T;
   }, [createSession, token]);
 
@@ -403,7 +458,7 @@ export function AdminDashboard() {
   }, [bootstrap?.poll_interval_seconds]);
 
   useEffect(() => {
-    if (!token) return undefined;
+    if (!token || sessionBlocked) return undefined;
     let disposed = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let consecutiveFailures = 0;
@@ -425,7 +480,7 @@ export function AdminDashboard() {
       setNextPollAt(null);
       if (timer) clearTimeout(timer);
     };
-  }, [loadPoll, serverPollIntervalMs, token]);
+  }, [loadPoll, serverPollIntervalMs, sessionBlocked, token]);
 
   const dashboard = bootstrap?.dashboard;
   const providerPayload = pollPayload?.provider || dashboard?.provider || {};
@@ -460,7 +515,11 @@ export function AdminDashboard() {
   const bridgeStatuses = normalizeBridgeStatuses(pollPayload?.bridge || dashboard?.bridge);
   const bridgeHardFailures = bridgeStatuses.filter((status) => status >= 500).length;
   const bridgeSoftFailures = bridgeStatuses.filter((status) => status >= 400).length;
-  const isDashboardDegraded = pollFailureCount >= POLL_DEGRADED_FAILURES || bridgeHardFailures > 0;
+  const hasBootstrapData = Boolean(bootstrap?.success || bootstrap?.dashboard);
+  const isDashboardDegraded = sessionBlocked
+    || pollFailureCount >= POLL_DEGRADED_FAILURES
+    || bridgeHardFailures > 0
+    || (Boolean(error) && !hasBootstrapData);
   const nextPollLabel = nextPollAt ? formatTime(new Date(nextPollAt).toISOString()) : '—';
   const lastPollLabel = lastPollAt ? formatTime(new Date(lastPollAt).toISOString()) : '—';
   const lastSuccessfulPollLabel = lastSuccessfulPollAt
@@ -470,6 +529,23 @@ export function AdminDashboard() {
   const handleRefresh = (): void => {
     void loadBootstrap();
   };
+
+  const resetSession = useCallback((): void => {
+    writeSessionCache(null);
+    sessionRequestRef.current = null;
+    setToken(null);
+    setError('');
+    setErrorCode('');
+    setNotice('');
+    setSessionBlocked(false);
+    setBootstrap(null);
+    setPollPayload(null);
+    setLastPollAt(null);
+    setLastSuccessfulPollAt(null);
+    setNextPollAt(null);
+    setPollFailureCount(0);
+    void loadBootstrap();
+  }, [loadBootstrap]);
 
   const renderProviderSection = (channel: ProviderChannel) => {
     const channelData = providersByChannel[channel] || {};
@@ -525,6 +601,26 @@ export function AdminDashboard() {
       {loading ? <p className="va-muted">Loading dashboard...</p> : null}
       {error ? <p className="va-error">{error}</p> : null}
       {notice ? <p className="va-notice">{notice}</p> : null}
+      {sessionBlocked ? (
+        <section className="va-grid">
+          <div className="va-card va-blocked">
+            <h3>Mini App Session Blocked</h3>
+            <p>
+              Code: <strong>{errorCode || 'miniapp_auth_invalid'}</strong>
+            </p>
+            <p>
+              Open this Mini App from the Telegram bot menu, then tap <strong>Retry Session</strong>.
+            </p>
+            <button
+              type="button"
+              onClick={resetSession}
+              disabled={loading || busyAction.length > 0}
+            >
+              Retry Session
+            </button>
+          </div>
+        </section>
+      ) : null}
 
       <section className="va-grid">
         <div className={`va-card va-health ${isDashboardDegraded ? 'is-degraded' : 'is-healthy'}`}>
@@ -542,103 +638,116 @@ export function AdminDashboard() {
         </div>
       </section>
 
-      <section className="va-grid">
-        {renderProviderSection('call')}
-        {renderProviderSection('sms')}
-        {renderProviderSection('email')}
-      </section>
+      {hasBootstrapData ? (
+        <>
+          <section className="va-grid">
+            {renderProviderSection('call')}
+            {renderProviderSection('sms')}
+            {renderProviderSection('email')}
+          </section>
 
-      <section className="va-grid">
-        <div className="va-card">
-          <h3>SMS Bulk Status (24h)</h3>
-          <p>Total recipients: <strong>{smsTotalRecipients}</strong></p>
-          <p>Successful: <strong>{smsSuccess}</strong> | Failed: <strong>{smsFailed}</strong></p>
-          <pre>{textBar(smsProcessedPercent)}</pre>
-        </div>
+          <section className="va-grid">
+            <div className="va-card">
+              <h3>SMS Bulk Status (24h)</h3>
+              <p>Total recipients: <strong>{smsTotalRecipients}</strong></p>
+              <p>Successful: <strong>{smsSuccess}</strong> | Failed: <strong>{smsFailed}</strong></p>
+              <pre>{textBar(smsProcessedPercent)}</pre>
+            </div>
 
-        <div className="va-card">
-          <h3>Email Bulk Status (24h)</h3>
-          <p>Total recipients: <strong>{emailTotalRecipients}</strong></p>
-          <p>Sent: <strong>{emailSent}</strong> | Failed: <strong>{emailFailed}</strong></p>
-          <p>Delivered: <strong>{emailDelivered}</strong></p>
-          <pre>{textBar(emailProcessedPercent)}</pre>
-          <pre>{textBar(emailDeliveredPercent)}</pre>
-        </div>
-      </section>
+            <div className="va-card">
+              <h3>Email Bulk Status (24h)</h3>
+              <p>Total recipients: <strong>{emailTotalRecipients}</strong></p>
+              <p>Sent: <strong>{emailSent}</strong> | Failed: <strong>{emailFailed}</strong></p>
+              <p>Delivered: <strong>{emailDelivered}</strong></p>
+              <pre>{textBar(emailProcessedPercent)}</pre>
+              <pre>{textBar(emailDeliveredPercent)}</pre>
+            </div>
+          </section>
 
-      <section className="va-grid">
-        <div className="va-card">
-          <h3>Email Jobs</h3>
-          {emailJobs.length === 0 ? <p className="va-muted">No recent jobs.</p> : null}
-          <ul className="va-list">
-            {emailJobs.slice(0, 8).map((job, index) => {
-              const jobId = toText(job.job_id, `job-${index + 1}`);
-              const jobStatus = toText(job.status);
-              const jobKey = `email-job-${jobId}-${index}`;
-              return (
-                <li key={jobKey}>
-                  <strong>{jobId}</strong>
-                  <span>{jobStatus}</span>
-                  <span>{toInt(job.sent)}/{toInt(job.total)} sent</span>
-                  <span>{formatTime(job.updated_at || job.created_at)}</span>
-                </li>
-              );
-            })}
-          </ul>
-        </div>
+          <section className="va-grid">
+            <div className="va-card">
+              <h3>Email Jobs</h3>
+              {emailJobs.length === 0 ? <p className="va-muted">No recent jobs.</p> : null}
+              <ul className="va-list">
+                {emailJobs.slice(0, 8).map((job, index) => {
+                  const jobId = toText(job.job_id, `job-${index + 1}`);
+                  const jobStatus = toText(job.status);
+                  const jobKey = `email-job-${jobId}-${index}`;
+                  return (
+                    <li key={jobKey}>
+                      <strong>{jobId}</strong>
+                      <span>{jobStatus}</span>
+                      <span>{toInt(job.sent)}/{toInt(job.total)} sent</span>
+                      <span>{formatTime(job.updated_at || job.created_at)}</span>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
 
-        <div className="va-card">
-          <h3>DLQ: Call Jobs ({toInt(dlqPayload.call_open, callDlq.length)})</h3>
-          {callDlq.length === 0 ? <p className="va-muted">No open call DLQ entries.</p> : null}
-          <ul className="va-list">
-            {callDlq.map((row) => {
-              const rowId = toInt(row.id);
-              const handleReplay = (): void => {
-                void runAction('dlq.call.replay', { id: rowId });
-              };
-              return (
-                <li key={`call-dlq-${rowId}`}>
-                  <span>#{rowId} {toText(row.job_type, 'job')}</span>
-                  <span>Replays: {toInt(row.replay_count)}</span>
-                  <button
-                    type="button"
-                    disabled={busyAction.length > 0 || rowId <= 0}
-                    onClick={handleReplay}
-                  >
-                    Replay
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
-        </div>
+            <div className="va-card">
+              <h3>DLQ: Call Jobs ({toInt(dlqPayload.call_open, callDlq.length)})</h3>
+              {callDlq.length === 0 ? <p className="va-muted">No open call DLQ entries.</p> : null}
+              <ul className="va-list">
+                {callDlq.map((row) => {
+                  const rowId = toInt(row.id);
+                  const handleReplay = (): void => {
+                    void runAction('dlq.call.replay', { id: rowId });
+                  };
+                  return (
+                    <li key={`call-dlq-${rowId}`}>
+                      <span>#{rowId} {toText(row.job_type, 'job')}</span>
+                      <span>Replays: {toInt(row.replay_count)}</span>
+                      <button
+                        type="button"
+                        disabled={busyAction.length > 0 || rowId <= 0}
+                        onClick={handleReplay}
+                      >
+                        Replay
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
 
-        <div className="va-card">
-          <h3>DLQ: Email ({toInt(dlqPayload.email_open, emailDlq.length)})</h3>
-          {emailDlq.length === 0 ? <p className="va-muted">No open email DLQ entries.</p> : null}
-          <ul className="va-list">
-            {emailDlq.map((row) => {
-              const rowId = toInt(row.id);
-              const handleReplay = (): void => {
-                void runAction('dlq.email.replay', { id: rowId });
-              };
-              return (
-                <li key={`email-dlq-${rowId}`}>
-                  <span>#{rowId} msg:{toText(row.message_id)}</span>
-                  <span>Reason: {toText(row.reason)}</span>
-                  <button
-                    type="button"
-                    disabled={busyAction.length > 0 || rowId <= 0}
-                    onClick={handleReplay}
-                  >
-                    Replay
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
-        </div>
-      </section>
+            <div className="va-card">
+              <h3>DLQ: Email ({toInt(dlqPayload.email_open, emailDlq.length)})</h3>
+              {emailDlq.length === 0 ? <p className="va-muted">No open email DLQ entries.</p> : null}
+              <ul className="va-list">
+                {emailDlq.map((row) => {
+                  const rowId = toInt(row.id);
+                  const handleReplay = (): void => {
+                    void runAction('dlq.email.replay', { id: rowId });
+                  };
+                  return (
+                    <li key={`email-dlq-${rowId}`}>
+                      <span>#{rowId} msg:{toText(row.message_id)}</span>
+                      <span>Reason: {toText(row.reason)}</span>
+                      <button
+                        type="button"
+                        disabled={busyAction.length > 0 || rowId <= 0}
+                        onClick={handleReplay}
+                      >
+                        Replay
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          </section>
+        </>
+      ) : (
+        <section className="va-grid">
+          <div className="va-card">
+            <h3>Waiting for Dashboard Data</h3>
+            <p className="va-muted">
+              Session is being established. If this persists, tap <strong>Refresh</strong> or reopen from Telegram.
+            </p>
+          </div>
+        </section>
+      )}
     </main>
   );
 }
