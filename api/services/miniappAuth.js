@@ -78,10 +78,11 @@ function buildDataCheckString(input) {
       : new URLSearchParams(String(input || ""));
   const pairs = [];
   for (const [key, value] of params.entries()) {
-    if (key === "hash" || key === "signature") continue;
+    // Telegram hash verification excludes only `hash`.
+    if (key === "hash") continue;
     pairs.push([key, value]);
   }
-  pairs.sort(([left], [right]) => left.localeCompare(right));
+  pairs.sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
   return pairs.map(([key, value]) => `${key}=${value}`).join("\n");
 }
 
