@@ -384,6 +384,54 @@ const miniAppInitDataMaxAgeSeconds = Number(
 const miniAppReplayWindowSeconds = Number(
   readEnv("MINI_APP_REPLAY_WINDOW_SECONDS") || "600",
 );
+const miniAppRateWindowSeconds = Number(
+  readEnv("MINI_APP_RATE_WINDOW_SECONDS") || "60",
+);
+const miniAppSessionRatePerUser = Number(
+  readEnv("MINI_APP_SESSION_RATE_PER_USER") || "20",
+);
+const miniAppSessionRateGlobal = Number(
+  readEnv("MINI_APP_SESSION_RATE_GLOBAL") || "300",
+);
+const miniAppBootstrapRatePerUser = Number(
+  readEnv("MINI_APP_BOOTSTRAP_RATE_PER_USER") || "30",
+);
+const miniAppBootstrapRateGlobal = Number(
+  readEnv("MINI_APP_BOOTSTRAP_RATE_GLOBAL") || "300",
+);
+const miniAppPollRatePerUser = Number(
+  readEnv("MINI_APP_POLL_RATE_PER_USER") || "120",
+);
+const miniAppPollRateGlobal = Number(
+  readEnv("MINI_APP_POLL_RATE_GLOBAL") || "1200",
+);
+const miniAppActionRatePerUser = Number(
+  readEnv("MINI_APP_ACTION_RATE_PER_USER") || "60",
+);
+const miniAppActionRateGlobal = Number(
+  readEnv("MINI_APP_ACTION_RATE_GLOBAL") || "600",
+);
+const miniAppMaxInitDataBytes = Number(
+  readEnv("MINI_APP_MAX_INIT_DATA_BYTES") || "8192",
+);
+const miniAppMaxActionPayloadBytes = Number(
+  readEnv("MINI_APP_MAX_ACTION_PAYLOAD_BYTES") || "65536",
+);
+const miniAppAlertWindowSeconds = Number(
+  readEnv("MINI_APP_ALERT_WINDOW_SECONDS") || "300",
+);
+const miniAppAlertCooldownSeconds = Number(
+  readEnv("MINI_APP_ALERT_COOLDOWN_SECONDS") || "300",
+);
+const miniAppAlertInvalidSignatureThreshold = Number(
+  readEnv("MINI_APP_ALERT_INVALID_SIGNATURE_THRESHOLD") || "8",
+);
+const miniAppAlertAuthFailuresThreshold = Number(
+  readEnv("MINI_APP_ALERT_AUTH_FAILURE_THRESHOLD") || "12",
+);
+const miniAppAlertBridgeFailuresThreshold = Number(
+  readEnv("MINI_APP_ALERT_BRIDGE_FAILURE_THRESHOLD") || "10",
+);
 
 function parseJsonObject(rawValue, label) {
   if (!rawValue) return {};
@@ -902,6 +950,68 @@ module.exports = {
     replayWindowSeconds: Number.isFinite(miniAppReplayWindowSeconds)
       ? Math.max(60, Math.floor(miniAppReplayWindowSeconds))
       : 600,
+    maxInitDataBytes: Number.isFinite(miniAppMaxInitDataBytes)
+      ? Math.max(1024, Math.floor(miniAppMaxInitDataBytes))
+      : 8192,
+    maxActionPayloadBytes: Number.isFinite(miniAppMaxActionPayloadBytes)
+      ? Math.max(4096, Math.floor(miniAppMaxActionPayloadBytes))
+      : 65536,
+    rateLimits: {
+      windowMs: Number.isFinite(miniAppRateWindowSeconds)
+        ? Math.max(1000, Math.floor(miniAppRateWindowSeconds * 1000))
+        : 60000,
+      session: {
+        perUser: Number.isFinite(miniAppSessionRatePerUser)
+          ? Math.max(0, Math.floor(miniAppSessionRatePerUser))
+          : 20,
+        global: Number.isFinite(miniAppSessionRateGlobal)
+          ? Math.max(0, Math.floor(miniAppSessionRateGlobal))
+          : 300,
+      },
+      bootstrap: {
+        perUser: Number.isFinite(miniAppBootstrapRatePerUser)
+          ? Math.max(0, Math.floor(miniAppBootstrapRatePerUser))
+          : 30,
+        global: Number.isFinite(miniAppBootstrapRateGlobal)
+          ? Math.max(0, Math.floor(miniAppBootstrapRateGlobal))
+          : 300,
+      },
+      poll: {
+        perUser: Number.isFinite(miniAppPollRatePerUser)
+          ? Math.max(0, Math.floor(miniAppPollRatePerUser))
+          : 120,
+        global: Number.isFinite(miniAppPollRateGlobal)
+          ? Math.max(0, Math.floor(miniAppPollRateGlobal))
+          : 1200,
+      },
+      action: {
+        perUser: Number.isFinite(miniAppActionRatePerUser)
+          ? Math.max(0, Math.floor(miniAppActionRatePerUser))
+          : 60,
+        global: Number.isFinite(miniAppActionRateGlobal)
+          ? Math.max(0, Math.floor(miniAppActionRateGlobal))
+          : 600,
+      },
+    },
+    alerting: {
+      windowMs: Number.isFinite(miniAppAlertWindowSeconds)
+        ? Math.max(1000, Math.floor(miniAppAlertWindowSeconds * 1000))
+        : 300000,
+      cooldownMs: Number.isFinite(miniAppAlertCooldownSeconds)
+        ? Math.max(1000, Math.floor(miniAppAlertCooldownSeconds * 1000))
+        : 300000,
+      thresholds: {
+        invalidSignature: Number.isFinite(miniAppAlertInvalidSignatureThreshold)
+          ? Math.max(0, Math.floor(miniAppAlertInvalidSignatureThreshold))
+          : 8,
+        authFailures: Number.isFinite(miniAppAlertAuthFailuresThreshold)
+          ? Math.max(0, Math.floor(miniAppAlertAuthFailuresThreshold))
+          : 12,
+        bridgeFailures: Number.isFinite(miniAppAlertBridgeFailuresThreshold)
+          ? Math.max(0, Math.floor(miniAppAlertBridgeFailuresThreshold))
+          : 10,
+      },
+    },
   },
   openRouter: {
     apiKey: ensure("OPENROUTER_API_KEY"),

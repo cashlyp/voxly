@@ -1,7 +1,11 @@
 import { useLaunchParams, useSignal, miniApp } from '@tma.js/sdk-react';
 import { AppRoot } from '@telegram-apps/telegram-ui';
+import { Suspense, lazy } from 'react';
 
-import { AdminDashboard } from '@/components/AdminDashboard.tsx';
+const AdminDashboard = lazy(async () => {
+  const module = await import('@/components/AdminDashboard.tsx');
+  return { default: module.AdminDashboard };
+});
 
 export function App() {
   const lp = useLaunchParams();
@@ -12,7 +16,9 @@ export function App() {
       appearance={isDark ? 'dark' : 'light'}
       platform={['macos', 'ios'].includes(lp.tgWebAppPlatform) ? 'ios' : 'base'}
     >
-      <AdminDashboard />
+      <Suspense fallback={<div style={{ padding: 16 }}>Loading dashboard...</div>}>
+        <AdminDashboard />
+      </Suspense>
     </AppRoot>
   );
 }
