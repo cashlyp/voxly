@@ -516,7 +516,7 @@ function createDigitCollectionService(options = {}) {
     return SUPPORTED_DIGIT_PROFILES.has(normalized);
   }
 
-  function maskDigitsForPreview(digits = '', profile = 'generic') {
+  function maskDigitsForPreview(digits = '') {
     if (showRawDigitsLive) return digits || '';
     const len = String(digits || '').length;
     if (!len) return '••';
@@ -776,7 +776,7 @@ function createDigitCollectionService(options = {}) {
     }
   });
 
-  const renderPromptTemplate = (template, expectation = {}, extras = {}) => {
+  const renderPromptTemplate = (template, expectation = {}) => {
     const label = buildExpectedLabel(expectation);
     const detail = buildRepromptDetail(expectation);
     const terminatorSuffix = expectation?.allow_terminator
@@ -875,7 +875,6 @@ function createDigitCollectionService(options = {}) {
   };
 
   function buildAdaptiveReprompt(expectation = {}, reason = '', attemptCount = 1) {
-    const label = buildExpectedLabel(expectation);
     const policy = resolveProfilePromptPolicy(expectation);
     const shortPrompt = renderPromptTemplate((policy.invalid || [])[0] || 'Enter the {label} now.', expectation);
     const detailedPrompt = renderPromptTemplate((policy.invalid || [])[1] || 'Please enter the {label}. {detail}', expectation);
@@ -1276,15 +1275,6 @@ function createDigitCollectionService(options = {}) {
       const entries = Array.from(captureVault.entries()).sort((a, b) => (a[1]?.created_at || 0) - (b[1]?.created_at || 0));
       for (let i = 0; i < overBy; i += 1) {
         captureVault.delete(entries[i][0]);
-      }
-    }
-  };
-
-  const clearVaultForCall = (callSid) => {
-    if (!callSid) return;
-    for (const [token, item] of captureVault.entries()) {
-      if (item?.call_sid === callSid) {
-        captureVault.delete(token);
       }
     }
   };
@@ -2784,7 +2774,7 @@ function createDigitCollectionService(options = {}) {
     };
   };
 
-  const buildRetryPolicy = ({ reason, attempt, source, expectation, affect, session, health, qualityScore, conditions = null }) => {
+  const buildRetryPolicy = ({ reason, attempt, expectation, affect, session, health, qualityScore, conditions = null }) => {
     const label = buildExpectedLabel(expectation || {});
     const patience = affect?.patience || 'high';
     const partial = session?.partialDigits || '';
@@ -3967,7 +3957,6 @@ function createDigitCollectionService(options = {}) {
     const timeoutMultiplier = computeChannelTimeoutMultiplier(channelConditions);
     const hasPartialInput = Boolean(String(exp.buffer || '').length);
     const timeoutResolution = resolveEffectiveTimeoutSeconds(exp, { hasPartialInput });
-    const timeoutFloor = timeoutResolution.floor_s;
     const effectiveTimeoutS = timeoutResolution.timeout_s;
     const timeoutMs = Math.max(5000, effectiveTimeoutS * 1000 * timeoutMultiplier);
     const timeoutGraceMs = Number.isFinite(Number(exp.timeout_grace_ms))
@@ -6958,7 +6947,6 @@ function createDigitCollectionService(options = {}) {
       }
     }
 
-    const lastStep = stepsToUse[stepsToUse.length - 1] || {};
     const planEndOnSuccess = typeof args.end_call_on_success === 'boolean'
       ? args.end_call_on_success
       : true;

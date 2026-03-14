@@ -144,13 +144,13 @@ class PersonalityEngine {
   }
 
   // Main method to analyze customer input and adapt personality
-  adaptPersonality(customerMessage, conversationHistory = []) {
+  adaptPersonality(customerMessage) {
     // Analyze current message
     const analysis = this.analyzeCustomerMessage(customerMessage);
     this.lastAnalysis = analysis;
     
     // Update conversation context
-    this.updateConversationContext(analysis, conversationHistory);
+    this.updateConversationContext(analysis);
     
     // Determine best personality
     const recommendedPersonality = this.selectOptimalPersonality();
@@ -239,7 +239,7 @@ class PersonalityEngine {
     return analysis;
   }
 
-  updateConversationContext(analysis, conversationHistory) {
+  updateConversationContext(analysis) {
     // Update mood tracking
     this.conversationContext.customerMood = analysis.mood;
     

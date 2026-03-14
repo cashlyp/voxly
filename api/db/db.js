@@ -2791,7 +2791,7 @@ class EnhancedDatabase {
     }
 
     // Backward compatibility method
-    async updateWebhookNotification(id, status, error_message = null, sent_at = null) {
+    async updateWebhookNotification(id, status, error_message = null) {
         return this.updateEnhancedWebhookNotification(id, status, error_message, null);
     }
 
@@ -6267,7 +6267,7 @@ class EnhancedDatabase {
            }
            
            // Simple query to test database connectivity
-           this.db.get('SELECT 1 as test', [], (err, row) => {
+           this.db.get('SELECT 1 as test', [], (err) => {
                if (err) {
                    reject(err);
                } else {

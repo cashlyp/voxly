@@ -27,7 +27,7 @@ const {
 const {
     section: formatSection,
     buildLine,
-    tipLine,
+    buildTextProgressBar,
     renderMenu,
     escapeMarkdown,
     sendEphemeral,
@@ -38,6 +38,8 @@ const {
 } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 const { getAccessProfile } = require('../utils/capabilities');
+
+const RECENT_SMS_PAGE_SIZE = 5;
 
 async function smsAlert(ctx, text) {
     await ctx.reply(formatSection('⚠️ SMS Alert', [text]));
@@ -217,36 +219,98 @@ async function smsConversationFlow(conversation, ctx) {
     }
 }
 
-async function sendRecentSms(ctx, limit = 10) {
+function buildRecentSmsKeyboard(ctx, page, totalPages, requestedLimit) {
+    const keyboard = new InlineKeyboard();
+    if (totalPages > 1) {
+        if (page > 1) {
+            keyboard.text('⬅️ Prev', buildCallbackData(ctx, `SMS_RECENT_PAGE:${page - 1}`));
+        }
+        keyboard.text('🔄 Refresh', buildCallbackData(ctx, `SMS_RECENT_PAGE:${page}`));
+        if (page < totalPages) {
+            keyboard.text('Next ➡️', buildCallbackData(ctx, `SMS_RECENT_PAGE:${page + 1}`));
+        }
+        keyboard.row();
+    }
+    keyboard.text('↕️ Change Count', buildCallbackData(ctx, 'SMS_RECENT'));
+    keyboard.text('⬅️ Back to SMS Center', buildCallbackData(ctx, 'SMS'));
+    keyboard.row();
+    keyboard.text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+    if (Number.isFinite(requestedLimit) && requestedLimit > 0) {
+        keyboard.row().text(`🧮 Showing ${requestedLimit}`, buildCallbackData(ctx, `SMS_RECENT_PAGE:${page}`));
+    }
+    return keyboard;
+}
+
+async function sendRecentSms(ctx, options = {}) {
     try {
         const allowed = await ensureAuthorizedAdmin(ctx);
         if (!allowed) {
             return;
         }
+
+        const normalized = typeof options === 'number' ? { limit: options } : (options || {});
+        const requestedLimitRaw = Number(normalized.limit);
+        const requestedLimit = Number.isFinite(requestedLimitRaw)
+            ? Math.max(1, Math.min(Math.floor(requestedLimitRaw), 20))
+            : 10;
+        const pageRaw = Number(normalized.page);
+        const requestedPage = Number.isFinite(pageRaw) ? Math.max(1, Math.floor(pageRaw)) : 1;
         const response = await httpClient.get(null, `${config.apiUrl}/api/sms/messages/recent`, {
-            params: { limit },
+            params: { limit: requestedLimit },
             timeout: 10000
         });
         if (!response.data?.success || !Array.isArray(response.data.messages) || response.data.messages.length === 0) {
-            await ctx.reply('ℹ️ No recent SMS messages found.');
+            await renderMenu(
+                ctx,
+                formatSection('🕒 Recent SMS', [
+                    'No recent SMS messages found.',
+                    'Try again after sending or receiving new messages.'
+                ]),
+                buildBackToMenuKeyboard(ctx, 'SMS', '⬅️ Back to SMS Center'),
+                { parseMode: 'Markdown' }
+            );
             return;
         }
         const messages = response.data.messages;
-        let messagesText = `📱 *Recent SMS Messages (${messages.length})*\n\n`;
-        messages.forEach((msg, index) => {
+        const totalPages = Math.max(1, Math.ceil(messages.length / RECENT_SMS_PAGE_SIZE));
+        const page = Math.min(requestedPage, totalPages);
+        const offset = (page - 1) * RECENT_SMS_PAGE_SIZE;
+        const pageItems = messages.slice(offset, offset + RECENT_SMS_PAGE_SIZE);
+
+        const cards = pageItems.map((msg, index) => {
             const time = new Date(msg.created_at).toLocaleString();
             const direction = msg.direction === 'inbound' ? '📨' : '📤';
             const toNumber = escapeMarkdown(msg.to_number || 'N/A');
             const fromNumber = escapeMarkdown(msg.from_number || 'N/A');
             const preview = escapeMarkdown((msg.body || '').substring(0, 80));
-            messagesText += `${index + 1}. ${direction} ${time}\n`;
-            messagesText += `   From: ${fromNumber}\n`;
-            messagesText += `   To: ${toNumber}\n`;
-            messagesText += `   Message: ${preview}${msg.body && msg.body.length > 80 ? '…' : ''}\n\n`;
+            return formatSection(`${direction} SMS #${offset + index + 1}`, [
+                buildLine('🕒', 'Time', escapeMarkdown(time)),
+                buildLine('📤', 'From', fromNumber),
+                buildLine('📨', 'To', toNumber),
+                buildLine('📝', 'Message', `${preview}${msg.body && msg.body.length > 80 ? '…' : ''}`)
+            ]);
         });
-        await ctx.reply(messagesText, { parse_mode: 'Markdown' });
+        const header = formatSection('📱 Recent SMS', [
+            buildLine('📄', 'Page', `${page}/${totalPages}`),
+            buildLine('📊', 'Loaded', `${messages.length} recent messages`)
+        ]);
+
+        await renderMenu(
+            ctx,
+            `${header}\n\n${cards.join('\n\n')}`,
+            buildRecentSmsKeyboard(ctx, page, totalPages, requestedLimit),
+            { parseMode: 'Markdown' }
+        );
     } catch (error) {
-        await replyApiError(ctx, error, 'Unable to fetch recent SMS messages.');
+        await renderMenu(
+            ctx,
+            formatSection('❌ Recent SMS Error', [
+                'Unable to fetch recent SMS messages.',
+                'Use refresh or return to SMS Center.'
+            ]),
+            buildBackToMenuKeyboard(ctx, 'SMS', '⬅️ Back to SMS Center'),
+            { parseMode: 'Markdown' }
+        );
     }
 }
 
@@ -270,7 +334,7 @@ async function recentSmsFlow(conversation, ctx) {
             ? Math.max(1, Math.min(parsedLimit, 20))
             : 10;
         await sendEphemeral(ctx, `📱 Fetching last ${limit} SMS messages...`);
-        await sendRecentSms(ctx, limit);
+        await sendRecentSms(ctx, { limit, page: 1 });
     } catch (error) {
         console.error('Recent SMS flow error:', error);
         await replyApiError(ctx, error, 'Error fetching recent SMS messages.');
@@ -304,11 +368,68 @@ async function fetchBulkSmsStatus(ctx, { limit = 10, hours = 24 } = {}) {
     return response.data;
 }
 
+async function fetchSmsProviderStatus() {
+    const response = await httpClient.get(null, `${config.apiUrl}/admin/provider`, {
+        params: { channel: 'sms' },
+        timeout: 10000,
+        headers: {
+            'x-admin-token': config.admin.apiToken,
+            'Content-Type': 'application/json'
+        }
+    });
+    return response.data || {};
+}
+
+async function sendBulkSmsPreflightCard(ctx) {
+    try {
+        const status = await fetchSmsProviderStatus();
+        const smsProvider = String(status.sms_provider || status.provider || 'unknown').toLowerCase();
+        const readinessMap = status.sms_readiness || status.providers?.sms?.readiness || {};
+        const isReady = readinessMap[smsProvider] !== false;
+        const lines = [
+            buildLine('🔌', 'Provider', escapeMarkdown(smsProvider.toUpperCase())),
+            buildLine('🛡️', 'Readiness', isReady ? '✅ Ready' : '⚠️ Check configuration'),
+            buildLine('📬', 'Channel', 'SMS'),
+            '',
+            isReady
+                ? 'Run a small test batch first if this is your first send today.'
+                : 'Readiness checks failed. Avoid live sends until the provider is fixed.'
+        ];
+        const keyboard = new InlineKeyboard()
+            .text('✅ Continue to Send', buildCallbackData(ctx, 'BULK_SMS_SEND'))
+            .row()
+            .text('🔄 Re-run Preflight', buildCallbackData(ctx, 'BULK_SMS_PRECHECK'))
+            .text('⬅️ Back to SMS Sender', buildCallbackData(ctx, 'BULK_SMS'))
+            .row()
+            .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+        await renderMenu(ctx, formatSection('🧪 Bulk SMS Preflight', lines), keyboard, { parseMode: 'Markdown' });
+    } catch (error) {
+        const keyboard = new InlineKeyboard()
+            .text('✅ Continue to Send', buildCallbackData(ctx, 'BULK_SMS_SEND'))
+            .row()
+            .text('⬅️ Back to SMS Sender', buildCallbackData(ctx, 'BULK_SMS'))
+            .row()
+            .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+        await renderMenu(
+            ctx,
+            formatSection('⚠️ Bulk SMS Preflight', [
+                'Could not verify provider readiness right now.',
+                'You can continue, but consider checking /provider first.'
+            ]),
+            keyboard,
+            { parseMode: 'Markdown' }
+        );
+    }
+}
+
 function formatBulkSmsOperation(operation) {
     const createdAt = new Date(operation.created_at).toLocaleString();
     const total = Number(operation.total_recipients || 0);
     const success = Number(operation.successful || 0);
     const failed = Number(operation.failed || 0);
+    const processed = Math.min(total, Math.max(0, success + failed));
+    const progress = total > 0 ? Math.round((processed / total) * 100) : 0;
+    const deliveryRate = total > 0 ? Math.round((success / total) * 100) : 0;
     const preview = operation.message
         ? escapeMarkdown(operation.message.substring(0, 60))
         : '—';
@@ -316,6 +437,8 @@ function formatBulkSmsOperation(operation) {
         `🆔 ${operation.id}`,
         `📅 ${createdAt}`,
         `📨 ${success}/${total} sent (${failed} failed)`,
+        `📈 Progress: ${buildTextProgressBar(progress)}`,
+        `✅ Delivery: ${buildTextProgressBar(deliveryRate)}`,
         `📝 ${preview}${operation.message && operation.message.length > 60 ? '…' : ''}`
     ].join('\n');
 }
@@ -325,11 +448,21 @@ async function sendBulkSmsList(ctx, { limit = 10, hours = 24 } = {}) {
         const data = await fetchBulkSmsStatus(ctx, { limit, hours });
         const operations = data?.operations || [];
         if (!operations.length) {
-            await ctx.reply('ℹ️ No bulk SMS jobs found in the selected window.');
+            await renderMenu(
+                ctx,
+                formatSection('📦 Recent Bulk SMS Jobs', ['No jobs found in the selected window.']),
+                buildBackToMenuKeyboard(ctx, 'BULK_SMS', '⬅️ Back to SMS Sender'),
+                { parseMode: 'Markdown' }
+            );
             return;
         }
         const blocks = operations.map((op) => formatBulkSmsOperation(op));
-        await ctx.reply(`📦 *Recent Bulk SMS Jobs*\n\n${blocks.join('\n\n')}`, { parse_mode: 'Markdown' });
+        await renderMenu(
+            ctx,
+            `📦 *Recent Bulk SMS Jobs*\n\n${blocks.join('\n\n')}`,
+            buildBackToMenuKeyboard(ctx, 'BULK_SMS', '⬅️ Back to SMS Sender'),
+            { parseMode: 'Markdown' }
+        );
     } catch (error) {
         await replyApiError(ctx, error, 'Failed to fetch bulk SMS jobs.');
     }
@@ -340,17 +473,36 @@ async function sendBulkSmsStats(ctx, { hours = 24 } = {}) {
         const data = await fetchBulkSmsStatus(ctx, { limit: 20, hours });
         const summary = data?.summary;
         if (!summary) {
-            await ctx.reply('ℹ️ Bulk SMS stats unavailable.');
+            await renderMenu(
+                ctx,
+                formatSection('📊 Bulk SMS Summary', ['Stats are unavailable for the selected period.']),
+                buildBackToMenuKeyboard(ctx, 'BULK_SMS', '⬅️ Back to SMS Sender'),
+                { parseMode: 'Markdown' }
+            );
             return;
         }
+        const totalRecipients = Number(summary.totalRecipients || 0);
+        const totalSuccess = Number(summary.totalSuccessful || 0);
+        const totalFailed = Number(summary.totalFailed || 0);
+        const processed = Math.max(0, Math.min(totalRecipients, totalSuccess + totalFailed));
+        const completionRate = totalRecipients > 0 ? Math.round((processed / totalRecipients) * 100) : 0;
+        const successRate = totalRecipients > 0 ? Math.round((totalSuccess / totalRecipients) * 100) : 0;
+        const failureRate = totalRecipients > 0 ? Math.round((totalFailed / totalRecipients) * 100) : 0;
         const lines = [
             `Total jobs: ${summary.totalOperations || 0}`,
-            `Recipients: ${summary.totalRecipients || 0}`,
-            `Success: ${summary.totalSuccessful || 0}`,
-            `Failed: ${summary.totalFailed || 0}`,
-            `Success rate: ${summary.successRate || 0}%`
+            `Recipients: ${totalRecipients}`,
+            `Success: ${totalSuccess}`,
+            `Failed: ${totalFailed}`,
+            `Progress: ${buildTextProgressBar(completionRate)}`,
+            `Success rate: ${buildTextProgressBar(successRate)}`,
+            `Failure rate: ${buildTextProgressBar(failureRate)}`
         ];
-        await ctx.reply(`📊 *Bulk SMS Summary (last ${data.time_period_hours || hours}h)*\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
+        await renderMenu(
+            ctx,
+            `📊 *Bulk SMS Summary (last ${data.time_period_hours || hours}h)*\n${lines.join('\n')}`,
+            buildBackToMenuKeyboard(ctx, 'BULK_SMS', '⬅️ Back to SMS Sender'),
+            { parseMode: 'Markdown' }
+        );
     } catch (error) {
         await replyApiError(ctx, error, 'Failed to fetch bulk SMS statistics.');
     }
@@ -391,7 +543,9 @@ async function bulkSmsStatusFlow(conversation, ctx) {
 
 function buildBulkSmsMenuKeyboard(ctx) {
     const keyboard = new InlineKeyboard()
+        .text('🧪 Preflight', buildCallbackData(ctx, 'BULK_SMS_PRECHECK'))
         .text('📤 Send Bulk SMS', buildCallbackData(ctx, 'BULK_SMS_SEND'))
+        .row()
         .text('🕒 Recent Jobs', buildCallbackData(ctx, 'BULK_SMS_LIST'))
         .row()
         .text('🧾 Job Status', buildCallbackData(ctx, 'BULK_SMS_STATUS'))
@@ -414,7 +568,10 @@ async function renderBulkSmsMenu(ctx) {
     startOperation(ctx, 'bulk-sms-menu');
     const keyboard = buildBulkSmsMenuKeyboard(ctx);
     const title = '📤 *SMS Sender*';
-    const lines = ['Manage bulk SMS sends below.'];
+    const lines = [
+        'Manage bulk SMS sends below.',
+        'Run preflight before large batches.'
+    ];
     await renderMenu(ctx, `${title}\n${lines.join('\n')}`, keyboard, { parseMode: 'Markdown' });
 }
 
@@ -923,6 +1080,17 @@ async function bulkSmsFlow(conversation, ctx) {
         ensureActive();
         return result;
     };
+    const guardedPost = async (url, data, options = {}) => {
+        const controller = new AbortController();
+        const release = registerAbortController(ctx, controller);
+        try {
+            const response = await httpClient.post(null, url, data, { timeout: 30000, signal: controller.signal, ...options });
+            ensureActive();
+            return response;
+        } finally {
+            release();
+        }
+    };
 
     try {
         ensureActive();
@@ -940,7 +1108,7 @@ async function bulkSmsFlow(conversation, ctx) {
             return;
         }
 
-        await ctx.reply(setupStepMessage('Bulk SMS setup', [
+        await ctx.reply(setupStepMessage('Bulk SMS setup (Step 1/3)', [
             'Enter phone numbers separated by commas or new lines.',
             'Maximum recipients: 100'
         ]), { parse_mode: 'Markdown' });
@@ -965,7 +1133,7 @@ async function bulkSmsFlow(conversation, ctx) {
             );
         }
 
-        await ctx.reply(setupStepMessage('Bulk SMS message', [
+        await ctx.reply(setupStepMessage('Bulk SMS setup (Step 2/3)', [
             `Enter the message for ${numbers.length} recipient(s).`,
             'Maximum length: 1600 characters'
         ]), { parse_mode: 'Markdown' });
@@ -981,7 +1149,7 @@ async function bulkSmsFlow(conversation, ctx) {
         while (true) {
             const segmentInfo = getSmsSegmentInfo(message);
             const previewLines = [
-                '📣 Bulk SMS Preview',
+                '📣 Bulk SMS Preview (Step 3/3)',
                 '',
                 `👥 Recipients: ${numbers.length}`,
                 `📱 Sample: ${numbers.slice(0, 3).join(', ')}${numbers.length > 3 ? '...' : ''}`,
@@ -1437,7 +1605,7 @@ function registerSmsCommands(bot) {
 
     bot.command('smssender', async ctx => {
         try {
-            await renderBulkSmsMenu(ctx);
+            await sendBulkSmsPreflightCard(ctx);
         } catch (error) {
             console.error('Bulk SMS command error:', error);
             await ctx.reply('❌ Could not open bulk SMS menu.');
@@ -1526,6 +1694,7 @@ module.exports = {
     sendRecentSms,
     sendBulkSmsList,
     sendBulkSmsStats,
+    sendBulkSmsPreflightCard,
     registerSmsCommands,
     viewSmsConversation,
     getSmsStats,

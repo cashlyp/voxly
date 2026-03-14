@@ -372,6 +372,18 @@ const streamAuthSecret = readEnv("STREAM_AUTH_SECRET") || apiHmacSecret;
 const streamAuthMaxSkewMs = Number(
   readEnv("STREAM_AUTH_MAX_SKEW_MS") || apiHmacMaxSkewMs || "300000",
 );
+const miniAppUrl = readEnv("MINI_APP_URL") || "";
+const miniAppSessionSecret =
+  readEnv("MINI_APP_SESSION_SECRET") || apiHmacSecret || adminApiToken || "";
+const miniAppSessionTtlSeconds = Number(
+  readEnv("MINI_APP_SESSION_TTL_SECONDS") || "900",
+);
+const miniAppInitDataMaxAgeSeconds = Number(
+  readEnv("MINI_APP_INITDATA_MAX_AGE_SECONDS") || "300",
+);
+const miniAppReplayWindowSeconds = Number(
+  readEnv("MINI_APP_REPLAY_WINDOW_SECONDS") || "600",
+);
 
 function parseJsonObject(rawValue, label) {
   if (!rawValue) return {};
@@ -877,6 +889,19 @@ module.exports = {
     viewerChatIds: telegramViewerChatIds,
     viewerUserIds: telegramViewerUserIds,
     webhookValidation: telegramWebhookValidation,
+  },
+  miniApp: {
+    url: miniAppUrl,
+    sessionSecret: miniAppSessionSecret,
+    sessionTtlSeconds: Number.isFinite(miniAppSessionTtlSeconds)
+      ? Math.max(60, Math.floor(miniAppSessionTtlSeconds))
+      : 900,
+    initDataMaxAgeSeconds: Number.isFinite(miniAppInitDataMaxAgeSeconds)
+      ? Math.max(30, Math.floor(miniAppInitDataMaxAgeSeconds))
+      : 300,
+    replayWindowSeconds: Number.isFinite(miniAppReplayWindowSeconds)
+      ? Math.max(60, Math.floor(miniAppReplayWindowSeconds))
+      : 600,
   },
   openRouter: {
     apiKey: ensure("OPENROUTER_API_KEY"),

@@ -307,11 +307,6 @@ function loadProfilePackDocument(profileId, fallbackText = "") {
   return document;
 }
 
-function readProfilePack(profileId, fallbackText) {
-  const doc = loadProfilePackDocument(profileId, fallbackText);
-  return String(doc?.content || "").trim() || String(fallbackText || "").trim();
-}
-
 function getProfilesDirectory() {
   return path.join(__dirname, "profiles");
 }

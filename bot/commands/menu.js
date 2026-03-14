@@ -5,6 +5,27 @@ const { cancelActiveFlow, resetSession } = require('../utils/sessionState');
 const { escapeHtml, renderMenu } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 
+function getMiniAppLaunchUrl() {
+    const configured = String(config.miniApp?.url || '').trim();
+    if (configured) return configured;
+    try {
+        return new URL('/miniapp', config.apiUrl).toString();
+    } catch {
+        return '';
+    }
+}
+
+function appendMiniAppLaunchButton(keyboard, label = '🧭 Admin Console') {
+    const launchUrl = getMiniAppLaunchUrl();
+    if (!launchUrl) return false;
+    if (typeof keyboard.webApp === 'function') {
+        keyboard.row().webApp(label, launchUrl);
+    } else {
+        keyboard.row().url(label, launchUrl);
+    }
+    return true;
+}
+
 async function handleMenu(ctx) {
     try {
         await cancelActiveFlow(ctx, 'command:/menu');
@@ -47,6 +68,7 @@ async function handleMenu(ctx) {
                 .row()
                 .text('📤 SMS Sender', buildCallbackData(ctx, 'BULK_SMS'))
                 .text('📧 Mailer', buildCallbackData(ctx, 'BULK_EMAIL'));
+            appendMiniAppLaunchButton(kb);
         } else if (!access.user) {
             const adminUsername = (config.admin.username || '').replace(/^@/, '');
             if (adminUsername) {

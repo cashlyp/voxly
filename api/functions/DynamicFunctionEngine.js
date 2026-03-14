@@ -261,7 +261,7 @@ class DynamicFunctionEngine {
       type: 'function',
       function: {
         name: adaptedFunction.name,
-        say: this.generateSayMessage(adaptedFunction.name, context),
+        say: this.generateSayMessage(adaptedFunction.name),
         description: adaptedFunction.description,
         parameters: adaptedFunction.parameters,
         returns: this.generateReturnSchema(adaptedFunction.name)
@@ -276,7 +276,7 @@ class DynamicFunctionEngine {
   }
 
   // Generate appropriate "say" messages based on context
-  generateSayMessage(functionName, context) {
+  generateSayMessage(functionName) {
     const messages = {
       'checkInventory': 'Let me check what we have available for you.',
       'checkPrice': 'Let me get you the current pricing information.',
@@ -416,7 +416,7 @@ class DynamicFunctionEngine {
     return async function(functionArgs) {
       console.log(`GPT -> called ${this.name || 'placeOrder'} function`);
       
-      const { items, customerInfo, paymentMethod = 'card' } = functionArgs;
+      const { items, paymentMethod = 'card' } = functionArgs;
       
       const orderId = `ORD-${Date.now().toString().slice(-8).toUpperCase()}`;
       const total = Math.floor(Math.random() * 1000) + 100; // Mock total
@@ -437,7 +437,7 @@ class DynamicFunctionEngine {
     return async function(functionArgs) {
       console.log(`GPT -> called ${this.name || 'lookupInformation'} function`);
       
-      const { topic, category, details } = functionArgs;
+      const { topic, category } = functionArgs;
       
       // Context-specific information responses
       const responses = {
@@ -458,7 +458,7 @@ class DynamicFunctionEngine {
     };
   }
 
-  createSupportFunction(context) {
+  createSupportFunction() {
     return async function(functionArgs) {
       console.log(`GPT -> called ${this.name || 'handleSupport'} function`);
       
@@ -480,7 +480,7 @@ class DynamicFunctionEngine {
     };
   }
 
-  createLeadQualificationFunction(context) {
+  createLeadQualificationFunction() {
     return async function(functionArgs) {
       console.log(`GPT -> called ${this.name || 'qualifyLead'} function`);
       

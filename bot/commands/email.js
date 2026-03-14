@@ -14,7 +14,7 @@ const {
 const {
   section,
   buildLine,
-  tipLine,
+  buildTextProgressBar,
   escapeMarkdown,
   emphasize,
   activateMenuMessage,
@@ -31,6 +31,8 @@ const {
 const { buildCallbackData } = require('../utils/actions');
 const { getAccessProfile } = require('../utils/capabilities');
 const { askOptionWithButtons } = require('../utils/persona');
+
+const BULK_EMAIL_HISTORY_PAGE_SIZE = 6;
 
 function normalizeEmail(value) {
   return String(value || '').trim().toLowerCase();
@@ -1181,7 +1183,9 @@ async function emailHistoryFlow(ctx) {
 
 function buildBulkEmailMenuKeyboard(ctx) {
   const keyboard = new InlineKeyboard()
+    .text('🧪 Preflight', buildCallbackData(ctx, 'BULK_EMAIL_PRECHECK'))
     .text('📤 Send Bulk Email', buildCallbackData(ctx, 'BULK_EMAIL_SEND'))
+    .row()
     .text('🧾 Job Status', buildCallbackData(ctx, 'BULK_EMAIL_STATUS'))
     .row()
     .text('🕒 History', buildCallbackData(ctx, 'BULK_EMAIL_LIST'))
@@ -1201,8 +1205,65 @@ async function renderBulkEmailMenu(ctx) {
   startOperation(ctx, 'bulk-email-menu');
   const keyboard = buildBulkEmailMenuKeyboard(ctx);
   const title = '📬 *Mailer*';
-  const lines = ['Manage bulk email operations below.'];
+  const lines = [
+    'Manage bulk email operations below.',
+    'Run preflight before large campaigns.'
+  ];
   await renderMenu(ctx, `${title}\n${lines.join('\n')}`, keyboard, { parseMode: 'Markdown' });
+}
+
+async function fetchEmailProviderStatus() {
+  const response = await httpClient.get(null, `${config.apiUrl}/admin/provider`, {
+    params: { channel: 'email' },
+    timeout: 10000,
+    headers: {
+      'x-admin-token': config.admin.apiToken,
+      'Content-Type': 'application/json'
+    }
+  });
+  return response.data || {};
+}
+
+async function sendBulkEmailPreflightCard(ctx) {
+  try {
+    const status = await fetchEmailProviderStatus();
+    const emailProvider = String(status.email_provider || status.provider || 'unknown').toLowerCase();
+    const readinessMap = status.email_readiness || status.providers?.email?.readiness || {};
+    const isReady = readinessMap[emailProvider] !== false;
+    const lines = [
+      buildLine('🔌', 'Provider', escapeMarkdown(emailProvider.toUpperCase())),
+      buildLine('🛡️', 'Readiness', isReady ? '✅ Ready' : '⚠️ Check configuration'),
+      buildLine('📬', 'Channel', 'Email'),
+      '',
+      isReady
+        ? 'Run a low-volume test list first if this is your first campaign today.'
+        : 'Readiness checks failed. Avoid live sends until provider setup is fixed.'
+    ];
+    const keyboard = new InlineKeyboard()
+      .text('✅ Continue to Send', buildCallbackData(ctx, 'BULK_EMAIL_SEND'))
+      .row()
+      .text('🔄 Re-run Preflight', buildCallbackData(ctx, 'BULK_EMAIL_PRECHECK'))
+      .text('⬅️ Back to Mailer', buildCallbackData(ctx, 'BULK_EMAIL'))
+      .row()
+      .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+    await renderMenu(ctx, section('🧪 Bulk Email Preflight', lines), keyboard, { parseMode: 'Markdown' });
+  } catch (error) {
+    const keyboard = new InlineKeyboard()
+      .text('✅ Continue to Send', buildCallbackData(ctx, 'BULK_EMAIL_SEND'))
+      .row()
+      .text('⬅️ Back to Mailer', buildCallbackData(ctx, 'BULK_EMAIL'))
+      .row()
+      .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+    await renderMenu(
+      ctx,
+      section('⚠️ Bulk Email Preflight', [
+        'Could not verify provider readiness right now.',
+        'You can continue, but consider checking /provider first.'
+      ]),
+      keyboard,
+      { parseMode: 'Markdown' }
+    );
+  }
 }
 
 async function fetchBulkEmailHistory(ctx, { limit = 10, offset = 0 } = {}) {
@@ -1213,12 +1274,36 @@ async function fetchBulkEmailHistory(ctx, { limit = 10, offset = 0 } = {}) {
   return response.data;
 }
 
-async function sendBulkEmailHistory(ctx, { limit = 10, offset = 0 } = {}) {
+function buildBulkEmailHistoryKeyboard(ctx, page, hasNextPage) {
+  const keyboard = new InlineKeyboard();
+  if (page > 1) {
+    keyboard.text('⬅️ Prev', buildCallbackData(ctx, `BULK_EMAIL_PAGE:${page - 1}`));
+  }
+  keyboard.text('🔄 Refresh', buildCallbackData(ctx, `BULK_EMAIL_PAGE:${page}`));
+  if (hasNextPage) {
+    keyboard.text('Next ➡️', buildCallbackData(ctx, `BULK_EMAIL_PAGE:${page + 1}`));
+  }
+  keyboard.row();
+  keyboard.text('⬅️ Back to Mailer', buildCallbackData(ctx, 'BULK_EMAIL'));
+  keyboard.row();
+  keyboard.text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+  return keyboard;
+}
+
+async function sendBulkEmailHistory(ctx, { limit = BULK_EMAIL_HISTORY_PAGE_SIZE, offset = 0, page = null } = {}) {
   try {
-    const data = await fetchBulkEmailHistory(ctx, { limit, offset });
+    const safeLimit = Math.max(1, Math.min(Number(limit) || BULK_EMAIL_HISTORY_PAGE_SIZE, 20));
+    const safePage = Number.isFinite(Number(page)) ? Math.max(1, Math.floor(Number(page))) : (Math.floor(offset / safeLimit) + 1);
+    const safeOffset = Number.isFinite(Number(offset)) ? Math.max(0, Math.floor(Number(offset))) : ((safePage - 1) * safeLimit);
+    const data = await fetchBulkEmailHistory(ctx, { limit: safeLimit, offset: safeOffset });
     const jobs = data?.jobs || [];
     if (!jobs.length) {
-      await ctx.reply('ℹ️ No bulk email jobs found for that range.');
+      await renderMenu(
+        ctx,
+        section('📦 Bulk Email History', ['No bulk email jobs found for that range.']),
+        buildBackToMenuKeyboard(ctx, 'BULK_EMAIL', '⬅️ Back to Mailer'),
+        { parseMode: 'Markdown' }
+      );
       return;
     }
     const lines = jobs.map((job) => {
@@ -1230,11 +1315,14 @@ async function sendBulkEmailHistory(ctx, { limit = 10, offset = 0 } = {}) {
         `🕒 ${escapeMarkdown(created)}`
       ].join('\n');
     });
-    const page = Math.floor(offset / limit) + 1;
-    await ctx.reply(`📦 *Bulk Email History* (page ${page})\n\n${lines.join('\n\n')}`, {
-      parse_mode: 'Markdown',
-      reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_EMAIL', '⬅️ Back to Mailer')
-    });
+    const hasNextPage = jobs.length === safeLimit;
+    const header = `📦 *Bulk Email History* (page ${safePage})\n\n${lines.join('\n\n')}`;
+    await renderMenu(
+      ctx,
+      header,
+      buildBulkEmailHistoryKeyboard(ctx, safePage, hasNextPage),
+      { parseMode: 'Markdown' }
+    );
   } catch (error) {
     await replyApiError(ctx, error, 'Failed to fetch bulk email history.');
   }
@@ -1259,7 +1347,7 @@ async function bulkEmailHistoryFlow(conversation, ctx) {
     const page = Math.max(parseInt(parts[0], 10) || 1, 1);
     const limit = Math.min(Math.max(parseInt(parts[1], 10) || 10, 1), 50);
     const offset = (page - 1) * limit;
-    await sendBulkEmailHistory(ctx, { limit, offset });
+    await sendBulkEmailHistory(ctx, { limit, offset, page });
   } catch (error) {
     await replyApiError(ctx, error, 'Failed to fetch bulk email history.');
   }
@@ -1278,23 +1366,44 @@ async function sendBulkEmailStats(ctx, { hours = 24 } = {}) {
     const data = await fetchBulkEmailStats(ctx, { hours });
     const stats = data?.stats;
     if (!stats) {
-      await ctx.reply('ℹ️ Bulk email stats unavailable.');
+      await renderMenu(
+        ctx,
+        section('📊 Bulk Email Stats', ['Stats are unavailable for the selected period.']),
+        buildBackToMenuKeyboard(ctx, 'BULK_EMAIL', '⬅️ Back to Mailer'),
+        { parseMode: 'Markdown' }
+      );
       return;
     }
+    const totalRecipients = Number(stats.total_recipients || 0);
+    const sent = Number(stats.sent || 0);
+    const failed = Number(stats.failed || 0);
+    const delivered = Number(stats.delivered || 0);
+    const bounced = Number(stats.bounced || 0);
+    const complained = Number(stats.complained || 0);
+    const suppressed = Number(stats.suppressed || 0);
+    const processed = Math.max(0, Math.min(totalRecipients, sent + failed + suppressed));
+    const completionRate = totalRecipients > 0 ? Math.round((processed / totalRecipients) * 100) : 0;
+    const deliveredRate = totalRecipients > 0 ? Math.round((delivered / totalRecipients) * 100) : 0;
+    const failureRate = totalRecipients > 0 ? Math.round((failed / totalRecipients) * 100) : 0;
     const lines = [
       `Jobs: ${stats.total_jobs || 0}`,
-      `Recipients: ${stats.total_recipients || 0}`,
-      `Sent: ${stats.sent || 0}`,
-      `Failed: ${stats.failed || 0}`,
-      `Delivered: ${stats.delivered || 0}`,
-      `Bounced: ${stats.bounced || 0}`,
-      `Complaints: ${stats.complained || 0}`,
-      `Suppressed: ${stats.suppressed || 0}`
+      `Recipients: ${totalRecipients}`,
+      `Sent: ${sent}`,
+      `Failed: ${failed}`,
+      `Delivered: ${delivered}`,
+      `Bounced: ${bounced}`,
+      `Complaints: ${complained}`,
+      `Suppressed: ${suppressed}`,
+      `Progress: ${buildTextProgressBar(completionRate)}`,
+      `Delivered rate: ${buildTextProgressBar(deliveredRate)}`,
+      `Failure rate: ${buildTextProgressBar(failureRate)}`
     ];
-    await ctx.reply(`📊 *Bulk Email Stats (last ${data.hours || hours}h)*\n${lines.join('\n')}`, {
-      parse_mode: 'Markdown',
-      reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_EMAIL', '⬅️ Back to Mailer')
-    });
+    await renderMenu(
+      ctx,
+      `📊 *Bulk Email Stats (last ${data.hours || hours}h)*\n${lines.join('\n')}`,
+      buildBackToMenuKeyboard(ctx, 'BULK_EMAIL', '⬅️ Back to Mailer'),
+      { parseMode: 'Markdown' }
+    );
   } catch (error) {
     await replyApiError(ctx, error, 'Failed to fetch bulk email stats.');
   }
@@ -1420,6 +1529,8 @@ function formatBulkStatusCard(job) {
   const bounced = Number(job.bounced || 0);
   const complained = Number(job.complained || 0);
   const progress = total ? Math.round(((sent + failed + suppressed) / total) * 100) : 0;
+  const deliveredRate = total ? Math.round((delivered / total) * 100) : 0;
+  const failedRate = total ? Math.round((failed / total) * 100) : 0;
 
   const lines = [
     buildLine('🆔', 'Job', jobId),
@@ -1432,7 +1543,9 @@ function formatBulkStatusCard(job) {
     buildLine('⛔', 'Suppressed', escapeMarkdown(String(suppressed))),
     buildLine('📉', 'Bounced', escapeMarkdown(String(bounced))),
     buildLine('⚠️', 'Complained', escapeMarkdown(String(complained))),
-    buildLine('📈', 'Progress', escapeMarkdown(`${progress}%`))
+    buildLine('📈', 'Progress', escapeMarkdown(buildTextProgressBar(progress))),
+    buildLine('📬', 'Delivered rate', escapeMarkdown(buildTextProgressBar(deliveredRate))),
+    buildLine('🚨', 'Failure rate', escapeMarkdown(buildTextProgressBar(failedRate)))
   ];
 
   return [
@@ -1633,7 +1746,7 @@ async function emailFlow(conversation, ctx) {
       return;
     }
 
-    await ctx.reply(setupStepMessage('Email setup', [
+    await ctx.reply(setupStepMessage('Email setup (Step 1/5)', [
       'Enter the recipient email address.'
     ]), { parse_mode: 'Markdown' });
     const toMsg = await waitForMessage();
@@ -1643,7 +1756,7 @@ async function emailFlow(conversation, ctx) {
       return;
     }
 
-    await ctx.reply(section('📤 From Address', [
+    await ctx.reply(section('📤 From Address (Step 2/5)', [
       'Optional. Type an email address or "skip" to use default.'
     ]), { parse_mode: 'Markdown' });
     const fromMsg = await waitForMessage();
@@ -1662,7 +1775,7 @@ async function emailFlow(conversation, ctx) {
     const mode = await askOptionWithButtons(
       conversation,
       ctx,
-      '🧩 *Choose email mode*',
+      '🧩 *Choose email mode (Step 3/5)*',
       modeOptions,
       { prefix: 'email-mode', columns: 2, ensureActive }
     );
@@ -1807,7 +1920,7 @@ async function bulkEmailFlow(conversation, ctx) {
       return;
     }
 
-    await ctx.reply(section('📨 Bulk Recipients', [
+    await ctx.reply(section('📨 Bulk Recipients (Step 1/5)', [
       'Paste emails separated by commas or new lines.',
       'You can also paste JSON: [{"email":"a@x.com","variables":{"name":"A"}}]'
     ]), { parse_mode: 'Markdown' });
@@ -1823,7 +1936,7 @@ async function bulkEmailFlow(conversation, ctx) {
       ]), { parse_mode: 'Markdown' });
     }
 
-    await ctx.reply(section('📤 From Address', [
+    await ctx.reply(section('📤 From Address (Step 2/5)', [
       'Optional. Type an email address or "skip" to use default.'
     ]), { parse_mode: 'Markdown' });
     const fromMsg = await waitForMessage();
@@ -1842,7 +1955,7 @@ async function bulkEmailFlow(conversation, ctx) {
     const mode = await askOptionWithButtons(
       conversation,
       ctx,
-      '🧩 *Choose bulk email mode*',
+      '🧩 *Choose bulk email mode (Step 3/5)*',
       modeOptions,
       { prefix: 'bulk-email-mode', columns: 2, ensureActive }
     );
@@ -1953,7 +2066,7 @@ function registerEmailCommands(bot) {
 
   bot.command('mailer', async (ctx) => {
     try {
-      await renderBulkEmailMenu(ctx);
+      await sendBulkEmailPreflightCard(ctx);
     } catch (error) {
       console.error('Bulk email command error:', error);
       await ctx.reply('❌ Could not open bulk email menu.');
@@ -1995,6 +2108,7 @@ module.exports = {
   bulkEmailStatsFlow,
   sendBulkEmailHistory,
   sendBulkEmailStats,
+  sendBulkEmailPreflightCard,
   emailHistoryFlow,
   registerEmailCommands,
   sendEmailStatusCard,

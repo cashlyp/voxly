@@ -162,7 +162,7 @@ function getUserMessage(error, fallback = 'API request failed.') {
 
 async function request(method, ctx, url, data, options = {}) {
   const normalized = normalizeOptions(options, url);
-  const { retry, admin, ...axiosOptions } = normalized;
+  const { retry, ...axiosOptions } = normalized;
   try {
     if (method === 'get') {
       return await withRetry(() => axios.get(url, axiosOptions), retry);
