@@ -15707,11 +15707,15 @@ app.post("/miniapp/session", async (req, res) => {
     });
   } catch (error) {
     if (error instanceof MiniAppAuthError) {
+      const message =
+        error.code === "miniapp_invalid_signature"
+          ? `${error.message}. Verify API TELEGRAM_BOT_TOKEN matches the bot that launched this Mini App.`
+          : error.message || "Mini App init data validation failed";
       return sendApiError(
         res,
         error.status || 401,
         error.code || "miniapp_auth_invalid",
-        error.message || "Mini App init data validation failed",
+        message,
         req.requestId || null,
       );
     }
