@@ -14,11 +14,15 @@ function buildInitDataQuery({
   authDate = 1710000000,
   queryId = "AAEAAAE",
   user = { id: 123456789, username: "admin_user", first_name: "Admin" },
+  signature = null,
 }) {
   const params = new URLSearchParams();
   params.set("auth_date", String(authDate));
   params.set("query_id", queryId);
   params.set("user", JSON.stringify(user));
+  if (signature) {
+    params.set("signature", String(signature));
+  }
   const rawWithoutHash = params.toString();
   const hash = computeInitDataHash(rawWithoutHash, botToken);
   params.set("hash", hash);
@@ -38,13 +42,15 @@ describe("miniappAuth", () => {
     expect(buildDataCheckString(params)).toBe("a=1\nb=2");
   });
 
-  test("buildDataCheckString excludes signature field as well", () => {
+  test("buildDataCheckString includes signature field and excludes only hash", () => {
     const params = new URLSearchParams();
     params.set("auth_date", "1710000000");
-    params.set("signature", "skip-me");
-    params.set("hash", "skip-too");
+    params.set("signature", "included");
+    params.set("hash", "excluded");
     params.set("query_id", "QID");
-    expect(buildDataCheckString(params)).toBe("auth_date=1710000000\nquery_id=QID");
+    expect(buildDataCheckString(params)).toBe(
+      "auth_date=1710000000\nquery_id=QID\nsignature=included",
+    );
   });
 
   test("validateInitData accepts valid payload", () => {
@@ -71,6 +77,17 @@ describe("miniappAuth", () => {
     const { raw, botToken } = buildInitDataQuery({});
     const tampered = raw.replace("admin_user", "evil_user");
     expect(() => validateInitData(tampered, botToken)).toThrow(MiniAppAuthError);
+  });
+
+  test("validateInitData accepts payloads that include signature field", () => {
+    const { raw, botToken } = buildInitDataQuery({
+      signature: "example-ed25519-signature",
+    });
+    const result = validateInitData(raw, botToken, {
+      nowSeconds: 1710000100,
+      maxAgeSeconds: 600,
+    });
+    expect(result.user.id).toBe(123456789);
   });
 
   test("session token round-trip works", () => {

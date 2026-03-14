@@ -266,8 +266,7 @@ function buildApiUrl(path: string): string {
 
 export function AdminDashboard() {
   const initDataRawFromHook = useRawInitData();
-  const initDataRawFromSignal = useSignal(initData.raw);
-  const initDataRaw = initDataRawFromHook || initDataRawFromSignal;
+  const initDataRaw = initDataRawFromHook;
   const initDataState = useSignal(initData.state) as SessionState | undefined;
   const [token, setToken] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(true);

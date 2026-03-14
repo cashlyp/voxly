@@ -92,6 +92,8 @@ const {
 } = require("./adapters/providerPreflight");
 const {
   MiniAppAuthError,
+  parseInitData,
+  computeInitDataHash,
   validateInitData,
   createMiniAppSessionToken,
   verifyMiniAppSessionToken,
@@ -6784,6 +6786,22 @@ function buildMiniAppReplayKey(validationResult = {}) {
 }
 
 function getMiniAppBotTokenCandidates() {
+  const normalizedCandidates = new Set();
+  const pushCandidate = (value) => {
+    let candidate = String(value || "").trim();
+    if (!candidate) return;
+    if (
+      (candidate.startsWith('"') && candidate.endsWith('"')) ||
+      (candidate.startsWith("'") && candidate.endsWith("'"))
+    ) {
+      candidate = candidate.slice(1, -1).trim();
+    }
+    if (!candidate) return;
+    normalizedCandidates.add(candidate);
+    if (/^bot\d+:/i.test(candidate)) {
+      normalizedCandidates.add(candidate.replace(/^bot/i, ""));
+    }
+  };
   const configured = Array.isArray(config.telegram?.botTokenCandidates)
     ? config.telegram.botTokenCandidates
     : [];
@@ -6791,20 +6809,17 @@ function getMiniAppBotTokenCandidates() {
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean);
-  return Array.from(
-    new Set(
-      [
-        ...configured,
-        config.telegram?.botToken,
-        process.env.TELEGRAM_BOT_TOKEN,
-        process.env.BOT_TOKEN,
-        process.env.MINI_APP_BOT_TOKEN,
-        ...envList,
-      ]
-        .map((value) => String(value || "").trim())
-        .filter(Boolean),
-    ),
-  );
+  for (const value of [
+    ...configured,
+    config.telegram?.botToken,
+    process.env.TELEGRAM_BOT_TOKEN,
+    process.env.BOT_TOKEN,
+    process.env.MINI_APP_BOT_TOKEN,
+    ...envList,
+  ]) {
+    pushCandidate(value);
+  }
+  return Array.from(normalizedCandidates.values());
 }
 
 function validateMiniAppInitDataWithCandidates(initDataRaw, options = {}) {
@@ -6848,6 +6863,57 @@ function validateMiniAppInitDataWithCandidates(initDataRaw, options = {}) {
       401,
     )
   );
+}
+
+function resolveMiniAppTokenBotId(token) {
+  const value = String(token || "").trim().replace(/^bot(?=\d+:)/i, "");
+  if (!value) return null;
+  const botId = value.split(":")[0];
+  return /^\d+$/.test(botId) ? botId : null;
+}
+
+function compareMiniAppHex(leftHex, rightHex) {
+  const left = Buffer.from(String(leftHex || ""), "hex");
+  const right = Buffer.from(String(rightHex || ""), "hex");
+  if (!left.length || left.length !== right.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(left, right);
+}
+
+function readMiniAppInitDataDiagnostics(initDataRaw = "") {
+  try {
+    const parsed = parseInitData(initDataRaw);
+    return {
+      has_signature_param: parsed.params.has("signature"),
+      provided_hash_prefix: String(parsed.hash || "").slice(0, 12) || null,
+      query_id_present: Boolean(parsed.queryId),
+      auth_date: Number.isFinite(parsed.authDate) ? parsed.authDate : null,
+      user_id: parsed.user?.id || null,
+    };
+  } catch {
+    return {
+      has_signature_param: false,
+      provided_hash_prefix: null,
+      query_id_present: false,
+      auth_date: null,
+      user_id: null,
+    };
+  }
+}
+
+function computeMiniAppHashDiagnostics(initDataRaw, botTokens = []) {
+  const hash = String(new URLSearchParams(String(initDataRaw || "")).get("hash") || "").trim();
+  if (!hash) return [];
+  return botTokens.map((token, index) => {
+    const expected = computeInitDataHash(initDataRaw, token);
+    return {
+      index,
+      bot_id: resolveMiniAppTokenBotId(token),
+      match: compareMiniAppHex(hash, expected),
+      expected_hash_prefix: expected.slice(0, 12),
+    };
+  });
 }
 
 function normalizeMiniAppTtlSeconds(ttlSeconds, fallbackSeconds = 300) {
@@ -16126,6 +16192,20 @@ app.post("/miniapp/session", async (req, res) => {
   } catch (error) {
     if (error instanceof MiniAppAuthError) {
       if (error.code === "miniapp_invalid_signature") {
+        const initDataDiagnostics = readMiniAppInitDataDiagnostics(initDataRaw);
+        const hashDiagnostics = computeMiniAppHashDiagnostics(initDataRaw, botTokenCandidates);
+        console.warn("miniapp_signature_diagnostics", {
+          route: "session",
+          request_id: req.requestId || null,
+          source: initDataSource,
+          init_data_len: initDataRaw.length,
+          token_candidates: botTokenCandidates.length,
+          token_bot_ids: hashDiagnostics
+            .map((entry) => entry.bot_id)
+            .filter(Boolean),
+          init_data: initDataDiagnostics,
+          hash_diagnostics: hashDiagnostics,
+        });
         noteMiniAppAlertSignal("invalid_signature", {
           route: "session",
           request_id: req.requestId || null,
