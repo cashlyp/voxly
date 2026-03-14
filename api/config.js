@@ -667,6 +667,19 @@ const telegramAdminChatId =
   readEnv("TELEGRAM_ADMIN_CHAT_ID") || readEnv("ADMIN_TELEGRAM_ID");
 const telegramAdminChatIds = parseList(readEnv("TELEGRAM_ADMIN_CHAT_IDS"));
 const telegramAdminUserIds = parseList(readEnv("TELEGRAM_ADMIN_USER_IDS"));
+const telegramPrimaryBotToken = ensure("TELEGRAM_BOT_TOKEN", process.env.BOT_TOKEN);
+const telegramBotTokenCandidates = Array.from(
+  new Set(
+    [
+      telegramPrimaryBotToken,
+      readEnv("BOT_TOKEN"),
+      readEnv("MINI_APP_BOT_TOKEN"),
+      ...parseList(readEnv("TELEGRAM_BOT_TOKENS")),
+    ]
+      .map((value) => String(value || "").trim())
+      .filter(Boolean),
+  ),
+);
 const telegramOperatorChatIds = parseList(
   readEnv("TELEGRAM_OPERATOR_CHAT_IDS"),
 );
@@ -928,7 +941,8 @@ module.exports = {
     },
   },
   telegram: {
-    botToken: ensure("TELEGRAM_BOT_TOKEN", process.env.BOT_TOKEN),
+    botToken: telegramPrimaryBotToken,
+    botTokenCandidates: telegramBotTokenCandidates,
     adminChatId: telegramAdminChatId,
     adminChatIds: telegramAdminChatIds,
     adminUserIds: telegramAdminUserIds,
