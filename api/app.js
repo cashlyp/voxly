@@ -1,5 +1,4 @@
 require("./utils/bootstrapLogger");
-require("dotenv").config();
 
 const express = require("express");
 const fetch = require("node-fetch");
@@ -16135,7 +16134,7 @@ app.post("/miniapp/session", async (req, res) => {
       }
       const message =
         error.code === "miniapp_invalid_signature"
-          ? `${error.message}. Verify API TELEGRAM_BOT_TOKEN matches the bot that launched this Mini App.`
+          ? `${error.message}. Verify API TELEGRAM_BOT_TOKEN/BOT_TOKEN/MINI_APP_BOT_TOKEN (or TELEGRAM_BOT_TOKENS) includes the bot that launched this Mini App.`
           : error.message || "Mini App init data validation failed";
       return sendApiError(
         res,

@@ -87,6 +87,15 @@
   box-shadow: 0 10px 24px rgba(140, 74, 22, 0.28);
 }
 
+.va-blocked {
+  border-color: rgba(255, 99, 132, 0.62);
+  box-shadow: 0 10px 24px rgba(120, 32, 50, 0.26);
+}
+
+.va-blocked button {
+  margin-top: 8px;
+}
+
 .va-card h3 {
   margin: 0 0 8px;
   font-size: 15px;
