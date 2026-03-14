@@ -22,6 +22,58 @@ function normalizeProviders(status = {}) {
     return { supported, active };
 }
 
+function buildCallReadinessMap(status = {}) {
+    const callReadiness = status.providers?.call?.readiness || {};
+    return {
+        twilio: typeof callReadiness.twilio === 'boolean' ? callReadiness.twilio : !!status.twilio_ready,
+        aws: typeof callReadiness.aws === 'boolean' ? callReadiness.aws : !!status.aws_ready,
+        vonage: typeof callReadiness.vonage === 'boolean' ? callReadiness.vonage : !!status.vonage_ready
+    };
+}
+
+function getProviderReadiness(status = {}, channel, provider) {
+    const normalizedProvider = String(provider || '').toLowerCase();
+    const state = status.providers?.[channel] || {};
+    const readiness = state.readiness || {};
+    if (typeof readiness[normalizedProvider] === 'boolean') {
+        return readiness[normalizedProvider];
+    }
+    if (channel === 'call') {
+        const callReadiness = buildCallReadinessMap(status);
+        if (typeof callReadiness[normalizedProvider] === 'boolean') {
+            return callReadiness[normalizedProvider];
+        }
+    }
+    return null;
+}
+
+function readinessBadge(value) {
+    if (value === true) return '✅';
+    if (value === false) return '⚠️';
+    return '—';
+}
+
+function formatReadinessMatrix(status = {}) {
+    const callState = status.providers?.call || {};
+    const smsState = status.providers?.sms || {};
+    const emailState = status.providers?.email || {};
+    const providers = Array.from(new Set([
+        ...(callState.supported_providers || SUPPORTED_PROVIDERS),
+        ...(smsState.supported_providers || []),
+        ...(emailState.supported_providers || [])
+    ])).map((item) => String(item || '').toLowerCase()).filter(Boolean);
+    if (!providers.length) {
+        return section('🧪 Readiness Matrix', ['No provider readiness data available.']);
+    }
+    const lines = providers.map((provider) => {
+        const callReady = readinessBadge(getProviderReadiness(status, 'call', provider));
+        const smsReady = readinessBadge(getProviderReadiness(status, 'sms', provider));
+        const emailReady = readinessBadge(getProviderReadiness(status, 'email', provider));
+        return `• ${provider.toUpperCase()} → call ${callReady} | sms ${smsReady} | email ${emailReady}`;
+    });
+    return section('🧪 Readiness Matrix', lines);
+}
+
 function formatProviderStatus(status) {
     if (!status) {
         return section('⚙️ Call Provider Settings', ['No status data available.']);
@@ -34,18 +86,20 @@ function formatProviderStatus(status) {
     const supportedValues = Array.isArray(status.supported_providers) && status.supported_providers.length > 0
         ? status.supported_providers
         : SUPPORTED_PROVIDERS;
-    const vonageReady = status.vonage_ready ? '✅ Ready' : '⚠️ Missing keys';
+    const smsProvider = String(status.sms_provider || status.providers?.sms?.provider || 'unknown').toUpperCase();
+    const emailProvider = String(status.email_provider || status.providers?.email?.provider || 'unknown').toUpperCase();
 
     const details = [
         buildLine('•', `Current Provider`, `*${current.toUpperCase()}*`),
         buildLine('•', `Stored Default`, stored.toUpperCase()),
-        buildLine('•', `AWS Ready`, status.aws_ready ? '✅' : '⚠️'),
-        buildLine('•', `Twilio Ready`, status.twilio_ready ? '✅' : '⚠️'),
-        buildLine('•', `Vonage Ready`, vonageReady),
+        buildLine('•', `SMS Provider`, smsProvider),
+        buildLine('•', `Email Provider`, emailProvider),
         buildLine('•', `Supported Backbones`, supportedValues.join(', ').toUpperCase())
     ];
-
-    return section('⚙️ Call Provider Settings', details);
+    return [
+        section('⚙️ Call Provider Settings', details),
+        formatReadinessMatrix(status)
+    ].join('\n\n');
 }
 
 function buildProviderKeyboard(ctx, activeProvider = '', supportedProviders = []) {
@@ -55,7 +109,7 @@ function buildProviderKeyboard(ctx, activeProvider = '', supportedProviders = []
         const normalized = provider.toLowerCase();
         const isActive = normalized === activeProvider;
         const label = isActive ? `✅ ${normalized.toUpperCase()}` : normalized.toUpperCase();
-        keyboard.text(label, buildCallbackData(ctx, `PROVIDER_SET:${normalized}`));
+        keyboard.text(label, buildCallbackData(ctx, `PROVIDER_CONFIRM:${normalized}`));
 
         const shouldInsertRow = index % 2 === 1 && index < providers.length - 1;
         if (shouldInsertRow) {
@@ -63,6 +117,17 @@ function buildProviderKeyboard(ctx, activeProvider = '', supportedProviders = []
         }
     });
     keyboard.row().text('🔄 Refresh', buildCallbackData(ctx, 'PROVIDER_STATUS'));
+    keyboard.row().text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+    return keyboard;
+}
+
+function buildProviderConfirmKeyboard(ctx, provider, canApply) {
+    const keyboard = new InlineKeyboard();
+    if (canApply) {
+        keyboard.text('✅ Apply Switch', buildCallbackData(ctx, `PROVIDER_APPLY:${provider}`));
+        keyboard.row();
+    }
+    keyboard.text('↩️ Choose Different', buildCallbackData(ctx, 'PROVIDER_STATUS'));
     keyboard.row().text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
     return keyboard;
 }
@@ -137,11 +202,48 @@ async function renderProviderMenu(ctx, { status, notice, forceRefresh = false } 
         if (notices.length) {
             message = `${notices.join('\n')}\n\n${message}`;
         }
-        message += '\n\nTap a provider below to switch.';
+        message += '\n\nTap a provider below to review readiness before switching.';
         await renderMenu(ctx, message, keyboard, { parseMode: 'Markdown' });
     } catch (error) {
         console.error('Provider status command error:', error);
         await ctx.reply(formatProviderError(error, 'fetch provider status'));
+    }
+}
+
+async function renderProviderConfirm(ctx, requestedProvider) {
+    try {
+        const status = await fetchProviderStatus({ force: true });
+        const { supported, active } = normalizeProviders(status);
+        const normalized = String(requestedProvider || '').toLowerCase();
+        if (!normalized || !supported.includes(normalized)) {
+            const options = supported.map((item) => `• /provider ${item}`).join('\n');
+            await ctx.reply(
+                `❌ Unsupported provider "${escapeMarkdown(requestedProvider || '')}".\n\nUsage:\n• /provider status\n${options}`
+            );
+            return;
+        }
+
+        const callReady = getProviderReadiness(status, 'call', normalized);
+        const smsReady = getProviderReadiness(status, 'sms', normalized);
+        const emailReady = getProviderReadiness(status, 'email', normalized);
+        const canApply = callReady !== false;
+        const lines = [
+            buildLine('•', 'Current call provider', active.toUpperCase()),
+            buildLine('•', 'Selected provider', normalized.toUpperCase()),
+            buildLine('•', 'Call readiness', callReady === false ? '⚠️ Not ready' : (callReady === true ? '✅ Ready' : '— Unknown')),
+            buildLine('•', 'SMS readiness', smsReady === false ? '⚠️ Not ready' : (smsReady === true ? '✅ Ready' : '— Unknown')),
+            buildLine('•', 'Email readiness', emailReady === false ? '⚠️ Not ready' : (emailReady === true ? '✅ Ready' : '— Unknown')),
+            '',
+            canApply
+                ? 'Apply switch when ready.'
+                : 'Switch blocked: selected call provider is not ready.'
+        ];
+        const message = section('🛡️ Confirm Provider Switch', lines);
+        const keyboard = buildProviderConfirmKeyboard(ctx, normalized, canApply);
+        await renderMenu(ctx, message, keyboard, { parseMode: 'Markdown' });
+    } catch (error) {
+        console.error('Provider confirm command error:', error);
+        await ctx.reply(formatProviderError(error, 'load provider confirmation'));
     }
 }
 
@@ -229,6 +331,7 @@ module.exports.updateProvider = updateProvider;
 module.exports.formatProviderStatus = formatProviderStatus;
 module.exports.handleProviderSwitch = handleProviderSwitch;
 module.exports.renderProviderMenu = renderProviderMenu;
+module.exports.renderProviderConfirm = renderProviderConfirm;
 module.exports.buildProviderKeyboard = buildProviderKeyboard;
 module.exports.SUPPORTED_PROVIDERS = SUPPORTED_PROVIDERS;
 module.exports.ADMIN_HEADER_NAME = ADMIN_HEADER_NAME;

@@ -4,6 +4,27 @@ const config = require('../config');
 const { escapeHtml, renderMenu } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
 
+function getMiniAppLaunchUrl() {
+    const configured = String(config.miniApp?.url || '').trim();
+    if (configured) return configured;
+    try {
+        return new URL('/miniapp', config.apiUrl).toString();
+    } catch {
+        return '';
+    }
+}
+
+function appendMiniAppLaunchButton(keyboard, label = '🧭 Admin Console') {
+    const launchUrl = getMiniAppLaunchUrl();
+    if (!launchUrl) return false;
+    if (typeof keyboard.webApp === 'function') {
+        keyboard.row().webApp(label, launchUrl);
+    } else {
+        keyboard.row().url(label, launchUrl);
+    }
+    return true;
+}
+
 async function handleHelp(ctx) {
     try {
         const user = await new Promise(r => getUser(ctx.from.id, r));
@@ -67,6 +88,7 @@ async function handleHelp(ctx) {
                 '📣 /smssender — bulk SMS center',
                 '📦 /mailer — bulk email center',
                 '🧪 /status — deep system status',
+                '🧭 /admin — open the Mini App admin console',
                 '🧰 /scripts — manage reusable prompts',
                 '🍃 /persona — sculpt adaptive agents',
                 '🔀 /provider — view or switch voice providers'
@@ -122,6 +144,7 @@ async function handleHelp(ctx) {
                         .text('📵 Caller Flags', buildCallbackData(ctx, 'CALLER_FLAGS'))
                         .row()
                         .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER_STATUS'));
+                    appendMiniAppLaunchButton(keyboard);
                 }
                 return keyboard;
             })()

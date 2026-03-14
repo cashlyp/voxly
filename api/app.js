@@ -5,6 +5,8 @@ const express = require("express");
 const fetch = require("node-fetch");
 const ExpressWs = require("express-ws");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 const helmet = require("helmet");
 const cors = require("cors");
 const compression = require("compression");
@@ -89,6 +91,12 @@ const {
   assertProviderPreflight,
   ProviderPreflightError,
 } = require("./adapters/providerPreflight");
+const {
+  MiniAppAuthError,
+  validateInitData,
+  createMiniAppSessionToken,
+  verifyMiniAppSessionToken,
+} = require("./services/miniappAuth");
 const {
   AwsConnectAdapter,
   AwsTtsAdapter,
@@ -207,6 +215,7 @@ const liveConsoleUserHoldMs = Number.isFinite(
 const HMAC_HEADER_TIMESTAMP = "x-api-timestamp";
 const HMAC_HEADER_SIGNATURE = "x-api-signature";
 const HMAC_BYPASS_PATH_PREFIXES = [
+  "/miniapp",
   "/webhook/",
   "/capture/",
   "/incoming",
@@ -248,6 +257,8 @@ const keypadProviderOverrides = new Map(); // scopeKey -> { provider, expiresAt,
 const keypadDtmfSeen = new Map(); // callSid -> { seenAt, source, digitsLength }
 const keypadDtmfWatchdogs = new Map(); // callSid -> timeoutId
 const vonageWebhookJtiCache = new Map(); // jti -> expiresAtMs
+const miniAppReplayCache = new Map(); // queryId/hash -> expiresAtMs
+const miniAppSessionRevocations = new Map(); // jti -> expiresAtMs
 const callRuntimePersistTimers = new Map(); // callSid -> timeoutId
 const callRuntimePendingWrites = new Map(); // callSid -> patch
 const callToolInFlight = new Map(); // callSid -> { tool, startedAt }
@@ -273,6 +284,9 @@ const CALL_STATUS_DEDUPE_MAX = 5000;
 const PROVIDER_EVENT_DEDUPE_MS = 5 * 60 * 1000;
 const PROVIDER_EVENT_DEDUPE_MAX = 10000;
 const VONAGE_WEBHOOK_JTI_CACHE_MAX = 5000;
+const MINI_APP_REPLAY_CACHE_MAX = 5000;
+const MINI_APP_SESSION_REVOCATION_MAX = 5000;
+const MINI_APP_INTERNAL_REQUEST_TIMEOUT_MS = 10000;
 const VONAGE_MAPPING_RECONCILE_BATCH_LIMIT = 250;
 const CALL_RUNTIME_PERSIST_DEBOUNCE_MS = 150;
 const CALL_RUNTIME_STATE_STALE_MS = 6 * 60 * 60 * 1000;
@@ -6737,6 +6751,270 @@ function parseBearerToken(value) {
   if (!match) return null;
   const token = match[1]?.trim();
   return token || null;
+}
+
+function pruneExpiringMap(cache, maxSize, nowMs = Date.now()) {
+  for (const [key, expiresAt] of cache.entries()) {
+    if (!Number.isFinite(expiresAt) || expiresAt <= nowMs) {
+      cache.delete(key);
+    }
+  }
+  if (cache.size <= maxSize) {
+    return;
+  }
+  const overflow = cache.size - maxSize;
+  const ordered = [...cache.entries()].sort((a, b) => a[1] - b[1]);
+  for (let i = 0; i < overflow; i += 1) {
+    cache.delete(ordered[i][0]);
+  }
+}
+
+function buildMiniAppReplayKey(validationResult = {}) {
+  if (validationResult.queryId) {
+    return `qid:${validationResult.queryId}`;
+  }
+  if (validationResult.hash) {
+    return `hash:${validationResult.hash}`;
+  }
+  return null;
+}
+
+function hasSeenMiniAppReplay(key, nowMs = Date.now()) {
+  if (!key) return false;
+  pruneExpiringMap(miniAppReplayCache, MINI_APP_REPLAY_CACHE_MAX, nowMs);
+  const expiresAt = miniAppReplayCache.get(String(key));
+  if (!Number.isFinite(expiresAt)) return false;
+  if (expiresAt <= nowMs) {
+    miniAppReplayCache.delete(String(key));
+    return false;
+  }
+  return true;
+}
+
+function markMiniAppReplay(key, ttlSeconds, nowMs = Date.now()) {
+  if (!key) return;
+  const safeTtl = Number.isFinite(Number(ttlSeconds))
+    ? Math.max(30, Math.floor(Number(ttlSeconds)))
+    : 300;
+  miniAppReplayCache.set(String(key), nowMs + safeTtl * 1000);
+  pruneExpiringMap(miniAppReplayCache, MINI_APP_REPLAY_CACHE_MAX, nowMs);
+}
+
+function isTelegramAdminUser(telegramId) {
+  const id = String(telegramId || "").trim();
+  if (!id) return false;
+  const adminUserIds = Array.isArray(config.telegram?.adminUserIds)
+    ? config.telegram.adminUserIds
+    : [];
+  const adminChatIds = Array.isArray(config.telegram?.adminChatIds)
+    ? config.telegram.adminChatIds
+    : [];
+  return adminUserIds.some((item) => String(item).trim() === id)
+    || adminChatIds.some((item) => String(item).trim() === id);
+}
+
+function getMiniAppCapabilitiesForRole(role) {
+  if (String(role || "").toLowerCase() !== "admin") {
+    return ["dashboard_view"];
+  }
+  return [
+    "dashboard_view",
+    "provider_manage",
+    "sms_bulk_manage",
+    "email_bulk_manage",
+    "caller_flags_manage",
+    "dlq_manage",
+    "users_manage",
+  ];
+}
+
+function parseMiniAppAuthorization(req) {
+  const authHeader = req?.headers?.authorization || req?.headers?.Authorization;
+  const bearer = parseBearerToken(authHeader);
+  if (bearer) {
+    return bearer;
+  }
+  const token = req?.headers?.["x-miniapp-token"];
+  return token ? String(token).trim() : null;
+}
+
+function requireMiniAppSession(req, res, next) {
+  const token = parseMiniAppAuthorization(req);
+  if (!token) {
+    return sendApiError(
+      res,
+      401,
+      "miniapp_auth_required",
+      "Mini App session token required",
+      req.requestId || null,
+    );
+  }
+  try {
+    const session = verifyMiniAppSessionToken(token, config.miniApp?.sessionSecret, {
+      skewSeconds: 30,
+    });
+    pruneExpiringMap(miniAppSessionRevocations, MINI_APP_SESSION_REVOCATION_MAX);
+    const revokedUntil = miniAppSessionRevocations.get(String(session.jti || ""));
+    if (Number.isFinite(revokedUntil) && revokedUntil > Date.now()) {
+      return sendApiError(
+        res,
+        401,
+        "miniapp_token_revoked",
+        "Mini App session token was revoked",
+        req.requestId || null,
+      );
+    }
+    req.miniAppSession = session;
+    return next();
+  } catch (error) {
+    if (error instanceof MiniAppAuthError) {
+      return sendApiError(
+        res,
+        error.status || 401,
+        error.code || "miniapp_auth_invalid",
+        error.message || "Invalid Mini App session token",
+        req.requestId || null,
+      );
+    }
+    return sendApiError(
+      res,
+      401,
+      "miniapp_auth_invalid",
+      "Invalid Mini App session token",
+      req.requestId || null,
+    );
+  }
+}
+
+function requireMiniAppCapability(req, res, capability) {
+  const session = req.miniAppSession || {};
+  const caps = Array.isArray(session.caps) ? session.caps : [];
+  if (!capability || caps.includes(capability)) {
+    return true;
+  }
+  sendApiError(
+    res,
+    403,
+    "miniapp_capability_denied",
+    `Capability "${capability}" is required`,
+    req.requestId || null,
+  );
+  return false;
+}
+
+function parseTmaAuthorization(req) {
+  const header = req?.headers?.authorization || req?.headers?.Authorization;
+  if (!header) return null;
+  const match = String(header).match(/^tma\s+(.+)$/i);
+  if (!match) return null;
+  const value = match[1]?.trim();
+  return value || null;
+}
+
+function buildMiniAppSessionSummary(session = {}) {
+  return {
+    telegram_id: session.telegram_id || null,
+    username: session.username || null,
+    first_name: session.first_name || null,
+    role: session.role || "user",
+    caps: Array.isArray(session.caps) ? session.caps : [],
+    exp: Number.isFinite(Number(session.exp)) ? Number(session.exp) : null,
+  };
+}
+
+function resolveMiniAppPublicUrl(req) {
+  const configured = String(config.miniApp?.url || "").trim();
+  if (configured) return configured;
+  const protocol =
+    req?.headers?.["x-forwarded-proto"] ||
+    req?.protocol ||
+    (isProduction ? "https" : "http");
+  const host =
+    req?.headers?.["x-forwarded-host"] ||
+    req?.headers?.host ||
+    config.server?.hostname ||
+    `127.0.0.1:${PORT}`;
+  return `${protocol}://${host}/miniapp`;
+}
+
+function buildInternalRequestPath(pathname, query = null) {
+  const basePath = String(pathname || "/").trim() || "/";
+  if (!query || typeof query !== "object") return basePath;
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value === undefined || value === null || value === "") continue;
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (item === undefined || item === null || item === "") continue;
+        params.append(key, String(item));
+      }
+      continue;
+    }
+    params.set(key, String(value));
+  }
+  const serialized = params.toString();
+  if (!serialized) return basePath;
+  return `${basePath}?${serialized}`;
+}
+
+function buildInternalHmacHeaders(method, requestPath, body) {
+  const secret = String(config.apiAuth?.hmacSecret || "").trim();
+  if (!secret) return {};
+  const timestamp = String(Date.now());
+  const normalizedMethod = String(method || "GET").toUpperCase();
+  const bodyText =
+    normalizedMethod === "GET" || normalizedMethod === "HEAD"
+      ? ""
+      : stableStringify(body || {});
+  const payload = `${timestamp}.${normalizedMethod}.${requestPath}.${bodyText}`;
+  const signature = crypto
+    .createHmac("sha256", secret)
+    .update(payload)
+    .digest("hex");
+  return {
+    [HMAC_HEADER_TIMESTAMP]: timestamp,
+    [HMAC_HEADER_SIGNATURE]: signature,
+  };
+}
+
+async function callMiniAppBridgeApi(options = {}) {
+  const method = String(options.method || "GET").toUpperCase();
+  const requestPath = buildInternalRequestPath(options.path || "/", options.query);
+  const targetUrl = `http://127.0.0.1:${PORT}${requestPath}`;
+  const requestId = options.requestId || null;
+  const body =
+    method === "GET" || method === "HEAD"
+      ? undefined
+      : options.body && typeof options.body === "object"
+        ? options.body
+        : {};
+
+  const headers = {
+    "content-type": "application/json",
+    ...(requestId ? { "x-request-id": requestId } : {}),
+    ...(config.admin?.apiToken ? { [ADMIN_HEADER_NAME]: config.admin.apiToken } : {}),
+    ...buildInternalHmacHeaders(method, requestPath, body),
+  };
+
+  const response = await fetch(targetUrl, {
+    method,
+    headers,
+    timeout: MINI_APP_INTERNAL_REQUEST_TIMEOUT_MS,
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  });
+  const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+  let payload = null;
+  if (contentType.includes("application/json")) {
+    payload = await response.json().catch(() => null);
+  } else {
+    const text = await response.text().catch(() => "");
+    payload = text ? { success: false, error: text } : null;
+  }
+  return {
+    ok: response.ok,
+    status: response.status,
+    data: payload,
+  };
 }
 
 function decodeBase64UrlJson(segment) {
@@ -15065,6 +15343,611 @@ function getProfileRuntimeStatus(options = {}) {
   };
 }
 
+async function getMiniAppDlqSnapshot() {
+  if (!db) {
+    return {
+      call_open: null,
+      email_open: null,
+      call_preview: [],
+      email_preview: [],
+    };
+  }
+  let callOpen = null;
+  let emailOpen = null;
+  let callPreview = [];
+  let emailPreview = [];
+
+  if (typeof db.countOpenCallJobDlq === "function") {
+    callOpen = await db.countOpenCallJobDlq().catch(() => null);
+  }
+  if (typeof db.countOpenEmailDlq === "function") {
+    emailOpen = await db.countOpenEmailDlq().catch(() => null);
+  }
+  if (typeof db.listCallJobDlq === "function") {
+    callPreview = await db.listCallJobDlq({ status: "open", limit: 5, offset: 0 }).catch(
+      () => [],
+    );
+  }
+  if (typeof db.listEmailDlq === "function") {
+    emailPreview = await db.listEmailDlq({ status: "open", limit: 5, offset: 0 }).catch(
+      () => [],
+    );
+  }
+
+  return {
+    call_open: callOpen,
+    email_open: emailOpen,
+    call_preview: Array.isArray(callPreview) ? callPreview : [],
+    email_preview: Array.isArray(emailPreview) ? emailPreview : [],
+  };
+}
+
+async function buildMiniAppBootstrapPayload(req) {
+  const requestId = req.requestId || null;
+  const [providerResult, smsResult, emailStatsResult, emailHistoryResult, dlqSnapshot] =
+    await Promise.all([
+      callMiniAppBridgeApi({
+        method: "GET",
+        path: "/admin/provider",
+        query: { channel: "call" },
+        requestId,
+      }).catch(() => ({ ok: false, status: 500, data: null })),
+      callMiniAppBridgeApi({
+        method: "GET",
+        path: "/api/sms/bulk/status",
+        query: { limit: 10, hours: 24 },
+        requestId,
+      }).catch(() => ({ ok: false, status: 500, data: null })),
+      callMiniAppBridgeApi({
+        method: "GET",
+        path: "/email/bulk/stats",
+        query: { hours: 24 },
+        requestId,
+      }).catch(() => ({ ok: false, status: 500, data: null })),
+      callMiniAppBridgeApi({
+        method: "GET",
+        path: "/email/bulk/history",
+        query: { limit: 10, offset: 0 },
+        requestId,
+      }).catch(() => ({ ok: false, status: 500, data: null })),
+      getMiniAppDlqSnapshot().catch(() => ({
+        call_open: null,
+        email_open: null,
+        call_preview: [],
+        email_preview: [],
+      })),
+    ]);
+
+  return {
+    provider: providerResult.ok ? providerResult.data : null,
+    sms_bulk: smsResult.ok ? smsResult.data : null,
+    email_bulk_stats: emailStatsResult.ok ? emailStatsResult.data : null,
+    email_bulk_history: emailHistoryResult.ok ? emailHistoryResult.data : null,
+    dlq: dlqSnapshot,
+    bridge: {
+      provider_status: providerResult.status,
+      sms_status: smsResult.status,
+      email_stats_status: emailStatsResult.status,
+      email_history_status: emailHistoryResult.status,
+    },
+  };
+}
+
+function buildMiniAppActionSpec(action, payload = {}) {
+  const normalizedAction = String(action || "").trim().toLowerCase();
+  const input = payload && typeof payload === "object" ? payload : {};
+
+  if (normalizedAction === "provider.get") {
+    const channel = resolveProviderChannel(input.channel || PROVIDER_CHANNELS.CALL);
+    if (!channel) {
+      return { error: "Invalid provider channel" };
+    }
+    return {
+      capability: "provider_manage",
+      method: "GET",
+      path: "/admin/provider",
+      query: { channel },
+    };
+  }
+
+  if (normalizedAction === "provider.set") {
+    const channel = resolveProviderChannel(input.channel || PROVIDER_CHANNELS.CALL);
+    const provider = String(input.provider || "")
+      .trim()
+      .toLowerCase();
+    if (!channel) {
+      return { error: "Invalid provider channel" };
+    }
+    if (!provider) {
+      return { error: "Provider is required" };
+    }
+    return {
+      capability: "provider_manage",
+      method: "POST",
+      path: "/admin/provider",
+      body: {
+        channel,
+        provider,
+      },
+    };
+  }
+
+  if (normalizedAction === "sms.bulk.status") {
+    const limit = parseBoundedInteger(input.limit, {
+      defaultValue: 10,
+      min: 1,
+      max: 50,
+    });
+    const hours = parseBoundedInteger(input.hours, {
+      defaultValue: 24,
+      min: 1,
+      max: 720,
+    });
+    return {
+      capability: "sms_bulk_manage",
+      method: "GET",
+      path: "/api/sms/bulk/status",
+      query: { limit, hours },
+    };
+  }
+
+  if (normalizedAction === "email.bulk.stats") {
+    const hours = parseBoundedInteger(input.hours, {
+      defaultValue: 24,
+      min: 1,
+      max: 720,
+    });
+    return {
+      capability: "email_bulk_manage",
+      method: "GET",
+      path: "/email/bulk/stats",
+      query: { hours },
+    };
+  }
+
+  if (normalizedAction === "email.bulk.history") {
+    const limit = parseBoundedInteger(input.limit, {
+      defaultValue: 10,
+      min: 1,
+      max: 50,
+    });
+    const offset = parseBoundedInteger(input.offset, {
+      defaultValue: 0,
+      min: 0,
+      max: 5000,
+    });
+    return {
+      capability: "email_bulk_manage",
+      method: "GET",
+      path: "/email/bulk/history",
+      query: { limit, offset },
+    };
+  }
+
+  if (normalizedAction === "email.bulk.job") {
+    const jobId = String(input.job_id || input.jobId || "").trim();
+    if (!isSafeId(jobId, { max: 128 })) {
+      return { error: "Invalid email bulk job id" };
+    }
+    return {
+      capability: "email_bulk_manage",
+      method: "GET",
+      path: `/email/bulk/${encodeURIComponent(jobId)}`,
+    };
+  }
+
+  if (normalizedAction === "dlq.call.list") {
+    const limit = parseBoundedInteger(input.limit, {
+      defaultValue: 20,
+      min: 1,
+      max: 100,
+    });
+    const offset = parseBoundedInteger(input.offset, {
+      defaultValue: 0,
+      min: 0,
+      max: 5000,
+    });
+    const status = input.status ? String(input.status) : "open";
+    return {
+      capability: "dlq_manage",
+      method: "GET",
+      path: "/admin/call-jobs/dlq",
+      query: { limit, offset, status },
+    };
+  }
+
+  if (normalizedAction === "dlq.call.replay") {
+    const id = Number(input.id);
+    if (!Number.isFinite(id) || id <= 0) {
+      return { error: "Invalid call DLQ id" };
+    }
+    return {
+      capability: "dlq_manage",
+      method: "POST",
+      path: `/admin/call-jobs/dlq/${Math.trunc(id)}/replay`,
+      body: {},
+    };
+  }
+
+  if (normalizedAction === "dlq.email.list") {
+    const limit = parseBoundedInteger(input.limit, {
+      defaultValue: 20,
+      min: 1,
+      max: 100,
+    });
+    const offset = parseBoundedInteger(input.offset, {
+      defaultValue: 0,
+      min: 0,
+      max: 5000,
+    });
+    const status = input.status ? String(input.status) : "open";
+    return {
+      capability: "dlq_manage",
+      method: "GET",
+      path: "/admin/email/dlq",
+      query: { limit, offset, status },
+    };
+  }
+
+  if (normalizedAction === "dlq.email.replay") {
+    const id = Number(input.id);
+    if (!Number.isFinite(id) || id <= 0) {
+      return { error: "Invalid email DLQ id" };
+    }
+    return {
+      capability: "dlq_manage",
+      method: "POST",
+      path: `/admin/email/dlq/${Math.trunc(id)}/replay`,
+      body: {},
+    };
+  }
+
+  return { error: "Unsupported miniapp action" };
+}
+
+app.post("/miniapp/session", async (req, res) => {
+  const initDataRaw =
+    parseTmaAuthorization(req) ||
+    String(req.headers?.["x-telegram-init-data"] || "").trim() ||
+    String(req.body?.init_data_raw || req.body?.initDataRaw || "").trim();
+  if (!initDataRaw) {
+    return sendApiError(
+      res,
+      400,
+      "miniapp_missing_init_data",
+      "Missing Telegram Mini App init data",
+      req.requestId || null,
+    );
+  }
+  if (!String(config.telegram?.botToken || "").trim()) {
+    return sendApiError(
+      res,
+      500,
+      "miniapp_missing_bot_token",
+      "Telegram bot token is not configured",
+      req.requestId || null,
+    );
+  }
+  if (!String(config.miniApp?.sessionSecret || "").trim()) {
+    return sendApiError(
+      res,
+      500,
+      "miniapp_missing_session_secret",
+      "Mini App session secret is not configured",
+      req.requestId || null,
+    );
+  }
+
+  try {
+    const validation = validateInitData(initDataRaw, config.telegram.botToken, {
+      maxAgeSeconds: config.miniApp?.initDataMaxAgeSeconds,
+    });
+    const userId =
+      validation.user?.id || validation.chat?.id || validation.receiver?.id || null;
+    if (!userId) {
+      return sendApiError(
+        res,
+        401,
+        "miniapp_missing_user",
+        "Telegram user id is missing from init data",
+        req.requestId || null,
+      );
+    }
+    const isAdminUser = isTelegramAdminUser(userId);
+    if (!isAdminUser) {
+      return sendApiError(
+        res,
+        403,
+        "miniapp_admin_required",
+        "Mini App access is restricted to Telegram administrators",
+        req.requestId || null,
+      );
+    }
+
+    const replayKey = buildMiniAppReplayKey(validation);
+    const replayDetected = hasSeenMiniAppReplay(replayKey);
+    markMiniAppReplay(replayKey, config.miniApp?.replayWindowSeconds);
+
+    const role = isAdminUser ? "admin" : "user";
+    const caps = getMiniAppCapabilitiesForRole(role);
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const ttlSeconds = Number(config.miniApp?.sessionTtlSeconds) || 900;
+    const jti = uuidv4();
+    const token = createMiniAppSessionToken(
+      {
+        jti,
+        sub: `tg:${String(userId)}`,
+        telegram_id: String(userId),
+        username: validation.user?.username || null,
+        first_name: validation.user?.first_name || null,
+        role,
+        caps,
+        query_id: validation.queryId || null,
+      },
+      config.miniApp.sessionSecret,
+      { nowSeconds, ttlSeconds },
+    );
+
+    return res.json({
+      success: true,
+      token_type: "Bearer",
+      token,
+      expires_in: ttlSeconds,
+      expires_at: nowSeconds + ttlSeconds,
+      replay_detected: replayDetected,
+      session: {
+        telegram_id: String(userId),
+        username: validation.user?.username || null,
+        first_name: validation.user?.first_name || null,
+        role,
+        caps,
+      },
+      launch_url: resolveMiniAppPublicUrl(req),
+      request_id: req.requestId || null,
+    });
+  } catch (error) {
+    if (error instanceof MiniAppAuthError) {
+      return sendApiError(
+        res,
+        error.status || 401,
+        error.code || "miniapp_auth_invalid",
+        error.message || "Mini App init data validation failed",
+        req.requestId || null,
+      );
+    }
+    console.error("miniapp_session_error", {
+      request_id: req.requestId || null,
+      error: buildErrorDetails(error),
+    });
+    return sendApiError(
+      res,
+      500,
+      "miniapp_session_failed",
+      "Failed to create Mini App session",
+      req.requestId || null,
+    );
+  }
+});
+
+app.post("/miniapp/logout", requireMiniAppSession, async (req, res) => {
+  const session = req.miniAppSession || {};
+  const jti = String(session.jti || "").trim();
+  const exp = Number(session.exp);
+  const nowMs = Date.now();
+  if (jti) {
+    const expiresAtMs = Number.isFinite(exp) ? exp * 1000 : nowMs + 5 * 60 * 1000;
+    miniAppSessionRevocations.set(jti, expiresAtMs);
+    pruneExpiringMap(miniAppSessionRevocations, MINI_APP_SESSION_REVOCATION_MAX, nowMs);
+  }
+  return res.json({
+    success: true,
+    revoked: Boolean(jti),
+    request_id: req.requestId || null,
+  });
+});
+
+app.get("/miniapp/bootstrap", requireMiniAppSession, async (req, res) => {
+  if (!requireMiniAppCapability(req, res, "dashboard_view")) {
+    return;
+  }
+  try {
+    const dashboard = await buildMiniAppBootstrapPayload(req);
+    return res.json({
+      success: true,
+      server_time: new Date().toISOString(),
+      launch_url: resolveMiniAppPublicUrl(req),
+      poll_interval_seconds: 10,
+      session: buildMiniAppSessionSummary(req.miniAppSession || {}),
+      dashboard,
+      request_id: req.requestId || null,
+    });
+  } catch (error) {
+    console.error("miniapp_bootstrap_error", {
+      request_id: req.requestId || null,
+      error: buildErrorDetails(error),
+    });
+    return sendApiError(
+      res,
+      500,
+      "miniapp_bootstrap_failed",
+      "Failed to load Mini App bootstrap payload",
+      req.requestId || null,
+    );
+  }
+});
+
+app.get("/miniapp/jobs/poll", requireMiniAppSession, async (req, res) => {
+  if (!requireMiniAppCapability(req, res, "dashboard_view")) {
+    return;
+  }
+  try {
+    const smsLimit = parseBoundedInteger(req.query?.sms_limit, {
+      defaultValue: 10,
+      min: 1,
+      max: 50,
+    });
+    const smsHours = parseBoundedInteger(req.query?.sms_hours, {
+      defaultValue: 24,
+      min: 1,
+      max: 720,
+    });
+    const emailLimit = parseBoundedInteger(req.query?.email_limit, {
+      defaultValue: 10,
+      min: 1,
+      max: 50,
+    });
+    const emailHours = parseBoundedInteger(req.query?.email_hours, {
+      defaultValue: 24,
+      min: 1,
+      max: 720,
+    });
+    const emailJobIds = String(req.query?.email_job_ids || "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter((value) => isSafeId(value, { max: 128 }))
+      .slice(0, 20);
+
+    const [smsResult, emailStatsResult, emailHistoryResult, dlqSnapshot, emailJobs] =
+      await Promise.all([
+        callMiniAppBridgeApi({
+          method: "GET",
+          path: "/api/sms/bulk/status",
+          query: { limit: smsLimit, hours: smsHours },
+          requestId: req.requestId || null,
+        }).catch(() => ({ ok: false, status: 500, data: null })),
+        callMiniAppBridgeApi({
+          method: "GET",
+          path: "/email/bulk/stats",
+          query: { hours: emailHours },
+          requestId: req.requestId || null,
+        }).catch(() => ({ ok: false, status: 500, data: null })),
+        callMiniAppBridgeApi({
+          method: "GET",
+          path: "/email/bulk/history",
+          query: { limit: emailLimit, offset: 0 },
+          requestId: req.requestId || null,
+        }).catch(() => ({ ok: false, status: 500, data: null })),
+        getMiniAppDlqSnapshot().catch(() => ({
+          call_open: null,
+          email_open: null,
+          call_preview: [],
+          email_preview: [],
+        })),
+        Promise.all(
+          emailJobIds.map(async (jobId) => {
+            if (!db?.getEmailBulkJob) return null;
+            const job = await db.getEmailBulkJob(jobId).catch(() => null);
+            return job ? normalizeEmailJobForApi(job) : null;
+          }),
+        ).catch(() => []),
+      ]);
+
+    return res.json({
+      success: true,
+      poll_at: new Date().toISOString(),
+      sms_bulk: smsResult.ok ? smsResult.data : null,
+      email_bulk_stats: emailStatsResult.ok ? emailStatsResult.data : null,
+      email_bulk_history: emailHistoryResult.ok ? emailHistoryResult.data : null,
+      email_jobs: emailJobs.filter(Boolean),
+      dlq: dlqSnapshot,
+      bridge: {
+        sms_status: smsResult.status,
+        email_stats_status: emailStatsResult.status,
+        email_history_status: emailHistoryResult.status,
+      },
+      request_id: req.requestId || null,
+    });
+  } catch (error) {
+    console.error("miniapp_poll_error", {
+      request_id: req.requestId || null,
+      error: buildErrorDetails(error),
+    });
+    return sendApiError(
+      res,
+      500,
+      "miniapp_poll_failed",
+      "Failed to fetch Mini App poll payload",
+      req.requestId || null,
+    );
+  }
+});
+
+app.post("/miniapp/action", requireMiniAppSession, async (req, res) => {
+  const action = String(req.body?.action || "").trim();
+  const payload =
+    req.body?.payload && typeof req.body.payload === "object" ? req.body.payload : {};
+  if (!action) {
+    return sendApiError(
+      res,
+      400,
+      "miniapp_action_required",
+      "Action is required",
+      req.requestId || null,
+    );
+  }
+  const spec = buildMiniAppActionSpec(action, payload);
+  if (spec.error) {
+    return sendApiError(
+      res,
+      400,
+      "miniapp_action_invalid",
+      spec.error,
+      req.requestId || null,
+    );
+  }
+  if (!requireMiniAppCapability(req, res, spec.capability)) {
+    return;
+  }
+
+  try {
+    const result = await callMiniAppBridgeApi({
+      method: spec.method,
+      path: spec.path,
+      query: spec.query,
+      body: spec.body,
+      requestId: req.requestId || null,
+    });
+    if (!result.ok) {
+      const message =
+        result.data?.error ||
+        result.data?.message ||
+        "Mini App action bridge request failed";
+      return sendApiError(
+        res,
+        Number(result.status) || 500,
+        "miniapp_action_failed",
+        message,
+        req.requestId || null,
+        {
+          action,
+          bridge_status: result.status,
+        },
+      );
+    }
+
+    return res.json({
+      success: true,
+      action,
+      data: result.data,
+      request_id: req.requestId || null,
+    });
+  } catch (error) {
+    console.error("miniapp_action_error", {
+      request_id: req.requestId || null,
+      action,
+      error: buildErrorDetails(error),
+    });
+    return sendApiError(
+      res,
+      500,
+      "miniapp_action_failed",
+      "Mini App action request failed",
+      req.requestId || null,
+      { action },
+    );
+  }
+});
+
 app.get("/admin/voice-runtime", requireAdminToken, async (req, res) => {
   try {
     return res.json({
@@ -22820,6 +23703,34 @@ app.get("/api/sms/bulk/status", requireOutboundAuthorization, async (req, res) =
       details: error.message,
     });
   }
+});
+
+const miniAppBuildDir = path.resolve(__dirname, "..", "miniapp", "dist");
+const miniAppFallbackDir = path.join(__dirname, "public", "miniapp");
+const miniAppPublicDir = fs.existsSync(miniAppBuildDir)
+  ? miniAppBuildDir
+  : miniAppFallbackDir;
+const miniAppStaticOptions = {
+  fallthrough: true,
+  index: false,
+  maxAge: isProduction ? "1h" : 0,
+};
+app.use("/assets", express.static(miniAppPublicDir, miniAppStaticOptions));
+app.use(
+  "/miniapp/assets",
+  express.static(miniAppPublicDir, miniAppStaticOptions),
+);
+app.get(["/miniapp", "/miniapp/"], (req, res) => {
+  const indexPath = path.join(miniAppPublicDir, "index.html");
+  if (!fs.existsSync(indexPath)) {
+    return res.status(503).json({
+      success: false,
+      error:
+        "Mini App build assets not found. Run: npm --prefix miniapp install && npm --prefix miniapp run build",
+    });
+  }
+  res.setHeader("cache-control", "no-store");
+  return res.sendFile(indexPath);
 });
 
 if (require.main === module) {

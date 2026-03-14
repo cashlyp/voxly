@@ -24,6 +24,16 @@ if (!adminApiToken || !apiHmacSecret) {
 }
 
 const scriptsApiUrl = process.env.SCRIPTS_API_URL || process.env.TEMPLATES_API_URL || process.env.API_URL;
+function resolveMiniAppUrl() {
+  const explicit = String(process.env.MINI_APP_URL || '').trim();
+  if (explicit) return explicit;
+  try {
+    return new URL('/miniapp', process.env.API_URL).toString();
+  } catch {
+    return '';
+  }
+}
+const miniAppUrl = resolveMiniAppUrl();
 
 function parsePositiveInt(value, fallback) {
   const parsed = Number.parseInt(String(value || ''), 10);
@@ -49,6 +59,9 @@ module.exports = {
   apiUrl: process.env.API_URL,
   botToken: process.env.BOT_TOKEN,
   scriptsApiUrl,
+  miniApp: {
+    url: miniAppUrl
+  },
   defaultVoiceModel: process.env.DEFAULT_VOICE_MODEL || 'aura-asteria-en',
   defaultBusinessId: process.env.DEFAULT_BUSINESS_ID || 'general',
   defaultPurpose: process.env.DEFAULT_CALL_PURPOSE || 'general',

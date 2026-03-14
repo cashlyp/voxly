@@ -1,0 +1,135 @@
+.va-dashboard {
+  box-sizing: border-box;
+  min-height: 100vh;
+  padding: 16px;
+  color: var(--tg-theme-text-color, #121212);
+  background:
+    radial-gradient(1200px 500px at -20% -30%, rgba(33, 150, 243, 0.12), transparent 60%),
+    radial-gradient(900px 480px at 120% -20%, rgba(76, 175, 80, 0.14), transparent 58%),
+    var(--tg-theme-bg-color, #f6f9fc);
+}
+
+.va-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+  margin-bottom: 16px;
+}
+
+.va-header h1 {
+  margin: 0 0 6px;
+  font-size: 22px;
+  line-height: 1.2;
+}
+
+.va-header-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+  font-size: 12px;
+}
+
+.va-header button,
+.va-card button,
+.va-chip {
+  border: 1px solid rgba(17, 39, 63, 0.2);
+  background: rgba(255, 255, 255, 0.85);
+  color: var(--tg-theme-text-color, #122033);
+  border-radius: 10px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.va-header button:disabled,
+.va-card button:disabled,
+.va-chip:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.va-chip-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.va-chip.is-active {
+  border-color: #2276e3;
+  background: rgba(34, 118, 227, 0.14);
+}
+
+.va-grid {
+  display: grid;
+  grid-template-columns: repeat(1, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.va-card {
+  background: rgba(255, 255, 255, 0.78);
+  border: 1px solid rgba(17, 39, 63, 0.12);
+  border-radius: 12px;
+  padding: 12px;
+  box-shadow: 0 8px 20px rgba(17, 39, 63, 0.06);
+}
+
+.va-card h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+
+.va-card p {
+  margin: 4px 0;
+  font-size: 13px;
+}
+
+.va-card pre {
+  margin: 6px 0 0;
+  font-size: 13px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+}
+
+.va-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.va-list li {
+  border: 1px solid rgba(17, 39, 63, 0.1);
+  border-radius: 10px;
+  padding: 8px;
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+  background: rgba(255, 255, 255, 0.84);
+}
+
+.va-muted {
+  color: var(--tg-theme-hint-color, #667);
+  font-size: 12px;
+}
+
+.va-error {
+  margin: 8px 0;
+  color: #a20f2b;
+  font-size: 13px;
+}
+
+.va-notice {
+  margin: 8px 0;
+  color: #0f6b2c;
+  font-size: 13px;
+}
+
+@media (min-width: 820px) {
+  .va-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

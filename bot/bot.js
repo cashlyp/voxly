@@ -380,6 +380,7 @@ const {
   sendRecentSms,
   sendBulkSmsList,
   sendBulkSmsStats,
+  sendBulkSmsPreflightCard,
   registerSmsCommands,
 } = require("./commands/sms");
 const {
@@ -392,6 +393,9 @@ const {
   bulkEmailStatusFlow,
   bulkEmailHistoryFlow,
   bulkEmailStatsFlow,
+  sendBulkEmailHistory,
+  sendBulkEmailStats,
+  sendBulkEmailPreflightCard,
   emailHistoryFlow,
   registerEmailCommands,
   sendEmailStatusCard,
@@ -412,6 +416,7 @@ const {
   registerProviderCommand,
   handleProviderSwitch,
   renderProviderMenu,
+  renderProviderConfirm,
 } = require("./commands/provider");
 const {
   addUserFlow,
@@ -488,6 +493,7 @@ registerMenuCommand(bot);
 registerGuideCommand(bot);
 registerApiCommands(bot);
 registerProviderCommand(bot);
+bot.command("admin", handleAdminMiniAppCommand);
 const API_BASE = config.apiUrl;
 const MENU_EXEMPT_CALLBACK_PREFIXES = ["alert:", "lc:", "tr:", "rca:", "retry:", "recap:"];
 
@@ -542,6 +548,51 @@ function resolveConversationFromPrefix(prefix) {
     return "call-conversation";
   }
   return null;
+}
+
+function getMiniAppLaunchUrl() {
+  const configured = String(config.miniApp?.url || "").trim();
+  if (configured) return configured;
+  try {
+    return new URL("/miniapp", config.apiUrl).toString();
+  } catch {
+    return "";
+  }
+}
+
+function appendMiniAppLaunchButton(keyboard, label = "🧭 Admin Console") {
+  const launchUrl = getMiniAppLaunchUrl();
+  if (!launchUrl || !keyboard) {
+    return false;
+  }
+  if (typeof keyboard.webApp === "function") {
+    keyboard.row().webApp(label, launchUrl);
+    return true;
+  }
+  keyboard.row().url(label, launchUrl);
+  return true;
+}
+
+async function handleAdminMiniAppCommand(ctx) {
+  const access = await getAccessProfile(ctx);
+  await syncChatCommands(ctx, access);
+  if (!access?.isAdmin) {
+    await ctx.reply("❌ Access denied. This action is available to administrators only.");
+    return;
+  }
+  const launchUrl = getMiniAppLaunchUrl();
+  if (!launchUrl) {
+    await ctx.reply(
+      "❌ Mini App URL is not configured. Set MINI_APP_URL to your Vercel deployment URL.",
+    );
+    return;
+  }
+  const keyboard = new InlineKeyboard();
+  appendMiniAppLaunchButton(keyboard);
+  await ctx.reply(
+    "🧭 *Admin Mini App*\nOpen the secure admin console to monitor provider, SMS, email, and DLQ operations.",
+    { parse_mode: "Markdown", reply_markup: keyboard },
+  );
 }
 
 // Start command handler
@@ -609,6 +660,7 @@ bot.command("start", async (ctx) => {
         .row()
         .text("🔍 Status", buildCallbackData(ctx, "STATUS"))
         .row();
+      appendMiniAppLaunchButton(kb);
     }
 
     // REQUEST ACCESS: For guests (admin-only)
@@ -755,6 +807,24 @@ bot.on("callback_query:data", async (ctx) => {
       const [, provider] = action.split(":");
       await cancelActiveFlow(ctx, `callback:${action}`);
       resetSession(ctx);
+      await renderProviderConfirm(ctx, provider?.toLowerCase());
+      finishMetric("ok");
+      return;
+    }
+
+    if (action.startsWith("PROVIDER_CONFIRM:")) {
+      const [, provider] = action.split(":");
+      await cancelActiveFlow(ctx, `callback:${action}`);
+      resetSession(ctx);
+      await renderProviderConfirm(ctx, provider?.toLowerCase());
+      finishMetric("ok");
+      return;
+    }
+
+    if (action.startsWith("PROVIDER_APPLY:")) {
+      const [, provider] = action.split(":");
+      await cancelActiveFlow(ctx, `callback:${action}`);
+      resetSession(ctx);
       await handleProviderSwitch(ctx, provider?.toLowerCase());
       finishMetric("ok");
       return;
@@ -802,6 +872,36 @@ bot.on("callback_query:data", async (ctx) => {
       return;
     }
 
+    if (action.startsWith("USERS_PAGE:")) {
+      const [, pageRaw] = action.split(":");
+      const page = Math.max(1, parseInt(pageRaw, 10) || 1);
+      await cancelActiveFlow(ctx, `callback:${action}`);
+      resetSession(ctx);
+      await sendUsersList(ctx, { page });
+      finishMetric("ok");
+      return;
+    }
+
+    if (action.startsWith("SMS_RECENT_PAGE:")) {
+      const [, pageRaw] = action.split(":");
+      const page = Math.max(1, parseInt(pageRaw, 10) || 1);
+      await cancelActiveFlow(ctx, `callback:${action}`);
+      resetSession(ctx);
+      await sendRecentSms(ctx, { page, limit: 10 });
+      finishMetric("ok");
+      return;
+    }
+
+    if (action.startsWith("BULK_EMAIL_PAGE:")) {
+      const [, pageRaw] = action.split(":");
+      const page = Math.max(1, parseInt(pageRaw, 10) || 1);
+      await cancelActiveFlow(ctx, `callback:${action}`);
+      resetSession(ctx);
+      await sendBulkEmailHistory(ctx, { page });
+      finishMetric("ok");
+      return;
+    }
+
     const parsedCallback = parseCallbackAction(action);
     if (parsedCallback) {
       const conversationTarget = resolveConversationFromPrefix(
@@ -835,7 +935,6 @@ bot.on("callback_query:data", async (ctx) => {
       SMS_SCHEDULE: "schedule-sms-conversation",
       SMS_STATUS: "sms-status-conversation",
       SMS_CONVO: "sms-thread-conversation",
-      SMS_RECENT: "sms-recent-conversation",
       SMS_STATS: "sms-stats-conversation",
       BULK_SMS_SEND: "bulk-sms-conversation",
       BULK_SMS_STATUS: "bulk-sms-status-conversation",
@@ -844,8 +943,6 @@ bot.on("callback_query:data", async (ctx) => {
       EMAIL_TEMPLATES: "email-templates-conversation",
       BULK_EMAIL_SEND: "bulk-email-conversation",
       BULK_EMAIL_STATUS: "bulk-email-status-conversation",
-      BULK_EMAIL_LIST: "bulk-email-history-conversation",
-      BULK_EMAIL_STATS: "bulk-email-stats-conversation",
       CALLLOG_RECENT: "calllog-recent-conversation",
       CALLLOG_SEARCH: "calllog-search-conversation",
       CALLLOG_DETAILS: "calllog-details-conversation",
@@ -867,11 +964,9 @@ bot.on("callback_query:data", async (ctx) => {
         CALLLOG_SEARCH: "call log (search)",
         CALLLOG_DETAILS: "call details lookup",
         CALLLOG_EVENTS: "call event lookup",
-        BULK_EMAIL_LIST: "bulk email history",
         BULK_EMAIL_STATS: "bulk email stats",
         SMS_STATUS: "SMS status",
         SMS_CONVO: "SMS conversation",
-        SMS_RECENT: "recent SMS",
         SMS_STATS: "SMS stats",
         CALLER_FLAGS_ALLOW: "caller allowlist",
         CALLER_FLAGS_BLOCK: "caller blocklist",
@@ -970,6 +1065,11 @@ bot.on("callback_query:data", async (ctx) => {
         finishMetric("ok");
         break;
 
+      case "ADMIN_PANEL":
+        await handleAdminMiniAppCommand(ctx);
+        finishMetric("ok");
+        break;
+
       case "PROVIDER_STATUS":
         await renderProviderMenu(ctx, { forceRefresh: true });
         finishMetric("ok");
@@ -1000,6 +1100,16 @@ bot.on("callback_query:data", async (ctx) => {
         finishMetric("ok");
         break;
 
+      case "BULK_SMS_PRECHECK":
+        await sendBulkSmsPreflightCard(ctx);
+        finishMetric("ok");
+        break;
+
+      case "BULK_EMAIL_PRECHECK":
+        await sendBulkEmailPreflightCard(ctx);
+        finishMetric("ok");
+        break;
+
       case "SCHEDULE_SMS":
         await renderSmsMenu(ctx);
         finishMetric("ok");
@@ -1021,7 +1131,22 @@ bot.on("callback_query:data", async (ctx) => {
         break;
 
       case "RECENT_SMS":
-        await sendRecentSms(ctx, 10);
+        await sendRecentSms(ctx, { limit: 10, page: 1 });
+        finishMetric("ok");
+        break;
+
+      case "SMS_RECENT":
+        await sendRecentSms(ctx, { limit: 10, page: 1 });
+        finishMetric("ok");
+        break;
+
+      case "BULK_EMAIL_LIST":
+        await sendBulkEmailHistory(ctx, { page: 1 });
+        finishMetric("ok");
+        break;
+
+      case "BULK_EMAIL_STATS":
+        await sendBulkEmailStats(ctx, { hours: 24 });
         finishMetric("ok");
         break;
 
@@ -1066,6 +1191,7 @@ const TELEGRAM_COMMANDS = [
   { command: "provider", description: "Manage call provider (admin only)" },
   { command: "callerflags", description: "Manage caller flags (admin only)" },
   { command: "users", description: "Manage users (admin only)" },
+  { command: "admin", description: "Open Mini App admin console" },
   { command: "status", description: "System status (admin only)" },
 ];
 

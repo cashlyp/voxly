@@ -2,9 +2,18 @@ const { InlineKeyboard } = require('grammy');
 const { getUser, getUserList, addUser, promoteUser, removeUser, isAdmin } = require('../db/db');
 const { buildCallbackData } = require('../utils/actions');
 const { guardAgainstCommandInterrupt, OperationCancelledError } = require('../utils/sessionState');
-const { renderMenu, buildBackToMenuKeyboard, cancelledMessage, setupStepMessage } = require('../utils/ui');
+const {
+  renderMenu,
+  buildBackToMenuKeyboard,
+  cancelledMessage,
+  setupStepMessage,
+  section,
+  buildLine,
+  escapeMarkdown
+} = require('../utils/ui');
 
 const CANCEL_KEYWORDS = new Set(['cancel', 'exit', 'quit']);
+const USERS_PAGE_SIZE = 6;
 
 function isCancelInput(value) {
   return CANCEL_KEYWORDS.has(String(value || '').trim().toLowerCase());
@@ -45,6 +54,24 @@ function buildUsersResultKeyboard(ctx) {
   });
 }
 
+function buildUsersListKeyboard(ctx, page, totalPages) {
+  const keyboard = new InlineKeyboard();
+  if (totalPages > 1) {
+    if (page > 1) {
+      keyboard.text('⬅️ Prev', buildCallbackData(ctx, `USERS_PAGE:${page - 1}`));
+    }
+    keyboard.text('🔄 Refresh', buildCallbackData(ctx, `USERS_PAGE:${page}`));
+    if (page < totalPages) {
+      keyboard.text('Next ➡️', buildCallbackData(ctx, `USERS_PAGE:${page + 1}`));
+    }
+    keyboard.row();
+  }
+  keyboard.text('⬅️ Back to User Management', buildCallbackData(ctx, 'USERS'));
+  keyboard.row();
+  keyboard.text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+  return keyboard;
+}
+
 async function renderUsersMenu(ctx, note = '') {
   const message = note
     ? setupStepMessage('User Management', [note])
@@ -52,8 +79,11 @@ async function renderUsersMenu(ctx, note = '') {
   await renderMenu(ctx, message, buildUsersKeyboard(ctx), { parseMode: 'Markdown' });
 }
 
-async function sendUsersList(ctx) {
+async function sendUsersList(ctx, { page = 1, pageSize = USERS_PAGE_SIZE } = {}) {
   try {
+    const allowed = await ensureAdminAccess(ctx);
+    if (!allowed) return;
+
     const users = await new Promise((resolve) => {
       getUserList((err, result) => {
         if (err) {
@@ -66,39 +96,64 @@ async function sendUsersList(ctx) {
     });
 
     if (!users || users.length === 0) {
-      await ctx.reply('📋 No users found in the system.', {
-        reply_markup: buildUsersResultKeyboard(ctx)
-      });
+      await renderMenu(
+        ctx,
+        section('👥 User Directory', [
+          'No users found in the system.',
+          'Use Add User to create the first account.'
+        ]),
+        buildUsersResultKeyboard(ctx),
+        { parseMode: 'Markdown' }
+      );
       return;
     }
 
-    let message = `📋 USERS LIST (${users.length}):\n\n`;
+    const safePageSize = Math.max(1, Math.min(Number(pageSize) || USERS_PAGE_SIZE, 15));
+    const totalPages = Math.max(1, Math.ceil(users.length / safePageSize));
+    const currentPage = Math.max(1, Math.min(Number(page) || 1, totalPages));
+    const offset = (currentPage - 1) * safePageSize;
+    const subset = users.slice(offset, offset + safePageSize);
 
-    users.forEach((item, index) => {
+    const cards = subset.map((item, index) => {
       const roleIcon = item.role === 'ADMIN' ? '🛡️' : '👤';
-      const username = item.username || 'no_username';
+      const username = escapeMarkdown(item.username || 'no_username');
       const joinDate = new Date(item.timestamp).toLocaleDateString();
-      message += `${index + 1}. ${roleIcon} @${username}\n`;
-      message += `   ID: ${item.telegram_id}\n`;
-      message += `   Role: ${item.role}\n`;
-      message += `   Joined: ${joinDate}\n\n`;
+      return section(`${roleIcon} @${username}`, [
+        buildLine('🆔', 'ID', escapeMarkdown(String(item.telegram_id || 'N/A'))),
+        buildLine('🏷️', 'Role', escapeMarkdown(item.role || 'USER')),
+        buildLine('📅', 'Joined', escapeMarkdown(joinDate)),
+        buildLine('🔢', 'Index', `${offset + index + 1}/${users.length}`)
+      ]);
     });
 
-    await ctx.reply(message, {
-      reply_markup: buildUsersResultKeyboard(ctx)
-    });
+    const header = section('👥 User Directory', [
+      buildLine('📄', 'Page', `${currentPage}/${totalPages}`),
+      buildLine('📊', 'Total users', String(users.length))
+    ]);
+    await renderMenu(
+      ctx,
+      `${header}\n\n${cards.join('\n\n')}`,
+      buildUsersListKeyboard(ctx, currentPage, totalPages),
+      { parseMode: 'Markdown' }
+    );
   } catch (error) {
     console.error('Users list error:', error);
-    await ctx.reply('❌ Error fetching users list. Please try again.', {
-      reply_markup: buildUsersResultKeyboard(ctx)
-    });
+    await renderMenu(
+      ctx,
+      section('❌ User Directory Error', [
+        'Failed to load users list.',
+        'Try refresh or return to the user menu.'
+      ]),
+      buildUsersResultKeyboard(ctx),
+      { parseMode: 'Markdown' }
+    );
   }
 }
 
 // ------------------------- Add User Flow -------------------------
 async function addUserFlow(conversation, ctx) {
   try {
-    await ctx.reply(setupStepMessage('Add User', [
+    await ctx.reply(setupStepMessage('Add User (Step 1/2)', [
       'Enter the Telegram numeric ID.',
       'Type `cancel` to stop.'
     ]), {
@@ -127,7 +182,7 @@ async function addUserFlow(conversation, ctx) {
       return;
     }
 
-    await ctx.reply(setupStepMessage('Add User', [
+    await ctx.reply(setupStepMessage('Add User (Step 2/2)', [
       'Enter the username (without @).',
       'Type `cancel` to stop.'
     ]), {
@@ -186,7 +241,7 @@ async function addUserFlow(conversation, ctx) {
 // ------------------------- Promote User Flow -------------------------
 async function promoteFlow(conversation, ctx) {
   try {
-    await ctx.reply(setupStepMessage('Promote User', [
+    await ctx.reply(setupStepMessage('Promote User (Step 1/1)', [
       'Enter the Telegram numeric ID to promote.',
       'Type `cancel` to stop.'
     ]), {
@@ -245,7 +300,7 @@ async function promoteFlow(conversation, ctx) {
 // ------------------------- Remove User Flow -------------------------
 async function removeUserFlow(conversation, ctx) {
   try {
-    await ctx.reply(setupStepMessage('Remove User', [
+    await ctx.reply(setupStepMessage('Remove User (Step 1/1)', [
       'Enter the Telegram numeric ID to remove.',
       'Type `cancel` to stop.'
     ]), {

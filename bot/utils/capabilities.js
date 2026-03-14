@@ -41,7 +41,8 @@ const CAPABILITY_RULES = {
   provider_manage: ['admin'],
   users_manage: ['admin'],
   status_admin: ['admin'],
-  caller_flags_manage: ['admin']
+  caller_flags_manage: ['admin'],
+  admin_panel: ['admin']
 };
 
 const COMMAND_CAPABILITIES = {
@@ -65,6 +66,7 @@ const COMMAND_CAPABILITIES = {
   provider: 'provider_manage',
   users: 'users_manage',
   callerflags: 'caller_flags_manage',
+  admin: 'admin_panel',
   status: 'status_admin',
   health: 'health',
   ping: 'health'
@@ -93,10 +95,16 @@ const ACTION_CAPABILITIES = [
   { match: (action) => action.startsWith('BULK_SMS_'), cap: 'bulk_sms' },
   { match: (action) => action.startsWith('BULK_EMAIL_'), cap: 'bulk_email' },
   { match: (action) => action === 'SCRIPTS', cap: 'scripts_manage' },
+  { match: (action) => action === 'ADMIN_PANEL', cap: 'admin_panel' },
   { match: (action) => action === 'PERSONA', cap: 'persona_manage' },
   { match: (action) => action === 'PROVIDER_STATUS', cap: 'provider_manage' },
   { match: (action) => action.startsWith('PROVIDER_SET:'), cap: 'provider_manage' },
+  { match: (action) => action.startsWith('PROVIDER_CONFIRM:'), cap: 'provider_manage' },
+  { match: (action) => action.startsWith('PROVIDER_APPLY:'), cap: 'provider_manage' },
   { match: (action) => ['USERS', 'USERS_LIST', 'ADDUSER', 'PROMOTE', 'REMOVE'].includes(action), cap: 'users_manage' },
+  { match: (action) => action.startsWith('USERS_PAGE:'), cap: 'users_manage' },
+  { match: (action) => action.startsWith('SMS_RECENT_PAGE:'), cap: 'sms_admin' },
+  { match: (action) => action.startsWith('BULK_EMAIL_PAGE:'), cap: 'bulk_email' },
   { match: (action) => ['CALLER_FLAGS', 'CALLER_FLAGS_LIST', 'CALLER_FLAGS_ALLOW', 'CALLER_FLAGS_BLOCK', 'CALLER_FLAGS_SPAM'].includes(action), cap: 'caller_flags_manage' },
   { match: (action) => action.startsWith('CALL_DETAILS:'), cap: 'calllog_view' },
   { match: (action) => action.startsWith('EMAIL_STATUS:'), cap: 'email_status' },

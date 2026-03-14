@@ -69,6 +69,19 @@ function buildLine(icon, label, value) {
     return `${icon} ${safeLabel ? `*${safeLabel}:* ` : ''}${safeValue}`;
 }
 
+function buildTextProgressBar(percent, options = {}) {
+    const width = Number.isFinite(Number(options.width)) && Number(options.width) > 0
+        ? Math.min(30, Math.floor(Number(options.width)))
+        : 10;
+    const filledChar = options.filledChar || '█';
+    const emptyChar = options.emptyChar || '░';
+    const safePercent = Number.isFinite(Number(percent))
+        ? Math.max(0, Math.min(100, Math.round(Number(percent))))
+        : 0;
+    const filled = Math.round((safePercent / 100) * width);
+    return `${filledChar.repeat(filled)}${emptyChar.repeat(Math.max(0, width - filled))} ${safePercent}%`;
+}
+
 function tipLine(icon, text) {
     return `${icon} ${text}`;
 }
@@ -398,6 +411,7 @@ module.exports = {
     escapeMarkdown,
     emphasize,
     buildLine,
+    buildTextProgressBar,
     tipLine,
     section,
     selectionExpiredMessage,
