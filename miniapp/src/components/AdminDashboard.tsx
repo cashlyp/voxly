@@ -1,4 +1,4 @@
-import { initData, useSignal } from '@tma.js/sdk-react';
+import { initData, useRawInitData, useSignal } from '@tma.js/sdk-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import '@/components/AdminDashboard.css';
@@ -76,7 +76,9 @@ function buildApiUrl(path: string): string {
 }
 
 export function AdminDashboard() {
-  const initDataRaw = useSignal(initData.raw);
+  const initDataRawFromHook = useRawInitData();
+  const initDataRawFromSignal = useSignal(initData.raw);
+  const initDataRaw = initDataRawFromHook || initDataRawFromSignal;
   const initDataState = useSignal(initData.state);
   const [token, setToken] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
