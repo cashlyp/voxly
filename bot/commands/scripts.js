@@ -14,8 +14,7 @@ const {
   URGENCY_OPTIONS,
   TECH_LEVEL_OPTIONS,
   askOptionWithButtons,
-  getOptionLabel,
-  invalidatePersonaCache
+  getOptionLabel
 } = require('../utils/persona');
 const { extractScriptVariables } = require('../utils/scripts');
 const {
@@ -31,9 +30,6 @@ const {
 } = require('../utils/sessionState');
 const { emailTemplatesFlow } = require('./email');
 const {
-  section,
-  buildLine,
-  tipLine,
   clearMenuMessages,
   upsertMenuMessage,
   dismissMenuMessage,
@@ -47,7 +43,6 @@ const {
 } = require('../../api/functions/Dating');
 const {
   normalizeCallScriptFlowType: normalizeCallScriptFlowTypeShared,
-  normalizeObjectiveTag: normalizeObjectiveTagShared,
   buildObjectiveTagsForFlow: buildObjectiveTagsForFlowShared,
   getCallScriptFlowTypes: getCallScriptFlowTypesShared,
   getPrimaryFlowType: getPrimaryFlowTypeShared,
@@ -68,11 +63,6 @@ attachHmacAuth(scriptsApi, {
   allowedOrigins: [new URL(config.scriptsApiUrl).origin],
   defaultBaseUrl: config.scriptsApiUrl
 });
-
-function styledNotice(ctx, title, lines) {
-  const content = Array.isArray(lines) ? lines : [lines];
-  return ctx.reply(section(title, content));
-}
 
 function nonJsonResponseError(endpoint, response) {
   const contentType = response?.headers?.['content-type'] || 'unknown';
@@ -490,10 +480,6 @@ function normalizeScriptName(name = '') {
 
 function normalizeCallScriptFlowType(rawType) {
   return normalizeCallScriptFlowTypeShared(rawType);
-}
-
-function normalizeObjectiveTag(entry) {
-  return normalizeObjectiveTagShared(entry);
 }
 
 function buildObjectiveTagsForFlow(flowType = null, existingTags = []) {
@@ -1012,7 +998,7 @@ async function collectPromptAndVoice(conversation, ctx, defaults = {}, ensureAct
   };
 }
 
-async function collectDigitCaptureConfig(conversation, ctx, defaults = {}, ensureActive) {
+async function collectDigitCaptureConfig(conversation, ctx, ensureActive) {
   const safeEnsureActive = typeof ensureActive === 'function'
     ? ensureActive
     : () => ensureOperationActive(ctx, getCurrentOpId(ctx));
@@ -1516,7 +1502,7 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
       safeEnsureActive
     );
     if (addCapture) {
-      const optionalCaptureConfig = await collectDigitCaptureConfig(conversation, ctx, {}, safeEnsureActive);
+      const optionalCaptureConfig = await collectDigitCaptureConfig(conversation, ctx, safeEnsureActive);
       if (!optionalCaptureConfig) {
         await ctx.reply('❌ Script creation cancelled.');
         return;
@@ -1524,7 +1510,7 @@ async function createCallScriptFlow(conversation, ctx, ensureActive) {
       captureConfig = optionalCaptureConfig;
     }
   } else {
-    captureConfig = await collectDigitCaptureConfig(conversation, ctx, {}, safeEnsureActive);
+    captureConfig = await collectDigitCaptureConfig(conversation, ctx, safeEnsureActive);
     if (!captureConfig) {
       await ctx.reply('❌ Script creation cancelled.');
       return;
@@ -1681,7 +1667,7 @@ async function editCallScriptFlow(conversation, ctx, script, ensureActive) {
 
   const adjustCapture = await confirm(conversation, ctx, 'Update digit capture settings?', safeEnsureActive);
   if (adjustCapture) {
-    const captureConfig = await collectDigitCaptureConfig(conversation, ctx, script, safeEnsureActive);
+    const captureConfig = await collectDigitCaptureConfig(conversation, ctx, safeEnsureActive);
     if (!captureConfig) {
       await ctx.reply('❌ Update cancelled.');
       return;

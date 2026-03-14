@@ -27,7 +27,6 @@ const {
 const {
     section: formatSection,
     buildLine,
-    tipLine,
     renderMenu,
     escapeMarkdown,
     sendEphemeral,

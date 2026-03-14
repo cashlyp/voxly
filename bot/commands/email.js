@@ -14,7 +14,6 @@ const {
 const {
   section,
   buildLine,
-  tipLine,
   escapeMarkdown,
   emphasize,
   activateMenuMessage,

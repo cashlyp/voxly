@@ -4,7 +4,6 @@ require("dotenv").config();
 const express = require("express");
 const fetch = require("node-fetch");
 const ExpressWs = require("express-ws");
-const path = require("path");
 const crypto = require("crypto");
 const helmet = require("helmet");
 const cors = require("cors");
@@ -1301,7 +1300,7 @@ function normalizePaymentSettings(input = {}, options = {}) {
   };
 }
 
-function normalizePaymentPolicy(input = {}, options = {}) {
+function normalizePaymentPolicy(input = {}) {
   const errors = [];
   const warnings = [];
   const source = input && typeof input === "object" ? input : {};
@@ -4342,7 +4341,7 @@ async function getDeepgramVoiceModelCatalog(options = {}) {
   return request;
 }
 
-function shouldUseTwilioPlay(callConfig) {
+function shouldUseTwilioPlay() {
   if (!config.deepgram?.apiKey) return false;
   if (!config.server?.hostname) return false;
   if (config.twilio?.ttsPlayEnabled === false) return false;
@@ -4422,7 +4421,7 @@ async function getTwilioTtsAudioUrl(text, callConfig, options = {}) {
   if (!cleaned) return null;
   const cacheOnly = options?.cacheOnly === true;
   const forceGenerate = options?.forceGenerate === true;
-  if (!forceGenerate && !shouldUseTwilioPlay(callConfig)) return null;
+  if (!forceGenerate && !shouldUseTwilioPlay()) return null;
   const voiceModel = resolveDeepgramVoiceModel(callConfig, {
     callSid: options?.callSid || callConfig?.call_sid || callConfig?.callSid,
   });
@@ -4531,7 +4530,7 @@ async function appendHostedTwilioSpeech(response, text, callConfig, options = {}
     }
     return { played: false, reason: "empty_text" };
   }
-  if (!shouldUseTwilioPlay(callConfig)) {
+  if (!shouldUseTwilioPlay()) {
     if (fallbackPauseSeconds > 0) {
       response.pause({ length: fallbackPauseSeconds });
     }
@@ -5619,10 +5618,9 @@ async function activateDtmfFallback(
   if (!digitService) return false;
   const provider = callConfig?.provider || currentProvider;
   if (provider !== "twilio") return false;
-  sttFallbackCalls.add(callSid);
-
   const configToUse = callConfig || callConfigurations.get(callSid);
   if (!configToUse) return false;
+  sttFallbackCalls.add(callSid);
 
   configToUse.digit_intent = { mode: "dtmf", reason, confidence: 1 };
   setCallFlowState(
@@ -5899,7 +5897,7 @@ function startGroupedGather(callSid, callConfig, options = {}) {
         activeExpectation.plan_id !== activePlan.id
       )
         return;
-      const usePlay = shouldUseTwilioPlay(callConfig);
+      const usePlay = shouldUseTwilioPlay();
       const ttsTimeoutMs = Number(config.twilio?.ttsMaxWaitMs) || 1200;
       const preambleUrl = usePlay
         ? await getTwilioTtsAudioUrlSafe(preamble, callConfig, ttsTimeoutMs)
@@ -7039,17 +7037,6 @@ function shouldApplyBypassPathRateLimit(req) {
     return false;
   }
   return true;
-}
-
-function sanitizeTelemetryValue(value) {
-  if (value == null) return null;
-  if (typeof value === "number") return value;
-  if (typeof value === "string") {
-    if (value.length > 120) return value.slice(0, 120);
-    return value;
-  }
-  if (typeof value === "boolean") return value;
-  return null;
 }
 
 app.use((req, res, next) => {
@@ -10077,26 +10064,6 @@ async function endCallForProvider(callSid) {
   throw new Error(`Unsupported provider ${provider}`);
 }
 
-async function connectInboundCall(callSid, hostOverride = null) {
-  const callConfig = callConfigurations.get(callSid);
-  const provider = callConfig?.provider || currentProvider;
-  if (provider !== "twilio") {
-    throw new Error("Inbound answer is only supported for Twilio");
-  }
-  const host = hostOverride || config.server?.hostname;
-  if (!host) {
-    throw new Error("Server hostname not configured");
-  }
-  const accountSid = config.twilio.accountSid;
-  const authToken = config.twilio.authToken;
-  if (!accountSid || !authToken) {
-    throw new Error("Twilio credentials not configured");
-  }
-  const client = twilio(accountSid, authToken);
-  const url = `https://${host}/incoming?answer=1`;
-  await client.calls(callSid).update({ url, method: "POST" });
-}
-
 function estimateSpeechDurationMs(text = "") {
   const words = String(text || "")
     .trim()
@@ -11184,7 +11151,6 @@ app.ws("/connection", (ws, req) => {
     let callStartTime = null;
     let functionSystem = null;
 
-    let gptErrorCount = 0;
     let gptService;
     let voiceAgentBridge = null;
     let voiceRuntimeMode = "legacy";
@@ -12676,7 +12642,6 @@ app.ws("/connection", (ws, req) => {
             }
           }
         } else if (event === "mark") {
-          const label = msg.mark.name;
           marks = marks.filter((m) => m !== msg.mark.name);
         } else if (event === "dtmf") {
           const digits = msg?.dtmf?.digits || msg?.dtmf?.digit || "";
@@ -14321,19 +14286,7 @@ async function handleCallEnd(callSid, callStartTime) {
         }
       }
 
-      if (digitEvents && digitEvents.length) {
-        const lines = digitEvents
-          .filter((d) => d.digits)
-          .map((d) => {
-            const label = DIGIT_PROFILE_LABELS[d.profile] || d.profile;
-            const display = digitService
-              ? digitService.formatDigitsGeneral(d.digits, null, "notify")
-              : d.digits;
-            const src = d.source || "unknown";
-            return `• ${label} [${src}]: ${display}`;
-          });
-        // Suppressed verbose digit timeline to avoid leaking sensitive digits in notifications
-      }
+      // Suppressed verbose digit timeline to avoid leaking sensitive digits in notifications
       await db.createEnhancedWebhookNotification(
         callSid,
         notificationType,
@@ -17292,7 +17245,7 @@ function computeCallJobBackoff(attempt) {
   return Math.max(500, deterministicDelay + offset);
 }
 
-function isRetryableCallJobError(error, _jobType = "") {
+function isRetryableCallJobError(error) {
   if (!error) return false;
   const statusCode = Number(error?.status || error?.statusCode || error?.httpStatus || NaN);
   const errorCode = String(error?.code || "").toLowerCase();
@@ -17462,7 +17415,7 @@ async function processCallJobs() {
         await db.completeCallJob(job.id, "completed");
       } catch (error) {
         const isTimeout = error?.code === "call_job_timeout";
-        const retryable = isRetryableCallJobError(error, job.job_type);
+        const retryable = isRetryableCallJobError(error);
         if (isTimeout) {
           db
             ?.logServiceHealth?.("call_jobs", "job_timeout", {
@@ -18511,8 +18464,6 @@ async function processCallStatusWebhookPayload(payload = {}, options = {}) {
     CallSid,
     CallStatus,
     Duration,
-    From,
-    To,
     CallDuration,
     AnsweredBy,
     ErrorCode,
@@ -22309,7 +22260,7 @@ app.get("/api/sms/database-stats", requireOutboundAuthorization, async (req, res
     ).toISOString();
 
     // Get comprehensive SMS statistics from database
-    const stats = await new Promise((resolve, reject) => {
+    const stats = await new Promise((resolve) => {
       const queries = {
         // Total messages
         totalMessages: `SELECT COUNT(*) as count FROM sms_messages`,

@@ -116,6 +116,7 @@ class EnhancedWebhookService {
   constructor() {
     this.isRunning = false;
     this.interval = null;
+    this.cleanupInterval = null;
     this.db = null;
     this.telegramBotToken = process.env.TELEGRAM_BOT_TOKEN;
     this.processInterval = 3000; // Check every 3 seconds for faster updates
@@ -594,7 +595,7 @@ class EnhancedWebhookService {
     this.processNotifications();
     
     // Cleanup old call data every 30 minutes
-    setInterval(() => {
+    this.cleanupInterval = setInterval(() => {
       this.cleanupOldCallData();
     }, 30 * 60 * 1000);
   }
@@ -603,6 +604,10 @@ class EnhancedWebhookService {
     if (this.interval) {
       clearInterval(this.interval);
       this.interval = null;
+    }
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
     }
     this.isRunning = false;
     this.activeCallStatus.clear();
@@ -647,7 +652,7 @@ class EnhancedWebhookService {
       return true;
     }
 
-    const { lastStatus, statusHistory } = currentStatusInfo;
+    const { lastStatus } = currentStatusInfo;
     
     // Don't send duplicate status
     if (lastStatus === newStatus) {
@@ -834,11 +839,9 @@ class EnhancedWebhookService {
         || this.isVoicemailAnswer(additionalData.answered_by);
 
       let adjustedStatus = correctedStatus;
-      let inboundGateStatus = null;
       if (callMeta?.inbound) {
         const gate = this.getInboundGate(call_sid);
         const gateStatus = gate?.status || 'pending';
-        inboundGateStatus = gateStatus;
         const pending = gateStatus === 'pending';
         if (pending && ['answered', 'in-progress'].includes(correctedStatus)) {
           adjustedStatus = 'ringing';
@@ -876,20 +879,17 @@ class EnhancedWebhookService {
 
       const victimName = callMeta.victimName || 'the victim';
       let message = '';
-      let emoji = '';
       let parseMode = null;
 
       switch (adjustedStatus) {
         case 'queued':
         case 'initiated':
-          emoji = '📞';
           message = this.buildStatusBubble('initiated', victimName);
           callTiming.initiated = new Date();
           this.scheduleNoResponseCheck(call_sid, telegram_chat_id);
           break;
 
         case 'ringing':
-          emoji = '🔔';
           message = this.buildStatusBubble('ringing', victimName);
           callTiming.ringing = new Date();
           this.clearNoResponseTimer(call_sid);
@@ -903,7 +903,6 @@ class EnhancedWebhookService {
           break;
 
         case 'answered':
-          emoji = '✅';
           message = this.buildStatusBubble('answered', victimName);
           callTiming.answered = new Date();
           this.clearNoResponseTimer(call_sid);
@@ -932,13 +931,11 @@ class EnhancedWebhookService {
           break;
 
         case 'in-progress':
-          emoji = '☎️';
           message = this.buildStatusBubble('in-progress', victimName);
           this.clearNoResponseTimer(call_sid);
           break;
 
         case 'completed':
-          emoji = '🏁';
           callTiming.completed = new Date();
           this.clearNoResponseTimer(call_sid);
 
@@ -975,7 +972,6 @@ class EnhancedWebhookService {
           }
           break;
         case 'voicemail':
-          emoji = '📮';
           this.clearNoResponseTimer(call_sid);
           message = this.buildStatusBubble('voicemail', victimName, {
             durationSeconds: additionalData.duration,
@@ -984,7 +980,6 @@ class EnhancedWebhookService {
           break;
 
         case 'busy':
-          emoji = '📵';
           message = this.buildStatusBubble('busy', victimName);
           this.clearNoResponseTimer(call_sid);
           // Calculate time before busy signal
@@ -999,7 +994,6 @@ class EnhancedWebhookService {
 
         case 'no-answer':
         case 'no_answer':
-          emoji = '❌';
           message = this.buildStatusBubble('no-answer', victimName, { voicemailDetected });
           this.clearNoResponseTimer(call_sid);
 
@@ -1035,19 +1029,16 @@ class EnhancedWebhookService {
           break;
 
         case 'failed':
-          emoji = '❌';
           message = this.buildStatusBubble('failed', victimName, { errorMsg: additionalData.error || additionalData.error_message });
           this.clearNoResponseTimer(call_sid);
           break;
 
         case 'canceled':
-          emoji = '🚫';
           message = this.buildStatusBubble('canceled', victimName);
           this.clearNoResponseTimer(call_sid);
           break;
 
         default:
-          emoji = '📱';
           message = this.buildStatusBubble(correctedStatus, victimName);
       }
 
@@ -1287,7 +1278,7 @@ class EnhancedWebhookService {
 
   // Process individual notification with enhanced error handling
   async sendNotification(notification) {
-    const { id, call_sid, notification_type, telegram_chat_id, phone_number } = notification;
+    const { id, call_sid, notification_type, telegram_chat_id } = notification;
 
     try {
       let success = false;
@@ -1880,7 +1871,6 @@ class EnhancedWebhookService {
   }
 
   buildSignalLine(entry) {
-    const phaseKey = entry?.phaseKey || 'waiting';
     const rawLevel = this.getRawSignalLevel(entry);
     const strength = this.getSmoothedSignalLevel(entry, rawLevel);
     const bars = this.renderSignalBars(Number.isFinite(strength) ? strength : 0, this.signalBarsMax);
@@ -2898,7 +2888,7 @@ class EnhancedWebhookService {
     };
 
     let totalAge = 0;
-    for (const [callSid, statusInfo] of this.activeCallStatus.entries()) {
+    for (const statusInfo of this.activeCallStatus.values()) {
       const status = statusInfo.lastStatus;
       stats.status_breakdown[status] = (stats.status_breakdown[status] || 0) + 1;
       

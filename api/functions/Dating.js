@@ -58,11 +58,6 @@ const PROFILE_TEXT_SIGNALS = Object.freeze({
   real_estate_agent: ["listing", "property", "open house", "tour"],
 });
 
-const LEGACY_OBJECTIVE_TAG_TO_PROFILE = Object.freeze({
-  celebrity_fan_engagement: "celebrity",
-  fan_engagement: "fan",
-});
-
 function normalizeLower(value) {
   return String(value || "").trim().toLowerCase();
 }

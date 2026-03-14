@@ -29,8 +29,6 @@ const {
   deriveConversationProfile,
 } = require('../../api/functions/Dating');
 const {
-  normalizeCallScriptFlowType: normalizeCallScriptFlowTypeShared,
-  normalizeObjectiveTag: normalizeObjectiveTagShared,
   getCallScriptFlowTypes: getCallScriptFlowTypesShared,
   getPrimaryFlowType: getPrimaryFlowTypeShared,
   getEffectiveObjectiveTags: getEffectiveObjectiveTagsShared,
@@ -140,14 +138,6 @@ const CALL_SCRIPT_FLOW_BADGES = Object.freeze({
 function isValidPhoneNumber(number) {
   const e164Regex = /^\+[1-9]\d{1,14}$/;
   return e164Regex.test((number || '').trim());
-}
-
-function normalizeObjectiveTag(entry) {
-  return normalizeObjectiveTagShared(entry);
-}
-
-function normalizeCallScriptFlowType(rawType) {
-  return normalizeCallScriptFlowTypeShared(rawType);
 }
 
 function getCallScriptFlowTypes(script = {}) {
@@ -837,10 +827,6 @@ async function callFlow(conversation, ctx) {
       configuration.meta?.scriptName ||
       configuration.payloadUpdates?.script ||
       'Custom';
-    const scriptDescription =
-      configuration.meta?.scriptDescription ||
-      configuration.payloadUpdates?.script_description ||
-      'No description provided';
     const personaLabel =
       configuration.meta?.personaLabel ||
       configuration.payloadUpdates?.persona_label ||

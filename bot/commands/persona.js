@@ -13,7 +13,6 @@ const {
 } = require('../utils/sessionState');
 const {
   askOptionWithButtons,
-  getOptionLabel,
   MOOD_OPTIONS,
   URGENCY_OPTIONS,
   TECH_LEVEL_OPTIONS,
@@ -22,11 +21,7 @@ const {
 } = require('../utils/persona');
 
 const {
-  section,
-  tipLine,
-  buildLine,
-  escapeMarkdown,
-  emphasize
+  section
 } = require('../utils/ui');
 
 const personaApi = axios.create({
@@ -220,7 +215,7 @@ async function chooseTone(conversation, ctx, prompt, options, ensureActive, fall
   if (choice.id === 'skip') {
     return undefined;
   }
-  return choice.id;
+  return mapMoodSelection(choice, fallback);
 }
 
 async function createPersonaFlow(conversation, ctx, ensureActive) {

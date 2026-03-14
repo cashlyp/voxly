@@ -364,7 +364,7 @@ async function validateTemplatesApiConnectivity() {
 }
 
 // Import dependencies
-const { getUser, expireInactiveUsers } = require("./db/db");
+const { expireInactiveUsers } = require("./db/db");
 const { callFlow, registerCallCommand } = require("./commands/call");
 const {
   smsFlow,
@@ -381,7 +381,6 @@ const {
   sendBulkSmsList,
   sendBulkSmsStats,
   registerSmsCommands,
-  getSmsStats,
 } = require("./commands/sms");
 const {
   emailFlow,
@@ -393,8 +392,6 @@ const {
   bulkEmailStatusFlow,
   bulkEmailHistoryFlow,
   bulkEmailStatsFlow,
-  sendBulkEmailHistory,
-  sendBulkEmailStats,
   emailHistoryFlow,
   registerEmailCommands,
   sendEmailStatusCard,
