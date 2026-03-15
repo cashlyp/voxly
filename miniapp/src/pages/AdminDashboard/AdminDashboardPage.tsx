@@ -1,7 +1,17 @@
-import { initData, settingsButton, useRawInitData, useSignal } from '@tma.js/sdk-react';
+import { backButton, hapticFeedback, initData, settingsButton, useRawInitData, useSignal } from '@tma.js/sdk-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import '@/components/AdminDashboard.css';
+import '@/pages/AdminDashboard/AdminDashboardPage.css';
+import { AuditIncidentsPage } from '@/pages/AdminDashboard/AuditIncidentsPage';
+import { MailerPage } from '@/pages/AdminDashboard/MailerPage';
+import { OpsDashboardPage } from '@/pages/AdminDashboard/OpsDashboardPage';
+import { ProviderControlPage } from '@/pages/AdminDashboard/ProviderControlPage';
+import { SettingsPage } from '@/pages/AdminDashboard/SettingsPage';
+import { ScriptStudioPage } from '@/pages/AdminDashboard/ScriptStudioPage';
+import { SmsSenderPage } from '@/pages/AdminDashboard/SmsSenderPage';
+import { UsersRolePage } from '@/pages/AdminDashboard/UsersRolePage';
+import { ErrorBoundary } from '@/components/ErrorBoundary';
+import type { DashboardVm } from '@/pages/AdminDashboard/types';
 
 const POLL_BASE_INTERVAL_MS = 10000;
 const POLL_MAX_INTERVAL_MS = 60000;
@@ -10,12 +20,39 @@ const POLL_JITTER_MS = 1200;
 const POLL_DEGRADED_FAILURES = 2;
 const SESSION_STORAGE_KEY = 'voxly-miniapp-session';
 const MAX_ACTIVITY_ITEMS = 18;
+const ACTION_REQUEST_TIMEOUT_MS = 15000;
+const ACTION_LATENCY_SAMPLE_LIMIT = 40;
+const STREAM_RECONNECT_BASE_MS = 2500;
+const STREAM_RECONNECT_MAX_MS = 30000;
+const STREAM_REFRESH_DEBOUNCE_MS = 350;
+const SMS_DEFAULT_COST_PER_SEGMENT = 0.0075;
 const API_BASE_URL = String(
   import.meta.env.VITE_API_BASE_URL || import.meta.env.VITE_API_BASE || '',
 ).trim().replace(/\/+$/, '');
 const SESSION_REFRESH_RETRY_COUNT = 1;
 
 type ProviderChannel = 'call' | 'sms' | 'email';
+
+function moduleGlyph(moduleId: string): string {
+  switch (moduleId) {
+    case 'ops':
+      return '◉';
+    case 'sms':
+      return '✉';
+    case 'mailer':
+      return '✦';
+    case 'provider':
+      return '⛭';
+    case 'content':
+      return '✎';
+    case 'users':
+      return '◎';
+    case 'audit':
+      return '⚑';
+    default:
+      return '•';
+  }
+}
 
 interface SessionStateUser {
   username?: unknown;
@@ -227,6 +264,10 @@ interface DashboardPayload {
   session?: unknown;
   provider?: ProviderPayload;
   provider_compatibility?: unknown;
+  module_layout?: unknown;
+  modules?: unknown;
+  feature_flags?: unknown;
+  flags?: unknown;
   sms_bulk?: SmsPayload;
   sms_stats?: unknown;
   email_bulk_stats?: EmailStatsPayload;
@@ -248,6 +289,10 @@ interface DashboardApiPayload extends DashboardPayload {
   dashboard?: DashboardPayload;
   session?: unknown;
   bridge?: unknown;
+  module_layout?: unknown;
+  modules?: unknown;
+  feature_flags?: unknown;
+  flags?: unknown;
   poll_interval_seconds?: unknown;
   poll_at?: unknown;
   server_time?: unknown;
@@ -256,6 +301,52 @@ interface DashboardApiPayload extends DashboardPayload {
 type JsonObject = Record<string, unknown>;
 type ActivityStatus = 'info' | 'success' | 'error';
 type DashboardModule = 'ops' | 'sms' | 'mailer' | 'provider' | 'content' | 'users' | 'audit';
+type ModuleConfig = {
+  enabled: boolean;
+  order: number | null;
+  label: string | null;
+};
+type StreamConnectionMode = 'disabled' | 'connecting' | 'connected' | 'fallback';
+type ActionRequestMeta = {
+  action_id: string;
+  request_id: string;
+  idempotency_key: string;
+  requested_at: string;
+  request_timeout_ms: number;
+  source: string;
+  ui_module: DashboardModule;
+};
+type FeatureFlags = Record<string, boolean>;
+type FeatureFlagRegistryEntry = {
+  key: string;
+  defaultEnabled: boolean;
+  description: string;
+};
+type FeatureFlagInspectorItem = {
+  key: string;
+  enabled: boolean;
+  source: 'server' | 'default';
+  defaultEnabled: boolean;
+  description: string;
+};
+type FeatureFlagsPayloadSource =
+  | 'poll.feature_flags'
+  | 'poll.dashboard.feature_flags'
+  | 'bootstrap.feature_flags'
+  | 'dashboard.feature_flags'
+  | 'poll.flags'
+  | 'poll.dashboard.flags'
+  | 'bootstrap.flags'
+  | 'dashboard.flags'
+  | 'default';
+type ProviderSwitchStage = 'idle' | 'simulated' | 'confirmed' | 'applied' | 'failed';
+type ProviderSwitchPostCheck = 'idle' | 'ok' | 'failed';
+type ProviderSwitchPlanState = {
+  target: string;
+  stage: ProviderSwitchStage;
+  postCheck: ProviderSwitchPostCheck;
+  rollbackSuggestion: string;
+};
 
 const MODULE_DEFINITIONS: Array<{ id: DashboardModule; label: string; capability: string }> = [
   { id: 'ops', label: 'Ops Dashboard', capability: 'dashboard_view' },
@@ -265,6 +356,109 @@ const MODULE_DEFINITIONS: Array<{ id: DashboardModule; label: string; capability
   { id: 'content', label: 'Script Studio', capability: 'caller_flags_manage' },
   { id: 'users', label: 'User & Role Admin', capability: 'users_manage' },
   { id: 'audit', label: 'Audit & Incidents', capability: 'dashboard_view' },
+];
+
+const MODULE_CONTEXT: Record<DashboardModule, { subtitle: string; detail: string }> = {
+  ops: {
+    subtitle: 'Operational health, runtime posture, and queue visibility.',
+    detail: 'Control plane overview for live operations.',
+  },
+  sms: {
+    subtitle: 'Bulk SMS console for recipients, scheduling, and delivery posture.',
+    detail: 'Outbound messaging pipeline.',
+  },
+  mailer: {
+    subtitle: 'Email audience delivery, template variables, and deliverability health.',
+    detail: 'Mailer orchestration workspace.',
+  },
+  provider: {
+    subtitle: 'Preflight, provider switching, and rollback safety controls.',
+    detail: 'Provider reliability and failover.',
+  },
+  content: {
+    subtitle: 'Call script drafting, review lifecycle, and simulation controls.',
+    detail: 'Conversation quality studio.',
+  },
+  users: {
+    subtitle: 'Role assignments, user oversight, and access governance.',
+    detail: 'Access and permissions console.',
+  },
+  audit: {
+    subtitle: 'Incident timeline, runbook actions, and immutable audit feed.',
+    detail: 'Governance and incident response.',
+  },
+};
+const MODULE_ID_SET = new Set<DashboardModule>(MODULE_DEFINITIONS.map((module) => module.id));
+const MODULE_DEFAULT_ORDER: Record<DashboardModule, number> = {
+  ops: 0,
+  sms: 1,
+  mailer: 2,
+  provider: 3,
+  content: 4,
+  users: 5,
+  audit: 6,
+};
+const FEATURE_FLAG_REGISTRY: FeatureFlagRegistryEntry[] = [
+  {
+    key: 'realtime_stream',
+    defaultEnabled: true,
+    description: 'Use live stream updates before falling back to polling.',
+  },
+  {
+    key: 'module_skeletons',
+    defaultEnabled: true,
+    description: 'Render loading skeleton cards while module data hydrates.',
+  },
+  {
+    key: 'module_error_boundaries',
+    defaultEnabled: true,
+    description: 'Isolate module rendering failures with recovery cards.',
+  },
+  {
+    key: 'runtime_controls',
+    defaultEnabled: true,
+    description: 'Show runtime maintenance and canary controls.',
+  },
+  {
+    key: 'provider_cards',
+    defaultEnabled: true,
+    description: 'Expose provider readiness and channel cards in Ops.',
+  },
+  {
+    key: 'advanced_tables',
+    defaultEnabled: true,
+    description: 'Enable search, filters, and pagination in admin tables.',
+  },
+  {
+    key: 'users_csv_export',
+    defaultEnabled: true,
+    description: 'Allow CSV export for user and role administration.',
+  },
+  {
+    key: 'runbook_actions',
+    defaultEnabled: true,
+    description: 'Enable incident runbook quick actions.',
+  },
+  {
+    key: 'incidents_csv_export',
+    defaultEnabled: true,
+    description: 'Allow CSV export for incident datasets.',
+  },
+  {
+    key: 'audit_csv_export',
+    defaultEnabled: true,
+    description: 'Allow CSV export for audit timeline records.',
+  },
+];
+const FEATURE_FLAG_REGISTRY_KEYS = new Set<string>(
+  FEATURE_FLAG_REGISTRY.map((entry) => entry.key),
+);
+const USER_ROLE_REASON_TEMPLATES = [
+  'Policy update',
+  'On-call rotation',
+  'Temporary incident response',
+  'Compliance request',
+  'Access cleanup',
 ];
 
 interface ActivityEntry {
@@ -367,6 +561,39 @@ function estimateSmsSegments(text: string): { segments: number; perSegment: numb
   return { segments: Math.ceil(body.length / multi), perSegment: multi };
 }
 
+function computePercentile(values: number[], percentile: number): number {
+  if (!Array.isArray(values) || values.length === 0) return 0;
+  const sorted = [...values]
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value) && value >= 0)
+    .sort((a, b) => a - b);
+  if (sorted.length === 0) return 0;
+  const safePercentile = Math.max(0, Math.min(100, percentile));
+  const position = (safePercentile / 100) * (sorted.length - 1);
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  if (lower === upper) return Math.round(sorted[lower]);
+  const weight = position - lower;
+  return Math.round((sorted[lower] * (1 - weight)) + (sorted[upper] * weight));
+}
+
+function renderTemplateString(template: string, variables: Record<string, unknown>): string {
+  if (!template) return '';
+  return String(template).replace(/\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g, (_, key: string) => {
+    const raw = variables[key];
+    if (raw === undefined || raw === null) return `{{${key}}}`;
+    if (typeof raw === 'string') return raw;
+    if (typeof raw === 'number' || typeof raw === 'boolean' || typeof raw === 'bigint') {
+      return String(raw);
+    }
+    try {
+      return JSON.stringify(raw);
+    } catch {
+      return '[unrenderable]';
+    }
+  });
+}
+
 function toInt(value: unknown, fallback = 0): number {
   const num = Number(value);
   return Number.isFinite(num) ? Math.floor(num) : fallback;
@@ -393,6 +620,123 @@ function asRecord(value: unknown): JsonObject {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? (value as JsonObject)
     : {};
+}
+
+function parseFlagValue(value: unknown): boolean | null {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (value === 1) return true;
+    if (value === 0) return false;
+    return null;
+  }
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on', 'enabled'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off', 'disabled'].includes(normalized)) return false;
+  }
+  return null;
+}
+
+function parseFeatureFlags(value: unknown): FeatureFlags {
+  const flags: FeatureFlags = {};
+  if (Array.isArray(value)) {
+    value.forEach((entry) => {
+      if (typeof entry === 'string' && entry.trim()) {
+        flags[entry.trim().toLowerCase()] = true;
+        return;
+      }
+      const record = asRecord(entry);
+      const key = toText(record.key ?? record.name ?? record.flag, '').trim().toLowerCase();
+      if (!key) return;
+      const parsed = parseFlagValue(record.enabled ?? record.value ?? true);
+      if (parsed === null) return;
+      flags[key] = parsed;
+    });
+    return flags;
+  }
+  const record = asRecord(value);
+  Object.entries(record).forEach(([key, raw]) => {
+    const normalized = String(key || '').trim().toLowerCase();
+    if (!normalized) return;
+    const parsed = parseFlagValue(raw);
+    if (parsed === null) return;
+    flags[normalized] = parsed;
+  });
+  return flags;
+}
+
+function parseDashboardModuleId(value: unknown): DashboardModule | null {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toLowerCase();
+  if (MODULE_ID_SET.has(normalized as DashboardModule)) {
+    return normalized as DashboardModule;
+  }
+  return null;
+}
+
+function parseModuleLayoutConfig(layout: unknown): Partial<Record<DashboardModule, ModuleConfig>> {
+  const root = asRecord(layout);
+  const candidates = root.modules ?? layout;
+  const rules: Partial<Record<DashboardModule, ModuleConfig>> = {};
+  const applyRule = (entry: unknown, keyHint?: string): void => {
+    if (typeof entry === 'string') {
+      const id = parseDashboardModuleId(entry) || parseDashboardModuleId(keyHint);
+      if (!id) return;
+      rules[id] = { enabled: true, order: null, label: null };
+      return;
+    }
+    if (typeof entry === 'boolean') {
+      const id = parseDashboardModuleId(keyHint);
+      if (!id) return;
+      rules[id] = { enabled: entry, order: null, label: null };
+      return;
+    }
+    if (typeof entry === 'number') {
+      const id = parseDashboardModuleId(keyHint);
+      if (!id) return;
+      rules[id] = {
+        enabled: true,
+        order: Number.isFinite(entry) ? Math.floor(entry) : null,
+        label: null,
+      };
+      return;
+    }
+    const record = asRecord(entry);
+    const id = parseDashboardModuleId(record.id ?? record.module ?? record.key ?? keyHint);
+    if (!id) return;
+    const hidden = record.hidden === true || record.disabled === true;
+    const enabled = hidden ? false : record.enabled !== false;
+    const orderRaw = Number(record.order);
+    const order = Number.isFinite(orderRaw) ? Math.floor(orderRaw) : null;
+    const label = typeof record.label === 'string' && record.label.trim() ? record.label.trim() : null;
+    rules[id] = { enabled, order, label };
+  };
+
+  if (Array.isArray(candidates)) {
+    candidates.forEach((entry) => applyRule(entry));
+    return rules;
+  }
+  if (candidates && typeof candidates === 'object') {
+    Object.entries(asRecord(candidates)).forEach(([key, value]) => {
+      applyRule(value, key);
+    });
+  }
+  return rules;
+}
+
+function createActionRequestMeta(action: string, moduleId: DashboardModule): ActionRequestMeta {
+  const nonce = Math.random().toString(36).slice(2, 10);
+  const ts = Date.now();
+  const actionId = `${action}:${ts}:${nonce}`;
+  return {
+    action_id: actionId,
+    request_id: actionId,
+    idempotency_key: actionId,
+    requested_at: new Date(ts).toISOString(),
+    request_timeout_ms: ACTION_REQUEST_TIMEOUT_MS,
+    source: 'miniapp_admin_console',
+    ui_module: moduleId,
+  };
 }
 
 function asStringList(value: unknown): string[] {
@@ -524,7 +868,14 @@ function buildApiUrl(path: string): string {
   return API_BASE_URL ? `${API_BASE_URL}${normalizedPath}` : normalizedPath;
 }
 
-export function AdminDashboard() {
+function buildEventStreamUrl(path: string, token: string): string {
+  const base = buildApiUrl(path);
+  const separator = base.includes('?') ? '&' : '?';
+  const encodedToken = encodeURIComponent(token);
+  return `${base}${separator}token=${encodedToken}&session_token=${encodedToken}&transport=sse`;
+}
+
+export function AdminDashboardPage() {
   const initDataRawFromHook = useRawInitData();
   const initDataRaw = initDataRawFromHook;
   const initDataState = useSignal(initData.state) as SessionState | undefined;
@@ -540,11 +891,16 @@ export function AdminDashboard() {
   const [pollPayload, setPollPayload] = useState<DashboardApiPayload | null>(null);
   const [busyAction, setBusyAction] = useState<string>('');
   const [pollFailureCount, setPollFailureCount] = useState<number>(0);
+  const [streamMode, setStreamMode] = useState<StreamConnectionMode>('disabled');
+  const [streamConnected, setStreamConnected] = useState<boolean>(false);
+  const [streamFailureCount, setStreamFailureCount] = useState<number>(0);
+  const [streamLastEventAt, setStreamLastEventAt] = useState<number | null>(null);
   const [lastPollAt, setLastPollAt] = useState<number | null>(null);
   const [lastSuccessfulPollAt, setLastSuccessfulPollAt] = useState<number | null>(null);
   const [nextPollAt, setNextPollAt] = useState<number | null>(null);
   const [sessionBlocked, setSessionBlocked] = useState<boolean>(false);
   const [activityLog, setActivityLog] = useState<ActivityEntry[]>([]);
+  const [actionLatencyMsSamples, setActionLatencyMsSamples] = useState<number[]>([]);
   const [activeModule, setActiveModule] = useState<DashboardModule>('ops');
   const [settingsOpen, setSettingsOpen] = useState<boolean>(false);
   const [pollingPaused, setPollingPaused] = useState<boolean>(false);
@@ -552,6 +908,8 @@ export function AdminDashboard() {
   const [smsMessageInput, setSmsMessageInput] = useState<string>('');
   const [smsScheduleAt, setSmsScheduleAt] = useState<string>('');
   const [smsProviderInput, setSmsProviderInput] = useState<string>('');
+  const [smsCostPerSegment, setSmsCostPerSegment] = useState<string>(String(SMS_DEFAULT_COST_PER_SEGMENT));
+  const [smsDryRunMode, setSmsDryRunMode] = useState<boolean>(false);
   const [mailerRecipientsInput, setMailerRecipientsInput] = useState<string>('');
   const [mailerSubjectInput, setMailerSubjectInput] = useState<string>('');
   const [mailerHtmlInput, setMailerHtmlInput] = useState<string>('');
@@ -577,6 +935,13 @@ export function AdminDashboard() {
   const [providerRollbackByChannel, setProviderRollbackByChannel] = useState<
     Partial<Record<ProviderChannel, string>>
   >({});
+  const [providerSwitchPlanByChannel, setProviderSwitchPlanByChannel] = useState<
+    Record<ProviderChannel, ProviderSwitchPlanState>
+  >({
+    call: { target: '', stage: 'idle', postCheck: 'idle', rollbackSuggestion: '' },
+    sms: { target: '', stage: 'idle', postCheck: 'idle', rollbackSuggestion: '' },
+    email: { target: '', stage: 'idle', postCheck: 'idle', rollbackSuggestion: '' },
+  });
   const [userSearch, setUserSearch] = useState<string>('');
   const [userSortBy, setUserSortBy] = useState<string>('last_activity');
   const [userSortDir, setUserSortDir] = useState<string>('desc');
@@ -585,6 +950,70 @@ export function AdminDashboard() {
   const [incidentsSnapshot, setIncidentsSnapshot] = useState<MiniAppIncidentsPayload | null>(null);
   const sessionRequestRef = useRef<Promise<string> | null>(null);
   const pollFailureNotedRef = useRef<boolean>(false);
+  const initialServerModuleAppliedRef = useRef<boolean>(false);
+  const streamRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const triggerHaptic = useCallback((
+    mode: 'selection' | 'impact' | 'success' | 'warning' | 'error',
+    impactStyle: 'light' | 'medium' | 'heavy' | 'rigid' | 'soft' = 'light',
+  ): void => {
+    const api = hapticFeedback as unknown as {
+      isSupported?: (() => boolean) | boolean;
+      selectionChanged?: (() => void) | { ifAvailable?: () => void };
+      impactOccurred?: ((style: 'light' | 'medium' | 'heavy' | 'rigid' | 'soft') => void) | {
+        ifAvailable?: (style: 'light' | 'medium' | 'heavy' | 'rigid' | 'soft') => void;
+      };
+      notificationOccurred?: ((state: 'success' | 'warning' | 'error') => void) | {
+        ifAvailable?: (state: 'success' | 'warning' | 'error') => void;
+      };
+    };
+    try {
+      const supported = typeof api.isSupported === 'function'
+        ? Boolean(api.isSupported())
+        : api.isSupported !== false;
+      if (!supported) return;
+      if (mode === 'selection') {
+        if (typeof api.selectionChanged === 'function') {
+          api.selectionChanged();
+          return;
+        }
+        api.selectionChanged?.ifAvailable?.();
+        return;
+      }
+      if (mode === 'impact') {
+        if (typeof api.impactOccurred === 'function') {
+          api.impactOccurred(impactStyle);
+          return;
+        }
+        api.impactOccurred?.ifAvailable?.(impactStyle);
+        return;
+      }
+      if (typeof api.notificationOccurred === 'function') {
+        api.notificationOccurred(mode);
+        return;
+      }
+      api.notificationOccurred?.ifAvailable?.(mode);
+    } catch {
+      // Ignore haptic errors to avoid blocking control-path actions.
+    }
+  }, []);
+
+  const toggleSettings = useCallback((next?: boolean): void => {
+    setSettingsOpen((prev) => {
+      const target = typeof next === 'boolean' ? next : !prev;
+      if (target !== prev) {
+        triggerHaptic('selection');
+      }
+      return target;
+    });
+  }, [triggerHaptic]);
+
+  const selectModule = useCallback((moduleId: DashboardModule): void => {
+    setActiveModule((prev) => {
+      if (prev === moduleId) return prev;
+      triggerHaptic('selection');
+      return moduleId;
+    });
+  }, [triggerHaptic]);
 
   const pushActivity = useCallback((
     status: ActivityStatus,
@@ -712,14 +1141,16 @@ export function AdminDashboard() {
       throw new Error(parseApiError(payload, response.status));
     }
     setErrorCode('');
-    return payload as T;
+    return (payload ?? {}) as T;
   }, [createSession, pushActivity, token]);
 
   const loadBootstrap = useCallback(async () => {
     setLoading(true);
     setError('');
     try {
-      const payload = await request<DashboardApiPayload>('/miniapp/bootstrap');
+      const payload = asRecord(
+        await request<DashboardApiPayload | null>('/miniapp/bootstrap'),
+      ) as DashboardApiPayload;
       const now = Date.now();
       setBootstrap(payload);
       setPollPayload(payload);
@@ -751,7 +1182,9 @@ export function AdminDashboard() {
     const startedAt = Date.now();
     setLastPollAt(startedAt);
     try {
-      const payload = await request<DashboardApiPayload>('/miniapp/jobs/poll');
+      const payload = asRecord(
+        await request<DashboardApiPayload | null>('/miniapp/jobs/poll'),
+      ) as DashboardApiPayload;
       setError('');
       setPollPayload(payload);
       setPollFailureCount(0);
@@ -782,62 +1215,332 @@ export function AdminDashboard() {
     }
   }, [pushActivity, request]);
 
+  const applyStreamPayload = useCallback((raw: unknown): boolean => {
+    const envelope = asRecord(raw);
+    const candidate = asRecord(envelope.payload ?? envelope.data ?? raw);
+    if (Object.keys(candidate).length === 0) return false;
+    const nextPayload = candidate as DashboardApiPayload;
+    setPollPayload((prev) => ({
+      ...(asRecord(prev) as DashboardApiPayload),
+      ...nextPayload,
+    }));
+    setLastSuccessfulPollAt(Date.now());
+    setPollFailureCount(0);
+    setError('');
+
+    const dashboardFromPayload = nextPayload.dashboard;
+    const usersFromPayload = nextPayload.users || dashboardFromPayload?.users;
+    const auditFromPayload = nextPayload.audit || dashboardFromPayload?.audit;
+    const incidentsFromPayload = nextPayload.incidents || dashboardFromPayload?.incidents;
+    if (usersFromPayload) setUsersSnapshot(usersFromPayload);
+    if (auditFromPayload) setAuditSnapshot(auditFromPayload);
+    if (incidentsFromPayload) setIncidentsSnapshot(incidentsFromPayload);
+    return true;
+  }, []);
+
+  const scheduleStreamRefresh = useCallback((): void => {
+    if (streamRefreshTimerRef.current) return;
+    streamRefreshTimerRef.current = setTimeout(() => {
+      streamRefreshTimerRef.current = null;
+      void loadPoll();
+    }, STREAM_REFRESH_DEBOUNCE_MS);
+  }, [loadPoll]);
+
   const invokeAction = useCallback(async (
     action: string,
     payload: Record<string, unknown>,
+    metaOverride?: Partial<ActionRequestMeta>,
   ): Promise<unknown> => {
-    const result = await request<{ success?: boolean; data?: unknown; error?: string }>('/miniapp/action', {
-      method: 'POST',
-      body: JSON.stringify({ action, payload }),
-    });
-    if (!result?.success) {
-      throw new Error(toText((result as Record<string, unknown>)?.error, 'Action failed'));
+    const actionMeta: ActionRequestMeta = {
+      ...createActionRequestMeta(action, activeModule),
+      ...metaOverride,
+    };
+    const abortController = new AbortController();
+    const timeout = setTimeout(() => abortController.abort(), actionMeta.request_timeout_ms);
+    try {
+      const rawResult = await request<{ success?: boolean; data?: unknown; error?: string } | null>('/miniapp/action', {
+        method: 'POST',
+        signal: abortController.signal,
+        headers: {
+          'X-Action-Id': actionMeta.action_id,
+          'X-Idempotency-Key': actionMeta.idempotency_key,
+        },
+        body: JSON.stringify({ action, payload, meta: actionMeta }),
+      });
+      const result = asRecord(rawResult);
+      if (result.success !== true) {
+        throw new Error(toText(result.error, 'Action failed'));
+      }
+      return result.data;
+    } catch (err) {
+      const isAbortError = err instanceof DOMException && err.name === 'AbortError';
+      if (isAbortError) {
+        throw new Error(`Action timed out after ${actionMeta.request_timeout_ms}ms`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeout);
     }
-    return result.data;
-  }, [request]);
+  }, [activeModule, request]);
 
   const runAction = useCallback(async (
     action: string,
     payload: Record<string, unknown>,
     options: { confirmText?: string; successMessage?: string } = {},
   ) => {
+    const actionMeta = createActionRequestMeta(action, activeModule);
+    const traceHint = actionMeta.action_id.slice(-8);
     if (options.confirmText && typeof window !== 'undefined') {
       const allowed = window.confirm(options.confirmText);
       if (!allowed) {
-        pushActivity('info', 'Action cancelled', `Cancelled: ${action}`);
+        triggerHaptic('warning');
+        pushActivity('info', 'Action cancelled', `Cancelled: ${action} (trace:${traceHint})`);
         return;
       }
     }
     setBusyAction(action);
     setNotice('');
     setError('');
+    const startedAt = Date.now();
     try {
-      await invokeAction(action, payload);
+      await invokeAction(action, payload, actionMeta);
       const successMessage = options.successMessage || `Action completed: ${action}`;
-      setNotice(successMessage);
-      pushActivity('success', 'Action completed', successMessage);
+      setNotice(`${successMessage} [${traceHint}]`);
+      triggerHaptic('success');
+      pushActivity('success', 'Action completed', `${successMessage} (trace:${traceHint})`);
       await loadBootstrap();
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       setError(detail);
-      pushActivity('error', `Action failed: ${action}`, detail);
+      triggerHaptic('error');
+      pushActivity('error', `Action failed: ${action}`, `${detail} (trace:${traceHint})`);
     } finally {
+      const latencyMs = Math.max(0, Date.now() - startedAt);
+      setActionLatencyMsSamples((prev) => [...prev, latencyMs].slice(-ACTION_LATENCY_SAMPLE_LIMIT));
       setBusyAction('');
     }
-  }, [invokeAction, loadBootstrap, pushActivity]);
+  }, [activeModule, invokeAction, loadBootstrap, pushActivity, triggerHaptic]);
+  const featureFlagsResolution = useMemo<{
+    payload: unknown;
+    source: FeatureFlagsPayloadSource;
+  }>(() => {
+    const candidates: Array<{ source: FeatureFlagsPayloadSource; payload: unknown }> = [
+      { source: 'poll.feature_flags', payload: pollPayload?.feature_flags },
+      { source: 'poll.dashboard.feature_flags', payload: pollPayload?.dashboard?.feature_flags },
+      { source: 'bootstrap.feature_flags', payload: bootstrap?.feature_flags },
+      { source: 'dashboard.feature_flags', payload: bootstrap?.dashboard?.feature_flags },
+      { source: 'poll.flags', payload: pollPayload?.flags },
+      { source: 'poll.dashboard.flags', payload: pollPayload?.dashboard?.flags },
+      { source: 'bootstrap.flags', payload: bootstrap?.flags },
+      { source: 'dashboard.flags', payload: bootstrap?.dashboard?.flags },
+    ];
+    const resolved = candidates.find((entry) => entry.payload !== undefined && entry.payload !== null);
+    if (!resolved) {
+      return {
+        payload: {},
+        source: 'default',
+      };
+    }
+    return resolved;
+  }, [
+    bootstrap?.dashboard?.feature_flags,
+    bootstrap?.dashboard?.flags,
+    bootstrap?.feature_flags,
+    bootstrap?.flags,
+    pollPayload?.dashboard?.feature_flags,
+    pollPayload?.dashboard?.flags,
+    pollPayload?.feature_flags,
+    pollPayload?.flags,
+  ]);
+  const featureFlags = useMemo(
+    () => parseFeatureFlags(featureFlagsResolution.payload),
+    [featureFlagsResolution.payload],
+  );
+  const featureFlagsSourceLabel = featureFlagsResolution.source;
+  const featureFlagsUpdatedAtRaw = pollPayload?.poll_at
+    || pollPayload?.server_time
+    || asRecord(pollPayload?.dashboard).poll_at
+    || asRecord(pollPayload?.dashboard).server_time
+    || bootstrap?.poll_at
+    || bootstrap?.server_time
+    || asRecord(bootstrap?.dashboard).poll_at
+    || asRecord(bootstrap?.dashboard).server_time
+    || null;
+  const featureFlagsUpdatedAtLabel = featureFlagsUpdatedAtRaw
+    ? formatTime(featureFlagsUpdatedAtRaw)
+    : '—';
+  const isFeatureEnabled = useCallback((flag: string, fallback = true): boolean => {
+    const normalized = String(flag || '').trim().toLowerCase();
+    if (!normalized) return fallback;
+    if (!(normalized in featureFlags)) return fallback;
+    return featureFlags[normalized];
+  }, [featureFlags]);
+  const featureFlagInspectorItems = useMemo<FeatureFlagInspectorItem[]>(() => {
+    const known = FEATURE_FLAG_REGISTRY.map((entry) => {
+      const hasOverride = Object.prototype.hasOwnProperty.call(featureFlags, entry.key);
+      const enabled = hasOverride ? featureFlags[entry.key] : entry.defaultEnabled;
+      return {
+        key: entry.key,
+        enabled,
+        source: hasOverride ? ('server' as const) : ('default' as const),
+        defaultEnabled: entry.defaultEnabled,
+        description: entry.description,
+      };
+    });
+    const dynamic = Object.entries(featureFlags)
+      .filter(([key]) => !FEATURE_FLAG_REGISTRY_KEYS.has(key))
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, enabled]) => ({
+        key,
+        enabled,
+        source: 'server' as const,
+        defaultEnabled: Boolean(enabled),
+        description: 'Server-defined feature flag.',
+      }));
+    return [...known, ...dynamic];
+  }, [featureFlags]);
+  const realtimeStreamEnabled = isFeatureEnabled('realtime_stream', true);
+  const moduleSkeletonsEnabled = isFeatureEnabled('module_skeletons', true);
+  const moduleErrorBoundariesEnabled = isFeatureEnabled('module_error_boundaries', true);
+
+  useEffect(() => () => {
+    if (streamRefreshTimerRef.current) {
+      clearTimeout(streamRefreshTimerRef.current);
+      streamRefreshTimerRef.current = null;
+    }
+  }, []);
 
   useEffect(() => {
     void loadBootstrap();
   }, [loadBootstrap]);
 
   useEffect(() => {
+    if (!realtimeStreamEnabled || !token || sessionBlocked || pollingPaused) {
+      setStreamMode('disabled');
+      setStreamConnected(false);
+      return undefined;
+    }
+    if (typeof EventSource === 'undefined') {
+      setStreamMode('fallback');
+      setStreamConnected(false);
+      return undefined;
+    }
+
+    let disposed = false;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let activeStream: EventSource | null = null;
+    let attemptCount = 0;
+    let endpointIndex = 0;
+    const endpoints = ['/miniapp/events', '/miniapp/stream'];
+
+    const closeStream = () => {
+      if (activeStream) {
+        activeStream.close();
+        activeStream = null;
+      }
+    };
+
+    const connect = () => {
+      if (disposed) return;
+      setStreamMode('connecting');
+      const nextEndpoint = endpoints[Math.max(0, Math.min(endpointIndex, endpoints.length - 1))];
+      const streamUrl = buildEventStreamUrl(nextEndpoint, token);
+      const source = new EventSource(streamUrl);
+      activeStream = source;
+
+      source.onopen = () => {
+        if (disposed) return;
+        attemptCount = 0;
+        setStreamMode('connected');
+        setStreamConnected(true);
+        setStreamFailureCount(0);
+      };
+
+      source.onmessage = (event) => {
+        if (disposed) return;
+        setStreamLastEventAt(Date.now());
+        const eventText = typeof event.data === 'string' ? event.data : String(event.data ?? '');
+        let parsed: unknown = eventText;
+        try {
+          parsed = JSON.parse(eventText);
+        } catch {
+          // Accept plain text event frames and trigger poll refresh below.
+        }
+        const applied = applyStreamPayload(parsed);
+        if (!applied) {
+          scheduleStreamRefresh();
+        }
+      };
+
+      source.onerror = () => {
+        if (disposed) return;
+        closeStream();
+        setStreamConnected(false);
+        if (endpointIndex < endpoints.length - 1) {
+          endpointIndex += 1;
+          connect();
+          return;
+        }
+        endpointIndex = 0;
+        attemptCount += 1;
+        setStreamMode('fallback');
+        setStreamFailureCount((prev) => prev + 1);
+        const delay = Math.min(
+          STREAM_RECONNECT_MAX_MS,
+          Math.round(STREAM_RECONNECT_BASE_MS * Math.pow(1.5, Math.max(0, attemptCount - 1))),
+        );
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          connect();
+        }, delay);
+      };
+    };
+
+    connect();
+    return () => {
+      disposed = true;
+      closeStream();
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+      }
+    };
+  }, [applyStreamPayload, pollingPaused, realtimeStreamEnabled, scheduleStreamRefresh, sessionBlocked, token]);
+
+  useEffect(() => {
     if (!settingsButton.onClick.isAvailable()) {
       return undefined;
     }
     return settingsButton.onClick(() => {
-      setSettingsOpen((prev) => !prev);
+      toggleSettings();
     });
-  }, []);
+  }, [toggleSettings]);
+
+  useEffect(() => {
+    if (settingsOpen || activeModule !== 'ops') {
+      backButton.show.ifAvailable();
+      return;
+    }
+    backButton.hide.ifAvailable();
+  }, [activeModule, settingsOpen]);
+
+  useEffect(() => {
+    if (!backButton.onClick.isAvailable()) {
+      return undefined;
+    }
+    return backButton.onClick(() => {
+      if (settingsOpen) {
+        toggleSettings(false);
+        return;
+      }
+      if (activeModule !== 'ops') {
+        selectModule('ops');
+        return;
+      }
+      if (typeof window !== 'undefined' && window.history.length > 1) {
+        window.history.back();
+      }
+    });
+  }, [activeModule, selectModule, settingsOpen, toggleSettings]);
 
   const serverPollIntervalMs = useMemo(() => {
     const intervalSeconds = Number(bootstrap?.poll_interval_seconds);
@@ -848,7 +1551,7 @@ export function AdminDashboard() {
   }, [bootstrap?.poll_interval_seconds]);
 
   useEffect(() => {
-    if (!token || sessionBlocked || pollingPaused) return undefined;
+    if (!token || sessionBlocked || pollingPaused || streamConnected) return undefined;
     let disposed = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let consecutiveFailures = 0;
@@ -870,7 +1573,7 @@ export function AdminDashboard() {
       setNextPollAt(null);
       if (timer) clearTimeout(timer);
     };
-  }, [loadPoll, pollingPaused, serverPollIntervalMs, sessionBlocked, token]);
+  }, [loadPoll, pollingPaused, serverPollIntervalMs, sessionBlocked, streamConnected, token]);
 
   const dashboard = bootstrap?.dashboard;
   const providerPayload = pollPayload?.provider || dashboard?.provider || {};
@@ -912,7 +1615,31 @@ export function AdminDashboard() {
   const sessionRoleSource = toText(sessionPayload.role_source, 'inferred');
   const sessionCaps = asStringList(sessionPayload.caps);
   const hasCapability = (capability: string): boolean => sessionCaps.includes(capability);
-  const visibleModules = MODULE_DEFINITIONS.filter((module) => hasCapability(module.capability));
+  const dashboardLayoutPayload = pollPayload?.module_layout
+    || bootstrap?.module_layout
+    || dashboard?.module_layout
+    || pollPayload?.modules
+    || bootstrap?.modules
+    || dashboard?.modules
+    || {};
+  const moduleLayoutConfig = parseModuleLayoutConfig(dashboardLayoutPayload);
+  const roleAllowedModules = MODULE_DEFINITIONS.filter((module) => hasCapability(module.capability));
+  const visibleModules = roleAllowedModules
+    .filter((module) => moduleLayoutConfig[module.id]?.enabled !== false)
+    .map((module) => ({
+      ...module,
+      label: moduleLayoutConfig[module.id]?.label || module.label,
+    }))
+    .sort((a, b) => {
+      const orderA = moduleLayoutConfig[a.id]?.order;
+      const orderB = moduleLayoutConfig[b.id]?.order;
+      const safeA = Number.isFinite(orderA) ? Number(orderA) : MODULE_DEFAULT_ORDER[a.id];
+      const safeB = Number.isFinite(orderB) ? Number(orderB) : MODULE_DEFAULT_ORDER[b.id];
+      return safeA - safeB;
+    });
+  const preferredServerModule = parseDashboardModuleId(
+    asRecord(dashboardLayoutPayload).active_module || asRecord(dashboardLayoutPayload).default_module,
+  );
   const settingsStatusLabel = !settingsButtonSupported
     ? 'Unsupported'
     : settingsButtonMounted
@@ -927,6 +1654,17 @@ export function AdminDashboard() {
       setActiveModule(visibleModules[0].id);
     }
   }, [activeModule, visibleModules]);
+  useEffect(() => {
+    if (initialServerModuleAppliedRef.current) return;
+    if (!preferredServerModule) return;
+    if (!visibleModules.some((module) => module.id === preferredServerModule)) {
+      initialServerModuleAppliedRef.current = true;
+      return;
+    }
+    initialServerModuleAppliedRef.current = true;
+    setActiveModule(preferredServerModule);
+  }, [preferredServerModule, visibleModules]);
+  const activeModuleMeta = MODULE_CONTEXT[activeModule] || MODULE_CONTEXT.ops;
 
   useEffect(() => {
     if (callScripts.length === 0) {
@@ -997,12 +1735,26 @@ export function AdminDashboard() {
     || pollFailureCount >= POLL_DEGRADED_FAILURES
     || bridgeHardFailures > 0
     || (Boolean(error) && !hasBootstrapData);
+  const streamModeLabel = streamMode === 'connected'
+    ? 'Realtime'
+    : streamMode === 'connecting'
+      ? 'Realtime (connecting)'
+      : streamMode === 'fallback'
+        ? 'Polling fallback'
+        : 'Disabled';
+  const streamLastEventLabel = streamLastEventAt
+    ? formatTime(new Date(streamLastEventAt).toISOString())
+    : '—';
   const syncModeLabel = pollingPaused
     ? 'Paused'
+    : streamConnected
+      ? isDashboardDegraded
+        ? 'Realtime (degraded)'
+        : 'Realtime'
     : isDashboardDegraded
       ? 'Degraded'
       : 'Healthy';
-  const nextPollLabel = pollingPaused
+  const nextPollLabel = pollingPaused || streamConnected
     ? 'Paused'
     : nextPollAt
       ? formatTime(new Date(nextPollAt).toISOString())
@@ -1011,6 +1763,10 @@ export function AdminDashboard() {
   const lastSuccessfulPollLabel = lastSuccessfulPollAt
     ? formatTime(new Date(lastSuccessfulPollAt).toISOString())
     : '—';
+  const pollFreshnessSeconds = lastSuccessfulPollAt
+    ? Math.max(0, Math.floor((Date.now() - lastSuccessfulPollAt) / 1000))
+    : -1;
+  const pollFreshnessLabel = pollFreshnessSeconds < 0 ? 'No successful poll yet' : `${pollFreshnessSeconds}s`;
   const uptimeScore = Math.max(
     0,
     100 - (pollFailureCount * 12) - (bridgeHardFailures * 18) - (bridgeSoftFailures * 6),
@@ -1030,6 +1786,21 @@ export function AdminDashboard() {
       + toInt(opsQueueBacklog.email_failed),
   );
   const callFailureRate = callTotal > 0 ? Math.round((callFailed / callTotal) * 100) : 0;
+  const sloErrorBudgetPercent = Math.max(
+    0,
+    Math.min(
+      100,
+      Math.round(100 - callFailureRate - (pollFailureCount * 2.5) - (bridgeHardFailures * 4)),
+    ),
+  );
+  const sloP95ActionLatencyMs = computePercentile(actionLatencyMsSamples, 95);
+  const degradedCauses = [
+    sessionBlocked ? 'Session auth blocked' : '',
+    pollFailureCount >= POLL_DEGRADED_FAILURES ? `Poll failures ${pollFailureCount}` : '',
+    bridgeHardFailures > 0 ? `Bridge hard failures ${bridgeHardFailures}` : '',
+    bridgeSoftFailures > 0 ? `Bridge soft failures ${bridgeSoftFailures}` : '',
+    (Boolean(error) && !hasBootstrapData) ? 'Bootstrap data unavailable' : '',
+  ].filter(Boolean);
   const callLogsTotal = toInt(callLogsPayload.total, callLogs.length);
   const voiceRuntime = asRecord(voiceRuntimePayload.runtime);
   const voiceRuntimeCircuit = asRecord(voiceRuntime.circuit);
@@ -1105,6 +1876,34 @@ export function AdminDashboard() {
     ? Math.round((providerReadinessTotals.ready / providerReadinessTotals.total) * 100)
     : 0;
   const providerDegradedCount = providerMatrixRows.filter((row) => row.degraded).length;
+  const providerCurrentByChannel: Record<ProviderChannel, string> = {
+    call: toText(asRecord(providersByChannel.call).provider, '').toLowerCase(),
+    sms: toText(asRecord(providersByChannel.sms).provider, '').toLowerCase(),
+    email: toText(asRecord(providersByChannel.email).provider, '').toLowerCase(),
+  };
+  const providerSupportedByChannel: Record<ProviderChannel, string[]> = {
+    call: asStringList(asRecord(providersByChannel.call).supported_providers),
+    sms: asStringList(asRecord(providersByChannel.sms).supported_providers),
+    email: asStringList(asRecord(providersByChannel.email).supported_providers),
+  };
+  useEffect(() => {
+    setProviderSwitchPlanByChannel((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      (['call', 'sms', 'email'] as ProviderChannel[]).forEach((channel) => {
+        const current = providerCurrentByChannel[channel];
+        const supported = providerSupportedByChannel[channel];
+        const fallbackTarget = current || supported[0] || '';
+        if (!fallbackTarget || prev[channel].target) return;
+        changed = true;
+        next[channel] = {
+          ...prev[channel],
+          target: fallbackTarget,
+        };
+      });
+      return changed ? next : prev;
+    });
+  }, [providerCurrentByChannel, providerSupportedByChannel]);
   const smsRecipientsParsed = parsePhoneList(smsRecipientsInput);
   const smsInvalidRecipients = smsRecipientsParsed.filter((phone) => !isValidE164(phone));
   const smsDuplicateCount = Math.max(
@@ -1114,6 +1913,32 @@ export function AdminDashboard() {
       .filter(Boolean).length - smsRecipientsParsed.length,
   );
   const smsSegmentEstimate = estimateSmsSegments(smsMessageInput);
+  const smsValidRecipients = smsRecipientsParsed.length - smsInvalidRecipients.length;
+  const smsLikelyLandlineRecipients = smsRecipientsParsed.filter((phone) => {
+    const digits = phone.replace(/\D/g, '');
+    return digits.length < 11 || /0000$/.test(digits);
+  }).length;
+  const smsValidationCategories = {
+    valid: smsValidRecipients,
+    invalid: smsInvalidRecipients.length,
+    duplicate: smsDuplicateCount,
+    likelyLandline: smsLikelyLandlineRecipients,
+  };
+  const smsCostPerSegmentNumber = Number(smsCostPerSegment);
+  const smsCostPerSegmentResolved = Number.isFinite(smsCostPerSegmentNumber) && smsCostPerSegmentNumber >= 0
+    ? smsCostPerSegmentNumber
+    : SMS_DEFAULT_COST_PER_SEGMENT;
+  const smsEstimatedCost = Number(
+    (smsValidRecipients * Math.max(1, smsSegmentEstimate.segments) * smsCostPerSegmentResolved).toFixed(4),
+  );
+  const smsRouteSimulationRows = providerMatrixRows
+    .filter((row) => row.channel === 'sms')
+    .map((row) => ({
+      provider: row.provider,
+      ready: row.ready,
+      degraded: row.degraded,
+      parityGapCount: row.parityGapCount,
+    }));
   const mailerRecipientsParsed = parseEmailList(mailerRecipientsInput);
   const mailerInvalidRecipients = mailerRecipientsParsed.filter((email) => !isLikelyEmail(email));
   const mailerDuplicateCount = Math.max(
@@ -1129,13 +1954,49 @@ export function AdminDashboard() {
       ...Array.from(String(mailerTextInput || '').matchAll(/{{\s*([\w.-]+)\s*}}/g)).map((m) => m[1]),
     ]),
   );
+  const mailerTemplatePreviewContext = useMemo(() => {
+    if (!mailerVariablesInput.trim()) return {};
+    try {
+      return asRecord(JSON.parse(mailerVariablesInput));
+    } catch {
+      return {};
+    }
+  }, [mailerVariablesInput]);
+  const mailerTemplatePreviewError = useMemo(() => {
+    if (!mailerVariablesInput.trim()) return '';
+    try {
+      JSON.parse(mailerVariablesInput);
+      return '';
+    } catch {
+      return 'Preview variables JSON is invalid.';
+    }
+  }, [mailerVariablesInput]);
+  const mailerTemplatePreviewSubject = renderTemplateString(mailerSubjectInput || '(no subject)', mailerTemplatePreviewContext);
+  const mailerTemplatePreviewBody = renderTemplateString(
+    mailerTextInput || mailerHtmlInput || '(no body content)',
+    mailerTemplatePreviewContext,
+  );
+  const mailerDomainHealthStatus = emailBouncePercent <= 2 && emailComplaintPercent <= 1
+    ? 'Healthy'
+    : emailBouncePercent <= 5 && emailComplaintPercent <= 2
+      ? 'Watch'
+      : 'Critical';
+  const mailerDomainHealthDetail = `Bounce ${emailBouncePercent}% · Complaint ${emailComplaintPercent}%`;
+  const mailerTrendBars = emailJobs.slice(0, 5).map((job) => {
+    const total = Math.max(1, toInt(job.total));
+    const delivered = Math.max(0, toInt(job.delivered));
+    const deliveryRate = Math.round((delivered / total) * 100);
+    return `${toText(job.status, 'job')} ${textBar(deliveryRate, 12)}`;
+  });
 
   const handleRefresh = (): void => {
+    triggerHaptic('impact', 'light');
     pushActivity('info', 'Manual refresh', 'Operator triggered dashboard refresh.');
     void loadBootstrap();
   };
 
   const resetSession = useCallback((): void => {
+    triggerHaptic('warning');
     writeSessionCache(null);
     sessionRequestRef.current = null;
     setToken(null);
@@ -1150,15 +2011,23 @@ export function AdminDashboard() {
     setNextPollAt(null);
     setPollFailureCount(0);
     setPollingPaused(false);
+    setActionLatencyMsSamples([]);
     setRuntimeCanaryInput('');
+    setSmsCostPerSegment(String(SMS_DEFAULT_COST_PER_SEGMENT));
+    setSmsDryRunMode(false);
     setCallScriptsSnapshot(null);
     setSelectedCallScriptId(0);
     setScriptSimulationResult(null);
+    setProviderSwitchPlanByChannel({
+      call: { target: '', stage: 'idle', postCheck: 'idle', rollbackSuggestion: '' },
+      sms: { target: '', stage: 'idle', postCheck: 'idle', rollbackSuggestion: '' },
+      email: { target: '', stage: 'idle', postCheck: 'idle', rollbackSuggestion: '' },
+    });
     setSettingsOpen(false);
     setActivityLog([]);
     pollFailureNotedRef.current = false;
     void loadBootstrap();
-  }, [loadBootstrap]);
+  }, [loadBootstrap, triggerHaptic]);
 
   const handleRecipientsFile = useCallback(async (
     file: File | null,
@@ -1211,13 +2080,31 @@ export function AdminDashboard() {
     }
   }, [invokeAction, pushActivity]);
 
-  const handleApplyUserRole = useCallback(async (telegramId: string, role: string): Promise<void> => {
-    const reason = typeof window !== 'undefined'
-      ? (window.prompt(`Provide audit reason for ${telegramId} -> ${role}`) || '').trim()
-      : '';
+  const handleApplyUserRole = useCallback(async (
+    telegramId: string,
+    role: 'admin' | 'operator' | 'viewer',
+    reasonHint = '',
+  ): Promise<void> => {
+    const reasonInput = typeof window !== 'undefined'
+      ? (window.prompt(
+        `Provide audit reason for ${telegramId} -> ${role}`,
+        reasonHint || '',
+      ) || '').trim()
+      : reasonHint.trim();
+    const reason = reasonInput || reasonHint.trim();
     if (!reason) {
       pushActivity('info', 'Role update cancelled', `No audit reason supplied for ${telegramId}.`);
       return;
+    }
+    if (role === 'admin' && typeof window !== 'undefined') {
+      const policyAck = (window.prompt(
+        'Two-step approval required. Type "APPROVE ADMIN" to continue.',
+        '',
+      ) || '').trim().toUpperCase();
+      if (policyAck !== 'APPROVE ADMIN') {
+        pushActivity('info', 'Admin elevation blocked', `${telegramId} elevation not approved.`);
+        return;
+      }
     }
     await runAction(
       'users.role.set',
@@ -1517,6 +2404,12 @@ export function AdminDashboard() {
       setError('SMS message is required.');
       return;
     }
+    if (smsDryRunMode) {
+      const previewMsg = `Dry-run complete: ${recipients.length} recipients, ${smsSegmentEstimate.segments} segment(s), est. $${smsEstimatedCost.toFixed(4)}.`;
+      setNotice(previewMsg);
+      pushActivity('info', 'SMS dry-run simulation', previewMsg);
+      return;
+    }
     if (smsScheduleAt) {
       setBusyAction('sms.schedule.send');
       setError('');
@@ -1567,9 +2460,12 @@ export function AdminDashboard() {
     invokeAction,
     pushActivity,
     runAction,
+    smsDryRunMode,
+    smsEstimatedCost,
     smsMessageInput,
     smsProviderInput,
     smsRecipientsParsed,
+    smsSegmentEstimate.segments,
     smsScheduleAt,
   ]);
 
@@ -1631,10 +2527,12 @@ export function AdminDashboard() {
         `Run preflight and switch ${channel.toUpperCase()} provider to "${normalizedTarget}"?`,
       );
       if (!proceed) {
+        triggerHaptic('warning');
         pushActivity('info', 'Provider switch cancelled', `${channel.toUpperCase()} switch was cancelled.`);
         return;
       }
     }
+    triggerHaptic('impact', 'medium');
     const key = `${channel}:${normalizedTarget}`;
     setProviderPreflightBusy(key);
     setError('');
@@ -1673,7 +2571,159 @@ export function AdminDashboard() {
     } finally {
       setProviderPreflightBusy('');
     }
-  }, [invokeAction, pushActivity, runAction]);
+  }, [invokeAction, pushActivity, runAction, triggerHaptic]);
+
+  const setProviderSwitchTarget = useCallback((channel: ProviderChannel, target: string): void => {
+    const normalized = String(target || '').trim().toLowerCase();
+    setProviderSwitchPlanByChannel((prev) => ({
+      ...prev,
+      [channel]: {
+        ...prev[channel],
+        target: normalized,
+        stage: normalized ? 'idle' : prev[channel].stage,
+        postCheck: 'idle',
+      },
+    }));
+  }, []);
+
+  const simulateProviderSwitchPlan = useCallback(async (channel: ProviderChannel): Promise<void> => {
+    const target = toText(providerSwitchPlanByChannel[channel]?.target, '').toLowerCase();
+    if (!target) {
+      setError(`Select a target provider for ${channel.toUpperCase()} simulation.`);
+      return;
+    }
+    const preflightKey = `${channel}:${target}:plan`;
+    setProviderPreflightBusy(preflightKey);
+    setError('');
+    try {
+      const result = await invokeAction('provider.preflight', {
+        channel,
+        provider: target,
+        network: 1,
+        reachability: 1,
+      }) as Record<string, unknown>;
+      const ok = result?.success === true || toText(result?.error, '') === '';
+      const rollbackTarget = providerCurrentByChannel[channel];
+      setProviderSwitchPlanByChannel((prev) => ({
+        ...prev,
+        [channel]: {
+          target,
+          stage: ok ? 'simulated' : 'failed',
+          postCheck: 'idle',
+          rollbackSuggestion: rollbackTarget || '',
+        },
+      }));
+      if (ok) {
+        pushActivity('success', 'Provider switch simulated', `${channel.toUpperCase()} ${target} passed preflight.`);
+      } else {
+        pushActivity('error', 'Provider simulation failed', `${channel.toUpperCase()} ${target} failed preflight.`);
+      }
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      setError(detail);
+      setProviderSwitchPlanByChannel((prev) => ({
+        ...prev,
+        [channel]: {
+          ...prev[channel],
+          stage: 'failed',
+          postCheck: 'idle',
+        },
+      }));
+      pushActivity('error', 'Provider simulation failed', detail);
+    } finally {
+      setProviderPreflightBusy('');
+    }
+  }, [invokeAction, providerCurrentByChannel, providerSwitchPlanByChannel, pushActivity, toText]);
+
+  const confirmProviderSwitchPlan = useCallback((channel: ProviderChannel): void => {
+    setProviderSwitchPlanByChannel((prev) => {
+      const plan = prev[channel];
+      if (!plan.target || plan.stage !== 'simulated') return prev;
+      return {
+        ...prev,
+        [channel]: {
+          ...plan,
+          stage: 'confirmed',
+        },
+      };
+    });
+    pushActivity('info', 'Provider switch confirmed', `${channel.toUpperCase()} switch plan confirmed.`);
+  }, [pushActivity]);
+
+  const applyProviderSwitchPlan = useCallback(async (channel: ProviderChannel): Promise<void> => {
+    const plan = providerSwitchPlanByChannel[channel];
+    const target = toText(plan?.target, '').toLowerCase();
+    if (!target || plan?.stage !== 'confirmed') {
+      setError(`Simulate and confirm ${channel.toUpperCase()} plan before apply.`);
+      return;
+    }
+    if (typeof window !== 'undefined') {
+      const approved = window.confirm(`Apply ${channel.toUpperCase()} provider switch to "${target}" now?`);
+      if (!approved) {
+        pushActivity('info', 'Provider switch cancelled', `${channel.toUpperCase()} switch apply was cancelled.`);
+        return;
+      }
+    }
+    const previousProvider = providerCurrentByChannel[channel];
+    await runAction(
+      'provider.set',
+      { channel, provider: target },
+      {
+        successMessage: `${channel.toUpperCase()} provider switched to ${target}.`,
+      },
+    );
+    try {
+      const postCheck = await invokeAction('provider.preflight', {
+        channel,
+        provider: target,
+        network: 1,
+        reachability: 1,
+      }) as Record<string, unknown>;
+      const healthy = postCheck?.success === true || toText(postCheck?.error, '') === '';
+      const rollbackSuggestion = healthy ? '' : previousProvider;
+      setProviderSwitchPlanByChannel((prev) => ({
+        ...prev,
+        [channel]: {
+          ...prev[channel],
+          stage: healthy ? 'applied' : 'failed',
+          postCheck: healthy ? 'ok' : 'failed',
+          rollbackSuggestion,
+        },
+      }));
+      if (healthy) {
+        pushActivity('success', 'Post-switch health check', `${channel.toUpperCase()} ${target} is healthy.`);
+      } else {
+        const msg = `${channel.toUpperCase()} ${target} post-check failed.${rollbackSuggestion ? ` Suggested rollback: ${rollbackSuggestion}` : ''}`;
+        setNotice(msg);
+        pushActivity('error', 'Post-switch health check failed', msg);
+      }
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      setProviderSwitchPlanByChannel((prev) => ({
+        ...prev,
+        [channel]: {
+          ...prev[channel],
+          stage: 'failed',
+          postCheck: 'failed',
+          rollbackSuggestion: previousProvider || '',
+        },
+      }));
+      setError(detail);
+      pushActivity('error', 'Post-switch verification failed', detail);
+    }
+  }, [invokeAction, providerCurrentByChannel, providerSwitchPlanByChannel, pushActivity, runAction, toText]);
+
+  const resetProviderSwitchPlan = useCallback((channel: ProviderChannel): void => {
+    setProviderSwitchPlanByChannel((prev) => ({
+      ...prev,
+      [channel]: {
+        target: '',
+        stage: 'idle',
+        postCheck: 'idle',
+        rollbackSuggestion: '',
+      },
+    }));
+  }, []);
 
   const renderProviderSection = (channel: ProviderChannel) => {
     const channelData = providersByChannel[channel] || {};
@@ -1776,70 +2826,307 @@ export function AdminDashboard() {
     );
   };
 
+  const moduleVm: DashboardVm = {
+    hasCapability,
+    isFeatureEnabled,
+    asRecord,
+    toInt,
+    toText,
+    formatTime,
+    textBar,
+    isDashboardDegraded,
+    syncModeLabel,
+    streamModeLabel,
+    streamLastEventLabel,
+    streamFailureCount,
+    pollFailureCount,
+    bridgeHardFailures,
+    bridgeSoftFailures,
+    sloErrorBudgetPercent,
+    sloP95ActionLatencyMs,
+    pollFreshnessLabel,
+    degradedCauses,
+    lastPollLabel,
+    lastSuccessfulPollLabel,
+    nextPollLabel,
+    callCompleted,
+    callTotal,
+    callFailed,
+    callFailureRate,
+    callSuccessRate,
+    queueBacklogTotal,
+    providerReadinessTotals,
+    providerReadinessPercent,
+    runtimeEffectiveMode,
+    runtimeModeOverride,
+    runtimeCanaryEffective,
+    runtimeCanaryOverrideLabel,
+    runtimeIsCircuitOpen,
+    runtimeForcedLegacyUntil,
+    runtimeActiveTotal,
+    runtimeActiveLegacy,
+    runtimeActiveVoiceAgent,
+    busyAction,
+    enableRuntimeMaintenance,
+    disableRuntimeMaintenance,
+    refreshRuntimeStatus,
+    runtimeCanaryInput,
+    setRuntimeCanaryInput,
+    applyRuntimeCanary,
+    clearRuntimeCanary,
+    activityLog,
+    renderProviderSection,
+    smsTotalRecipients,
+    smsSuccess,
+    smsFailed,
+    smsProcessedPercent,
+    emailTotalRecipients,
+    emailSent,
+    emailFailed,
+    emailDelivered,
+    emailBounced,
+    emailComplained,
+    emailSuppressed,
+    emailProcessedPercent,
+    emailDeliveredPercent,
+    emailBouncePercent,
+    emailComplaintPercent,
+    callLogs,
+    callLogsTotal,
+    emailJobs,
+    dlqPayload,
+    callDlq,
+    emailDlq,
+    runAction,
+    hasMeaningfulData,
+    smsRecipientsInput,
+    setSmsRecipientsInput,
+    handleRecipientsFile,
+    smsProviderInput,
+    setSmsProviderInput,
+    smsMessageInput,
+    setSmsMessageInput,
+    smsScheduleAt,
+    setSmsScheduleAt,
+    sendSmsFromConsole,
+    smsRecipientsParsed,
+    smsInvalidRecipients,
+    smsDuplicateCount,
+    smsSegmentEstimate,
+    smsCostPerSegment,
+    setSmsCostPerSegment,
+    smsEstimatedCost,
+    smsDryRunMode,
+    setSmsDryRunMode,
+    smsValidationCategories,
+    smsRouteSimulationRows,
+    mailerRecipientsInput,
+    setMailerRecipientsInput,
+    mailerTemplateIdInput,
+    setMailerTemplateIdInput,
+    mailerSubjectInput,
+    setMailerSubjectInput,
+    mailerHtmlInput,
+    setMailerHtmlInput,
+    mailerTextInput,
+    setMailerTextInput,
+    mailerVariablesInput,
+    setMailerVariablesInput,
+    mailerScheduleAt,
+    setMailerScheduleAt,
+    sendMailerFromConsole,
+    mailerRecipientsParsed,
+    mailerInvalidRecipients,
+    mailerDuplicateCount,
+    mailerVariableKeys,
+    mailerTemplatePreviewSubject,
+    mailerTemplatePreviewBody,
+    mailerTemplatePreviewError,
+    mailerDomainHealthStatus,
+    mailerDomainHealthDetail,
+    mailerTrendBars,
+    providerDegradedCount,
+    providerPreflightBusy,
+    preflightActiveProviders,
+    loading,
+    handleRefresh,
+    providerMatrixRows,
+    providerCurrentByChannel,
+    providerSupportedByChannel,
+    providerSwitchPlanByChannel,
+    setProviderSwitchTarget,
+    simulateProviderSwitchPlan,
+    confirmProviderSwitchPlan,
+    applyProviderSwitchPlan,
+    resetProviderSwitchPlan,
+    scriptFlowFilter,
+    setScriptFlowFilter,
+    refreshCallScriptsModule,
+    callScriptsTotal,
+    callScripts,
+    selectedCallScriptId,
+    setSelectedCallScriptId,
+    selectedCallScript,
+    selectedCallScriptLifecycleState,
+    selectedCallScriptLifecycle,
+    scriptNameInput,
+    setScriptNameInput,
+    scriptDefaultProfileInput,
+    setScriptDefaultProfileInput,
+    scriptDescriptionInput,
+    setScriptDescriptionInput,
+    scriptPromptInput,
+    setScriptPromptInput,
+    scriptFirstMessageInput,
+    setScriptFirstMessageInput,
+    scriptObjectiveTagsInput,
+    setScriptObjectiveTagsInput,
+    saveCallScriptDraft,
+    submitCallScriptForReview,
+    scriptReviewNoteInput,
+    setScriptReviewNoteInput,
+    reviewCallScript,
+    promoteCallScriptLive,
+    scriptSimulationVariablesInput,
+    setScriptSimulationVariablesInput,
+    simulateCallScript,
+    scriptSimulationResult,
+    userSearch,
+    setUserSearch,
+    userSortBy,
+    setUserSortBy,
+    userSortDir,
+    setUserSortDir,
+    refreshUsersModule,
+    usersPayload,
+    usersRows,
+    roleReasonTemplates: USER_ROLE_REASON_TEMPLATES,
+    handleApplyUserRole,
+    refreshAuditModule,
+    runbookAction,
+    incidentsPayload,
+    incidentRows,
+    runbookRows,
+    auditRows,
+  };
+  const showModuleSkeleton = moduleSkeletonsEnabled && loading && !hasBootstrapData;
+  const moduleBoundaryKeySuffix = `${activeModule}:${lastSuccessfulPollAt ?? 0}`;
+  const renderModuleFallback = (moduleLabel: string) => (
+    <div className="va-card va-module-fallback">
+      <h3>{moduleLabel} is temporarily unavailable</h3>
+      <p className="va-muted">
+        This module hit a render-time error. Refresh data and reopen the module.
+      </p>
+      <button
+        type="button"
+        onClick={handleRefresh}
+        disabled={loading || busyAction.length > 0}
+      >
+        Reload Module Data
+      </button>
+    </div>
+  );
+  const wrapModulePane = (moduleKey: DashboardModule, label: string, pane: JSX.Element) => {
+    if (!moduleErrorBoundariesEnabled) {
+      return <div key={`module-${moduleKey}`}>{pane}</div>;
+    }
+    return (
+      <ErrorBoundary
+        key={`${moduleKey}-${moduleBoundaryKeySuffix}`}
+        fallback={renderModuleFallback(label)}
+      >
+        {pane}
+      </ErrorBoundary>
+    );
+  };
+
   return (
     <main className="va-dashboard">
-      <header className="va-header">
-        <div>
-          <h1>Voxly Admin Console</h1>
-          <p className="va-muted">Telegram Mini App dashboard for provider, SMS, email, and DLQ operations.</p>
-        </div>
-        <div className="va-header-meta">
-          <span>Admin: {userLabel}</span>
-          <span>Role: {sessionRole} ({sessionRoleSource})</span>
-          <span>Settings button: {settingsStatusLabel}</span>
-          <button
-            type="button"
-            onClick={() => setSettingsOpen((prev) => !prev)}
-            disabled={loading}
-          >
-            {settingsOpen ? 'Close Settings' : 'Open Settings'}
-          </button>
-          <button type="button" onClick={handleRefresh} disabled={loading || busyAction.length > 0}>
-            Refresh
-          </button>
-        </div>
-      </header>
+      {settingsOpen ? (
+        <header className="va-header is-settings">
+          <div className="va-settings-header-grid">
+            <button
+              type="button"
+              className="va-settings-back"
+              onClick={() => toggleSettings(false)}
+              disabled={loading}
+            >
+              Back
+            </button>
+            <div className="va-settings-header-center">
+              <strong>VOICEDNUT</strong>
+              <span>mini app</span>
+            </div>
+            <button
+              type="button"
+              className="va-settings-header-action"
+              onClick={handleRefresh}
+              disabled={loading || busyAction.length > 0}
+            >
+              Sync
+            </button>
+          </div>
+        </header>
+      ) : (
+        <header className="va-header">
+          <div className="va-header-copy">
+            <h1>Voicednut Admin Console</h1>
+            <p className="va-muted">{activeModuleMeta.subtitle}</p>
+            <p className="va-module-context-line">
+              <span className="va-module-context-icon" aria-hidden>{moduleGlyph(activeModule)}</span>
+              <span>{activeModuleMeta.detail}</span>
+            </p>
+          </div>
+          <div className="va-header-meta">
+            <span>Admin: {userLabel}</span>
+            <span>Role: {sessionRole} ({sessionRoleSource})</span>
+            <span>Settings button: {settingsStatusLabel}</span>
+            <span>Feature flags: {Object.keys(featureFlags).length || 'default'}</span>
+            <button
+              type="button"
+              onClick={() => toggleSettings(true)}
+              disabled={loading}
+            >
+              Open Settings
+            </button>
+            <button type="button" onClick={handleRefresh} disabled={loading || busyAction.length > 0}>
+              Refresh
+            </button>
+          </div>
+        </header>
+      )}
 
       {loading ? <p className="va-muted">Loading dashboard...</p> : null}
       {error ? <p className="va-error">{error}</p> : null}
       {notice ? <p className="va-notice">{notice}</p> : null}
       {settingsOpen ? (
-        <section className="va-grid">
-          <div className="va-card">
-            <h3>Mini App Settings</h3>
-            <p className="va-muted">
-              Opened via Telegram Settings Button (`settings_button_pressed`) when supported.
-            </p>
-            <p>
-              Live polling: <strong>{pollingPaused ? 'paused' : 'active'}</strong>
-            </p>
-            <p>
-              API base URL: <strong>{API_BASE_URL || 'same-origin'}</strong>
-            </p>
-            <div className="va-inline-tools">
-              <button
-                type="button"
-                onClick={() => setPollingPaused((prev) => !prev)}
-              >
-                {pollingPaused ? 'Resume Live Polling' : 'Pause Live Polling'}
-              </button>
-              <button type="button" onClick={handleRefresh}>
-                Sync Now
-              </button>
-              <button
-                type="button"
-                onClick={resetSession}
-                disabled={loading || busyAction.length > 0}
-              >
-                Retry Session
-              </button>
-              <button type="button" onClick={() => setSettingsOpen(false)}>
-                Close Settings
-              </button>
-            </div>
-          </div>
+        <section className="va-view-stage va-view-stage-settings">
+        <SettingsPage
+          userLabel={userLabel}
+          sessionRole={sessionRole}
+          sessionRoleSource={sessionRoleSource}
+            pollingPaused={pollingPaused}
+            loading={loading}
+          busy={busyAction.length > 0}
+          settingsStatusLabel={settingsStatusLabel}
+          apiBaseUrl={API_BASE_URL || 'same-origin'}
+          visibleModules={visibleModules}
+          featureFlags={featureFlagInspectorItems}
+          featureFlagsSourceLabel={featureFlagsSourceLabel}
+          featureFlagsUpdatedAtLabel={featureFlagsUpdatedAtLabel}
+          onTogglePolling={() => setPollingPaused((prev) => !prev)}
+          onSyncNow={handleRefresh}
+          onRetrySession={resetSession}
+            onJumpToModule={(moduleId) => {
+              if (!MODULE_DEFINITIONS.some((module) => module.id === moduleId)) return;
+              selectModule(moduleId as DashboardModule);
+              toggleSettings(false);
+            }}
+          />
         </section>
       ) : null}
+      {!settingsOpen ? (
+        <section className="va-view-stage va-view-stage-dashboard">
       {sessionBlocked ? (
         <section className="va-grid">
           <div className="va-card va-blocked">
@@ -1885,7 +3172,7 @@ export function AdminDashboard() {
             </article>
             <article>
               <span>Data Feed</span>
-              <strong>{hasBootstrapData ? 'Online' : 'Warming up'}</strong>
+              <strong>{streamConnected ? 'Realtime' : hasBootstrapData ? 'Polling' : 'Warming up'}</strong>
             </article>
           </div>
         </div>
@@ -1897,7 +3184,7 @@ export function AdminDashboard() {
             key={module.id}
             type="button"
             className={`va-chip ${activeModule === module.id ? 'is-active' : ''}`}
-            onClick={() => setActiveModule(module.id)}
+            onClick={() => selectModule(module.id)}
           >
             {module.label}
           </button>
@@ -1906,871 +3193,94 @@ export function AdminDashboard() {
       {visibleModules.length === 0 ? (
         <p className="va-error">No dashboard modules are enabled for this role.</p>
       ) : null}
-
-      {activeModule === 'ops' && hasCapability('dashboard_view') ? (
+      {showModuleSkeleton ? (
+        <section className="va-grid va-module-skeleton-grid">
+          {['Loading module', 'Preparing data', 'Syncing controls'].map((label) => (
+            <div key={label} className="va-card va-module-skeleton-card">
+              <div className="va-module-skeleton-title" />
+              <div className="va-module-skeleton-line" />
+              <div className="va-module-skeleton-line short" />
+              <p className="va-muted">{label}...</p>
+            </div>
+          ))}
+        </section>
+      ) : (
         <>
-      <section className="va-grid">
-        <div className={`va-card va-health ${isDashboardDegraded ? 'is-degraded' : 'is-healthy'}`}>
-          <h3>Live Sync Health</h3>
-          <p>
-            Mode: <strong>{syncModeLabel}</strong>
-          </p>
-          <p>
-            Poll failures: <strong>{pollFailureCount}</strong> | Bridge 5xx: <strong>{bridgeHardFailures}</strong>
-            {' '}| Bridge 4xx/5xx: <strong>{bridgeSoftFailures}</strong>
-          </p>
-          <p>Last poll attempt: <strong>{lastPollLabel}</strong></p>
-          <p>Last successful poll: <strong>{lastSuccessfulPollLabel}</strong></p>
-          <p>Next poll scheduled: <strong>{nextPollLabel}</strong></p>
-        </div>
-
-        <div className="va-card">
-          <h3>Ops Snapshot</h3>
-          <p>
-            Calls: <strong>{callCompleted}</strong> completed / <strong>{callTotal}</strong> total
-          </p>
-          <p>
-            Call failures: <strong>{callFailed}</strong> ({callFailureRate}%)
-          </p>
-          <p>
-            Success rate: <strong>{Math.max(0, Math.min(100, Math.round(callSuccessRate)))}%</strong>
-          </p>
-          <p>
-            Queue backlog: <strong>{queueBacklogTotal}</strong>
-          </p>
-          <p>
-            Provider readiness: <strong>{providerReadinessTotals.ready}/{providerReadinessTotals.total}</strong>
-          </p>
-          <pre>{textBar(providerReadinessPercent)}</pre>
-        </div>
-
-        <div className="va-card">
-          <h3>Voice Runtime Control</h3>
-          <p>
-            Effective mode: <strong>{runtimeEffectiveMode}</strong>
-            {' '}| Override: <strong>{runtimeModeOverride}</strong>
-          </p>
-          <p>
-            Canary effective: <strong>{runtimeCanaryEffective}%</strong>
-            {' '}| Override: <strong>{runtimeCanaryOverrideLabel}</strong>
-          </p>
-          <p>
-            Circuit: <strong>{runtimeIsCircuitOpen ? 'Open' : 'Closed'}</strong>
-            {' '}| Forced legacy until: <strong>{runtimeForcedLegacyUntil}</strong>
-          </p>
-          <p>
-            Active calls: <strong>{runtimeActiveTotal}</strong>
-            {' '}| Legacy: <strong>{runtimeActiveLegacy}</strong>
-            {' '}| Voice Agent: <strong>{runtimeActiveVoiceAgent}</strong>
-          </p>
-          <div className="va-inline-tools">
-            <button
-              type="button"
-              disabled={busyAction.length > 0}
-              onClick={() => { void enableRuntimeMaintenance(); }}
-            >
-              Enable Maintenance
-            </button>
-            <button
-              type="button"
-              disabled={busyAction.length > 0}
-              onClick={() => { void disableRuntimeMaintenance(); }}
-            >
-              Disable Maintenance
-            </button>
-            <button
-              type="button"
-              disabled={busyAction.length > 0}
-              onClick={() => { void refreshRuntimeStatus(); }}
-            >
-              Refresh Runtime
-            </button>
-          </div>
-          <div className="va-inline-tools">
-            <input
-              className="va-input"
-              inputMode="numeric"
-              min={0}
-              max={100}
-              placeholder="Canary % (0-100)"
-              value={runtimeCanaryInput}
-              onChange={(event) => setRuntimeCanaryInput(event.target.value)}
-            />
-            <button
-              type="button"
-              disabled={busyAction.length > 0}
-              onClick={() => { void applyRuntimeCanary(); }}
-            >
-              Apply Canary
-            </button>
-            <button
-              type="button"
-              disabled={busyAction.length > 0}
-              onClick={() => { void clearRuntimeCanary(); }}
-            >
-              Clear Canary
-            </button>
-          </div>
-        </div>
-
-        <div className="va-card">
-          <h3>Activity Timeline</h3>
-          {activityLog.length === 0 ? (
-            <p className="va-muted">No activity recorded yet.</p>
-          ) : (
-            <ul className="va-list va-list-activity">
-              {activityLog.map((entry) => (
-                <li key={entry.id}>
-                  <span className={`va-pill va-pill-${entry.status}`}>{entry.status}</span>
-                  <strong>{entry.title}</strong>
-                  <span>{entry.detail}</span>
-                  <span>{formatTime(entry.at)}</span>
-                </li>
-              ))}
-            </ul>
+          {wrapModulePane(
+            'ops',
+            'Ops Dashboard',
+            <OpsDashboardPage
+              visible={activeModule === 'ops' && hasCapability('dashboard_view')}
+              vm={moduleVm}
+            />,
           )}
-        </div>
-      </section>
-
-      <section className="va-grid">
-        {renderProviderSection('call')}
-        {renderProviderSection('sms')}
-        {renderProviderSection('email')}
-      </section>
-
-      <section className="va-grid">
-        <div className="va-card">
-          <h3>SMS Bulk Status (24h)</h3>
-          <p>Total recipients: <strong>{smsTotalRecipients}</strong></p>
-          <p>Successful: <strong>{smsSuccess}</strong> | Failed: <strong>{smsFailed}</strong></p>
-          <pre>{textBar(smsProcessedPercent)}</pre>
-        </div>
-
-        <div className="va-card">
-          <h3>Email Bulk Status (24h)</h3>
-          <p>Total recipients: <strong>{emailTotalRecipients}</strong></p>
-          <p>Sent: <strong>{emailSent}</strong> | Failed: <strong>{emailFailed}</strong></p>
-          <p>Delivered: <strong>{emailDelivered}</strong></p>
-          <p>
-            Bounced: <strong>{emailBounced}</strong> | Complaints: <strong>{emailComplained}</strong>
-            {' '}| Suppressed: <strong>{emailSuppressed}</strong>
-          </p>
-          <pre>{textBar(emailProcessedPercent)}</pre>
-          <pre>{textBar(emailDeliveredPercent)}</pre>
-        </div>
-      </section>
-
-      <section className="va-grid">
-        <div className="va-card">
-          <h3>Recent Call Logs</h3>
-          <p>
-            Showing <strong>{callLogs.length}</strong> of <strong>{callLogsTotal}</strong> recent calls.
-          </p>
-          {callLogs.length === 0 ? <p className="va-muted">No recent calls available.</p> : null}
-          <ul className="va-list">
-            {callLogs.slice(0, 10).map((row, index) => {
-              const callSid = toText(row.call_sid, `call-${index + 1}`);
-              return (
-                <li key={`call-log-${callSid}-${index}`}>
-                  <strong>{callSid}</strong>
-                  <span>
-                    {toText(row.direction, 'unknown')} | {toText(row.status_normalized, toText(row.status, 'unknown'))}
-                  </span>
-                  <span>
-                    Runtime: {toText(row.voice_runtime, 'unknown')}
-                    {' '}| Duration: {toInt(row.duration)}s
-                    {' '}| Transcripts: {toInt(row.transcript_count)}
-                  </span>
-                  <span>
-                    Number: {toText(row.phone_number, 'n/a')}
-                    {' '}| Ended: {toText(row.ended_reason, 'n/a')}
-                  </span>
-                  <span>{formatTime(row.created_at)}</span>
-                </li>
-              );
-            })}
-          </ul>
-        </div>
-
-        <div className="va-card">
-          <h3>Email Jobs</h3>
-          {emailJobs.length === 0 ? <p className="va-muted">No recent jobs.</p> : null}
-          <ul className="va-list">
-            {emailJobs.slice(0, 8).map((job, index) => {
-              const jobId = toText(job.job_id, `job-${index + 1}`);
-              const jobStatus = toText(job.status);
-              const jobKey = `email-job-${jobId}-${index}`;
-              return (
-                <li key={jobKey}>
-                  <strong>{jobId}</strong>
-                  <span>{jobStatus}</span>
-                  <span>{toInt(job.sent)}/{toInt(job.total)} sent</span>
-                  <span>
-                    Failed: {toInt(job.failed)} | Delivered: {toInt(job.delivered)} | Bounced: {toInt(job.bounced)}
-                  </span>
-                  <span>{formatTime(job.updated_at || job.created_at)}</span>
-                </li>
-              );
-            })}
-          </ul>
-        </div>
-
-        <div className="va-card">
-          <h3>DLQ: Call Jobs ({toInt(dlqPayload.call_open, callDlq.length)})</h3>
-          {callDlq.length === 0 ? <p className="va-muted">No open call DLQ entries.</p> : null}
-          <ul className="va-list">
-            {callDlq.map((row) => {
-              const rowId = toInt(row.id);
-              const handleReplay = (): void => {
-                void runAction(
-                  'dlq.call.replay',
-                  { id: rowId },
-                  {
-                    confirmText: `Replay call DLQ #${rowId}?`,
-                    successMessage: `Replay requested for call DLQ #${rowId}.`,
-                  },
-                );
-              };
-              return (
-                <li key={`call-dlq-${rowId}`}>
-                  <span>#{rowId} {toText(row.job_type, 'job')}</span>
-                  <span>Replays: {toInt(row.replay_count)}</span>
-                  <button
-                    type="button"
-                    disabled={busyAction.length > 0 || rowId <= 0}
-                    onClick={handleReplay}
-                  >
-                    Replay
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
-        </div>
-
-        <div className="va-card">
-          <h3>DLQ: Email ({toInt(dlqPayload.email_open, emailDlq.length)})</h3>
-          {emailDlq.length === 0 ? <p className="va-muted">No open email DLQ entries.</p> : null}
-          <ul className="va-list">
-            {emailDlq.map((row) => {
-              const rowId = toInt(row.id);
-              const handleReplay = (): void => {
-                void runAction(
-                  'dlq.email.replay',
-                  { id: rowId },
-                  {
-                    confirmText: `Replay email DLQ #${rowId}?`,
-                    successMessage: `Replay requested for email DLQ #${rowId}.`,
-                  },
-                );
-              };
-              return (
-                <li key={`email-dlq-${rowId}`}>
-                  <span>#{rowId} msg:{toText(row.message_id)}</span>
-                  <span>Reason: {toText(row.reason)}</span>
-                  <button
-                    type="button"
-                    disabled={busyAction.length > 0 || rowId <= 0}
-                    onClick={handleReplay}
-                  >
-                    Replay
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
-        </div>
-      </section>
-
-      {!hasMeaningfulData ? (
-        <section className="va-grid">
-          <div className="va-card">
-            <h3>Connected, Waiting for Operational Activity</h3>
-            <p className="va-muted">
-              Session is healthy. Data cards will populate as provider, SMS, email, and DLQ events arrive.
-            </p>
-          </div>
-        </section>
-      ) : null}
+          {wrapModulePane(
+            'sms',
+            'SMS Sender',
+            <SmsSenderPage
+              visible={activeModule === 'sms' && hasCapability('sms_bulk_manage')}
+              vm={moduleVm}
+            />,
+          )}
+          {wrapModulePane(
+            'mailer',
+            'Mailer Console',
+            <MailerPage
+              visible={activeModule === 'mailer' && hasCapability('email_bulk_manage')}
+              vm={moduleVm}
+            />,
+          )}
+          {wrapModulePane(
+            'provider',
+            'Provider Control',
+            <ProviderControlPage
+              visible={activeModule === 'provider' && hasCapability('provider_manage')}
+              vm={moduleVm}
+            />,
+          )}
+          {wrapModulePane(
+            'content',
+            'Script Studio',
+            <ScriptStudioPage
+              visible={activeModule === 'content' && hasCapability('caller_flags_manage')}
+              vm={moduleVm}
+            />,
+          )}
+          {wrapModulePane(
+            'users',
+            'User & Role Admin',
+            <UsersRolePage
+              visible={activeModule === 'users' && hasCapability('users_manage')}
+              vm={moduleVm}
+            />,
+          )}
+          {wrapModulePane(
+            'audit',
+            'Audit & Incidents',
+            <AuditIncidentsPage
+              visible={activeModule === 'audit' && hasCapability('dashboard_view')}
+              vm={moduleVm}
+            />,
+          )}
         </>
-      ) : null}
-
-      {activeModule === 'sms' && hasCapability('sms_bulk_manage') ? (
-        <section className="va-grid">
-          <div className="va-card">
-            <h3>SMS Sender Console</h3>
-            <p className="va-muted">
-              Upload recipients, estimate segments, schedule delivery, and track bulk job outcomes.
-            </p>
-            <textarea
-              className="va-input va-textarea"
-              placeholder="Recipients (+15551230001), separated by comma/newline"
-              value={smsRecipientsInput}
-              onChange={(event) => setSmsRecipientsInput(event.target.value)}
-              rows={5}
-            />
-            <div className="va-inline-tools">
-              <input
-                type="file"
-                accept=".csv,.txt"
-                onChange={(event) => {
-                  const file = event.target.files?.[0] || null;
-                  void handleRecipientsFile(file, 'sms');
-                  event.currentTarget.value = '';
-                }}
-              />
-              <input
-                className="va-input"
-                placeholder="Provider (optional)"
-                value={smsProviderInput}
-                onChange={(event) => setSmsProviderInput(event.target.value)}
-              />
-            </div>
-            <textarea
-              className="va-input va-textarea"
-              placeholder="Message body"
-              value={smsMessageInput}
-              onChange={(event) => setSmsMessageInput(event.target.value)}
-              rows={4}
-            />
-            <div className="va-inline-tools">
-              <label className="va-muted">
-                Schedule at:
-                <input
-                  className="va-input"
-                  type="datetime-local"
-                  value={smsScheduleAt}
-                  onChange={(event) => setSmsScheduleAt(event.target.value)}
-                />
-              </label>
+      )}
+      {visibleModules.length > 0 ? (
+        <nav className="va-bottom-nav-wrap" aria-label="Quick module navigation">
+          <div className="va-bottom-nav">
+            {visibleModules.map((module) => (
               <button
+                key={`bottom-${module.id}`}
                 type="button"
-                disabled={busyAction.length > 0}
-                onClick={() => { void sendSmsFromConsole(); }}
+                className={`va-bottom-nav-item ${activeModule === module.id ? 'is-active' : ''}`}
+                onClick={() => selectModule(module.id)}
               >
-                {smsScheduleAt ? 'Schedule SMS Batch' : 'Send SMS Batch'}
+                <span className="va-bottom-nav-glyph" aria-hidden>{moduleGlyph(module.id)}</span>
+                <span>{module.label}</span>
               </button>
-            </div>
-            <p className="va-muted">
-              Recipients: <strong>{smsRecipientsParsed.length}</strong>
-              {' '}| Invalid: <strong>{smsInvalidRecipients.length}</strong>
-              {' '}| Duplicates removed: <strong>{smsDuplicateCount}</strong>
-            </p>
-            <p className="va-muted">
-              Segment estimate: <strong>{smsSegmentEstimate.segments}</strong>
-              {' '}segment(s), {smsSegmentEstimate.perSegment} chars/segment.
-            </p>
+            ))}
           </div>
-          <div className="va-card">
-            <h3>SMS Job Tracker</h3>
-            <p>Total recipients (24h): <strong>{smsTotalRecipients}</strong></p>
-            <p>Successful: <strong>{smsSuccess}</strong> | Failed: <strong>{smsFailed}</strong></p>
-            <pre>{textBar(smsProcessedPercent)}</pre>
-            {smsInvalidRecipients.length > 0 ? (
-              <p className="va-muted">
-                Suppression preview (invalid format): {smsInvalidRecipients.slice(0, 10).join(', ')}
-              </p>
-            ) : null}
-          </div>
-        </section>
+        </nav>
       ) : null}
-
-      {activeModule === 'mailer' && hasCapability('email_bulk_manage') ? (
-        <section className="va-grid">
-          <div className="va-card">
-            <h3>Mailer Console</h3>
-            <textarea
-              className="va-input va-textarea"
-              placeholder="Recipient emails separated by comma/newline"
-              value={mailerRecipientsInput}
-              onChange={(event) => setMailerRecipientsInput(event.target.value)}
-              rows={5}
-            />
-            <div className="va-inline-tools">
-              <input
-                type="file"
-                accept=".csv,.txt"
-                onChange={(event) => {
-                  const file = event.target.files?.[0] || null;
-                  void handleRecipientsFile(file, 'mailer');
-                  event.currentTarget.value = '';
-                }}
-              />
-              <input
-                className="va-input"
-                placeholder="Template ID (optional)"
-                value={mailerTemplateIdInput}
-                onChange={(event) => setMailerTemplateIdInput(event.target.value)}
-              />
-            </div>
-            <input
-              className="va-input"
-              placeholder="Subject (supports {{variables}})"
-              value={mailerSubjectInput}
-              onChange={(event) => setMailerSubjectInput(event.target.value)}
-            />
-            <textarea
-              className="va-input va-textarea"
-              placeholder="HTML body (optional)"
-              value={mailerHtmlInput}
-              onChange={(event) => setMailerHtmlInput(event.target.value)}
-              rows={4}
-            />
-            <textarea
-              className="va-input va-textarea"
-              placeholder="Text body (optional)"
-              value={mailerTextInput}
-              onChange={(event) => setMailerTextInput(event.target.value)}
-              rows={3}
-            />
-            <textarea
-              className="va-input va-textarea"
-              placeholder={'Variables JSON, e.g. {"first_name":"Ada"}'}
-              value={mailerVariablesInput}
-              onChange={(event) => setMailerVariablesInput(event.target.value)}
-              rows={3}
-            />
-            <div className="va-inline-tools">
-              <label className="va-muted">
-                Send at:
-                <input
-                  className="va-input"
-                  type="datetime-local"
-                  value={mailerScheduleAt}
-                  onChange={(event) => setMailerScheduleAt(event.target.value)}
-                />
-              </label>
-              <button
-                type="button"
-                disabled={busyAction.length > 0}
-                onClick={() => { void sendMailerFromConsole(); }}
-              >
-                Queue Mailer Job
-              </button>
-            </div>
-            <p className="va-muted">
-              Audience: <strong>{mailerRecipientsParsed.length}</strong>
-              {' '}| Invalid: <strong>{mailerInvalidRecipients.length}</strong>
-              {' '}| Duplicates removed: <strong>{mailerDuplicateCount}</strong>
-            </p>
-            <p className="va-muted">
-              Template variables detected: {mailerVariableKeys.length ? mailerVariableKeys.join(', ') : 'none'}
-            </p>
-          </div>
-          <div className="va-card">
-            <h3>Deliverability Monitor</h3>
-            <p>Total recipients (24h): <strong>{emailTotalRecipients}</strong></p>
-            <p>Sent: <strong>{emailSent}</strong> | Failed: <strong>{emailFailed}</strong></p>
-            <p>Delivered: <strong>{emailDelivered}</strong></p>
-            <p>
-              Bounced: <strong>{emailBounced}</strong> | Complaints: <strong>{emailComplained}</strong>
-              {' '}| Suppressed: <strong>{emailSuppressed}</strong>
-            </p>
-            <pre>{textBar(emailProcessedPercent)}</pre>
-            <pre>{textBar(emailDeliveredPercent)}</pre>
-            <pre>{textBar(emailBouncePercent)}</pre>
-            <pre>{textBar(emailComplaintPercent)}</pre>
-            {emailJobs.length > 0 ? (
-              <ul className="va-list">
-                {emailJobs.slice(0, 6).map((job, index) => (
-                  <li key={`mailer-job-${index}`}>
-                    <strong>{toText(job.job_id, `job-${index + 1}`)}</strong>
-                    <span>{toText(job.status, 'unknown')}</span>
-                    <span>{toInt(job.sent)}/{toInt(job.total)} sent</span>
-                    <span>
-                      Fail: {toInt(job.failed)} | Deliv: {toInt(job.delivered)} | Bounce: {toInt(job.bounced)}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            ) : <p className="va-muted">No recent mailer jobs.</p>}
-          </div>
-        </section>
-      ) : null}
-
-      {activeModule === 'provider' && hasCapability('provider_manage') ? (
-        <>
-          <section className="va-grid">
-            <div className="va-card">
-              <h3>Provider Preflight Matrix</h3>
-              <p>
-                Ready providers: <strong>{providerReadinessTotals.ready}/{providerReadinessTotals.total}</strong>
-                {' '}| Degraded: <strong>{providerDegradedCount}</strong>
-              </p>
-              <pre>{textBar(providerReadinessPercent)}</pre>
-              <div className="va-inline-tools">
-                <button
-                  type="button"
-                  disabled={busyAction.length > 0 || providerPreflightBusy.length > 0}
-                  onClick={() => { void preflightActiveProviders(); }}
-                >
-                  Preflight Active Providers
-                </button>
-                <button
-                  type="button"
-                  disabled={loading || busyAction.length > 0}
-                  onClick={handleRefresh}
-                >
-                  Refresh Matrix
-                </button>
-              </div>
-              {providerMatrixRows.length === 0 ? (
-                <p className="va-muted">Compatibility matrix is warming up.</p>
-              ) : (
-                <ul className="va-list va-matrix-list">
-                  {providerMatrixRows.map((row) => (
-                    <li key={`matrix-${row.channel}-${row.provider}`}>
-                      <strong>{row.channel.toUpperCase()} · {row.provider}</strong>
-                      <span>
-                        Ready: <strong>{row.ready ? 'yes' : 'no'}</strong>
-                        {' '}| Degraded: <strong>{row.degraded ? 'yes' : 'no'}</strong>
-                      </span>
-                      <span>
-                        Flows: <strong>{row.flowCount}</strong>
-                        {' '}| Parity gaps: <strong>{row.parityGapCount}</strong>
-                      </span>
-                      {row.channel === 'call' ? (
-                        <span>Payment mode: <strong>{row.paymentMode}</strong></span>
-                      ) : null}
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          </section>
-          <section className="va-grid">
-            {renderProviderSection('call')}
-            {renderProviderSection('sms')}
-            {renderProviderSection('email')}
-          </section>
-        </>
-      ) : null}
-
-      {activeModule === 'content' && hasCapability('caller_flags_manage') ? (
-        <section className="va-grid">
-          <div className="va-card">
-            <h3>Script & Persona Studio</h3>
-            <p className="va-muted">
-              Draft edits, persona/profile tuning, review approvals, and promote-live workflow.
-            </p>
-            <div className="va-inline-tools">
-              <input
-                className="va-input"
-                placeholder="Flow filter (optional)"
-                value={scriptFlowFilter}
-                onChange={(event) => setScriptFlowFilter(event.target.value)}
-              />
-              <button
-                type="button"
-                onClick={() => { void refreshCallScriptsModule(); }}
-              >
-                Refresh Scripts
-              </button>
-            </div>
-            <p className="va-muted">
-              Scripts available: <strong>{callScriptsTotal}</strong>
-            </p>
-            <ul className="va-list">
-              {callScripts.slice(0, 60).map((script) => {
-                const scriptId = toInt(script.id);
-                const lifecycle = toText(script.lifecycle_state, 'draft');
-                const active = scriptId === selectedCallScriptId;
-                return (
-                  <li key={`call-script-${scriptId}`}>
-                    <strong>{toText(script.name, `script-${scriptId || 'unknown'}`)}</strong>
-                    <span>
-                      ID: {scriptId} | Flow: {toText(script.flow_type, 'general')} | v{toInt(script.version, 1)}
-                    </span>
-                    <span>
-                      Lifecycle: <strong>{lifecycle}</strong>
-                      {' '}| Persona(default_profile): <strong>{toText(script.default_profile, 'general')}</strong>
-                    </span>
-                    <button
-                      type="button"
-                      className={active ? 'va-chip is-active' : 'va-chip'}
-                      onClick={() => setSelectedCallScriptId(scriptId)}
-                    >
-                      {active ? 'Selected' : 'Select'}
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
-          </div>
-
-          <div className="va-card">
-            <h3>Draft Editor & Approval</h3>
-            {selectedCallScript ? (
-              <>
-                <p>
-                  Editing script: <strong>{toText(selectedCallScript.name, 'unknown')}</strong>
-                  {' '}(# {selectedCallScriptId})
-                </p>
-                <p className="va-muted">
-                  Lifecycle: <strong>{selectedCallScriptLifecycleState}</strong>
-                  {' '}| Submitted: <strong>{formatTime(selectedCallScriptLifecycle.submitted_for_review_at)}</strong>
-                  {' '}| Reviewed: <strong>{formatTime(selectedCallScriptLifecycle.reviewed_at)}</strong>
-                </p>
-                <input
-                  className="va-input"
-                  placeholder="Script name"
-                  value={scriptNameInput}
-                  onChange={(event) => setScriptNameInput(event.target.value)}
-                />
-                <input
-                  className="va-input"
-                  placeholder="Persona profile (default_profile)"
-                  value={scriptDefaultProfileInput}
-                  onChange={(event) => setScriptDefaultProfileInput(event.target.value)}
-                />
-                <textarea
-                  className="va-input va-textarea"
-                  placeholder="Description"
-                  value={scriptDescriptionInput}
-                  onChange={(event) => setScriptDescriptionInput(event.target.value)}
-                  rows={2}
-                />
-                <textarea
-                  className="va-input va-textarea"
-                  placeholder="Prompt"
-                  value={scriptPromptInput}
-                  onChange={(event) => setScriptPromptInput(event.target.value)}
-                  rows={6}
-                />
-                <textarea
-                  className="va-input va-textarea"
-                  placeholder="First message"
-                  value={scriptFirstMessageInput}
-                  onChange={(event) => setScriptFirstMessageInput(event.target.value)}
-                  rows={3}
-                />
-                <input
-                  className="va-input"
-                  placeholder="Objective tags (comma-separated)"
-                  value={scriptObjectiveTagsInput}
-                  onChange={(event) => setScriptObjectiveTagsInput(event.target.value)}
-                />
-                <div className="va-inline-tools">
-                  <button
-                    type="button"
-                    disabled={busyAction.length > 0}
-                    onClick={() => { void saveCallScriptDraft(); }}
-                  >
-                    Save Draft
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busyAction.length > 0}
-                    onClick={() => { void submitCallScriptForReview(); }}
-                  >
-                    Submit Review
-                  </button>
-                </div>
-                <textarea
-                  className="va-input va-textarea"
-                  placeholder="Review note / approval reason"
-                  value={scriptReviewNoteInput}
-                  onChange={(event) => setScriptReviewNoteInput(event.target.value)}
-                  rows={2}
-                />
-                <div className="va-inline-tools">
-                  <button
-                    type="button"
-                    disabled={busyAction.length > 0}
-                    onClick={() => { void reviewCallScript('approve'); }}
-                  >
-                    Approve
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busyAction.length > 0}
-                    onClick={() => { void reviewCallScript('reject'); }}
-                  >
-                    Reject
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busyAction.length > 0}
-                    onClick={() => { void promoteCallScriptLive(); }}
-                  >
-                    Promote Live
-                  </button>
-                </div>
-                <h3>Simulation</h3>
-                <textarea
-                  className="va-input va-textarea"
-                  placeholder={'Variables JSON, e.g. {"customer_name":"Ada"}'}
-                  value={scriptSimulationVariablesInput}
-                  onChange={(event) => setScriptSimulationVariablesInput(event.target.value)}
-                  rows={3}
-                />
-                <div className="va-inline-tools">
-                  <button
-                    type="button"
-                    disabled={busyAction.length > 0}
-                    onClick={() => { void simulateCallScript(); }}
-                  >
-                    Run Simulation
-                  </button>
-                </div>
-                {scriptSimulationResult ? (
-                  <pre>
-                    {JSON.stringify(asRecord(scriptSimulationResult).simulation || scriptSimulationResult, null, 2)}
-                  </pre>
-                ) : null}
-              </>
-            ) : (
-              <p className="va-muted">Select a script from the list to edit and review.</p>
-            )}
-          </div>
-        </section>
-      ) : null}
-
-      {activeModule === 'users' && hasCapability('users_manage') ? (
-        <section className="va-grid">
-          <div className="va-card">
-            <h3>User & Role Admin</h3>
-            <div className="va-inline-tools">
-              <input
-                className="va-input"
-                placeholder="Search Telegram ID"
-                value={userSearch}
-                onChange={(event) => setUserSearch(event.target.value)}
-              />
-              <select
-                className="va-input"
-                value={userSortBy}
-                onChange={(event) => setUserSortBy(event.target.value)}
-              >
-                <option value="last_activity">Last Activity</option>
-                <option value="total_calls">Total Calls</option>
-                <option value="role">Role</option>
-              </select>
-              <select
-                className="va-input"
-                value={userSortDir}
-                onChange={(event) => setUserSortDir(event.target.value)}
-              >
-                <option value="desc">DESC</option>
-                <option value="asc">ASC</option>
-              </select>
-              <button type="button" onClick={() => { void refreshUsersModule(); }}>
-                Refresh Users
-              </button>
-            </div>
-            <p className="va-muted">
-              Total users tracked: <strong>{toInt(usersPayload.total, usersRows.length)}</strong>
-            </p>
-            <ul className="va-list">
-              {usersRows.slice(0, 80).map((user) => {
-                const telegramId = toText(user.telegram_id, '');
-                const role = toText(user.role, 'viewer');
-                return (
-                  <li key={`user-role-${telegramId}`}>
-                    <strong>{telegramId || 'unknown'}</strong>
-                    <span>Role: {role} ({toText(user.role_source, 'inferred')})</span>
-                    <span>Calls: {toInt(user.total_calls)} | Failed: {toInt(user.failed_calls)}</span>
-                    <span>Last activity: {formatTime(user.last_activity)}</span>
-                    <div className="va-inline-tools">
-                      <button type="button" onClick={() => { void handleApplyUserRole(telegramId, 'admin'); }}>
-                        Promote Admin
-                      </button>
-                      <button type="button" onClick={() => { void handleApplyUserRole(telegramId, 'operator'); }}>
-                        Set Operator
-                      </button>
-                      <button type="button" onClick={() => { void handleApplyUserRole(telegramId, 'viewer'); }}>
-                        Demote Viewer
-                      </button>
-                    </div>
-                  </li>
-                );
-              })}
-            </ul>
-          </div>
-        </section>
-      ) : null}
-
-      {activeModule === 'audit' && hasCapability('dashboard_view') ? (
-        <section className="va-grid">
-          <div className="va-card">
-            <h3>Audit & Incident Center</h3>
-            <div className="va-inline-tools">
-              <button type="button" onClick={() => { void refreshAuditModule(); }}>
-                Refresh Alerts
-              </button>
-              <button
-                type="button"
-                disabled={!hasCapability('sms_bulk_manage')}
-                onClick={() => { void runbookAction('runbook.sms.reconcile'); }}
-              >
-                Runbook: SMS Reconcile
-              </button>
-              <button
-                type="button"
-                disabled={!hasCapability('provider_manage')}
-                onClick={() => { void runbookAction('runbook.payment.reconcile'); }}
-              >
-                Runbook: Payment Reconcile
-              </button>
-              <button
-                type="button"
-                disabled={!hasCapability('provider_manage')}
-                onClick={() => { void runbookAction('runbook.provider.preflight'); }}
-              >
-                Runbook: Provider Preflight
-              </button>
-            </div>
-            <p className="va-muted">
-              Alert count: <strong>{toInt(incidentsPayload.total_alerts, incidentRows.length)}</strong>
-            </p>
-            <ul className="va-list">
-              {incidentRows.slice(0, 30).map((incident, index) => (
-                <li key={`incident-${index}`}>
-                  <strong>{toText(incident.service_name, 'service')}</strong>
-                  <span>Status: {toText(incident.status, 'unknown')}</span>
-                  <span>{toText((asRecord(incident.details).message), toText(incident.details, ''))}</span>
-                  <span>{formatTime(incident.timestamp)}</span>
-                </li>
-              ))}
-            </ul>
-            {runbookRows.length > 0 ? (
-              <>
-                <h3>Runbook Actions</h3>
-                <ul className="va-list">
-                  {runbookRows.map((runbook, index) => {
-                    const action = toText(runbook.action, '');
-                    const capability = toText(runbook.capability, 'dashboard_view');
-                    return (
-                      <li key={`runbook-${index}`}>
-                        <strong>{toText(runbook.label, 'Runbook')}</strong>
-                        <span>{action || 'unknown_action'}</span>
-                        <button
-                          type="button"
-                          disabled={busyAction.length > 0 || !action || !hasCapability(capability)}
-                          onClick={() => { void runbookAction(action, {}); }}
-                        >
-                          Execute
-                        </button>
-                      </li>
-                    );
-                  })}
-                </ul>
-              </>
-            ) : null}
-          </div>
-          <div className="va-card">
-            <h3>Immutable Activity Timeline</h3>
-            <ul className="va-list">
-              {auditRows.slice(0, 40).map((row, index) => (
-                <li key={`audit-${index}`}>
-                  <strong>{toText(row.service_name, 'service')}</strong>
-                  <span>Status: {toText(row.status, 'unknown')}</span>
-                  <span>{toText((asRecord(row.details).message), toText(row.details, ''))}</span>
-                  <span>{formatTime(row.timestamp)}</span>
-                </li>
-              ))}
-            </ul>
-          </div>
         </section>
       ) : null}
     </main>

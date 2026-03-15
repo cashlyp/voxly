@@ -1,6 +1,6 @@
-# Voxly Mini App (Vercel)
+# Voicednut Mini App (Vercel)
 
-This project is the Telegram Mini App admin console for Voxly, scaffolded via:
+This project is the Telegram Mini App admin console for Voicednut, scaffolded via:
 
 ```bash
 npx @tma.js/create-mini-app@latest
