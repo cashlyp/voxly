@@ -375,6 +375,7 @@ const streamAuthMaxSkewMs = Number(
 const miniAppUrl = readEnv("MINI_APP_URL") || "";
 const miniAppSessionSecret =
   readEnv("MINI_APP_SESSION_SECRET") || apiHmacSecret || adminApiToken || "";
+const miniAppAllowUnknownUsers = readBooleanEnv("MINI_APP_ALLOW_UNKNOWN_USERS", false);
 const miniAppSessionTtlSeconds = Number(
   readEnv("MINI_APP_SESSION_TTL_SECONDS") || "900",
 );
@@ -955,6 +956,7 @@ module.exports = {
   miniApp: {
     url: miniAppUrl,
     sessionSecret: miniAppSessionSecret,
+    allowUnknownUsers: miniAppAllowUnknownUsers,
     sessionTtlSeconds: Number.isFinite(miniAppSessionTtlSeconds)
       ? Math.max(60, Math.floor(miniAppSessionTtlSeconds))
       : 900,

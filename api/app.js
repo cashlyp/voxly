@@ -262,6 +262,7 @@ const miniAppReplayFallbackCache = new Map(); // queryId/hash -> expiresAtMs
 const miniAppSessionRevocationFallback = new Map(); // jti -> expiresAtMs
 const miniAppAlertCounters = new Map(); // signal -> { count, windowStartMs }
 const miniAppAlertCooldowns = new Map(); // signal -> cooldownUntilMs
+const miniAppRoleOverrides = new Map(); // telegram_id -> role
 const callRuntimePersistTimers = new Map(); // callSid -> timeoutId
 const callRuntimePendingWrites = new Map(); // callSid -> patch
 const callToolInFlight = new Map(); // callSid -> { tool, startedAt }
@@ -299,6 +300,8 @@ const CALL_PROVIDER_SETTING_KEY = "call_provider_v1";
 const SMS_PROVIDER_SETTING_KEY = "sms_provider_v1";
 const EMAIL_PROVIDER_SETTING_KEY = "email_provider_v1";
 const PAYMENT_FEATURE_SETTING_KEY = "payment_feature_config_v1";
+const MINI_APP_ROLE_OVERRIDES_SETTING_KEY = "miniapp_role_overrides_v1";
+const MINI_APP_AUDIT_DEFAULT_LIMIT = 40;
 const DEEPGRAM_VOICE_MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 const CALL_PHASE_ORDER = Object.freeze([
   "dialing",
@@ -7180,22 +7183,435 @@ function recordMiniAppRouteTelemetry(req, res, durationMs) {
   db?.logServiceHealth?.("miniapp_route", payload.ok ? "ok" : "error", payload).catch(() => {});
 }
 
-function isTelegramAdminUser(telegramId) {
+function getConfiguredMiniAppRoles() {
+  const roles = new Map();
+  const append = (values, role) => {
+    for (const value of values) {
+      const normalized = String(value || "").trim();
+      if (!normalized) continue;
+      // Keep highest privilege if duplicates exist.
+      if (roles.get(normalized) === "admin") continue;
+      if (roles.get(normalized) === "operator" && role === "viewer") continue;
+      roles.set(normalized, role);
+    }
+  };
+  append(
+    [
+      ...(Array.isArray(config.telegram?.viewerUserIds) ? config.telegram.viewerUserIds : []),
+      ...(Array.isArray(config.telegram?.viewerChatIds) ? config.telegram.viewerChatIds : []),
+    ],
+    "viewer",
+  );
+  append(
+    [
+      ...(Array.isArray(config.telegram?.operatorUserIds)
+        ? config.telegram.operatorUserIds
+        : []),
+      ...(Array.isArray(config.telegram?.operatorChatIds)
+        ? config.telegram.operatorChatIds
+        : []),
+    ],
+    "operator",
+  );
+  append(
+    [
+      ...(Array.isArray(config.telegram?.adminUserIds) ? config.telegram.adminUserIds : []),
+      ...(Array.isArray(config.telegram?.adminChatIds) ? config.telegram.adminChatIds : []),
+    ],
+    "admin",
+  );
+  return roles;
+}
+
+function getConfiguredMiniAppAdminIds() {
+  const adminIds = new Set();
+  for (const [id, role] of getConfiguredMiniAppRoles().entries()) {
+    if (role === "admin") {
+      adminIds.add(id);
+    }
+  }
+  return adminIds;
+}
+
+function normalizeMiniAppRole(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (normalized === "admin") return "admin";
+  if (normalized === "operator") return "operator";
+  if (normalized === "viewer") return "viewer";
+  return null;
+}
+
+function listMiniAppRoleOverrides() {
+  return Array.from(miniAppRoleOverrides.entries())
+    .map(([telegram_id, role]) => ({
+      telegram_id: String(telegram_id || "").trim(),
+      role: normalizeMiniAppRole(role),
+    }))
+    .filter((entry) => entry.telegram_id && entry.role);
+}
+
+async function persistMiniAppRoleOverrides() {
+  if (!db?.setSetting) return;
+  try {
+    await db.setSetting(
+      MINI_APP_ROLE_OVERRIDES_SETTING_KEY,
+      JSON.stringify({ users: listMiniAppRoleOverrides() }),
+    );
+  } catch (error) {
+    console.error("Failed to persist Mini App role overrides:", error);
+  }
+}
+
+async function loadMiniAppRoleOverrides() {
+  miniAppRoleOverrides.clear();
+  if (!db?.getSetting) return;
+  try {
+    const raw = await db.getSetting(MINI_APP_ROLE_OVERRIDES_SETTING_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    const users = Array.isArray(parsed?.users) ? parsed.users : [];
+    for (const row of users) {
+      const telegramId = String(row?.telegram_id || "").trim();
+      const role = normalizeMiniAppRole(row?.role);
+      if (!telegramId || !role) continue;
+      miniAppRoleOverrides.set(telegramId, role);
+    }
+  } catch (error) {
+    console.error("Failed to load Mini App role overrides:", error);
+  }
+}
+
+function resolveMiniAppUserRole(telegramId) {
+  const id = String(telegramId || "").trim();
+  if (!id) return null;
+  const configuredRole = normalizeMiniAppRole(getConfiguredMiniAppRoles().get(id));
+  if (configuredRole) return configuredRole;
+  const override = normalizeMiniAppRole(miniAppRoleOverrides.get(id));
+  if (override) return override;
+  return null;
+}
+
+function resolveMiniAppRoleSource(telegramId) {
+  const id = String(telegramId || "").trim();
+  if (!id) return "inferred";
+  if (getConfiguredMiniAppRoles().has(id)) return "config";
+  if (miniAppRoleOverrides.has(id)) return "override";
+  return "inferred";
+}
+
+function isMiniAppUserAllowed(telegramId) {
   const id = String(telegramId || "").trim();
   if (!id) return false;
-  const adminUserIds = Array.isArray(config.telegram?.adminUserIds)
-    ? config.telegram.adminUserIds
-    : [];
-  const adminChatIds = Array.isArray(config.telegram?.adminChatIds)
-    ? config.telegram.adminChatIds
-    : [];
-  return adminUserIds.some((item) => String(item).trim() === id)
-    || adminChatIds.some((item) => String(item).trim() === id);
+  if (resolveMiniAppUserRole(id)) return true;
+  if (config.miniApp?.allowUnknownUsers === true) return true;
+  return false;
+}
+
+function isTelegramAdminUser(telegramId) {
+  return resolveMiniAppUserRole(telegramId) === "admin";
+}
+
+async function queryMiniAppRecentUserSessions(options = {}) {
+  if (!db?.db) return [];
+  const limit = Math.max(1, Math.min(200, Number(options.limit) || 80));
+  return new Promise((resolve) => {
+    db.db.all(
+      `
+        SELECT
+          telegram_chat_id,
+          total_calls,
+          successful_calls,
+          failed_calls,
+          total_duration,
+          session_start,
+          session_end,
+          last_activity
+        FROM user_sessions
+        ORDER BY datetime(last_activity) DESC
+        LIMIT ?
+      `,
+      [limit],
+      (error, rows) => {
+        if (error) {
+          console.error("miniapp_users_recent_query_failed", buildErrorDetails(error));
+          resolve([]);
+          return;
+        }
+        resolve(Array.isArray(rows) ? rows : []);
+      },
+    );
+  });
+}
+
+async function listMiniAppUsers(options = {}) {
+  const limit = Math.max(1, Math.min(200, Number(options.limit) || 80));
+  const offset = Math.max(0, Number(options.offset) || 0);
+  const search = String(options.search || "")
+    .trim()
+    .toLowerCase();
+  const sortBy = String(options.sortBy || "last_activity")
+    .trim()
+    .toLowerCase();
+  const sortDir = String(options.sortDir || "desc")
+    .trim()
+    .toLowerCase() === "asc"
+    ? "asc"
+    : "desc";
+  const rowsById = new Map();
+  const recentSessions = await queryMiniAppRecentUserSessions({ limit: 500 });
+
+  for (const [id, role] of getConfiguredMiniAppRoles().entries()) {
+    rowsById.set(id, {
+      telegram_id: id,
+      role: normalizeMiniAppRole(role) || "viewer",
+      role_source: "config",
+      total_calls: 0,
+      successful_calls: 0,
+      failed_calls: 0,
+      total_duration: 0,
+      session_start: null,
+      session_end: null,
+      last_activity: null,
+    });
+  }
+  for (const [id, rawRole] of miniAppRoleOverrides.entries()) {
+    const normalized = String(id || "").trim();
+    const role = normalizeMiniAppRole(rawRole);
+    if (!normalized || !role) continue;
+    const current = rowsById.get(normalized) || {
+      telegram_id: normalized,
+      role: role,
+      role_source: "override",
+      total_calls: 0,
+      successful_calls: 0,
+      failed_calls: 0,
+      total_duration: 0,
+      session_start: null,
+      session_end: null,
+      last_activity: null,
+    };
+    if (current.role_source !== "config") {
+      current.role = role;
+      current.role_source = "override";
+    }
+    rowsById.set(normalized, current);
+  }
+  for (const row of recentSessions) {
+    const id = String(row?.telegram_chat_id || "").trim();
+    if (!id) continue;
+    const current = rowsById.get(id) || {
+      telegram_id: id,
+      role: resolveMiniAppUserRole(id) || "viewer",
+      role_source: resolveMiniAppRoleSource(id),
+      total_calls: 0,
+      successful_calls: 0,
+      failed_calls: 0,
+      total_duration: 0,
+      session_start: null,
+      session_end: null,
+      last_activity: null,
+    };
+    current.total_calls = Number(row?.total_calls) || 0;
+    current.successful_calls = Number(row?.successful_calls) || 0;
+    current.failed_calls = Number(row?.failed_calls) || 0;
+    current.total_duration = Number(row?.total_duration) || 0;
+    current.session_start = row?.session_start || null;
+    current.session_end = row?.session_end || null;
+    current.last_activity = row?.last_activity || null;
+    rowsById.set(id, current);
+  }
+
+  let rows = Array.from(rowsById.values());
+  if (search) {
+    rows = rows.filter((row) =>
+      String(row.telegram_id || "")
+        .toLowerCase()
+        .includes(search),
+    );
+  }
+  rows.sort((left, right) => {
+    let compared = 0;
+    if (sortBy === "total_calls") {
+      compared = Number(left.total_calls || 0) - Number(right.total_calls || 0);
+    } else if (sortBy === "role") {
+      compared = String(left.role || "").localeCompare(String(right.role || ""));
+    } else {
+      compared = String(left.last_activity || "").localeCompare(String(right.last_activity || ""));
+    }
+    if (compared === 0) {
+      compared = String(left.telegram_id || "").localeCompare(String(right.telegram_id || ""));
+    }
+    return sortDir === "asc" ? compared : -compared;
+  });
+
+  return {
+    total: rows.length,
+    rows: rows.slice(offset, offset + limit),
+    limit,
+    offset,
+  };
+}
+
+async function setMiniAppUserRole(options = {}) {
+  const telegramId = String(options.telegramId || "").trim();
+  const nextRole = normalizeMiniAppRole(options.role);
+  const reason = String(options.reason || "").trim().slice(0, 500) || null;
+  const actor = String(options.actor || "").trim() || "miniapp_admin";
+  if (!telegramId) {
+    throw new Error("telegram_id is required");
+  }
+  if (!nextRole) {
+    throw new Error("role must be one of: admin, operator, viewer");
+  }
+  if (!reason) {
+    throw new Error("reason is required for role changes");
+  }
+  if (getConfiguredMiniAppAdminIds().has(telegramId) && nextRole !== "admin") {
+    throw new Error("Configured admin users cannot be demoted via Mini App");
+  }
+  miniAppRoleOverrides.set(telegramId, nextRole);
+  await persistMiniAppRoleOverrides();
+  db?.logServiceHealth?.("miniapp_users", "role_changed", {
+    telegram_id: telegramId,
+    role: nextRole,
+    actor,
+    reason,
+    at: new Date().toISOString(),
+  }).catch(() => {});
+  return {
+    telegram_id: telegramId,
+    role: nextRole,
+    role_source: resolveMiniAppRoleSource(telegramId),
+    reason,
+  };
+}
+
+async function getMiniAppAuditFeed(options = {}) {
+  const limit = Math.max(
+    1,
+    Math.min(200, Number(options.limit) || MINI_APP_AUDIT_DEFAULT_LIMIT),
+  );
+  const hours = Math.max(1, Math.min(720, Number(options.hours) || 24));
+  const summary = db?.getServiceHealthSummary
+    ? await db.getServiceHealthSummary(hours).catch(() => null)
+    : null;
+  if (!db?.db) {
+    return {
+      summary,
+      rows: [],
+      limit,
+      hours,
+    };
+  }
+  const rows = await new Promise((resolve) => {
+    db.db.all(
+      `
+        SELECT
+          id,
+          service_name,
+          status,
+          details,
+          timestamp
+        FROM service_health_logs
+        WHERE timestamp >= datetime('now', ?)
+        ORDER BY datetime(timestamp) DESC
+        LIMIT ?
+      `,
+      [`-${hours} hours`, limit],
+      (error, resultRows) => {
+        if (error) {
+          console.error("miniapp_audit_query_failed", buildErrorDetails(error));
+          resolve([]);
+          return;
+        }
+        resolve(Array.isArray(resultRows) ? resultRows : []);
+      },
+    );
+  });
+  return {
+    summary,
+    rows: rows.map((row) => ({
+      id: row?.id || null,
+      service_name: row?.service_name || null,
+      status: row?.status || null,
+      details: safeJsonParse(row?.details, row?.details || null),
+      timestamp: row?.timestamp || null,
+    })),
+    limit,
+    hours,
+  };
+}
+
+async function getMiniAppIncidentSummary(options = {}) {
+  const hours = Math.max(1, Math.min(720, Number(options.hours) || 24));
+  const auditFeed = await getMiniAppAuditFeed({
+    hours,
+    limit: Math.max(20, Math.min(120, Number(options.limit) || 80)),
+  });
+  const alerts = [];
+  for (const entry of auditFeed.rows) {
+    const serviceName = String(entry?.service_name || "").toLowerCase();
+    const status = String(entry?.status || "").toLowerCase();
+    if (
+      status.includes("error")
+      || status.includes("degraded")
+      || status.includes("failed")
+      || status.includes("threshold")
+      || serviceName === "miniapp_alert"
+    ) {
+      alerts.push({
+        id: entry.id,
+        service_name: entry.service_name,
+        status: entry.status,
+        details: entry.details,
+        timestamp: entry.timestamp,
+      });
+    }
+    if (alerts.length >= 40) break;
+  }
+  return {
+    success: true,
+    alerts,
+    total_alerts: alerts.length,
+    hours,
+    runbooks: [
+      {
+        action: "runbook.sms.reconcile",
+        label: "Reconcile stale SMS statuses",
+        capability: "sms_bulk_manage",
+      },
+      {
+        action: "runbook.payment.reconcile",
+        label: "Reconcile stale payment sessions",
+        capability: "provider_manage",
+      },
+      {
+        action: "runbook.provider.preflight",
+        label: "Run provider preflight checks",
+        capability: "provider_manage",
+      },
+    ],
+    summary: auditFeed.summary,
+  };
 }
 
 function getMiniAppCapabilitiesForRole(role) {
-  if (String(role || "").toLowerCase() !== "admin") {
+  const normalizedRole = String(role || "")
+    .trim()
+    .toLowerCase();
+  if (normalizedRole === "viewer") {
     return ["dashboard_view"];
+  }
+  if (normalizedRole === "operator") {
+    return [
+      "dashboard_view",
+      "provider_manage",
+      "sms_bulk_manage",
+      "email_bulk_manage",
+      "dlq_manage",
+    ];
   }
   return [
     "dashboard_view",
@@ -7238,6 +7654,35 @@ async function requireMiniAppSession(req, res, next) {
     const session = verifyMiniAppSessionToken(token, config.miniApp?.sessionSecret, {
       skewSeconds: 30,
     });
+    const telegramId = String(session.telegram_id || "").trim();
+    if (!telegramId) {
+      noteMiniAppAlertSignal("auth_failures", {
+        route: req.path || req.originalUrl || "/miniapp",
+        code: "miniapp_session_missing_telegram_id",
+        request_id: req.requestId || null,
+      });
+      return sendApiError(
+        res,
+        401,
+        "miniapp_auth_invalid",
+        "Mini App session token is missing telegram_id",
+        req.requestId || null,
+      );
+    }
+    if (!isMiniAppUserAllowed(telegramId)) {
+      noteMiniAppAlertSignal("auth_failures", {
+        route: req.path || req.originalUrl || "/miniapp",
+        code: "miniapp_admin_required",
+        request_id: req.requestId || null,
+      });
+      return sendApiError(
+        res,
+        403,
+        "miniapp_admin_required",
+        "Mini App access is restricted to authorized Telegram users",
+        req.requestId || null,
+      );
+    }
     const isRevoked = await isMiniAppSessionRevoked(String(session.jti || ""), {
       requestId: req.requestId || null,
     });
@@ -7255,7 +7700,15 @@ async function requireMiniAppSession(req, res, next) {
         req.requestId || null,
       );
     }
-    req.miniAppSession = session;
+    const authoritativeRole = resolveMiniAppUserRole(telegramId) || "viewer";
+    const authoritativeCaps = getMiniAppCapabilitiesForRole(authoritativeRole);
+    req.miniAppSession = {
+      ...session,
+      telegram_id: telegramId,
+      role: authoritativeRole,
+      caps: authoritativeCaps,
+      role_source: resolveMiniAppRoleSource(telegramId),
+    };
     return next();
   } catch (error) {
     noteMiniAppAlertSignal("auth_failures", {
@@ -7312,7 +7765,8 @@ function buildMiniAppSessionSummary(session = {}) {
     telegram_id: session.telegram_id || null,
     username: session.username || null,
     first_name: session.first_name || null,
-    role: session.role || "user",
+    role: session.role || "viewer",
+    role_source: session.role_source || null,
     caps: Array.isArray(session.caps) ? session.caps : [],
     exp: Number.isFinite(Number(session.exp)) ? Number(session.exp) : null,
   };
@@ -7373,8 +7827,495 @@ function buildInternalHmacHeaders(method, requestPath, body) {
   };
 }
 
+function parseMiniAppCallScriptPath(pathname = "") {
+  const normalizedPath = String(pathname || "").trim();
+  if (normalizedPath === "/api/call-scripts") {
+    return { kind: "list" };
+  }
+  const match = normalizedPath.match(
+    /^\/api\/call-scripts\/([^/]+)(?:\/(submit-review|review|promote-live|simulate))?$/,
+  );
+  if (!match) return null;
+  const scriptIdRaw = String(match[1] || "").trim();
+  const scriptId = Number(scriptIdRaw);
+  if (!Number.isFinite(scriptId) || scriptId <= 0) {
+    return { kind: "invalid_id", scriptIdRaw };
+  }
+  const action = match[2] || "update";
+  return {
+    kind: "script_action",
+    action,
+    scriptId: Math.trunc(scriptId),
+  };
+}
+
+function getMiniAppScriptActor(options = {}) {
+  const requestId = String(options.requestId || "").trim();
+  return requestId ? `miniapp:${requestId}` : "miniapp";
+}
+
+async function runMiniAppCallScriptLocalBridge(options = {}) {
+  const method = String(options.method || "GET").toUpperCase();
+  const path = String(options.path || "").trim();
+  const bodyInput = options.body && typeof options.body === "object" ? options.body : {};
+  const parsedPath = parseMiniAppCallScriptPath(path);
+  if (!parsedPath) {
+    return null;
+  }
+  if (parsedPath.kind === "invalid_id") {
+    return {
+      ok: false,
+      status: 400,
+      data: {
+        success: false,
+        error: "Invalid script id",
+      },
+    };
+  }
+  try {
+    if (parsedPath.kind === "list") {
+      if (method !== "GET") {
+        return {
+          ok: false,
+          status: 405,
+          data: { success: false, error: "Method not allowed for call script listing" },
+        };
+      }
+      const data = await getMiniAppCallScriptSnapshot(options.query || {});
+      return {
+        ok: true,
+        status: 200,
+        data,
+      };
+    }
+
+    const scriptId = parsedPath.scriptId;
+    const existing = normalizeScriptTemplateRecord(
+      await db?.getCallTemplateById?.(scriptId),
+    );
+    if (!existing) {
+      return {
+        ok: false,
+        status: 404,
+        data: { success: false, error: "Script not found" },
+      };
+    }
+
+    if (parsedPath.action === "update") {
+      if (method !== "PUT") {
+        return {
+          ok: false,
+          status: 405,
+          data: { success: false, error: "Method not allowed for call script update" },
+        };
+      }
+      const requestBody = isPlainObject(bodyInput) ? bodyInput : {};
+      const updates = { ...requestBody };
+      if (updates.name !== undefined) {
+        const normalizedName = normalizeCallTemplateName(updates.name);
+        if (!normalizedName) {
+          return {
+            ok: false,
+            status: 400,
+            data: { success: false, error: "name cannot be empty" },
+          };
+        }
+        const duplicate = await findCallTemplateNameCollision(normalizedName, scriptId);
+        if (duplicate) {
+          return {
+            ok: false,
+            status: 409,
+            data: {
+              success: false,
+              error: `Script '${normalizedName}' already exists`,
+              code: "SCRIPT_NAME_DUPLICATE",
+              suggested_name: await suggestCallTemplateName(normalizedName, scriptId),
+            },
+          };
+        }
+        updates.name = normalizedName;
+      }
+
+      let warnings = [];
+      if (callScriptPaymentFieldTouched(requestBody)) {
+        const paymentSettings = normalizePaymentSettings(
+          {
+            payment_enabled: updates.payment_enabled ?? existing.payment_enabled,
+            payment_connector:
+              updates.payment_connector ?? existing.payment_connector,
+            payment_amount: updates.payment_amount ?? existing.payment_amount,
+            payment_currency:
+              updates.payment_currency ?? existing.payment_currency,
+            payment_description:
+              updates.payment_description ?? existing.payment_description,
+            payment_start_message:
+              updates.payment_start_message ?? existing.payment_start_message,
+            payment_success_message:
+              updates.payment_success_message ?? existing.payment_success_message,
+            payment_failure_message:
+              updates.payment_failure_message ?? existing.payment_failure_message,
+            payment_retry_message:
+              updates.payment_retry_message ?? existing.payment_retry_message,
+          },
+          {
+            provider: currentProvider,
+            requireConnectorWhenEnabled: true,
+          },
+        );
+        if (paymentSettings.errors.length) {
+          return {
+            ok: false,
+            status: 400,
+            data: { success: false, error: paymentSettings.errors.join(" ") },
+          };
+        }
+        warnings = paymentSettings.warnings;
+        Object.assign(updates, paymentSettings.normalized);
+      }
+
+      if (Object.prototype.hasOwnProperty.call(requestBody, "payment_policy")) {
+        const rawPolicy = requestBody.payment_policy;
+        if (
+          typeof rawPolicy === "string" &&
+          rawPolicy.trim() &&
+          !parsePaymentPolicy(rawPolicy)
+        ) {
+          return {
+            ok: false,
+            status: 400,
+            data: {
+              success: false,
+              error: "payment_policy must be a valid JSON object.",
+            },
+          };
+        }
+        const paymentPolicy = normalizePaymentPolicy(parsePaymentPolicy(rawPolicy) || {});
+        if (paymentPolicy.errors.length) {
+          return {
+            ok: false,
+            status: 400,
+            data: { success: false, error: paymentPolicy.errors.join(" ") },
+          };
+        }
+        updates.payment_policy =
+          Object.keys(paymentPolicy.normalized).length > 0
+            ? paymentPolicy.normalized
+            : null;
+        warnings = [...warnings, ...paymentPolicy.warnings];
+      }
+
+      const objectiveMetadata = normalizeCallScriptObjectiveMetadata(requestBody, {
+        allowPartial: true,
+      });
+      if (objectiveMetadata.errors.length) {
+        return {
+          ok: false,
+          status: 400,
+          data: { success: false, error: objectiveMetadata.errors.join(" ") },
+        };
+      }
+      Object.assign(updates, objectiveMetadata.normalized);
+      warnings = [...warnings, ...objectiveMetadata.warnings];
+
+      const updatedRows = await db.updateCallTemplate(scriptId, updates);
+      if (!updatedRows) {
+        return {
+          ok: false,
+          status: 404,
+          data: { success: false, error: "Script not found" },
+        };
+      }
+      const previousLifecycle = normalizeCallScriptLifecycleState(
+        existing.lifecycle_state,
+        "draft",
+      );
+      if (["review", "approved", "live"].includes(previousLifecycle)) {
+        await db.setCallTemplateLifecycle(scriptId, {
+          lifecycle_state: "draft",
+          submitted_for_review_at: null,
+          reviewed_at: null,
+          reviewed_by: null,
+          review_note: null,
+          live_at: null,
+          live_by: null,
+        });
+      }
+      const script = normalizeScriptTemplateRecord(await db.getCallTemplateById(scriptId));
+      if (inboundDefaultScriptId === scriptId) {
+        inboundDefaultScript = script || null;
+        inboundDefaultLoadedAt = Date.now();
+      }
+      await persistCallTemplateVersionSnapshot(script, {
+        reason: "update",
+        actor: getMiniAppScriptActor(options),
+      });
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          success: true,
+          script: {
+            ...script,
+            lifecycle: buildCallScriptLifecycleCard(script),
+          },
+          warnings,
+        },
+      };
+    }
+
+    if (parsedPath.action === "submit-review") {
+      if (method !== "POST") {
+        return {
+          ok: false,
+          status: 405,
+          data: { success: false, error: "Method not allowed for submit-review" },
+        };
+      }
+      if (!existing.prompt || !existing.first_message) {
+        return {
+          ok: false,
+          status: 400,
+          data: {
+            success: false,
+            error: "Script must include prompt and first_message before review",
+          },
+        };
+      }
+      const lifecycleState = normalizeCallScriptLifecycleState(
+        existing.lifecycle_state,
+        "draft",
+      );
+      if (lifecycleState !== "draft" && lifecycleState !== "review") {
+        return {
+          ok: false,
+          status: 400,
+          data: {
+            success: false,
+            error: `Only draft scripts can be submitted for review (current state: ${lifecycleState})`,
+          },
+        };
+      }
+      if (lifecycleState === "draft") {
+        await db.setCallTemplateLifecycle(scriptId, {
+          lifecycle_state: "review",
+          submitted_for_review_at: new Date().toISOString(),
+          reviewed_at: null,
+          reviewed_by: null,
+          review_note: null,
+        });
+      }
+      const updated = normalizeScriptTemplateRecord(await db.getCallTemplateById(scriptId));
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          success: true,
+          script: { ...updated, lifecycle: buildCallScriptLifecycleCard(updated) },
+        },
+      };
+    }
+
+    if (parsedPath.action === "review") {
+      if (method !== "POST") {
+        return {
+          ok: false,
+          status: 405,
+          data: { success: false, error: "Method not allowed for review" },
+        };
+      }
+      const decision = String(bodyInput?.decision || "").trim().toLowerCase();
+      if (!["approve", "reject"].includes(decision)) {
+        return {
+          ok: false,
+          status: 400,
+          data: { success: false, error: "decision must be approve or reject" },
+        };
+      }
+      const lifecycleState = normalizeCallScriptLifecycleState(
+        existing.lifecycle_state,
+        "draft",
+      );
+      if (lifecycleState !== "review") {
+        return {
+          ok: false,
+          status: 400,
+          data: {
+            success: false,
+            error: `Script must be in review before ${decision} (current state: ${lifecycleState})`,
+          },
+        };
+      }
+      const note = bodyInput?.note ?? null;
+      const actor = getMiniAppScriptActor(options);
+      if (decision === "approve") {
+        await db.setCallTemplateLifecycle(scriptId, {
+          lifecycle_state: "approved",
+          reviewed_at: new Date().toISOString(),
+          reviewed_by: actor,
+          review_note: note,
+        });
+      } else {
+        await db.setCallTemplateLifecycle(scriptId, {
+          lifecycle_state: "draft",
+          reviewed_at: new Date().toISOString(),
+          reviewed_by: actor,
+          review_note:
+            note === null || note === undefined || String(note).trim() === ""
+              ? "Returned to draft during review."
+              : note,
+        });
+      }
+      const updated = normalizeScriptTemplateRecord(await db.getCallTemplateById(scriptId));
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          success: true,
+          decision,
+          script: { ...updated, lifecycle: buildCallScriptLifecycleCard(updated) },
+        },
+      };
+    }
+
+    if (parsedPath.action === "promote-live") {
+      if (method !== "POST") {
+        return {
+          ok: false,
+          status: 405,
+          data: { success: false, error: "Method not allowed for promote-live" },
+        };
+      }
+      const lifecycleState = normalizeCallScriptLifecycleState(
+        existing.lifecycle_state,
+        "draft",
+      );
+      if (lifecycleState !== "approved" && lifecycleState !== "live") {
+        return {
+          ok: false,
+          status: 400,
+          data: {
+            success: false,
+            error: "Script must be approved before it can be promoted to live",
+          },
+        };
+      }
+      if (lifecycleState !== "live") {
+        await db.promoteCallTemplateLive(scriptId, getMiniAppScriptActor(options));
+      }
+      const updated = normalizeScriptTemplateRecord(await db.getCallTemplateById(scriptId));
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          success: true,
+          script: { ...updated, lifecycle: buildCallScriptLifecycleCard(updated) },
+        },
+      };
+    }
+
+    if (parsedPath.action === "simulate") {
+      if (method !== "POST") {
+        return {
+          ok: false,
+          status: 405,
+          data: { success: false, error: "Method not allowed for simulate" },
+        };
+      }
+      const rawVariables = isPlainObject(bodyInput?.variables)
+        ? bodyInput.variables
+        : {};
+      const variables = {};
+      Object.entries(rawVariables).forEach(([key, value]) => {
+        const normalizedKey = String(key || "").trim();
+        if (!normalizedKey) return;
+        variables[normalizedKey] =
+          value === null || value === undefined ? "" : String(value);
+      });
+      const mergedText = `${existing.prompt || ""}\n${existing.first_message || ""}`;
+      const requiredVariables = extractCallTemplateVariables(mergedText);
+      const missingVariables = requiredVariables.filter(
+        (key) => !Object.prototype.hasOwnProperty.call(variables, key),
+      );
+      const renderedPrompt = renderCallTemplateWithVariables(
+        existing.prompt || "",
+        variables,
+      );
+      const renderedFirstMessage = renderCallTemplateWithVariables(
+        existing.first_message || "",
+        variables,
+      );
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          success: true,
+          simulation: {
+            script_id: existing.id,
+            script_name: existing.name,
+            lifecycle_state: existing.lifecycle_state,
+            required_variables: requiredVariables,
+            missing_variables: missingVariables,
+            variables,
+            rendered_prompt: renderedPrompt,
+            rendered_first_message: renderedFirstMessage,
+          },
+        },
+      };
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      status: 500,
+      data: {
+        success: false,
+        error: String(error?.message || "Call script bridge operation failed"),
+      },
+    };
+  }
+
+  return {
+    ok: false,
+    status: 400,
+    data: {
+      success: false,
+      error: "Unsupported call script bridge action",
+    },
+  };
+}
+
 async function callMiniAppBridgeApi(options = {}) {
   const method = String(options.method || "GET").toUpperCase();
+  const path = String(options.path || "/").trim() || "/";
+  if (method === "GET" && path === "/admin/miniapp/calls") {
+    try {
+      const data = await listMiniAppCallLogs(options.query || {});
+      return {
+        ok: true,
+        status: 200,
+        data,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        status: 500,
+        data: {
+          success: false,
+          error: "Failed to list Mini App call logs",
+          details: buildErrorDetails(error),
+        },
+      };
+    }
+  }
+  const callScriptBridgeResult = await runMiniAppCallScriptLocalBridge({
+    method,
+    path,
+    query: options.query,
+    body: options.body,
+    requestId: options.requestId,
+  });
+  if (callScriptBridgeResult) {
+    return callScriptBridgeResult;
+  }
   const requestPath = buildInternalRequestPath(options.path || "/", options.query);
   const targetUrl = `http://127.0.0.1:${PORT}${requestPath}`;
   const requestId = options.requestId || null;
@@ -11624,6 +12565,7 @@ async function startServer(options = {}) {
     await loadStoredEmailProvider();
     await loadPaymentFeatureConfig();
     await loadVoiceRuntimeControlSettings();
+    await loadMiniAppRoleOverrides();
     await refreshInboundDefaultScript(true);
     await loadKeypadProviderOverrides();
     logStartupRuntimeProfile();
@@ -15821,9 +16763,141 @@ async function getMiniAppDlqSnapshot() {
   };
 }
 
+async function listMiniAppCallLogs(options = {}) {
+  const limit = parseBoundedInteger(options.limit, {
+    defaultValue: 20,
+    min: 1,
+    max: 100,
+  });
+  const offset = parseBoundedInteger(options.offset, {
+    defaultValue: 0,
+    min: 0,
+    max: 5000,
+  });
+  const status = String(options.status || "")
+    .trim()
+    .toLowerCase();
+  const direction = String(options.direction || "")
+    .trim()
+    .toLowerCase();
+  const query = String(options.query || "")
+    .trim();
+
+  if (!db?.getRecentCalls) {
+    return {
+      success: true,
+      rows: [],
+      limit,
+      offset,
+      total: 0,
+    };
+  }
+
+  const rows = await db
+    .getRecentCalls({
+      limit,
+      offset,
+      status: status || null,
+      direction: direction || null,
+      query: query || null,
+    })
+    .catch(() => []);
+
+  const total = await (db?.getCallsCount ? db.getCallsCount().catch(() => null) : null);
+  const normalizedRows = (Array.isArray(rows) ? rows : []).map((row) => {
+    const call = normalizeCallRecordForApi(row) || {};
+    return {
+      call_sid: call.call_sid || null,
+      phone_number: call.phone_number || null,
+      status: call.status || null,
+      status_normalized: call.status_normalized || null,
+      direction: call.direction || null,
+      duration: Number.isFinite(Number(call.duration)) ? Number(call.duration) : 0,
+      transcript_count: Number(call.transcript_count) || 0,
+      voice_runtime: normalizeVoiceRuntimeLabel(call.voice_runtime || null),
+      ended_reason: call.ended_reason || null,
+      created_at: call.created_at || null,
+      updated_at: call.updated_at || null,
+    };
+  });
+
+  return {
+    success: true,
+    rows: normalizedRows,
+    limit,
+    offset,
+    total: Number.isFinite(Number(total)) ? Number(total) : normalizedRows.length,
+  };
+}
+
+async function getMiniAppCallScriptSnapshot(options = {}) {
+  const limit = parseBoundedInteger(options.limit, {
+    defaultValue: 80,
+    min: 1,
+    max: 200,
+  });
+  const flowFilter = parseCallScriptFlowFilter(
+    options.flow_type ?? options.flowType,
+  );
+  if (flowFilter.invalid.length) {
+    throw new Error(
+      `Invalid flow_type value(s): ${flowFilter.invalid.join(
+        ", ",
+      )}. Allowed values: ${CALL_SCRIPT_FLOW_TYPES.join(", ")}`,
+    );
+  }
+  if (!db?.getCallTemplates) {
+    return {
+      success: true,
+      scripts: [],
+      total: 0,
+      limit,
+      flow_types: flowFilter.values,
+    };
+  }
+  let scripts = (await db.getCallTemplates().catch(() => [])).map((item) =>
+    normalizeScriptTemplateRecord(item),
+  );
+  if (flowFilter.values.length) {
+    scripts = scripts.filter((script) =>
+      Array.isArray(script?.flow_types)
+        ? script.flow_types.some((flow) => flowFilter.values.includes(flow))
+        : flowFilter.values.includes(script?.flow_type),
+    );
+  }
+  const normalizedScripts = scripts.slice(0, limit).map((script) => ({
+    ...script,
+    lifecycle: buildCallScriptLifecycleCard(script),
+  }));
+  return {
+    success: true,
+    scripts: normalizedScripts,
+    total: scripts.length,
+    limit,
+    flow_types: flowFilter.values,
+  };
+}
+
 async function buildMiniAppBootstrapPayload(req) {
   const requestId = req.requestId || null;
-  const [providerResult, smsResult, emailStatsResult, emailHistoryResult, dlqSnapshot] =
+  const [
+    providerResult,
+    providerCompatResult,
+    smsResult,
+    smsStatsResult,
+    emailStatsResult,
+    emailHistoryResult,
+    systemStatusResult,
+    healthResult,
+    voiceRuntimeResult,
+    callScripts,
+    dlqSnapshot,
+    callLogs,
+    callStats,
+    usersSnapshot,
+    auditFeed,
+    incidents,
+  ] =
     await Promise.all([
       callMiniAppBridgeApi({
         method: "GET",
@@ -15833,8 +16907,18 @@ async function buildMiniAppBootstrapPayload(req) {
       }).catch(() => ({ ok: false, status: 500, data: null })),
       callMiniAppBridgeApi({
         method: "GET",
+        path: "/status/provider-compat",
+        requestId,
+      }).catch(() => ({ ok: false, status: 500, data: null })),
+      callMiniAppBridgeApi({
+        method: "GET",
         path: "/api/sms/bulk/status",
         query: { limit: 10, hours: 24 },
+        requestId,
+      }).catch(() => ({ ok: false, status: 500, data: null })),
+      callMiniAppBridgeApi({
+        method: "GET",
+        path: "/api/sms/stats",
         requestId,
       }).catch(() => ({ ok: false, status: 500, data: null })),
       callMiniAppBridgeApi({
@@ -15849,25 +16933,112 @@ async function buildMiniAppBootstrapPayload(req) {
         query: { limit: 10, offset: 0 },
         requestId,
       }).catch(() => ({ ok: false, status: 500, data: null })),
+      callMiniAppBridgeApi({
+        method: "GET",
+        path: "/status",
+        requestId,
+      }).catch(() => ({ ok: false, status: 500, data: null })),
+      callMiniAppBridgeApi({
+        method: "GET",
+        path: "/health",
+        requestId,
+      }).catch(() => ({ ok: false, status: 500, data: null })),
+      callMiniAppBridgeApi({
+        method: "GET",
+        path: "/admin/voice-runtime",
+        requestId,
+      }).catch(() => ({ ok: false, status: 500, data: null })),
+      getMiniAppCallScriptSnapshot({ limit: 80 }).catch(() => ({
+        success: true,
+        scripts: [],
+        total: 0,
+        limit: 80,
+        flow_types: [],
+      })),
       getMiniAppDlqSnapshot().catch(() => ({
         call_open: null,
         email_open: null,
         call_preview: [],
         email_preview: [],
       })),
+      listMiniAppCallLogs({ limit: 12, offset: 0 }).catch(() => ({
+        success: true,
+        rows: [],
+        limit: 12,
+        offset: 0,
+        total: 0,
+      })),
+      db?.getEnhancedCallStats
+        ? db.getEnhancedCallStats(24).catch(() => null)
+        : Promise.resolve(null),
+      listMiniAppUsers({ limit: 50, offset: 0 }).catch(() => ({
+        total: 0,
+        rows: [],
+        limit: 50,
+        offset: 0,
+      })),
+      getMiniAppAuditFeed({ hours: 24, limit: 25 }).catch(() => ({
+        summary: null,
+        rows: [],
+        hours: 24,
+        limit: 25,
+      })),
+      getMiniAppIncidentSummary({ hours: 24, limit: 50 }).catch(() => ({
+        success: false,
+        alerts: [],
+        total_alerts: 0,
+        runbooks: [],
+        summary: null,
+      })),
     ]);
+
+  const smsSummary = smsResult.ok ? smsResult.data?.summary || null : null;
+  const emailSummary = emailStatsResult.ok ? emailStatsResult.data?.stats || null : null;
+  const queueBacklog = {
+    dlq_call_open: Number(dlqSnapshot?.call_open) || 0,
+    dlq_email_open: Number(dlqSnapshot?.email_open) || 0,
+    sms_failed: Number(smsSummary?.totalFailed) || 0,
+    email_failed: Number(emailSummary?.failed) || 0,
+  };
+  const queueBacklogTotal =
+    queueBacklog.dlq_call_open
+    + queueBacklog.dlq_email_open
+    + queueBacklog.sms_failed
+    + queueBacklog.email_failed;
 
   return {
     provider: providerResult.ok ? providerResult.data : null,
+    provider_compatibility: providerCompatResult.ok ? providerCompatResult.data : null,
     sms_bulk: smsResult.ok ? smsResult.data : null,
+    sms_stats: smsStatsResult.ok ? smsStatsResult.data : null,
     email_bulk_stats: emailStatsResult.ok ? emailStatsResult.data : null,
     email_bulk_history: emailHistoryResult.ok ? emailHistoryResult.data : null,
+    voice_runtime: voiceRuntimeResult.ok ? voiceRuntimeResult.data : null,
+    call_scripts: callScripts,
     dlq: dlqSnapshot,
+    call_logs: callLogs,
+    call_stats: callStats,
+    users: usersSnapshot,
+    audit: auditFeed,
+    incidents,
+    ops: {
+      queue_backlog: {
+        ...queueBacklog,
+        total: queueBacklogTotal,
+      },
+      status: systemStatusResult.ok ? systemStatusResult.data : null,
+      health: healthResult.ok ? healthResult.data : null,
+    },
     bridge: {
       provider_status: providerResult.status,
+      provider_compat_status: providerCompatResult.status,
       sms_status: smsResult.status,
+      sms_stats_status: smsStatsResult.status,
       email_stats_status: emailStatsResult.status,
       email_history_status: emailHistoryResult.status,
+      status_path_status: systemStatusResult.status,
+      health_path_status: healthResult.status,
+      voice_runtime_status: voiceRuntimeResult.status,
     },
   };
 }
@@ -15908,6 +17079,395 @@ function buildMiniAppActionSpec(action, payload = {}) {
         channel,
         provider,
       },
+    };
+  }
+
+  if (normalizedAction === "provider.preflight") {
+    const channel = resolveProviderChannel(input.channel || PROVIDER_CHANNELS.CALL);
+    const provider = String(input.provider || "")
+      .trim()
+      .toLowerCase();
+    if (!channel) {
+      return { error: "Invalid provider channel" };
+    }
+    if (!provider) {
+      return { error: "Provider is required" };
+    }
+    const network =
+      String(input.network ?? input.live ?? "1").toLowerCase() === "0" ? "0" : "1";
+    const reachability =
+      String(input.reachability ?? "1").toLowerCase() === "0" ? "0" : "1";
+    return {
+      capability: "provider_manage",
+      method: "GET",
+      path: "/admin/provider/preflight",
+      query: { channel, provider, network, reachability },
+    };
+  }
+
+  if (normalizedAction === "provider.rollback") {
+    const channel = resolveProviderChannel(input.channel || PROVIDER_CHANNELS.CALL);
+    const provider = String(input.provider || input.previous_provider || "")
+      .trim()
+      .toLowerCase();
+    if (!channel) {
+      return { error: "Invalid provider channel" };
+    }
+    if (!provider) {
+      return { error: "Provider is required for rollback" };
+    }
+    return {
+      capability: "provider_manage",
+      method: "POST",
+      path: "/admin/provider",
+      body: {
+        channel,
+        provider,
+      },
+    };
+  }
+
+  if (normalizedAction === "calls.list") {
+    const limit = parseBoundedInteger(input.limit, {
+      defaultValue: 20,
+      min: 1,
+      max: 100,
+    });
+    const offset = parseBoundedInteger(input.offset, {
+      defaultValue: 0,
+      min: 0,
+      max: 5000,
+    });
+    const status = String(input.status || "").trim().toLowerCase() || undefined;
+    const direction = String(input.direction || "").trim().toLowerCase() || undefined;
+    const query = String(input.query || input.search || "").trim() || undefined;
+    return {
+      capability: "dashboard_view",
+      method: "GET",
+      path: "/admin/miniapp/calls",
+      query: { limit, offset, status, direction, query },
+    };
+  }
+
+  if (normalizedAction === "runtime.status") {
+    return {
+      capability: "provider_manage",
+      method: "GET",
+      path: "/admin/voice-runtime",
+    };
+  }
+
+  if (normalizedAction === "runtime.maintenance.enable") {
+    const durationMs = parseBoundedInteger(input.duration_ms || input.durationMs, {
+      defaultValue: 15 * 60 * 1000,
+      min: 60 * 1000,
+      max: 24 * 60 * 60 * 1000,
+    });
+    return {
+      capability: "provider_manage",
+      method: "POST",
+      path: "/admin/voice-runtime",
+      body: {
+        mode: "legacy",
+        open_circuit: true,
+        force_legacy_for_ms: durationMs,
+      },
+    };
+  }
+
+  if (normalizedAction === "runtime.maintenance.disable") {
+    return {
+      capability: "provider_manage",
+      method: "POST",
+      path: "/admin/voice-runtime",
+      body: {
+        mode: "clear",
+        force_legacy_for_ms: 0,
+        reset_circuit: true,
+      },
+    };
+  }
+
+  if (normalizedAction === "runtime.canary.set") {
+    const canaryPercent = parseBoundedInteger(input.canary_percent || input.canaryPercent, {
+      defaultValue: 0,
+      min: 0,
+      max: 100,
+    });
+    return {
+      capability: "provider_manage",
+      method: "POST",
+      path: "/admin/voice-runtime",
+      body: {
+        mode: "hybrid",
+        canary_percent: canaryPercent,
+      },
+    };
+  }
+
+  if (normalizedAction === "runtime.canary.clear") {
+    return {
+      capability: "provider_manage",
+      method: "POST",
+      path: "/admin/voice-runtime",
+      body: {
+        canary_percent: "clear",
+      },
+    };
+  }
+
+  if (normalizedAction === "callscript.list") {
+    const limit = parseBoundedInteger(input.limit, {
+      defaultValue: 80,
+      min: 1,
+      max: 200,
+    });
+    const flowType = String(input.flow_type || input.flowType || "")
+      .trim()
+      .toLowerCase();
+    if (flowType) {
+      const flowFilter = parseCallScriptFlowFilter(flowType);
+      if (flowFilter.invalid.length) {
+        return {
+          error: `Invalid flow_type value(s): ${flowFilter.invalid.join(
+            ", ",
+          )}. Allowed values: ${CALL_SCRIPT_FLOW_TYPES.join(", ")}`,
+        };
+      }
+    }
+    return {
+      capability: "caller_flags_manage",
+      method: "GET",
+      path: "/api/call-scripts",
+      query: {
+        limit,
+        flow_type: flowType || undefined,
+      },
+    };
+  }
+
+  if (normalizedAction === "callscript.update") {
+    const scriptId = Number(input.id || input.script_id || input.scriptId);
+    if (!Number.isFinite(scriptId) || scriptId <= 0) {
+      return { error: "Valid script id is required" };
+    }
+    const updates = {};
+    if (input.name !== undefined) updates.name = String(input.name || "").trim();
+    if (input.description !== undefined) {
+      updates.description = input.description === null ? null : String(input.description || "");
+    }
+    if (input.prompt !== undefined) {
+      updates.prompt = input.prompt === null ? null : String(input.prompt || "");
+    }
+    if (input.first_message !== undefined || input.firstMessage !== undefined) {
+      updates.first_message = String(input.first_message ?? input.firstMessage ?? "");
+    }
+    if (input.default_profile !== undefined || input.defaultProfile !== undefined) {
+      updates.default_profile = String(input.default_profile ?? input.defaultProfile ?? "")
+        .trim()
+        .toLowerCase();
+    }
+    if (input.objective_tags !== undefined || input.objectiveTags !== undefined) {
+      const rawTags = input.objective_tags ?? input.objectiveTags;
+      if (Array.isArray(rawTags)) {
+        updates.objective_tags = rawTags.map((entry) => String(entry || "").trim()).filter(Boolean);
+      } else if (typeof rawTags === "string") {
+        updates.objective_tags = rawTags
+          .split(",")
+          .map((entry) => entry.trim())
+          .filter(Boolean);
+      } else if (rawTags === null) {
+        updates.objective_tags = null;
+      } else {
+        return { error: "objective_tags must be a comma string, array, or null" };
+      }
+    }
+    if (Object.keys(updates).length === 0) {
+      return { error: "At least one script field must be provided for update" };
+    }
+    return {
+      capability: "caller_flags_manage",
+      method: "PUT",
+      path: `/api/call-scripts/${Math.trunc(scriptId)}`,
+      body: updates,
+    };
+  }
+
+  if (normalizedAction === "callscript.submit_review") {
+    const scriptId = Number(input.id || input.script_id || input.scriptId);
+    if (!Number.isFinite(scriptId) || scriptId <= 0) {
+      return { error: "Valid script id is required" };
+    }
+    return {
+      capability: "caller_flags_manage",
+      method: "POST",
+      path: `/api/call-scripts/${Math.trunc(scriptId)}/submit-review`,
+      body: {},
+    };
+  }
+
+  if (normalizedAction === "callscript.review") {
+    const scriptId = Number(input.id || input.script_id || input.scriptId);
+    const decision = String(input.decision || "").trim().toLowerCase();
+    const note = input.note === undefined ? null : String(input.note || "");
+    if (!Number.isFinite(scriptId) || scriptId <= 0) {
+      return { error: "Valid script id is required" };
+    }
+    if (!["approve", "reject"].includes(decision)) {
+      return { error: "decision must be approve or reject" };
+    }
+    return {
+      capability: "caller_flags_manage",
+      method: "POST",
+      path: `/api/call-scripts/${Math.trunc(scriptId)}/review`,
+      body: {
+        decision,
+        note,
+      },
+    };
+  }
+
+  if (normalizedAction === "callscript.promote_live") {
+    const scriptId = Number(input.id || input.script_id || input.scriptId);
+    if (!Number.isFinite(scriptId) || scriptId <= 0) {
+      return { error: "Valid script id is required" };
+    }
+    return {
+      capability: "caller_flags_manage",
+      method: "POST",
+      path: `/api/call-scripts/${Math.trunc(scriptId)}/promote-live`,
+      body: {},
+    };
+  }
+
+  if (normalizedAction === "callscript.simulate") {
+    const scriptId = Number(input.id || input.script_id || input.scriptId);
+    const variables =
+      input.variables && typeof input.variables === "object" ? input.variables : {};
+    if (!Number.isFinite(scriptId) || scriptId <= 0) {
+      return { error: "Valid script id is required" };
+    }
+    return {
+      capability: "caller_flags_manage",
+      method: "POST",
+      path: `/api/call-scripts/${Math.trunc(scriptId)}/simulate`,
+      body: { variables },
+    };
+  }
+
+  if (normalizedAction === "sms.bulk.send") {
+    const recipients = Array.isArray(input.recipients) ? input.recipients : [];
+    const message = String(input.message || "").trim();
+    if (!recipients.length) {
+      return { error: "Recipients are required" };
+    }
+    if (!message) {
+      return { error: "Message is required" };
+    }
+    let provider = null;
+    if (input.provider !== undefined && input.provider !== null && input.provider !== "") {
+      try {
+        provider = normalizeProvider(PROVIDER_CHANNELS.SMS, input.provider);
+      } catch {
+        return { error: `Provider must be one of: ${SUPPORTED_SMS_PROVIDERS.join(", ")}` };
+      }
+    }
+    return {
+      capability: "sms_bulk_manage",
+      method: "POST",
+      path: "/api/sms/bulk",
+      body: {
+        recipients,
+        message,
+        provider: provider || undefined,
+        options:
+          input.options && typeof input.options === "object"
+            ? input.options
+            : {},
+      },
+    };
+  }
+
+  if (normalizedAction === "sms.schedule.send") {
+    const to = String(input.to || "").trim();
+    const message = String(input.message || "").trim();
+    const scheduledTime = String(input.scheduled_time || input.scheduledTime || "").trim();
+    if (!to || !message || !scheduledTime) {
+      return { error: "to, message, and scheduled_time are required" };
+    }
+    let provider = null;
+    if (input.provider !== undefined && input.provider !== null && input.provider !== "") {
+      try {
+        provider = normalizeProvider(PROVIDER_CHANNELS.SMS, input.provider);
+      } catch {
+        return { error: `Provider must be one of: ${SUPPORTED_SMS_PROVIDERS.join(", ")}` };
+      }
+    }
+    return {
+      capability: "sms_bulk_manage",
+      method: "POST",
+      path: "/api/sms/schedule",
+      body: {
+        to,
+        message,
+        scheduled_time: scheduledTime,
+        provider: provider || undefined,
+        options:
+          input.options && typeof input.options === "object"
+            ? input.options
+            : {},
+      },
+    };
+  }
+
+  if (normalizedAction === "email.bulk.send") {
+    const recipients = Array.isArray(input.recipients) ? input.recipients : [];
+    if (!recipients.length) {
+      return { error: "Recipients are required" };
+    }
+    let provider = null;
+    if (input.provider !== undefined && input.provider !== null && input.provider !== "") {
+      try {
+        provider = normalizeProvider(PROVIDER_CHANNELS.EMAIL, input.provider);
+      } catch {
+        return { error: `Provider must be one of: ${SUPPORTED_EMAIL_PROVIDERS.join(", ")}` };
+      }
+    }
+    const body = {
+      recipients,
+      provider: provider || undefined,
+      script_id: input.script_id || input.scriptId || undefined,
+      subject: input.subject || undefined,
+      html: input.html || undefined,
+      text: input.text || undefined,
+      variables:
+        input.variables && typeof input.variables === "object"
+          ? input.variables
+          : undefined,
+      metadata:
+        input.metadata && typeof input.metadata === "object"
+          ? input.metadata
+          : undefined,
+      send_at: input.send_at || input.sendAt || undefined,
+      is_marketing: input.is_marketing === true,
+    };
+    return {
+      capability: "email_bulk_manage",
+      method: "POST",
+      path: "/email/bulk",
+      body,
+    };
+  }
+
+  if (normalizedAction === "email.preview") {
+    return {
+      capability: "email_bulk_manage",
+      method: "POST",
+      path: "/email/preview",
+      body:
+        input && typeof input === "object"
+          ? input
+          : {},
     };
   }
 
@@ -16041,6 +17601,154 @@ function buildMiniAppActionSpec(action, payload = {}) {
     };
   }
 
+  if (normalizedAction === "users.list") {
+    const limit = parseBoundedInteger(input.limit, {
+      defaultValue: 50,
+      min: 1,
+      max: 200,
+    });
+    const offset = parseBoundedInteger(input.offset, {
+      defaultValue: 0,
+      min: 0,
+      max: 2000,
+    });
+    const search = input.search ? String(input.search) : undefined;
+    const sortBy = input.sort_by || input.sortBy || undefined;
+    const sortDir = input.sort_dir || input.sortDir || undefined;
+    return {
+      capability: "users_manage",
+      method: "GET",
+      path: "/admin/miniapp/users",
+      query: { limit, offset, search, sort_by: sortBy, sort_dir: sortDir },
+    };
+  }
+
+  if (normalizedAction === "users.role.set") {
+    const telegramId = String(input.telegram_id || input.telegramId || "").trim();
+    const role = normalizeMiniAppRole(input.role);
+    const reason = String(input.reason || "").trim();
+    if (!telegramId) {
+      return { error: "telegram_id is required" };
+    }
+    if (!role) {
+      return { error: "role must be one of: admin, operator, viewer" };
+    }
+    if (!reason) {
+      return { error: "reason is required" };
+    }
+    return {
+      capability: "users_manage",
+      method: "POST",
+      path: "/admin/miniapp/users/role",
+      body: {
+        telegram_id: telegramId,
+        role,
+        reason,
+      },
+    };
+  }
+
+  if (normalizedAction === "audit.feed") {
+    const limit = parseBoundedInteger(input.limit, {
+      defaultValue: 50,
+      min: 1,
+      max: 200,
+    });
+    const hours = parseBoundedInteger(input.hours, {
+      defaultValue: 24,
+      min: 1,
+      max: 720,
+    });
+    return {
+      capability: "dashboard_view",
+      method: "GET",
+      path: "/admin/miniapp/audit",
+      query: { limit, hours },
+    };
+  }
+
+  if (normalizedAction === "incidents.summary") {
+    const limit = parseBoundedInteger(input.limit, {
+      defaultValue: 80,
+      min: 1,
+      max: 200,
+    });
+    const hours = parseBoundedInteger(input.hours, {
+      defaultValue: 24,
+      min: 1,
+      max: 720,
+    });
+    return {
+      capability: "dashboard_view",
+      method: "GET",
+      path: "/admin/miniapp/incidents",
+      query: { limit, hours },
+    };
+  }
+
+  if (normalizedAction === "runbook.sms.reconcile") {
+    const staleMinutes = parseBoundedInteger(input.stale_minutes || input.staleMinutes, {
+      defaultValue: 30,
+      min: 1,
+      max: 24 * 60,
+    });
+    const limit = parseBoundedInteger(input.limit, {
+      defaultValue: 200,
+      min: 1,
+      max: 5000,
+    });
+    return {
+      capability: "sms_bulk_manage",
+      method: "POST",
+      path: "/api/sms/reconcile",
+      body: {
+        stale_minutes: staleMinutes,
+        limit,
+      },
+    };
+  }
+
+  if (normalizedAction === "runbook.payment.reconcile") {
+    const staleSeconds = parseBoundedInteger(input.stale_seconds || input.staleSeconds, {
+      defaultValue: 600,
+      min: 60,
+      max: 7 * 24 * 60 * 60,
+    });
+    const limit = parseBoundedInteger(input.limit, {
+      defaultValue: 200,
+      min: 1,
+      max: 5000,
+    });
+    return {
+      capability: "provider_manage",
+      method: "POST",
+      path: "/api/payment/reconcile",
+      body: {
+        stale_seconds: staleSeconds,
+        limit,
+      },
+    };
+  }
+
+  if (normalizedAction === "runbook.provider.preflight") {
+    const channel = resolveProviderChannel(input.channel || PROVIDER_CHANNELS.CALL);
+    const provider = String(input.provider || "").trim().toLowerCase();
+    if (!channel || !provider) {
+      return { error: "channel and provider are required" };
+    }
+    return {
+      capability: "provider_manage",
+      method: "GET",
+      path: "/admin/provider/preflight",
+      query: {
+        channel,
+        provider,
+        network: 1,
+        reachability: 1,
+      },
+    };
+  }
+
   return { error: "Unsupported miniapp action" };
 }
 
@@ -16134,16 +17842,19 @@ app.post("/miniapp/session", async (req, res) => {
         req.requestId || null,
       );
     }
-    const isAdminUser = isTelegramAdminUser(userId);
-    if (!isAdminUser) {
+    const normalizedUserId = String(userId);
+    if (!isMiniAppUserAllowed(normalizedUserId)) {
       return sendApiError(
         res,
         403,
         "miniapp_admin_required",
-        "Mini App access is restricted to Telegram administrators",
+        "Mini App access is restricted to authorized Telegram users",
         req.requestId || null,
       );
     }
+    const role = resolveMiniAppUserRole(normalizedUserId) || "viewer";
+    const caps = getMiniAppCapabilitiesForRole(role);
+    const roleSource = resolveMiniAppRoleSource(normalizedUserId);
 
     const replayKey = buildMiniAppReplayKey(validation);
     const replayDetected = await detectAndMarkMiniAppReplay(
@@ -16152,16 +17863,14 @@ app.post("/miniapp/session", async (req, res) => {
       { requestId: req.requestId || null },
     );
 
-    const role = isAdminUser ? "admin" : "user";
-    const caps = getMiniAppCapabilitiesForRole(role);
     const nowSeconds = Math.floor(Date.now() / 1000);
     const ttlSeconds = Number(config.miniApp?.sessionTtlSeconds) || 900;
     const jti = uuidv4();
     const token = createMiniAppSessionToken(
       {
         jti,
-        sub: `tg:${String(userId)}`,
-        telegram_id: String(userId),
+        sub: `tg:${normalizedUserId}`,
+        telegram_id: normalizedUserId,
         username: validation.user?.username || null,
         first_name: validation.user?.first_name || null,
         role,
@@ -16180,10 +17889,11 @@ app.post("/miniapp/session", async (req, res) => {
       expires_at: nowSeconds + ttlSeconds,
       replay_detected: replayDetected,
       session: {
-        telegram_id: String(userId),
+        telegram_id: normalizedUserId,
         username: validation.user?.username || null,
         first_name: validation.user?.first_name || null,
         role,
+        role_source: roleSource,
         caps,
       },
       launch_url: resolveMiniAppPublicUrl(req),
@@ -16339,7 +18049,7 @@ app.get("/miniapp/jobs/poll", requireMiniAppSession, async (req, res) => {
       .filter((value) => isSafeId(value, { max: 128 }))
       .slice(0, 20);
 
-    const [smsResult, emailStatsResult, emailHistoryResult, dlqSnapshot, emailJobs] =
+    const [smsResult, emailStatsResult, emailHistoryResult, voiceRuntimeResult, dlqSnapshot, emailJobs, callLogs] =
       await Promise.all([
         callMiniAppBridgeApi({
           method: "GET",
@@ -16359,6 +18069,11 @@ app.get("/miniapp/jobs/poll", requireMiniAppSession, async (req, res) => {
           query: { limit: emailLimit, offset: 0 },
           requestId: req.requestId || null,
         }).catch(() => ({ ok: false, status: 500, data: null })),
+        callMiniAppBridgeApi({
+          method: "GET",
+          path: "/admin/voice-runtime",
+          requestId: req.requestId || null,
+        }).catch(() => ({ ok: false, status: 500, data: null })),
         getMiniAppDlqSnapshot().catch(() => ({
           call_open: null,
           email_open: null,
@@ -16372,20 +18087,31 @@ app.get("/miniapp/jobs/poll", requireMiniAppSession, async (req, res) => {
             return job ? normalizeEmailJobForApi(job) : null;
           }),
         ).catch(() => []),
+        listMiniAppCallLogs({ limit: 8, offset: 0 }).catch(() => ({
+          success: true,
+          rows: [],
+          limit: 8,
+          offset: 0,
+          total: 0,
+        })),
       ]);
 
     return res.json({
       success: true,
       poll_at: new Date().toISOString(),
+      session: buildMiniAppSessionSummary(req.miniAppSession || {}),
       sms_bulk: smsResult.ok ? smsResult.data : null,
       email_bulk_stats: emailStatsResult.ok ? emailStatsResult.data : null,
       email_bulk_history: emailHistoryResult.ok ? emailHistoryResult.data : null,
+      voice_runtime: voiceRuntimeResult.ok ? voiceRuntimeResult.data : null,
       email_jobs: emailJobs.filter(Boolean),
       dlq: dlqSnapshot,
+      call_logs: callLogs,
       bridge: {
         sms_status: smsResult.status,
         email_stats_status: emailStatsResult.status,
         email_history_status: emailHistoryResult.status,
+        voice_runtime_status: voiceRuntimeResult.status,
       },
       request_id: req.requestId || null,
     });
@@ -16915,6 +18641,120 @@ app.post(
     }
   },
 );
+
+app.get("/admin/miniapp/users", requireAdminToken, async (req, res) => {
+  try {
+    const search = String(req.query?.search || "").trim();
+    const sortBy = String(req.query?.sort_by || req.query?.sortBy || "last_activity");
+    const sortDir = String(req.query?.sort_dir || req.query?.sortDir || "desc");
+    const limit = Number(req.query?.limit);
+    const offset = Number(req.query?.offset);
+    const result = await listMiniAppUsers({
+      search,
+      sortBy,
+      sortDir,
+      limit,
+      offset,
+    });
+    return res.json({
+      success: true,
+      ...result,
+    });
+  } catch (error) {
+    console.error("miniapp_users_list_error", buildErrorDetails(error));
+    return res.status(500).json({
+      success: false,
+      error: "Failed to list Mini App users",
+    });
+  }
+});
+
+app.get("/admin/miniapp/calls", requireAdminToken, async (req, res) => {
+  try {
+    const limit = Number(req.query?.limit);
+    const offset = Number(req.query?.offset);
+    const status = String(req.query?.status || "").trim();
+    const direction = String(req.query?.direction || "").trim();
+    const query = String(req.query?.query || req.query?.search || "").trim();
+    const result = await listMiniAppCallLogs({
+      limit,
+      offset,
+      status,
+      direction,
+      query,
+    });
+    return res.json(result);
+  } catch (error) {
+    console.error("miniapp_calls_list_error", buildErrorDetails(error));
+    return res.status(500).json({
+      success: false,
+      error: "Failed to list Mini App call logs",
+    });
+  }
+});
+
+app.post("/admin/miniapp/users/role", requireAdminToken, async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const telegramId = body.telegram_id || body.telegramId;
+    const role = body.role;
+    const reason = body.reason;
+    const actor =
+      String(req.body?.actor || req.requestId || "miniapp_admin")
+        .trim()
+        .slice(0, 120) || "miniapp_admin";
+    const updated = await setMiniAppUserRole({
+      telegramId,
+      role,
+      reason,
+      actor,
+    });
+    return res.json({
+      success: true,
+      user: updated,
+    });
+  } catch (error) {
+    const message = String(error?.message || "Failed to update Mini App user role");
+    const status = /required|must be|cannot be demoted/i.test(message) ? 400 : 500;
+    return res.status(status).json({
+      success: false,
+      error: message,
+    });
+  }
+});
+
+app.get("/admin/miniapp/audit", requireAdminToken, async (req, res) => {
+  try {
+    const hours = Number(req.query?.hours);
+    const limit = Number(req.query?.limit);
+    const feed = await getMiniAppAuditFeed({ hours, limit });
+    return res.json({
+      success: true,
+      ...feed,
+    });
+  } catch (error) {
+    console.error("miniapp_audit_feed_error", buildErrorDetails(error));
+    return res.status(500).json({
+      success: false,
+      error: "Failed to load Mini App audit feed",
+    });
+  }
+});
+
+app.get("/admin/miniapp/incidents", requireAdminToken, async (req, res) => {
+  try {
+    const hours = Number(req.query?.hours);
+    const limit = Number(req.query?.limit);
+    const summary = await getMiniAppIncidentSummary({ hours, limit });
+    return res.json(summary);
+  } catch (error) {
+    console.error("miniapp_incidents_error", buildErrorDetails(error));
+    return res.status(500).json({
+      success: false,
+      error: "Failed to load Mini App incidents",
+    });
+  }
+});
 
 app.get("/admin/payment/feature", requireAdminToken, async (req, res) => {
   try {
