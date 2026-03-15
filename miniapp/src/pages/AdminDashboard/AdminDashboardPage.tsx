@@ -33,6 +33,7 @@ import {
 import {
   buildApiUrl,
   buildEventStreamUrl,
+  isNgrokApiBase,
   isSessionBootstrapBlockingCode,
   readSessionCache,
   writeSessionCache,
@@ -111,6 +112,8 @@ const SMS_DEFAULT_COST_PER_SEGMENT = 0.0075;
 const API_BASE_URL = String(
   import.meta.env.VITE_API_BASE_URL || import.meta.env.VITE_API_BASE || '',
 ).trim().replace(/\/+$/, '');
+const API_BASE_IS_NGROK = isNgrokApiBase(API_BASE_URL);
+const NGROK_BYPASS_HEADER = 'ngrok-skip-browser-warning';
 const SESSION_REFRESH_RETRY_COUNT = 1;
 
 type ProviderChannel = 'call' | 'sms' | 'email';
@@ -787,17 +790,27 @@ export function AdminDashboardPage() {
     }
 
     const sessionRequest = (async (): Promise<string> => {
+      const sessionHeaders = new Headers({
+        Authorization: `tma ${initDataRaw}`,
+        'x-telegram-init-data': initDataRaw,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      });
+      if (API_BASE_IS_NGROK) {
+        sessionHeaders.set(NGROK_BYPASS_HEADER, '1');
+      }
       const response = await fetch(buildApiUrl('/miniapp/session', API_BASE_URL), {
         method: 'POST',
-        headers: {
-          Authorization: `tma ${initDataRaw}`,
-          'x-telegram-init-data': initDataRaw,
-          'Content-Type': 'application/json',
-        },
+        headers: sessionHeaders,
         body: JSON.stringify({ init_data_raw: initDataRaw }),
       });
 
       const payload = (await parseJsonResponse(response)) as SessionResponse | null;
+      if (response.ok && !payload) {
+        throw new Error(
+          'Session endpoint returned an empty/non-JSON response. Verify VITE_API_BASE_URL points to the API origin.',
+        );
+      }
       const code = toText(payload?.code, '');
       if (!response.ok || !payload?.success || !payload?.token) {
         if (isSessionBootstrapBlockingCode(code)) {
@@ -836,6 +849,10 @@ export function AdminDashboardPage() {
     const activeToken = token || await createSession();
     const headers = new Headers(options.headers || {});
     headers.set('Authorization', `Bearer ${activeToken}`);
+    headers.set('Accept', 'application/json');
+    if (API_BASE_IS_NGROK) {
+      headers.set(NGROK_BYPASS_HEADER, '1');
+    }
     if (!headers.has('Content-Type') && options.body !== undefined) {
       headers.set('Content-Type', 'application/json');
     }
@@ -846,6 +863,11 @@ export function AdminDashboardPage() {
     });
 
     const payload = await parseJsonResponse(response);
+    if (response.ok && !payload) {
+      throw new Error(
+        `API returned an empty/non-JSON response for ${path}. Verify VITE_API_BASE_URL is configured to your backend.`,
+      );
+    }
     if (response.status === 401 && retryCount < SESSION_REFRESH_RETRY_COUNT) {
       writeSessionCache(SESSION_STORAGE_KEY, null);
       setToken(null);
@@ -1058,7 +1080,7 @@ export function AdminDashboardPage() {
     streamFailureCount,
     streamLastEventAt,
   } = useDashboardEventStream({
-    enabled: realtimeStreamEnabled && !sessionBlocked && !pollingPaused,
+    enabled: realtimeStreamEnabled && !sessionBlocked && !pollingPaused && !API_BASE_IS_NGROK,
     token,
     buildEventStreamUrl: resolveEventStreamUrl,
     applyStreamPayload,
