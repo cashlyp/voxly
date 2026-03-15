@@ -1,4 +1,5 @@
 import type { CallScriptRow, DashboardVm } from './types';
+import { selectScriptStudioPageVm } from './vmSelectors';
 
 type ScriptStudioPageProps = {
   visible: boolean;
@@ -46,7 +47,7 @@ export function ScriptStudioPage({ visible, vm }: ScriptStudioPageProps) {
     simulateCallScript,
     scriptSimulationResult,
     asRecord,
-  } = vm;
+  } = selectScriptStudioPageVm(vm);
 
   return (
     <section className="va-grid">

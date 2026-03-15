@@ -1,4 +1,5 @@
 import type { DashboardVm, EmailJob } from './types';
+import { selectMailerPageVm } from './vmSelectors';
 
 type MailerPageProps = {
   visible: boolean;
@@ -51,7 +52,7 @@ export function MailerPage({ visible, vm }: MailerPageProps) {
     emailJobs,
     toText,
     toInt,
-  } = vm;
+  } = selectMailerPageVm(vm);
 
   return (
     <section className="va-grid">

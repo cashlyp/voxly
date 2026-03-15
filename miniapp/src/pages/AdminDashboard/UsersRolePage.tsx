@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 
 import type { DashboardVm, UserRow } from './types';
+import { selectUsersRolePageVm } from './vmSelectors';
 
 type UsersRolePageProps = {
   visible: boolean;
@@ -53,7 +54,7 @@ export function UsersRolePage({ visible, vm }: UsersRolePageProps) {
     toText,
     formatTime,
     handleApplyUserRole,
-  } = vm;
+  } = selectUsersRolePageVm(vm);
   const advancedTablesEnabled = isFeatureEnabled('advanced_tables', true);
   const usersCsvEnabled = isFeatureEnabled('users_csv_export', advancedTablesEnabled);
   const [roleFilter, setRoleFilter] = useState<'all' | 'admin' | 'operator' | 'viewer'>('all');

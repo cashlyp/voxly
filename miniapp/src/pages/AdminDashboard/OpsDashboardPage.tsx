@@ -6,6 +6,7 @@ import type {
   DlqEmailRow,
   EmailJob,
 } from './types';
+import { selectOpsPageVm } from './vmSelectors';
 
 type OpsDashboardPageProps = {
   visible: boolean;
@@ -84,7 +85,7 @@ export function OpsDashboardPage({ visible, vm }: OpsDashboardPageProps) {
     emailDlq,
     runAction,
     hasMeaningfulData,
-  } = vm;
+  } = selectOpsPageVm(vm);
   const runtimeControlsEnabled = isFeatureEnabled('runtime_controls', true);
   const providerCardsEnabled = isFeatureEnabled('provider_cards', true);
 
@@ -404,10 +405,10 @@ export function OpsDashboardPage({ visible, vm }: OpsDashboardPageProps) {
 
       {!hasMeaningfulData ? (
         <section className="va-grid">
-          <div className="va-card">
-            <h3>Connected, Waiting for Operational Activity</h3>
+          <div className="va-card va-empty-state">
+            <h3>No Recent Operational Activity</h3>
             <p className="va-muted">
-              Session is healthy. Data cards will populate as provider, SMS, email, and DLQ events arrive.
+              Connection is active. Metrics and recent events will appear as traffic and jobs are processed.
             </p>
           </div>
         </section>

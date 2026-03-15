@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 
 import type { AuditRow, DashboardVm, IncidentRow, RunbookRow } from './types';
+import { selectAuditIncidentsPageVm } from './vmSelectors';
 
 type AuditIncidentsPageProps = {
   visible: boolean;
@@ -66,7 +67,7 @@ export function AuditIncidentsPage({ visible, vm }: AuditIncidentsPageProps) {
     runbookRows,
     busyAction,
     auditRows,
-  } = vm;
+  } = selectAuditIncidentsPageVm(vm);
   const advancedTablesEnabled = isFeatureEnabled('advanced_tables', true);
   const runbookActionsEnabled = isFeatureEnabled('runbook_actions', true);
   const incidentCsvEnabled = isFeatureEnabled('incidents_csv_export', advancedTablesEnabled);

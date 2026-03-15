@@ -1,4 +1,5 @@
 import type { DashboardVm, ProviderMatrixRow } from './types';
+import { selectProviderPageVm } from './vmSelectors';
 
 type ProviderControlPageProps = {
   visible: boolean;
@@ -28,7 +29,7 @@ export function ProviderControlPage({ visible, vm }: ProviderControlPageProps) {
     applyProviderSwitchPlan,
     resetProviderSwitchPlan,
     renderProviderSection,
-  } = vm;
+  } = selectProviderPageVm(vm);
 
   return (
     <>

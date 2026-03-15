@@ -12,6 +12,9 @@ Stack:
 - `@telegram-apps/telegram-ui`
 - Vite
 
+Architecture and rollout plan:
+- `docs/architecture-roadmap.md`
+
 ## Environment
 
 Create `.env` from `.env.example`:

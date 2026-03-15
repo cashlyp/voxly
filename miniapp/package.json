@@ -11,6 +11,8 @@
     "build": "tsc --noEmit && vite build",
     "lint": "eslint src --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "lint:fix": "eslint src --ext ts,tsx --report-unused-disable-directives --max-warnings 0 --fix",
+    "smoke:admin-dashboard": "node scripts/smoke-admin-dashboard.mjs",
+    "validate:prod": "npm run lint && npm run build && npm run smoke:admin-dashboard",
     "preview": "vite preview",
     "predeploy": "npm run build"
   },

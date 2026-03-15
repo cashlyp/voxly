@@ -1,4 +1,5 @@
 import type { DashboardVm } from './types';
+import { selectSmsPageVm } from './vmSelectors';
 
 type SmsSenderPageProps = {
   visible: boolean;
@@ -36,7 +37,7 @@ export function SmsSenderPage({ visible, vm }: SmsSenderPageProps) {
     smsFailed,
     smsProcessedPercent,
     textBar,
-  } = vm;
+  } = selectSmsPageVm(vm);
 
   return (
     <section className="va-grid">
